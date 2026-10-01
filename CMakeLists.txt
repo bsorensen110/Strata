@@ -263,11 +263,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
   # perf-review D-1: the tensor-core prompt attention vs the FP32 kernel and FP64 (GPU, synthetic, no model); with
-  # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON.  CUDA only: HIP compiles the tensor-core kernel out.
+  # the tests, or alone with -DSTRATA_PARITY_PROMPT_ATTN=ON.  On HIP the tensor-core kernel is the gfx12 (RDNA4) WMMA
+  # port; other HIP targets refuse it and the harness reports SKIP.
   if((STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN) AND STRATA_ENABLE_CUDA)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_include_directories(qsa_prompt_attn_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels CUDA::cudart)
+  elseif((STRATA_BUILD_TESTS OR STRATA_PARITY_PROMPT_ATTN) AND STRATA_ENABLE_HIP)
+    add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
+    set_source_files_properties(src/kernels/qsa_prompt_attn_parity.cpp PROPERTIES LANGUAGE HIP)
+    target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels strata_hip_runtime)
+    add_test(NAME qsa_prompt_attn_parity COMMAND qsa_prompt_attn_parity)
   endif()
   # the QSA selection (block scores on the warp kernel and the tensor-core one, top-k): a GPU bench with a
   # scorer-vs-scorer comparison and an FP64 accuracy gate (synthetic, no model); the ctest runs a 32K context under a

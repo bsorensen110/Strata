@@ -176,6 +176,14 @@ an RX 9070 XT 16 GB and a Radeon AI PRO R9700 32 GB (both gfx1201), a Ryzen 9 39
   starts. `"split_skip_if_fits": true` in the config (0.1.31, opt-in) runs such a pair on the first card alone when it
   holds every profiled expert: with the R9700 first, 4K prompts 1,776 tok/s (split: 1,244) and decode ~60 tok/s
   (split: ~51), the tokens of the R9700 alone (docs/MULTI_GPU.md).
+- **Prompt attention (gfx1200/gfx1201 only):** the int8-KV QSA prompt attention runs on the matrix cores
+  (`v_wmma_f32_16x16x16_f16`, wave32, the gfx12 fragment layout) instead of the ordered FP32 fallback. Same
+  algorithm and accuracy contract as the CUDA kernel (FP16 hi+lo split, fixed summation order, online softmax). The
+  device is checked at run time (`gcnArchName`), so other AMD targets keep the old kernel; fp16 and K8V4 pools and
+  `STRATA_PROMPT_ATTN_OLD=1` also select it. `qsa_prompt_attn_parity` (registered with ctest) compares both kernels
+  with an FP64 reference. Measured on the R9700 (Swift 1.5 IQ3_XXS, `--kv int8`): the attention phase of a 31K-token
+  prompt fell from 6.9 s to 1.1 s and the whole prompt from 22.8 s to 16.9 s (1.35x); a 108K-token prompt from
+  100.7 s to 79.7 s (1.26x). Decode is unchanged, and 32K/124K needle recall was 4/4 with either kernel.
 - **Known:** rarely (about 1 start in 10) a HIP run's greedy output differs from another start's at some token, on
   one card or two and on engine 0.1.29 as well; not yet explained.
 - **Not validated:** images, long contexts beyond 16K, answer-quality benchmarks.
