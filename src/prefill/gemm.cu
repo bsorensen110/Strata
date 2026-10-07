@@ -682,15 +682,54 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 }
 
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+#include <ggml.h>
+
+namespace {
+// The weight types STRATA_DENSE_MMQ=1 runs through MMQ.  MMQ wins by skipping the dequantize-to-FP16 step,
+// so it only pays where that step is expensive relative to the GEMM.  Measured on this pack at T=162/T=663
+// over three dense shapes: IQ4_XS 2.98x/1.60x and Q6_K 2.69x/1.21x win everywhere, while Q5_K (47.5% of the
+// dense FLOPs) measures 0.93x/0.76x, IQ3_S 0.85x/0.70x and Q4_K 0.87x/0.75x.  Gating by type turns a 0.95x
+// global flip into the ~2.7-3.0x on the ~35% of dense work that gains.
+// STRATA_DENSE_MMQ_TYPES=iq4_xs,q6_k overrides the list without a rebuild.
+bool dense_mmq_type_allowed(int type) {
+    static const std::vector<int> allowed = [] {
+        std::vector<int> out;
+        const char* e = std::getenv("STRATA_DENSE_MMQ_TYPES");
+        if (e && e[0]) {
+            const std::string s(e);
+            size_t b = 0;
+            for (;;) {
+                const size_t p = s.find(',', b);
+                const std::string name = s.substr(b, p == std::string::npos ? p : p - b);
+                for (int t = 0; t < GGML_TYPE_COUNT; ++t)
+                    if (name == ggml_type_name((ggml_type) t)) out.push_back(t);
+                if (p == std::string::npos) break;
+                b = p + 1;
+            }
+            return out;
+        }
+        out.push_back(GGML_TYPE_IQ4_XS);
+        out.push_back(GGML_TYPE_Q6_K);
+        return out;
+    }();
+    for (int t : allowed) if (t == type) return true;
+    return false;
+}
+}  // namespace
+
 bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int64_t T, int64_t N, int64_t K,
                       int64_t ldy) {
     namespace mmq = strata::prefill::mmq;
     constexpr int64_t kRows = 1024, kMaxK = 8192;
-    static const bool enabled = [] {
+    // 0 or unset: off.  1: only the weight types the sweep measured as a win (the gate above).  all: every
+    // type llama.cpp has a tile for - the pre-gate behaviour, kept so an A/B can still measure it.
+    static const int mode = [] {
         const char* e = std::getenv("STRATA_DENSE_MMQ");
-        return e && e[0] == '1';
+        if (!e || !e[0] || e[0] == '0') return 0;
+        return std::strcmp(e, "all") == 0 ? 2 : 1;
     }();
-    if (!enabled || mmq_failed_ || !mmq::built() || !mmq::fits(type, N)) return false;
+    if (mode == 0 || mmq_failed_ || !mmq::built() || !mmq::fits(type, N)) return false;
+    if (mode == 1 && !dense_mmq_type_allowed(type)) return false;
     // K must be a multiple of 256: llama.cpp's MMQ loads the weights in 256-value K chunks, and the
     // chunk past a partial row reads past the row (the next row's bytes - or, for the last weight
     // row, bytes past the tensor, which no caller guarantees to be zeros). The MoE path is safe
