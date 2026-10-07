@@ -107,12 +107,20 @@ public:
         return true;
     }
 
+    // A row may only answer a token count within a factor of two of the bucket it was measured at.
+    // The engine resolves a call to the NEAREST row of its shape, so when a bucket has no row - dropped by the
+    // tuner, or never tuned - the next-nearest surviving bucket used to answer it anyway: with rows only at
+    // 4096 and 8192 a 162-token prompt ran the kernel measured at 4096, a 25x extrapolation that measured
+    // slower than hipBLASEx.  Outside that window there is no row, and the caller falls back.
     const TuningRow* closest(InputType type, int n, int k, int ldy, int t) const {
         const TuningRow* best = nullptr;
         int64_t best_distance = std::numeric_limits<int64_t>::max();
         for (const auto& row : rows_) {
             if (row.type != type || row.n != n || row.k != k || row.ldy != ldy) continue;
-            const int64_t distance = row.t_bucket >= t ? int64_t(row.t_bucket) - t : int64_t(t) - row.t_bucket;
+            const int64_t bucket = row.t_bucket;
+            const int64_t tokens = t;
+            if (bucket > 2 * tokens || 2 * bucket < tokens) continue;
+            const int64_t distance = bucket >= tokens ? bucket - tokens : tokens - bucket;
             if (distance < best_distance ||
                 (distance == best_distance && (!best || row.t_bucket < best->t_bucket))) {
                 best = &row;
