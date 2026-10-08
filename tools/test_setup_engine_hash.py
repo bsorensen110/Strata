@@ -297,7 +297,9 @@ class WhatARefusalDoesToTheCaller(unittest.TestCase):
         (Path(self.tmp.name) / "engine").mkdir(parents=True, exist_ok=True)
         # get_prebuilt looks for the release with a HEAD request before it downloads (0.2.0), and keeps the engine in
         # an engine folder of its own: no network, and never this checkout's engine folder.  A published release answers the probe.
+        # The DFlash setup path (2956ec5f) also resolves prebuilt_bases: isolate that to the temp dir as well.
         for patcher in (mock.patch.object(setup, "engine_dir", lambda toolkit=13: Path(self.tmp.name) / "engine"),
+                        mock.patch.object(setup, "prebuilt_bases", return_value=[str(Path(self.tmp.name) / "dist") + "/"]),
                         mock.patch.object(setup, "_urlopen", lambda req, timeout=None: mock.MagicMock())):
             patcher.start()
             self.addCleanup(patcher.stop)
