@@ -486,6 +486,10 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: gr_parity [--selftest]\n"); return 2; }
     }
 
+    // Exercise the production HC variant selector on real dimensions (2560/4/320); the small 256/4/32 fixture
+    // below covers the scalar contract but cannot validate the production-sized tiled down-read.
+    if (selftest) strata::kernels::fused_gr_check();
+
     const long long n_embd = 256, hc = 4, hc_lr = 32;
     const long long hc_dim = hc * n_embd;
     const float eps = 1e-6f;
