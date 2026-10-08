@@ -1,5 +1,4 @@
-// src/kernels/fused_gr_bench.cpp - fused_gr_read_multi: the AMD fast kernels (STRATA_GR_FAST) against the old
-// ones, bit for bit on every output (lo, rs, inject, mixed, the in-place R), and each one's time.
+// src/kernels/fused_gr_bench.cpp - fused_gr_read_multi: correctness and timing for HC read paths.
 //
 //     build/fused_gr_bench [iters] [T min] [T max]
 #include "strata/kernels/fused_gr.hpp"
@@ -63,6 +62,14 @@ int main(int argc, char** argv) {
     cudaEventCreate(&e0);
     cudaEventCreate(&e1);
     int failures = 0;
+    const bool hc_variant_bench = std::getenv("STRATA_HC_BENCH_DIRECT") != nullptr;
+    const int selected_hc_variant = hc_variant_bench ? K::fused_gr_variant() : 0;
+    if (hc_variant_bench && selected_hc_variant != 3 && selected_hc_variant != 4) return 2;
+    if (hc_variant_bench) {
+        std::fprintf(stderr, "fused_gr_bench: selected HC variant %d (%s)\n", selected_hc_variant,
+                     selected_hc_variant == 3 ? "staged" : "small-CTA staged");
+        K::fused_gr_set_fast(0);
+    }
     for (int T = t_lo; T <= t_hi; ++T)
         for (int apply = 0; apply < 2; ++apply)
             for (int inject = 0; inject < 2; ++inject) {
@@ -75,25 +82,48 @@ int main(int argc, char** argv) {
                     a[t].inject_out = dio + (size_t) t * HC; a[t].mixed = dmix + (size_t) t * N;
                 }
                 std::vector<float> out[2];
-                for (int f = 0; f < 2; ++f) {
+                const int measurement_arms = hc_variant_bench ? 1 : 2;
+                for (int f = 0; f < measurement_arms; ++f) {
+                    if (hc_variant_bench && K::fused_gr_variant() != selected_hc_variant) return 2;
                     cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
                     cudaMemset(dlo, 0xff, (size_t) TM * LR * 4);
                     cudaMemset(drs, 0xff, (size_t) TM * HC * 4);
                     cudaMemset(dio, 0xff, (size_t) TM * HC * 4);
                     cudaMemset(dmix, 0xff, (size_t) TM * N * 4);
-                    K::fused_gr_set_fast(f);
+                    K::fused_gr_set_fast(hc_variant_bench ? 0 : f);
                     K::fused_gr_read_multi(a, T, dxn, s);
                     cudaStreamSynchronize(s);
                     auto& o = out[f];
                     o.resize((size_t) TM * (D + LR + HC + HC + N));
-                    float* p = o.data();
-                    cudaMemcpy(p, dR, (size_t) TM * D * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * D;
-                    cudaMemcpy(p, dlo, (size_t) TM * LR * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * LR;
-                    cudaMemcpy(p, drs, (size_t) TM * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * HC;
-                    cudaMemcpy(p, dio, (size_t) TM * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * HC;
-                    cudaMemcpy(p, dmix, (size_t) TM * N * 4, cudaMemcpyDeviceToHost);
+                    if (!hc_variant_bench) {
+                        float* p = o.data();
+                        cudaMemcpy(p, dR, (size_t) TM * D * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * D;
+                        cudaMemcpy(p, dlo, (size_t) TM * LR * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * LR;
+                        cudaMemcpy(p, drs, (size_t) TM * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * HC;
+                        cudaMemcpy(p, dio, (size_t) TM * HC * 4, cudaMemcpyDeviceToHost); p += (size_t) TM * HC;
+                        cudaMemcpy(p, dmix, (size_t) TM * N * 4, cudaMemcpyDeviceToHost);
+                    }
                 }
-                const bool same = std::memcmp(out[0].data(), out[1].data(), out[0].size() * 4) == 0;
+                const bool same = hc_variant_bench ? true : std::memcmp(out[0].data(), out[1].data(), out[0].size() * 4) == 0;
+                if (hc_variant_bench) {
+                    double kernel_us = 1e30;
+                    for (int round = 0; round < 3; ++round) {
+                        K::fused_gr_set_fast(0);
+                        for (int i = 0; i < 30; ++i) K::fused_gr_read_multi(a, T, dxn, s);
+                        cudaEventRecord(e0, s);
+                        for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(a, T, dxn, s);
+                        cudaEventRecord(e1, s);
+                        cudaEventSynchronize(e1);
+                        float ms = 0.0f;
+                        cudaEventElapsedTime(&ms, e0, e1);
+                        kernel_us = std::fmin(kernel_us, 1e3 * ms / iters);
+                    }
+                    std::printf("T %d apply %d inject %d | HC-read %6.1f us (%s) | %s\n", T, apply, inject, kernel_us,
+                                selected_hc_variant == 3 ? "staged" : "small-CTA staged",
+                                same ? "bitwise equal" : "DIFFERS");
+                    if (!same) ++failures;
+                    continue;
+                }
                 double us[2] = {1e30, 1e30};
                 for (int round = 0; round < 3; ++round)
                     for (int f = 0; f < 2; ++f) {

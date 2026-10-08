@@ -60,6 +60,7 @@ bool fits(int, int64_t) { return false; }
 size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
 size_t q8_bytes(int64_t, int64_t) { return 0; }
 void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*) {}
+void quantize_scatter(const float*, const int32_t*, const int32_t*, void*, int, int64_t, int64_t, int64_t, int, void*) {}
 Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product&, void*) {}
@@ -3232,8 +3233,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         pt.mark(kPfGather, cs);
                         if (use_mmq) {
-                            // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
-                            mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
+                            // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`:
+                            // each token quantized once and written to its K rows (slot_dev, the inverse of src_dev)
+                            mmq::quantize_scatter(m.mixed, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                             // reads the group's own quantized H)
                             const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;
@@ -3589,11 +3591,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // entry the routing skipped inside an open group first gathers what the group holds so far
                         // (`flush`), so no more than a group's entries are ever held back from the issuer.
                         // STRATA_PREFILL_GROUP_GATHER=0: one gather, one wait and one record per expert.
+                        // The staged walk (a chunk below stream_all_min(), or no ring) groups the same way: a resident
+                        // expert holds no slot, and a staged expert's slot is gathered (`flush`) before stage_one
+                        // hands that slot to a new copy, so no copy lands on a blob the group has not gathered yet.
+                        // Same bytes into the same group slots, so the same output.  STRATA_PREFILL_GROUP_GATHER_STAGED=0:
+                        // the staged walk gathers one expert at a time again (A/B).
                         static const bool group_env = [] {
                             const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
                             return v == nullptr || std::atoi(v) != 0;
                         }();
-                        const bool group_gather = group_env && stream_all && use_mmq && lay.native &&
+                        static const bool group_staged_env = [] {
+                            const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER_STAGED");
+                            return v == nullptr || std::atoi(v) != 0;
+                        }();
+                        const bool group_gather = group_env && (stream_all || group_staged_env) && use_mmq && lay.native &&
                                                   MMQ_GROUP <= mmq::kGatherGroupMax;
                         mmq::GatherGroup gg;
                         int gg_slots[MMQ_GROUP];
@@ -3634,7 +3645,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gg.blob[q] = blob_dev;
                                     gg.n = (int) q + 1;
                                     if (slot >= 0) gg_slots[gg_nslots++] = slot;
-                                    if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                    if (q + 1 < MMQ_GROUP && j + 1 < order.size()) {
+                                        // the staged walk's ring is STAGE slots: gather (and release) every STAGE/2
+                                        // held ones, so the copy that reuses a slot never waits on a gather that
+                                        // waits on the copy just before it
+                                        if (!stream_all && gg_nslots >= STAGE / 2) flush();
+                                        return true;
+                                    }
                                     flush();
                                     gg = mmq::GatherGroup{};
                                 } else if (lay.native) {
@@ -3696,10 +3713,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             size_t pending = 0;
                             const bool stream_ahead = stream_ahead_enabled();
                             const size_t lookahead = STAGE - 1;
+                            // group gather: does the open group still hold staging slot `sl` (copied, not gathered)?
+                            auto slot_held = [&](int sl) {
+                                for (int i = 0; i < gg_nslots; ++i)
+                                    if (gg_slots[i] == sl) return true;
+                                return false;
+                            };
                             for (size_t j = 0; j < order.size(); ++j) {
                                 // Resident experts occupy no staging slot. Keep STAGE actual transfers ahead,
                                 // rather than STAGE positions in the mixed resident/streamed order.
                                 while (staged < order.size() && (stream_ahead ? pending < STAGE : staged <= j + lookahead)) {
+                                    // group gather: the next copy reuses slot stage_next; if the open group still holds
+                                    // it, gather what the group holds first (flush records the slots' release event,
+                                    // which stage_one's copy then waits on)
+                                    if (group_gather && gg_nslots > 0 && slot_held(stage_next) &&
+                                        !(m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + order[staged]] >= 0))
+                                        flush();
                                     if (!stage_one(staged)) return false;
                                     if (stage_of[staged] >= 0) ++pending;
                                     ++staged;
@@ -3709,10 +3738,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     ++stats_.experts_resident;
                                     if (!compute(j, m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e]), -1)) return false;
                                 } else {
-                                    pt.mark(kPfWaitCopy, cs);
-                                    cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
+                                    if (!group_gather) {   // group gather: flush waits once, on the group's last copy
+                                        pt.mark(kPfWaitCopy, cs);
+                                        cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
+                                    }
                                     if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j])) return false;
-                                    --pending;   // compute recorded the slot's release event before any reuse
+                                    --pending;   // the slot's release event is recorded before any reuse: by compute, or
+                                                 // (group gather) by the flush ahead of the stage_one that reuses it
                                 }
                             }
                         } else {
