@@ -572,10 +572,19 @@ __global__ void __launch_bounds__(THREADS) gr_up_v3_kernel(GrMulti m, const floa
 //    weights are loaded while the current one is used.  A tile is 160 = 5 x 32 chunks of 8, so a lane still
 //    accumulates its chunks lane + 32 q in ascending order, as in the plain read with either tile.  Before sm_80
 //    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
-constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3, kHcSmallCta = 4;
+constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3, kHcSmallCta = 4, kHcReuseTwoRows = 5,
+              kHcRegisterPipe = 6, kHcRegisterHalf = 7;
 constexpr int HC_SMALL_CTA_THREADS = 128;
 constexpr int HC_SMALL_CTA_WARPS = HC_SMALL_CTA_THREADS / 32;
 constexpr int HC_SMALL_CTA_BLOCKS = LR / HC_SMALL_CTA_WARPS;
+constexpr int HC_REUSE_THREADS = 128;
+constexpr int HC_REUSE_WARPS = HC_REUSE_THREADS / 32;
+constexpr int HC_REUSE_ROWS_PER_WARP = 2;
+constexpr int HC_REUSE_ROWS_PER_BLOCK = HC_REUSE_WARPS * HC_REUSE_ROWS_PER_WARP;
+constexpr int HC_REUSE_BLOCKS = LR / HC_REUSE_ROWS_PER_BLOCK;
+static_assert(LR % HC_REUSE_ROWS_PER_BLOCK == 0, "reuse CTA rows tile the down projection");
+static_assert(HC_REUSE_THREADS % 32 == 0, "reuse CTA has whole wave32 warps");
+static_assert(HC_REUSE_BLOCKS == DOWN_BLOCKS, "reuse CTA keeps the original row-CTA count");
 constexpr int H_TILE = 1280;                          // staged tile: half a stream = 160 chunks of 8, 5 per lane
 constexpr int HQ = H_TILE / 8 / 32;
 constexpr int N_HTILES = D / H_TILE;                  // 8
@@ -625,7 +634,9 @@ __global__ void __launch_bounds__(THREADS) gr_norm_split_kernel(GrMulti m) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIPCC__)
 #define STRATA_GR_CP_ASYNC 1
 #endif
-__device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
+// CUDA sm_80+ can enqueue a global-to-shared copy; HIP/gfx12 performs the ordinary vector load/store here.
+// These helpers deliberately describe the CUDA group operations rather than implying HIP has asynchronous copies.
+__device__ __forceinline__ void gr_copy_gmem_to_smem16(void* smem, const void* gmem) {
 #if defined(STRATA_GR_CP_ASYNC)
     const unsigned sa = (unsigned) __cvta_generic_to_shared(smem);
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(sa), "l"(gmem) : "memory");
@@ -633,23 +644,80 @@ __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
     *reinterpret_cast<float4*>(smem) = *reinterpret_cast<const float4*>(gmem);
 #endif
 }
-__device__ __forceinline__ void cp_async_commit() {
+// CUDA cp.async queue operations are deliberately named as CUDA-specific.
+__device__ __forceinline__ void gr_cuda_async_group_commit() {
 #if defined(STRATA_GR_CP_ASYNC)
     asm volatile("cp.async.commit_group;\n" ::: "memory");
 #endif
 }
-__device__ __forceinline__ void cp_async_wait1() {
+__device__ __forceinline__ void gr_cuda_async_group_wait1() {
 #if defined(STRATA_GR_CP_ASYNC)
     asm volatile("cp.async.wait_group 1;\n" ::: "memory");
 #endif
 }
-__device__ __forceinline__ void cp_async_wait0() {
+__device__ __forceinline__ void gr_cuda_async_group_wait0() {
 #if defined(STRATA_GR_CP_ASYNC)
     asm volatile("cp.async.wait_group 0;\n" ::: "memory");
 #endif
 }
 
-// `dot8` with its 8 activations as two float4: the same eight fmaf in the same order
+// The staged read uses the original CTA mapping. The gfx12 copy is synchronous; do not infer overlap from CUDA helper names.
+__device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf,
+                                            int t, int nthreads) {
+    for (int i = t; i < T * (H_TILE / 4); i += nthreads) {
+        const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);
+        const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
+        gr_copy_gmem_to_smem16(buf + (size_t) k * (H_TILE / 4) +
+                               (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
+    }
+}
+
+// No direct global-to-LDS DMA path: the on-device gfx1201 probe reports
+// __builtin_amdgcn_global_load_async_to_lds_b128 not invocable, so the staged tiles reach LDS by way of the
+// per-thread copy in `stage_htile` above and nothing else.
+//
+// A software pipeline for the staged read - tile h + 2 read into a thread's own slots before tile h's arithmetic,
+// with no barrier in between, so the load is in flight during it - was tried on gfx1201 and is NOT used.  Its slot
+// array, intended as per-thread VGPR slots, measured private_segment_fixed_size 48 bytes at T=1 through 176 bytes
+// at T=8 on gfx1201 (ROCm 7.17), with scratch_store_b128 between the global load and scratch_load_b128 before the
+// LDS store: per-thread private scratch, not VGPR slots, so the tile travels through memory - the copy this
+// pipeline existed to avoid.  Written as scalars (not the float4 memcpy) it measured the same.  No performance was
+// measured, and the variant is not dispatched; see the STRATA_HC_SPLIT list below.
+
+// The register tuple the opt-in pipelined variants (STRATA_HC_SPLIT=6 and 7) carry the next tile in.  A
+// `HcChain<N>` is N+1 float4 in the thread's own registers, every slot reached at a compile-time index: the
+// first attempt's runtime-indexed slot array lowered to per-thread private scratch on gfx1201 (see the note
+// above), while this compile-time chain measured vgpr_spill 0 and private_segment_fixed_size 0 on gfx1201
+// (ROCm 7.17) for every T the dispatch uses.  Slot d of a thread's tuple takes float4 index
+// t + d*THREADS of the tile; a slot past the runtime total is zeroed and never stored.
+template <int I> struct HcChain { float4 head; HcChain<I - 1> tail; };
+template <> struct HcChain<0> { float4 head; };
+
+template <int Dd, int NN>
+__device__ __forceinline__ void hc_load_all(HcChain<NN>& c, const GrMulti& m, int h, int t, int total) {
+    const int idx = t + Dd * THREADS;
+    if (idx < total) {
+        const int k = idx / (H_TILE / 4), s4 = idx - k * (H_TILE / 4);
+        c.head = *reinterpret_cast<const float4*>(m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4);
+    } else {
+        c.head = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    if constexpr (NN > 0) hc_load_all<Dd + 1, NN - 1>(c.tail, m, h, t, total);
+}
+
+// Store the tuple into the staged tile layout - the same destination `stage_htile` writes, the same guarded
+// slots, and only in-bounds values.
+template <int Dd, int NN>
+__device__ __forceinline__ void hc_scatter_all(const HcChain<NN>& c, float4* buf, int t, int total) {
+    const int idx = t + Dd * THREADS;
+    if (idx < total) {
+        const int k = idx / (H_TILE / 4), s4 = idx - k * (H_TILE / 4);
+        buf[(size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1)] = c.head;
+    }
+    if constexpr (NN > 0) hc_scatter_all<Dd + 1, NN - 1>(c.tail, buf, t, total);
+}
+
+// `dot8` with its 8 activations as two float4: the same eight fmaf in the same order.
 __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const float4 x1) {
     float acc = 0.0f;
     acc = fmaf(__uint_as_float(w.x << 16), x0.x, acc);
@@ -663,19 +731,9 @@ __device__ __forceinline__ float dot8v(const uint4 w, const float4 x0, const flo
     return acc;
 }
 
-// Stage tile `h` of every token into `buf`: [T][2 planes][160 chunks] float4, plane 0 = floats 0-3 of a chunk.
-__device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, float4* buf, int t, int nthreads) {
-    for (int i = t; i < T * (H_TILE / 4); i += nthreads) {
-        const int k = i / (H_TILE / 4), s4 = i - k * (H_TILE / 4);   // s4: float4 of the tile, chunk s4/2, half s4&1
-        const float* src = m.xn + (size_t) k * D + (size_t) h * H_TILE + (size_t) s4 * 4;
-        cp_async16(buf + (size_t) k * (H_TILE / 4) + (s4 & 1) * (H_TILE / 8) + (s4 >> 1), src);
-    }
-}
-
-// 4-warp CTA variant for gfx1201 occupancy experiments: identical row/warp mapping and arithmetic order.
 template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false, int BLOCK_THREADS = THREADS>
 __global__ void __launch_bounds__(BLOCK_THREADS) gr_down_staged_kernel(GrMulti m) {
-    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+    extern __shared__ __align__(16) float4 hbuf[];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     constexpr int CTA_WARPS = BLOCK_THREADS / 32;
     constexpr int CTA_BLOCKS = LR / CTA_WARPS;
@@ -685,7 +743,7 @@ __global__ void __launch_bounds__(BLOCK_THREADS) gr_down_staged_kernel(GrMulti m
     const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
     const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
     const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
-    const size_t buf_f4 = (size_t) T * (H_TILE / 4);    // float4 per buffer (the second one follows the first)
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
     float acc[MAX_T];
 #pragma unroll
     for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
@@ -695,17 +753,17 @@ __global__ void __launch_bounds__(BLOCK_THREADS) gr_down_staged_kernel(GrMulti m
         for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
     }
     stage_htile(m, T, 0, hbuf, t, BLOCK_THREADS);
-    cp_async_commit();
+    gr_cuda_async_group_commit();
     stage_htile(m, T, 1, hbuf + buf_f4, t, BLOCK_THREADS);
-    cp_async_commit();
+    gr_cuda_async_group_commit();
 #pragma unroll 1
     for (int h = 0; h < N_HTILES; ++h) {
         if (active && h + 1 < N_HTILES) {
 #pragma unroll
             for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
         }
-        if (h + 1 < N_HTILES) cp_async_wait1();         // tile h has landed (h + 1 may still be on its way)
-        else cp_async_wait0();
+        if (h + 1 < N_HTILES) gr_cuda_async_group_wait1();
+        else gr_cuda_async_group_wait0();
         __syncthreads();
         const float4* cur = hbuf + (h & 1) * buf_f4;
         if (active) {
@@ -722,9 +780,9 @@ __global__ void __launch_bounds__(BLOCK_THREADS) gr_down_staged_kernel(GrMulti m
                 }
             }
         }
-        __syncthreads();                                // every warp is done with buffer h & 1
+        __syncthreads();
         if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, BLOCK_THREADS);
-        cp_async_commit();                              // an empty group at the end keeps the wait counts simple
+        gr_cuda_async_group_commit();
         if (h + 1 < N_HTILES) {
 #pragma unroll
             for (int q = 0; q < HQ; ++q) wv[q] = wnext[q];
@@ -734,13 +792,276 @@ __global__ void __launch_bounds__(BLOCK_THREADS) gr_down_staged_kernel(GrMulti m
     float s[MAX_T];
 #pragma unroll
     for (int k = 0; k < MAX_T; ++k) s[k] = (EXACT_T || k < T) ? warp_sum(acc[k]) : 0.0f;
-    // lane k writes token k (every lane holds every sum after the xor reduction)
 #pragma unroll
     for (int k = 0; k < MAX_T; ++k) {
         if ((!EXACT_T && k >= T) || lane != k) continue;
-        if (inject_block) {
-            m.a[k].inject_out[row] = s[k];
-        } else {
+        if (inject_block) m.a[k].inject_out[row] = s[k];
+        else {
+            const float x = s[k] / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
+// Opt-in 4-warp CTA that gives each warp two independent output rows while staging the activation tile once.
+template <int MAX_T>
+__global__ void __launch_bounds__(HC_REUSE_THREADS) gr_down_reuse_two_rows_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    constexpr int CTA_ROWS = HC_REUSE_ROWS_PER_BLOCK;
+    const int T = MAX_T;
+    const bool inject_block = blockIdx.x == HC_REUSE_BLOCKS;
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
+    const uint16_t* wbase = inject_block ? m.a[0].w_inject : m.a[0].w_down;
+    float acc[HC_REUSE_ROWS_PER_WARP][MAX_T];
+    uint4 wv[HC_REUSE_ROWS_PER_WARP][HQ], wnext[HC_REUSE_ROWS_PER_WARP][HQ];
+    bool active[HC_REUSE_ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < HC_REUSE_ROWS_PER_WARP; ++r) {
+        const int row = inject_block ? warp * HC_REUSE_ROWS_PER_WARP + r
+                                     : blockIdx.x * CTA_ROWS + warp * HC_REUSE_ROWS_PER_WARP + r;
+        active[r] = inject_block ? (m.a[0].w_inject != nullptr && row < HC) : (row < LR);
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) acc[r][k] = 0.0f;
+        const uint4* w4 = reinterpret_cast<const uint4*>(wbase + (size_t) (active[r] ? row : 0) * D);
+        if (active[r]) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[r][q] = __ldg(w4 + lane + 32 * q);
+        }
+    }
+    stage_htile(m, T, 0, hbuf, t, HC_REUSE_THREADS);
+    gr_cuda_async_group_commit();
+    stage_htile(m, T, 1, hbuf + buf_f4, t, HC_REUSE_THREADS);
+    gr_cuda_async_group_commit();
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+#pragma unroll
+        for (int r = 0; r < HC_REUSE_ROWS_PER_WARP; ++r) {
+            const int row = inject_block ? warp * HC_REUSE_ROWS_PER_WARP + r
+                                         : blockIdx.x * CTA_ROWS + warp * HC_REUSE_ROWS_PER_WARP + r;
+            const uint4* w4 = reinterpret_cast<const uint4*>(wbase + (size_t) (active[r] ? row : 0) * D);
+            if (active[r] && h + 1 < N_HTILES) {
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) wnext[r][q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+            }
+        }
+        if (h + 1 < N_HTILES) gr_cuda_async_group_wait1();
+        else gr_cuda_async_group_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+#pragma unroll
+        for (int r = 0; r < HC_REUSE_ROWS_PER_WARP; ++r) {
+            if (active[r]) {
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) {
+                    const int j = lane + 32 * q;
+                    const Bf16x8 wvq = unpack8(wv[r][q]);
+#pragma unroll
+                    for (int k = 0; k < MAX_T; ++k) {
+                        const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                        acc[r][k] += dot8u(wvq, pk[j], pk[H_TILE / 8 + j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, HC_REUSE_THREADS);
+        gr_cuda_async_group_commit();
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int r = 0; r < HC_REUSE_ROWS_PER_WARP; ++r) {
+#pragma unroll
+                for (int q = 0; q < HQ; ++q) wv[r][q] = wnext[r][q];
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < HC_REUSE_ROWS_PER_WARP; ++r) {
+        if (!active[r]) continue;
+        const int row = inject_block ? warp * HC_REUSE_ROWS_PER_WARP + r
+                                     : blockIdx.x * CTA_ROWS + warp * HC_REUSE_ROWS_PER_WARP + r;
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) {
+            const float s = warp_sum(acc[r][k]);
+            if (lane != k) continue;
+            if (inject_block) m.a[k].inject_out[row] = s;
+            else {
+                const float x = s / (float) HC;
+                m.a[k].lo[row] = x / (1.0f + __expf(-x));
+            }
+        }
+    }
+}
+
+// Opt-in (STRATA_HC_SPLIT=6): the staged schedule with the NEXT tile carried in registers.  Same CTA mapping,
+// same tile, same weights, same dot and the same order as `gr_down_staged_kernel`; only the arrival of tile
+// h + 2 changes.  The staged kernel reads global -> LDS after the barrier of tile h; here tile h + 2 is read
+// into the thread's own tuple (registers) while tile h + 1's dot runs, and scattered to the LDS buffer after
+// that dot, before the barrier of tile h + 2.  The load is a plain global -> VGPR load (gfx1201 has no
+// invocable global -> LDS async copy; see the note above), so nothing here claims an asynchronous copy.
+// The prime (tiles 0, 1 to LDS, tile 2 to the tuple) and the double-buffer/barrier ownership are the staged
+// kernel's: the scatter at h writes buffer h & 1, which tile h's dot just released, and tile h + 2 is read
+// from it at h + 2.  Bitwise the staged kernel: identical values, identical accumulation order.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS) gr_down_register_pipe_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
+    const int total = T * (H_TILE / 4);
+    constexpr int NS = (MAX_T * (H_TILE / 4) + THREADS - 1) / THREADS;   // tuple slots for the widest launch
+    static_assert(NS * THREADS >= MAX_T * (H_TILE / 4), "the tuple covers the widest tile");
+    float acc[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
+    uint4 wv[HQ], wnext[HQ];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+    }
+    stage_htile(m, T, 0, hbuf, t, THREADS);
+    gr_cuda_async_group_commit();
+    stage_htile(m, T, 1, hbuf + buf_f4, t, THREADS);
+    gr_cuda_async_group_commit();
+    HcChain<NS - 1> tup;
+    hc_load_all<0, NS - 1>(tup, m, 2, t, total);
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (active && h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+        }
+        if (h + 1 < N_HTILES) gr_cuda_async_group_wait1();
+        else gr_cuda_async_group_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int j = lane + 32 * q;
+                const Bf16x8 wvq = unpack8(wv[q]);
+#pragma unroll
+                for (int k = 0; k < MAX_T; ++k) {
+                    if (EXACT_T || k < T) {
+                        const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                        acc[k] += dot8u(wvq, pk[j], pk[H_TILE / 8 + j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();                                // buffer h & 1 is free: the tile it held was just dotted
+        if (h + 2 < N_HTILES) hc_scatter_all<0, NS - 1>(tup, hbuf + (h & 1) * buf_f4, t, total);
+        if (h + 3 < N_HTILES) hc_load_all<0, NS - 1>(tup, m, h + 3, t, total);
+        gr_cuda_async_group_commit();                   // an empty group at the end keeps the wait counts simple
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[q] = wnext[q];
+        }
+    }
+    if (!active) return;
+    float s[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) s[k] = (EXACT_T || k < T) ? warp_sum(acc[k]) : 0.0f;
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        if ((!EXACT_T && k >= T) || lane != k) continue;
+        if (inject_block) m.a[k].inject_out[row] = s[k];
+        else {
+            const float x = s[k] / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
+// Opt-in (STRATA_HC_SPLIT=7): the same pipeline with the tuple split in two compile-time halves, so only
+// half the slots are live across a full dot.  The second half is loaded mid-dot (at q == 2, a plain global
+// load interleaved with the arithmetic) and the first half after the scatter, which is the schedule the
+// synthetic A/B measured; the halves are slots [0, H0) and [H0, NS) of the same tile, so the scatter covers
+// every slot exactly once and the buffer holds the whole tile before its barrier.  Same bitwise contract as
+// the pipe variant above.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS) gr_down_register_half_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
+    const int total = T * (H_TILE / 4);
+    constexpr int NS = (MAX_T * (H_TILE / 4) + THREADS - 1) / THREADS;
+    constexpr int H0 = (NS + 1) / 2;                    // the first half's slots; the rest are t1's
+    static_assert(H0 >= 1 && NS - H0 >= 0, "both halves exist for the widest tile");
+    float acc[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
+    uint4 wv[HQ], wnext[HQ];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+    }
+    stage_htile(m, T, 0, hbuf, t, THREADS);
+    gr_cuda_async_group_commit();
+    stage_htile(m, T, 1, hbuf + buf_f4, t, THREADS);
+    gr_cuda_async_group_commit();
+    HcChain<H0 - 1> t0;
+    HcChain<NS - H0 - 1> t1;
+    hc_load_all<0, H0 - 1>(t0, m, 2, t, total);
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (active && h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+        }
+        if (h + 1 < N_HTILES) gr_cuda_async_group_wait1();
+        else gr_cuda_async_group_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                if (q == 2 && h + 2 < N_HTILES)
+                    hc_load_all<H0, NS - H0 - 1>(t1, m, h + 2, t, total);   // in flight during the dot
+                const int j = lane + 32 * q;
+                const Bf16x8 wvq = unpack8(wv[q]);
+#pragma unroll
+                for (int k = 0; k < MAX_T; ++k) {
+                    if (EXACT_T || k < T) {
+                        const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                        acc[k] += dot8u(wvq, pk[j], pk[H_TILE / 8 + j]);
+                    }
+                }
+            }
+        }
+        if (h + 2 < N_HTILES) hc_load_all<H0, NS - H0 - 1>(t1, m, h + 2, t, total);   // the warps that did not dot
+        __syncthreads();
+        if (h + 2 < N_HTILES) {
+            hc_scatter_all<0, H0 - 1>(t0, hbuf + (h & 1) * buf_f4, t, total);
+            hc_scatter_all<H0, NS - H0 - 1>(t1, hbuf + (h & 1) * buf_f4, t, total);
+        }
+        if (h + 3 < N_HTILES) hc_load_all<0, H0 - 1>(t0, m, h + 3, t, total);
+        gr_cuda_async_group_commit();
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[q] = wnext[q];
+        }
+    }
+    if (!active) return;
+    float s[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) s[k] = (EXACT_T || k < T) ? warp_sum(acc[k]) : 0.0f;
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        if ((!EXACT_T && k >= T) || lane != k) continue;
+        if (inject_block) m.a[k].inject_out[row] = s[k];
+        else {
             const float x = s[k] / (float) HC;
             m.a[k].lo[row] = x / (1.0f + __expf(-x));
         }
@@ -827,7 +1148,7 @@ int down_chunk(bool staged, int* tile_out) {
         set_staged_attr(gr_down_staged_kernel<8, true>, 8);
         set_staged_attr(gr_down_staged_kernel<4, false>, 4);
         set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
-        // Configure the 4-warp CTA experiment under the same shared-memory contract.
+        // Configure the 4-warp and 2-row-per-warp variants under the same shared-memory contract.
         set_staged_attr(gr_down_staged_kernel<1, true, HC_SMALL_CTA_THREADS>, 1);
         set_staged_attr(gr_down_staged_kernel<2, true, HC_SMALL_CTA_THREADS>, 2);
         set_staged_attr(gr_down_staged_kernel<3, true, HC_SMALL_CTA_THREADS>, 3);
@@ -837,6 +1158,21 @@ int down_chunk(bool staged, int* tile_out) {
         set_staged_attr(gr_down_staged_kernel<7, true, HC_SMALL_CTA_THREADS>, 7);
         set_staged_attr(gr_down_staged_kernel<8, true, HC_SMALL_CTA_THREADS>, 8);
         set_staged_attr(gr_down_staged_kernel<kFusedGrMaxT, false, HC_SMALL_CTA_THREADS>, kFusedGrMaxT);
+        // The register-tuple variants (6/7) stage the same two tiles: the same shared-memory contract.
+        // Only the instantiations the dispatch uses are configured: on gfx1201 the exact tuple kernels
+        // measure private_segment_fixed_size 0 and vgpr_spill 0 up to MAX_T 4 (pipe) / 7 (half), and the
+        // generic (runtime-T) kernel measures 0 for both; the exact kernels past that point spill, so
+        // they are not dispatched and not compiled in (see the launch below).
+        set_staged_attr(gr_down_register_pipe_kernel<1, true>, 1);
+        set_staged_attr(gr_down_register_pipe_kernel<2, true>, 2);
+        set_staged_attr(gr_down_register_pipe_kernel<3, true>, 3);
+        set_staged_attr(gr_down_register_pipe_kernel<4, true>, 4);
+        set_staged_attr(gr_down_register_pipe_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
+        set_staged_attr(gr_down_register_half_kernel<1, true>, 1);
+        set_staged_attr(gr_down_register_half_kernel<2, true>, 2);
+        set_staged_attr(gr_down_register_half_kernel<3, true>, 3);
+        set_staged_attr(gr_down_register_half_kernel<4, true>, 4);
+        set_staged_attr(gr_down_register_half_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
         cudaGetLastError();      // drop any error the attempt left behind
         // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
         // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
@@ -921,17 +1257,52 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         // kFusedGrMaxT - the same tile, block size, accumulation order and plain/split/staged path, so the same bits
         // (decided once per device: this runs per layer when decode is not captured)
         const bool max4 = ct <= 4 && gr_down_max4();
-        if (staged && variant == kHcSmallCta) {
-            const unsigned grid = HC_SMALL_CTA_BLOCKS + 1;
+        if (staged && (variant == kHcSmallCta || variant == kHcReuseTwoRows)) {
+            const bool reuse_rows = variant == kHcReuseTwoRows;
+            const unsigned grid = (reuse_rows ? HC_REUSE_BLOCKS : HC_SMALL_CTA_BLOCKS) + 1;
             const size_t cta_smem = (size_t) ct * 2 * H_TILE * sizeof(float);
-            if (exact_t && ct == 1) gr_down_staged_kernel<1, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
-            else if (exact_t && ct == 2) gr_down_staged_kernel<2, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
-            else if (exact_t && ct == 3) gr_down_staged_kernel<3, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
-            else if (exact_t && ct == 4) gr_down_staged_kernel<4, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
-            else if (exact_t && ct == 5) gr_down_staged_kernel<5, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
-            else if (exact_t && ct == 6) gr_down_staged_kernel<6, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
-            else if (exact_t && ct == 7) gr_down_staged_kernel<7, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
-            else gr_down_staged_kernel<8, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
+            if (reuse_rows) {
+                if (exact_t && ct == 1) gr_down_reuse_two_rows_kernel<1><<<grid, HC_REUSE_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 2) gr_down_reuse_two_rows_kernel<2><<<grid, HC_REUSE_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 3) gr_down_reuse_two_rows_kernel<3><<<grid, HC_REUSE_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 4) gr_down_reuse_two_rows_kernel<4><<<grid, HC_REUSE_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 5) gr_down_reuse_two_rows_kernel<5><<<grid, HC_REUSE_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 6) gr_down_reuse_two_rows_kernel<6><<<grid, HC_REUSE_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 7) gr_down_reuse_two_rows_kernel<7><<<grid, HC_REUSE_THREADS, cta_smem, st>>>(c);
+                else gr_down_reuse_two_rows_kernel<8><<<grid, HC_REUSE_THREADS, cta_smem, st>>>(c);
+            } else {
+                if (exact_t && ct == 1) gr_down_staged_kernel<1, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 2) gr_down_staged_kernel<2, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 3) gr_down_staged_kernel<3, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 4) gr_down_staged_kernel<4, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 5) gr_down_staged_kernel<5, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 6) gr_down_staged_kernel<6, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 7) gr_down_staged_kernel<7, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
+                else gr_down_staged_kernel<8, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
+            }
+        } else if (staged && (variant == kHcRegisterPipe || variant == kHcRegisterHalf)) {
+            // opt-in (STRATA_HC_SPLIT=6/7): the staged grid, CTA size and shared-memory contract; the tile
+            // schedule is the kernel's own.  A launch of exactly ct tokens is its own instantiation, as staged.
+            const bool pipe = variant == kHcRegisterPipe;
+            const unsigned grid = DOWN_BLOCKS + 1;
+            const size_t cta_smem = (size_t) ct * 2 * H_TILE * sizeof(float);
+            // A launch of ct <= 4 tokens is its own instantiation; past that the tuple's live slots push the
+            // exact kernels over the 256-VGPR budget on gfx1201 (measured: pipe spills from MAX_T 5, half at
+            // MAX_T 8), so those launches take the generic kernel, which measures vgpr_spill 0 and
+            // private_segment_fixed_size 0 for both.  The runtime-T bounds change the codegen, not the sums.
+            if (pipe) {
+                if (exact_t && ct == 1) gr_down_register_pipe_kernel<1, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 2) gr_down_register_pipe_kernel<2, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 3) gr_down_register_pipe_kernel<3, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 4) gr_down_register_pipe_kernel<4, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else gr_down_register_pipe_kernel<kFusedGrMaxT, false><<<grid, THREADS, cta_smem, st>>>(c);
+            } else {
+                if (exact_t && ct == 1) gr_down_register_half_kernel<1, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 2) gr_down_register_half_kernel<2, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 3) gr_down_register_half_kernel<3, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 4) gr_down_register_half_kernel<4, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else gr_down_register_half_kernel<kFusedGrMaxT, false><<<grid, THREADS, cta_smem, st>>>(c);
+            }
         } else if (staged) {
             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
@@ -967,13 +1338,20 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     }
 }
 
-/// STRATA_HC_SPLIT: unset or 2 = staged, 1 = split, 3 = self-tested small-CTA staged, 0 = plain
+/// STRATA_HC_SPLIT: unset or 2 = staged, 1 = split, 3 = small CTA, 5 = 2 rows/warp (4-warp CTA), 0 = plain,
+/// 6 = staged with the next tile in a register tuple, 7 = the same with the tuple in two halves.  6 and 7 are
+/// opt-in and self-checked against staged before use.  Any other value takes the staged default: the first
+/// software-pipeline attempt (a runtime-indexed slot array) is not dispatched - it lowers to per-thread
+/// private scratch on gfx1201, not the VGPR slots it meant to use.
 int env_variant() {
     const char* e = std::getenv("STRATA_HC_SPLIT");
     if (e == nullptr || e[0] == '\0') return kHcStaged;
     if (e[0] == '0') return kHcPlain;
     if (e[0] == '1') return kHcSplit;
     if (e[0] == '3') return kHcSmallCta;
+    if (e[0] == '5') return kHcReuseTwoRows;
+    if (e[0] == '6') return kHcRegisterPipe;
+    if (e[0] == '7') return kHcRegisterHalf;
     return kHcStaged;
 }
 
@@ -1836,13 +2214,15 @@ void fused_gr_read(const FusedGrArgs& a, void* stream) {
 
 namespace {
 
-/// The plain read, split, staged and (for one token) the single-token read on random bf16 weights and random inputs,
-/// 1..8 tokens, with and without the pending write; every output of split and staged compared with the plain read's
-/// bit for bit (and the plain read's with the single-token read's).  `why[v]` gets the first difference of variant
-/// v; false if the check itself could not run.
-bool fused_gr_selftest(bool ok_variant[5], std::string why[5]) {
+/// The plain read, split, staged, small-CTA, two-row-per-warp, the two register-tuple variants, and (for one
+/// token) the single-token read on random bf16 weights and random inputs, 1..8 tokens, with and without the
+/// pending write and with and without the inject weights; every output of each multi variant is compared with
+/// the plain read bit for bit (and the plain read with the single-token read), and the variants that reuse the
+/// staged tile schedule (5, 6, 7) with the staged read bit for bit.  `why[v]` records the first difference for
+/// a multi variant; false if the check itself could not run.
+bool fused_gr_selftest(bool ok_variant[8], std::string why[8]) {
     constexpr int TM = kFusedGrMaxT;
-    constexpr int NV = 5;                             // sets: 0 = plain, 1 = split, 2 = staged, 3 = single-token, 4 = smaller CTA
+    constexpr int NV = 8;   // 0 plain, 1 split, 2 staged, 3 single, 4 small CTA, 5 reuse CTA, 6 register pipe, 7 register half
     std::mt19937 rng(20260930u);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     std::vector<uint16_t> h_down((size_t) LR * D), h_up((size_t) D * LR), h_inj((size_t) HC * D);
@@ -1854,7 +2234,7 @@ bool fused_gr_selftest(bool ok_variant[5], std::string why[5]) {
     for (auto& x : h_R) x = nd(rng);
     for (auto& x : h_bo) x = 0.5f * nd(rng);
     for (auto& x : h_ip) x = 2.0f * nd(rng);
-    for (int v = 0; v < 5; ++v) { ok_variant[v] = v == 1; why[v].clear(); }
+    for (int v = 0; v < NV; ++v) { ok_variant[v] = v == 1; why[v].clear(); }
 
     const size_t n_set = (size_t) TM * (D + D + LR + HC + HC + N);   // R_out, xn, lo, rs, inject, mixed (floats)
     const size_t bytes = h_down.size() * 2 + h_up.size() * 2 + h_inj.size() * 2 +
@@ -1892,7 +2272,8 @@ bool fused_gr_selftest(bool ok_variant[5], std::string why[5]) {
     if (!ok) why[0] = "setting up the check failed";
     std::vector<float> h1, h2;
     // true when equal; false with the first difference in `w` (or a read-back failure in `ok`)
-    auto same = [&](const float* d1, const float* d2, size_t n, const char* what, int T, int apply, std::string& w) {
+    auto same = [&](const float* d1, const float* d2, size_t n, const char* what, int T, int apply, int inj,
+                    std::string& w) {
         h1.resize(n);
         h2.resize(n);
         if (cudaMemcpyAsync(h1.data(), d1, n * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess ||
@@ -1908,24 +2289,29 @@ bool fused_gr_selftest(bool ok_variant[5], std::string why[5]) {
             std::memcpy(&u2, &h2[i], 4);
             if (u1 != u2) {
                 char buf[192];
-                std::snprintf(buf, sizeof buf, "%s differs for %d token(s)%s at %zu (%08x, not %08x)", what, T,
-                              apply ? " with the pending write" : "", i, u2, u1);
+                std::snprintf(buf, sizeof buf, "%s differs for %d token(s)%s%s at %zu (%08x, not %08x)", what, T,
+                              apply ? " with the pending write" : "", inj ? "" : " without the inject weights", i,
+                              u2, u1);
                 w = buf;
                 return false;
             }
         }
         return true;
     };
-    auto all_same = [&](const Set& s1, const Set& s2, int T, int apply, std::string& w) {
-        return same(s1.lo, s2.lo, (size_t) T * LR, "lo", T, apply, w) &&
-               same(s1.rs, s2.rs, (size_t) T * HC, "rs", T, apply, w) &&
-               same(s1.inj, s2.inj, (size_t) T * HC, "inject", T, apply, w) &&
-               same(s1.mixed, s2.mixed, (size_t) T * N, "mixed", T, apply, w) &&
-               same(s1.R_out, s2.R_out, (size_t) T * D, "R", T, apply, w);
+    auto all_same = [&](const Set& s1, const Set& s2, int T, int apply, int inj, std::string& w) {
+        return same(s1.lo, s2.lo, (size_t) T * LR, "lo", T, apply, inj, w) &&
+               same(s1.rs, s2.rs, (size_t) T * HC, "rs", T, apply, inj, w) &&
+               same(s1.inj, s2.inj, (size_t) T * HC, "inject", T, apply, inj, w) &&
+               same(s1.mixed, s2.mixed, (size_t) T * N, "mixed", T, apply, inj, w) &&
+               same(s1.R_out, s2.R_out, (size_t) T * D, "R", T, apply, inj, w);
     };
-    ok_variant[2] = ok_variant[3] = ok_variant[4] = ok;
+    // Split is the bitwise-single-token reference; staged is checked against it separately. The reuse CTA and the
+    // register-tuple variants must match the staged candidate exactly, so those gates isolate the tile schedule
+    // and CTA shape, not any pre-existing staged delta.
+    ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = ok_variant[6] = ok_variant[7] = ok;
     bool single_ok = ok;
-    for (int apply = 0; apply < 2 && ok; ++apply) {
+    for (int inj = 0; inj < 2 && ok; ++inj) {
+      for (int apply = 0; apply < 2 && ok; ++apply) {
         for (int T = 1; T <= TM && ok; ++T) {
             FusedGrArgs a[NV][TM];
             for (int v = 0; v < NV; ++v) {
@@ -1935,7 +2321,9 @@ bool fused_gr_selftest(bool ok_variant[5], std::string why[5]) {
                     FusedGrArgs& x = a[v][k];
                     x.R = d_R + (size_t) k * D; x.R_out = set[v].R_out + (size_t) k * D; x.apply = apply != 0;
                     x.bo_prev = d_bo + (size_t) k * N; x.inj_prev = d_ip + (size_t) k * HC;
-                    x.w_norm = d_norm; x.w_down = d_down; x.w_up = d_up; x.w_inject = d_inj; x.eps = 1e-6f;
+                    x.w_norm = d_norm; x.w_down = d_down; x.w_up = d_up;
+                    x.w_inject = inj ? d_inj : nullptr;   // the inject block stays inert without the weights
+                    x.eps = 1e-6f;
                     x.lo = set[v].lo + (size_t) k * LR; x.rs = set[v].rs + (size_t) k * HC;
                     x.inject_out = set[v].inj + (size_t) k * HC; x.mixed = set[v].mixed + (size_t) k * N;
                 }
@@ -1952,21 +2340,40 @@ bool fused_gr_selftest(bool ok_variant[5], std::string why[5]) {
             small_cta_m.xn = set[4].xn;
             small_cta_m.T = T;
             launch_multi(small_cta_m, kHcSmallCta, st, nullptr, 0);
+            GrMulti reuse_rows_m;
+            for (int k = 0; k < T; ++k) reuse_rows_m.a[k] = a[5][k];
+            reuse_rows_m.xn = set[5].xn;
+            reuse_rows_m.T = T;
+            launch_multi(reuse_rows_m, kHcReuseTwoRows, st, nullptr, 0);
+            GrMulti pipe_m;
+            for (int k = 0; k < T; ++k) pipe_m.a[k] = a[6][k];
+            pipe_m.xn = set[6].xn;
+            pipe_m.T = T;
+            launch_multi(pipe_m, kHcRegisterPipe, st, nullptr, 0);
+            GrMulti half_m;
+            for (int k = 0; k < T; ++k) half_m.a[k] = a[7][k];
+            half_m.xn = set[7].xn;
+            half_m.T = T;
+            launch_multi(half_m, kHcRegisterHalf, st, nullptr, 0);
             if (T == 1) fused_gr_read(a[3][0], st);
             if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) {
                 why[0] = "a kernel of the check failed";
                 ok = false;
                 break;
             }
-            if (ok_variant[2] && !all_same(set[0], set[1], T, apply, why[2])) ok_variant[2] = false;
-            if (ok && ok_variant[3] && !all_same(set[0], set[2], T, apply, why[3])) ok_variant[3] = false;
-            if (ok_variant[4] && !all_same(set[0], set[4], T, apply, why[4])) ok_variant[4] = false;
-            if (ok && T == 1 && single_ok && !all_same(set[3], set[0], T, apply, why[1])) single_ok = false;
+            if (ok_variant[2] && !all_same(set[0], set[1], T, apply, inj, why[2])) ok_variant[2] = false;
+            if (ok && ok_variant[3] && !all_same(set[0], set[2], T, apply, inj, why[3])) ok_variant[3] = false;
+            if (ok_variant[4] && !all_same(set[0], set[4], T, apply, inj, why[4])) ok_variant[4] = false;
+            if (ok_variant[5] && !all_same(set[2], set[5], T, apply, inj, why[5])) ok_variant[5] = false;
+            if (ok_variant[6] && !all_same(set[2], set[6], T, apply, inj, why[6])) ok_variant[6] = false;
+            if (ok_variant[7] && !all_same(set[2], set[7], T, apply, inj, why[7])) ok_variant[7] = false;
+            if (ok && T == 1 && single_ok && !all_same(set[3], set[0], T, apply, inj, why[1])) single_ok = false;
         }
+      }
     }
     if (!single_ok && ok) {                            // the plain read itself disagrees with the single-token read
-        why[2] = why[3] = "the plain read differs from the single-token read: " + why[1];
-        ok_variant[2] = ok_variant[3] = ok_variant[4] = false;
+        why[2] = why[3] = why[4] = why[5] = why[6] = why[7] = "the plain read differs from the single-token read: " + why[1];
+        ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = ok_variant[6] = ok_variant[7] = false;
     }
     if (st != nullptr) {
         cudaStreamSynchronize(st);
@@ -1974,7 +2381,8 @@ bool fused_gr_selftest(bool ok_variant[5], std::string why[5]) {
     }
     cudaFree(base);
     cudaGetLastError();
-    if (!ok) ok_variant[2] = ok_variant[3] = ok_variant[4] = false;
+    if (!ok)
+        ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = ok_variant[6] = ok_variant[7] = false;
     return ok;
 }
 
@@ -1990,7 +2398,9 @@ int fused_gr_variant() {
     if (e != nullptr && e[0] != '0') return env_variant();
     // not checked on this card: the plain read, unless STRATA_HC_SPLIT names a variant (a test such as gr_parity)
     e = std::getenv("STRATA_HC_SPLIT");
-    return e != nullptr && (e[0] == '1' || e[0] == '2' || e[0] == '3') ? env_variant() : kHcPlain;
+    return e != nullptr && (e[0] == '1' || e[0] == '2' || e[0] == '3' || e[0] == '5' || e[0] == '6' || e[0] == '7')
+               ? env_variant()
+               : kHcPlain;
 }
 
 void fused_gr_check() {
@@ -2004,26 +2414,36 @@ void fused_gr_check() {
                      dev);
         return;
     }
-    bool okv[5];
-    std::string why[5];
+    constexpr int NV = 8;                             // the arity fused_gr_selftest writes
+    bool okv[NV];
+    std::string why[NV];
     const bool ran = fused_gr_selftest(okv, why);
     int use = kHcPlain;
-    if (want == kHcSmallCta && okv[kHcSmallCta]) use = kHcSmallCta;
+    if (want == kHcRegisterPipe && okv[kHcRegisterPipe]) use = kHcRegisterPipe;
+    else if (want == kHcRegisterHalf && okv[kHcRegisterHalf]) use = kHcRegisterHalf;
+    else if (want == kHcReuseTwoRows && okv[kHcReuseTwoRows]) use = kHcReuseTwoRows;
+    else if (want == kHcSmallCta && okv[kHcSmallCta]) use = kHcSmallCta;
     else if (want >= kHcStaged && okv[kHcStaged]) use = kHcStaged;
     else if (okv[kHcSplit]) use = kHcSplit;
     g_variant[dev].store(use);
     if (!ran)
         std::fprintf(stderr, "strata hc: CUDA%d: the check of split/staged could not run (%s)\n", dev, why[0].c_str());
-    static const char* const name[5] = {"", "plain", "split", "staged", "small-CTA staged"};
-    for (int v = kHcSmallCta; v >= kHcSplit; --v)
-        if ((v <= want || (want == kHcSmallCta && v == kHcSmallCta)) && !okv[v] && ran)
-            std::fprintf(stderr, "strata hc: CUDA%d: the %s read differs from the plain read on this card - not used: "
-                                 "%s\n", dev, name[v], why[v].c_str());
-    static const char* const what[5] = {
+    static const char* const name[NV] = {"",        "plain",   "split",   "staged",      "small-CTA staged",
+                                          "2-row-per-warp staged", "register-pipe staged", "register-half staged"};
+    for (int v = kHcRegisterHalf; v >= kHcSplit; --v)
+        if (v <= want && !okv[v] && ran) {
+            const char* against = v >= kHcReuseTwoRows ? "the staged read" : "the plain read";
+            std::fprintf(stderr, "strata hc: CUDA%d: the %s read differs from %s on this card - not used: %s\n",
+                         dev, name[v], against, why[v].c_str());
+        }
+    static const char* const what[NV] = {
         "", "the plain read (the norm per token, the down projection on 41 blocks)",
         "split (the norm per token and stream, then the plain down projection)",
         "staged (the norm per token and stream, the staged down projection)",
-        "small-CTA staged (the norm per token and stream, four-warps-per-block staged down projection)"};
+        "small-CTA staged (the norm per token and stream, four-warps-per-block staged down projection)",
+        "2-row-per-warp staged (four warps per CTA, two rows sharing each activation tile)",
+        "register-pipe staged (the staged read with the next tile carried in a register tuple, STRATA_HC_SPLIT=6)",
+        "register-half staged (the same with the tuple in two halves, STRATA_HC_SPLIT=7)"};
     std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
                                    "for the earlier ones)" : "");

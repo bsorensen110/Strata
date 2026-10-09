@@ -1,4 +1,4 @@
-// src/kernels/fused_gr_bench.cpp - fused_gr_read_multi: correctness and timing for HC read paths.
+// src/kernels/fused_gr_bench.cpp - fused_gr_read_multi and the isolated down-kernel arm timing.
 //
 //     build/fused_gr_bench [iters] [T min] [T max]
 #include "strata/kernels/fused_gr.hpp"
@@ -63,11 +63,30 @@ int main(int argc, char** argv) {
     cudaEventCreate(&e1);
     int failures = 0;
     const bool hc_variant_bench = std::getenv("STRATA_HC_BENCH_DIRECT") != nullptr;
+    const char* expect_reuse_env = std::getenv("STRATA_HC_EXPECT_REUSE");
+    const bool expect_reuse_variant = expect_reuse_env != nullptr && expect_reuse_env[0] != '0';
+    const char* expect_variant_env = std::getenv("STRATA_HC_EXPECT_VARIANT");
+    const int expect_variant = expect_variant_env != nullptr ? std::atoi(expect_variant_env) : -1;
     const int selected_hc_variant = hc_variant_bench ? K::fused_gr_variant() : 0;
-    if (hc_variant_bench && selected_hc_variant != 3 && selected_hc_variant != 4) return 2;
+    if (hc_variant_bench && selected_hc_variant != 3 && selected_hc_variant != 4 && selected_hc_variant != 5 &&
+        selected_hc_variant != 6 && selected_hc_variant != 7)
+        return 2;
+    if (expect_reuse_variant && selected_hc_variant != 5) {
+        std::fprintf(stderr, "fused_gr_bench: expected two-row reuse variant 5, selected %d\n", selected_hc_variant);
+        return 2;
+    }
+    if (expect_variant >= 0 && selected_hc_variant != expect_variant) {
+        std::fprintf(stderr, "fused_gr_bench: expected HC variant %d, selected %d\n", expect_variant,
+                     selected_hc_variant);
+        return 2;
+    }
     if (hc_variant_bench) {
-        std::fprintf(stderr, "fused_gr_bench: selected HC variant %d (%s)\n", selected_hc_variant,
-                     selected_hc_variant == 3 ? "staged" : "small-CTA staged");
+        const char* variant_name = selected_hc_variant == 3    ? "staged"
+                                   : selected_hc_variant == 4  ? "small-CTA staged"
+                                   : selected_hc_variant == 5  ? "2-row-per-warp staged"
+                                   : selected_hc_variant == 6  ? "register-pipe staged"
+                                                               : "register-half staged";
+        std::fprintf(stderr, "fused_gr_bench: selected HC variant %d (%s)\n", selected_hc_variant, variant_name);
         K::fused_gr_set_fast(0);
     }
     for (int T = t_lo; T <= t_hi; ++T)
@@ -119,8 +138,13 @@ int main(int argc, char** argv) {
                         kernel_us = std::fmin(kernel_us, 1e3 * ms / iters);
                     }
                     std::printf("T %d apply %d inject %d | HC-read %6.1f us (%s) | %s\n", T, apply, inject, kernel_us,
-                                selected_hc_variant == 3 ? "staged" : "small-CTA staged",
-                                same ? "bitwise equal" : "DIFFERS");
+                                selected_hc_variant == 3    ? "staged"
+                                : selected_hc_variant == 4  ? "small-CTA staged"
+                                : selected_hc_variant == 5  ? "2-row-per-warp staged"
+                                : selected_hc_variant == 6  ? "register-pipe staged"
+                                                            : "register-half staged",
+                                hc_variant_bench ? "timed-only; parity is a separate gate"
+                                                 : (same ? "bitwise equal" : "DIFFERS"));
                     if (!same) ++failures;
                     continue;
                 }

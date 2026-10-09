@@ -65,11 +65,17 @@ void fused_gr_set_fast(int on);
 /// every output with the plain read's operations in its order, so bitwise the plain read's and the single-token
 /// read's: plain (0.1.31's default: the norm one block per token, the down projection on 41 blocks), split (the norm
 /// one block per token and stream, then the plain down projection), staged (split's norm, with the staged down
-/// projection), and small-CTA staged (same staged kernel using four warps per block). `fused_gr_check` compares the
-/// variants against the plain read on the current card with random weights and inputs (1..8 tokens, with and without
-/// the pending write) before using one. STRATA_HC_SPLIT=0 keeps plain, =1 stops at split, =2 uses staged, and =3
-/// opts into the four-warp staged experiment. The check runs once per card (Verifier::init calls it) and prints the
-/// selected path. On an unchecked card, `fused_gr_variant` is plain unless STRATA_HC_SPLIT explicitly names a variant.
+/// projection), small-CTA staged (same staged kernel using four warps per block), two rows per warp on a
+/// four-warp CTA (same eight rows per CTA as the baseline), and two pipelined staged reads that carry the next
+/// activation tile in a register tuple (the full tuple, and the tuple split in two halves). `fused_gr_check`
+/// compares the variants against the plain read on the current card with random weights and inputs (1..8 tokens,
+/// with and without the pending write, with and without the inject weights) - the tuple variants against the
+/// staged read - before using one. STRATA_HC_SPLIT=0 keeps plain, =1 stops at split, =2 uses staged, =3 opts into
+/// the four-warp staged experiment, =5 opts into the four-warp/two-row-per-warp reuse experiment, =6 opts into the
+/// register-tuple pipeline and =7 into its half-tuple form; any other value takes staged, and a tuple variant
+/// that fails its check falls back to staged. The check runs once per card (Verifier::init calls it) and prints
+/// the selected path. On an unchecked card, `fused_gr_variant` is plain unless STRATA_HC_SPLIT explicitly names
+/// a variant.
 void fused_gr_check();
 int fused_gr_variant();
 
