@@ -350,6 +350,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
+                          src/kernels/hc_pack.cpp
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
@@ -635,6 +636,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME hip_prompt_attn_iu8 COMMAND hip_prompt_attn_wmma 32768 2048 3)
     set_tests_properties(hip_prompt_attn_iu8 PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77 ENVIRONMENT "STRATA_PA_IU8=1")
     list(APPEND _strata_hip_tests hip_prompt_attn_iu8)
+    # S27 (STRATA_HC_PACK): the CPU gate for the 12-bit packed hc weights - every BF16 pattern round-trips and
+    # every escape's slot matches the kernel's rank formula.  No GPU: it packs on the CPU (src/kernels/hc_pack.cpp).
+    add_executable(hip_hc_pack_parity src/kernels/hc_pack_parity.cpp)
+    target_include_directories(hip_hc_pack_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(hip_hc_pack_parity PRIVATE strata_kernels strata_hip_runtime)
+    add_test(NAME hip_hc_pack_parity COMMAND hip_hc_pack_parity)
+    list(APPEND _strata_hip_tests hip_hc_pack_parity)
     if(STRATA_HIPBLASLT_AVAILABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/prefill_hipblaslt_gemm.cpp")
       add_executable(hip_prefill_hipblaslt_gemm tests/hip/prefill_hipblaslt_gemm.cpp)
       target_include_directories(hip_prefill_hipblaslt_gemm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")

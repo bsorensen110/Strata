@@ -17,6 +17,8 @@
 // must be different buffers (every block reads the former while one block writes the latter).
 #pragma once
 
+#include "strata/kernels/hc_pack.hpp"   // S27 STRATA_HC_PACK: the packed hc weight image (HcPackedWeights)
+
 #include <cstdint>
 
 namespace strata::kernels {
@@ -31,6 +33,13 @@ struct FusedGrArgs {
     const uint16_t* w_down = nullptr;  ///< bf16 [hc_lr][hc*n_embd]
     const uint16_t* w_up = nullptr;    ///< bf16 [hc*n_embd][hc_lr]
     const uint16_t* w_inject = nullptr;///< bf16 [hc][hc*n_embd], or null (the final mixer)
+    /// S27 STRATA_HC_PACK=1 (hc-rdna4-proposals-20261009 3.2): device-view descriptors for the 12-bit packed
+    /// images. These are embedded by value in FusedGrArgs (the descriptor's plane pointers are device pointers),
+    /// never host pointers to descriptor structs: GrMulti is passed by value to a GPU kernel. A null `lows` keeps
+    /// that matrix's plain BF16 read; pack_inject stays empty when w_inject is null.
+    HcPackedWeights pack_down{};    ///< packed w_down; `lows == nullptr` means plain BF16
+    HcPackedWeights pack_up{};      ///< packed w_up; `lows == nullptr` means plain BF16
+    HcPackedWeights pack_inject{};  ///< packed w_inject, or empty with w_inject null
     float eps = 1e-6f;
     float* lo = nullptr;               ///< workspace, hc_lr floats
     float* rs = nullptr;               ///< workspace, hc floats
@@ -78,5 +87,8 @@ void fused_gr_set_fast(int on);
 /// a variant.
 void fused_gr_check();
 int fused_gr_variant();
+/// The bench and the loader: 1 when the packed staged arm is selected (STRATA_HC_PACK=1 on a card whose self-test
+/// passed it), 0 otherwise.  Latched per device with the variant, and logged by fused_gr_check.
+int fused_gr_hc_pack();
 
 }  // namespace strata::kernels

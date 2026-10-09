@@ -373,6 +373,155 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
     if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
 }
 
+// ==================== S27 STRATA_HC_PACK: the packed weight read (hc-rdna4-proposals-20261009 3.2) ============
+// The packed arm changes only how the weight BYTES arrive: the 13 bytes per 8 values (8 lows, 4 nibbles, 1 flag
+// byte) are composed back to the identical BF16 bits in registers, and the escapes - values whose exponent left
+// [111,126] - are overwritten with their exact bits from the side list.  Everything else (CTA mapping, tiles,
+// lane order, the eight fmaf in dot8u's order, the xor reduction, the LDS contract) is the kernel it copies.
+//
+// gfx1201 ISA: composition uses 32-bit ops only (no v_add_u16 / v_sub_u16 / v_add_u8 / v_min_u8 / v_add3_u16 /
+// v_lshl_add_u16).  The three fields are disjoint - sign bit 15, exponent bits 7..14, mantissa bits 0..6 - and
+// the largest exponent 126 << 7 = 0x3F00 never carries into bit 15, so the adds below are the ORs.
+__device__ __forceinline__ uint32_t hc_pack_word(uint32_t lo2, uint32_t nb) {
+    const uint32_t a0 = lo2 & 0xFFu, a1 = (lo2 >> 8) & 0xFFu;
+    const uint32_t v0 = ((a0 & 0x80u) << 8) + ((uint32_t(HC_PACK_EXP_BASE) + (nb & 0xFu)) << 7) + (a0 & 0x7Fu);
+    const uint32_t v1 = ((a1 & 0x80u) << 8) + ((uint32_t(HC_PACK_EXP_BASE) + ((nb >> 4) & 0xFu)) << 7) + (a1 & 0x7Fu);
+    return v0 + (v1 << 16);
+}
+// One chunk = 8 values: lows lo.x = bytes 0..3, lo.y = bytes 4..7; nibble byte b carries values 2b (low nibble)
+// and 2b+1.  `fl` is the chunk's flag byte (bit i: value i is an escape) - the pack has no in-band marker,
+// because the window uses all 16 nibble values and the low byte all 8 bits.
+__device__ __forceinline__ uint4 hc_compose8(uint2 lo, uint32_t nb, uint32_t fl, uint32_t& emask) {
+    uint4 w;
+    w.x = hc_pack_word(lo.x & 0xFFFFu, nb & 0xFFu);
+    w.y = hc_pack_word((lo.x >> 16) & 0xFFFFu, (nb >> 8) & 0xFFu);
+    w.z = hc_pack_word(lo.y & 0xFFFFu, (nb >> 16) & 0xFFu);
+    w.w = hc_pack_word((lo.y >> 16) & 0xFFFFu, (nb >> 24) & 0xFFu);
+    emask = fl;
+    return w;
+}
+// Overwrite the escape values of a composed chunk, ascending value order, with the exact bits from the side
+// list starting at `slot`.  0.041% of values, so this loop almost never runs its body.
+__device__ __forceinline__ void hc_apply_escapes(uint4& w, uint32_t emask, const uint16_t* esc_value, uint32_t slot) {
+#pragma unroll
+    for (int i = 0; i < HC_PACK_VALUES; ++i) {
+        if ((emask & (1u << i)) == 0u) continue;
+        const uint32_t sh = (i & 1) ? 16u : 0u;
+        const uint32_t mask = 0xFFFFu << sh;
+        const uint32_t bits = uint32_t(__ldg(esc_value + slot)) << sh;
+        // Update the vector component explicitly: indexing from &w.x into sibling struct members is not a
+        // standard C++ array operation, even though the CUDA vector layout is contiguous.
+        switch (i >> 1) {
+            case 0: w.x = (w.x & ~mask) | bits; break;
+            case 1: w.y = (w.y & ~mask) | bits; break;
+            case 2: w.z = (w.z & ~mask) | bits; break;
+            default: w.w = (w.w & ~mask) | bits; break;
+        }
+        ++slot;
+    }
+}
+// Escapes this warp's lanes before this one found in this group: a 5-step shuffle scan of the per-lane counts
+// (a ballot would count lanes, not escapes - a lane's chunk can hold up to 8 of them).  Warp-converged: every
+// lane of the warp calls it, with cnt 0 where it read nothing.
+__device__ __forceinline__ uint32_t hc_warp_before(uint32_t cnt) {
+    uint32_t run = cnt, before = 0;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const uint32_t t = __shfl_up_sync(0xffffffffu, run, o);
+        if ((threadIdx.x & 31u) >= uint32_t(o)) {
+            before += t;
+            run += t;
+        }
+    }
+    return before;
+}
+
+// gr_up_multi_kernel with the packed weight arrival: same CTA mapping (UPM_BLOCKS, 16 columns, warp w walks
+// rows w, w+WARPS, ... of its 64), same lo[] tiles, same warp_sum, same lane == k epilogue.  A warp's two
+// chunks per row are the group's lane-th chunk (group 0) and the (32 + lane)-th (group 1, lanes < LR/8-32);
+// the lanes that read nothing in the plain read compose to zeros here too, so the dots are the same zeros.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS) gr_up_multi_packed_kernel(GrMulti m) {
+    __shared__ __align__(16) float lo[MAX_T][LR];
+    __shared__ float g[MAX_T][HC][UPM_COLS];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const int d0 = blockIdx.x * UPM_COLS;
+    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    __syncthreads();
+    const HcPackedWeights& pk = m.a[0].pack_up;
+    if (pk.lows == nullptr) return;
+    const uint2* lows = reinterpret_cast<const uint2*>(pk.lows);
+    const uint32_t* nib = reinterpret_cast<const uint32_t*>(pk.nibbles);
+    const uint8_t* flag = pk.flags;
+    const uint32_t chunks_per_row = LR / HC_PACK_VALUES;      // 40: whole chunks, LR = 320
+    for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const size_t crow = (size_t) i * chunks_per_row;
+        const uint32_t wb = __ldg(pk.esc_warp_row +
+                                  (blockIdx.x * pk.warps_per_block + warp) * pk.rows_per_warp + (r - warp) / WARPS);
+        uint4 wa4, wb4;
+        uint32_t ea = 0, eb = 0;
+        const uint2 la = __ldg(lows + crow + lane);
+        const uint32_t na = __ldg(nib + crow + lane);
+        ea = __ldg(flag + crow + lane);
+        wa4 = hc_compose8(la, na, ea, ea);
+        const bool second = lane < LR / 8 - 32;
+        uint2 lb = make_uint2(0, 0);
+        uint32_t nb2 = 0, fb = 0;
+        if (second) {
+            lb = __ldg(lows + crow + 32 + lane);
+            nb2 = __ldg(nib + crow + 32 + lane);
+            fb = __ldg(flag + crow + 32 + lane);
+        }
+        eb = fb;
+        wb4 = second ? hc_compose8(lb, nb2, fb, eb) : make_uint4(0, 0, 0, 0);
+        hc_apply_escapes(wa4, ea, pk.esc_value,
+                         wb + __ldg(pk.esc_row_group + i * pk.groups_per_row + 0) + hc_warp_before(__popc(ea)));
+        hc_apply_escapes(wb4, eb, pk.esc_value,
+                         wb + __ldg(pk.esc_row_group + i * pk.groups_per_row + 1) + hc_warp_before(__popc(eb)));
+        const Bf16x8 wa = unpack8(wa4);
+        const Bf16x8 wb8 = unpack8(wb4);
+        // the epilogue inputs of this lane's token, fetched while the dots run
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            rsc = a.rs[c];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) {
+            if (!EXACT_T && k >= T) break;
+            float acc = dot8u_ptr(wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8u_ptr(wb8, lo[k] + (32 + lane) * 8);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsc;
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
+}
+
 
 // ================================ hc read v3 (opt-in: STRATA_GR_V3=1) - two kernels, stream-split ================
 // The norm kernel runs on only T blocks (~16 us of pure latency per call) and `down` on 41 blocks (~280 GB/s).
@@ -574,6 +723,12 @@ __global__ void __launch_bounds__(THREADS) gr_up_v3_kernel(GrMulti m, const floa
 //    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
 constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3, kHcSmallCta = 4, kHcReuseTwoRows = 5,
               kHcRegisterPipe = 6, kHcRegisterHalf = 7;
+// STRATA_HC_PACK=1 (S27, hc-rdna4-proposals-20261009 3.2): the STAGED read with the weight bytes arriving packed
+// (include/strata/kernels/hc_pack.hpp).  Not a variant of its own - it is kHcStaged with the packed arm latched
+// (the latch lives below launch_multi, so the predicate is declared here).
+bool pack_on();
+// (g_pack), so the staged grid, tiles, lane order, dot order and LDS contract are the staged read's unchanged.
+constexpr int kHcPacked = 8;
 constexpr int HC_SMALL_CTA_THREADS = 128;
 constexpr int HC_SMALL_CTA_WARPS = HC_SMALL_CTA_THREADS / 32;
 constexpr int HC_SMALL_CTA_BLOCKS = LR / HC_SMALL_CTA_WARPS;
@@ -786,6 +941,118 @@ __global__ void __launch_bounds__(BLOCK_THREADS) gr_down_staged_kernel(GrMulti m
         if (h + 1 < N_HTILES) {
 #pragma unroll
             for (int q = 0; q < HQ; ++q) wv[q] = wnext[q];
+        }
+    }
+    if (!active) return;
+    float s[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) s[k] = (EXACT_T || k < T) ? warp_sum(acc[k]) : 0.0f;
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        if ((!EXACT_T && k >= T) || lane != k) continue;
+        if (inject_block) m.a[k].inject_out[row] = s[k];
+        else {
+            const float x = s[k] / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
+// gr_down_staged_kernel with the packed weight arrival (STRATA_HC_PACK=1): the same grid (DOWN_BLOCKS + 1), the
+// same 256-thread CTA, the same two-buffer tile schedule and stage_htile calls, the same prefetch of the next
+// tile's weights, the same j = lane + 32*q lane order, the same dot8u per token, the same warp_sum and lane == k
+// epilogue.  Only the weight bytes differ: a chunk arrives as 8 low bytes + 4 nibble bytes + 1 flag byte and is
+// composed in registers at the dot site, exactly where the plain kernel unpacks its uint4.
+//
+// A warp's chunks in tile h are 160h + lane + 32q (q < HQ = 5), so its escape-prefix group is 5h + q and its lane
+// is the chunk's lane - the group is the 32 chunks one warp reads in one tile, in the order it reads them.
+// D = 10240 and LR = 320 are both multiples of 8, so every row is a whole number of chunks (1280 and 40) and
+// there is no tail to handle.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS) gr_down_staged_packed_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    constexpr int CTA_WARPS = THREADS / 32;
+    constexpr int CTA_BLOCKS = LR / CTA_WARPS;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const bool inject_block = blockIdx.x == CTA_BLOCKS;
+    const int row = inject_block ? warp : blockIdx.x * CTA_WARPS + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    // w_inject null: the launch lets pack_inject be null too, and the plain kernel's injection CTA writes nothing
+    // there.  Take the same exit before touching the (absent) pack.
+    const HcPackedWeights& pk = inject_block ? m.a[0].pack_inject : m.a[0].pack_down;
+    if (pk.lows == nullptr) return;
+    const uint2* lows = reinterpret_cast<const uint2*>(pk.lows);
+    const uint32_t* nib = reinterpret_cast<const uint32_t*>(pk.nibbles);
+    const uint8_t* flag = pk.flags;
+    const size_t crow = (size_t) (active ? row : 0) * (D / HC_PACK_VALUES);      // 1280 chunks per row
+    const uint32_t wb = active ? __ldg(pk.esc_warp_row + (blockIdx.x * pk.warps_per_block + warp) * pk.rows_per_warp)
+                               : 0u;
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
+    float acc[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
+    uint2 lo[HQ], lonext[HQ];
+    uint32_t nb[HQ], nbnext[HQ];
+    uint32_t fl[HQ], flnext[HQ];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) {
+            const size_t c = lane + 32 * q;
+            lo[q] = __ldg(lows + crow + c);
+            nb[q] = __ldg(nib + crow + c);
+            fl[q] = __ldg(flag + crow + c);
+        }
+    }
+    stage_htile(m, T, 0, hbuf, t, THREADS);
+    gr_cuda_async_group_commit();
+    stage_htile(m, T, 1, hbuf + buf_f4, t, THREADS);
+    gr_cuda_async_group_commit();
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (active && h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const size_t c = (h + 1) * (H_TILE / 8) + lane + 32 * q;
+                lonext[q] = __ldg(lows + crow + c);
+                nbnext[q] = __ldg(nib + crow + c);
+                flnext[q] = __ldg(flag + crow + c);
+            }
+        }
+        if (h + 1 < N_HTILES) gr_cuda_async_group_wait1();
+        else gr_cuda_async_group_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int j = lane + 32 * q;
+                uint4 w4;
+                uint32_t emask = 0;
+                w4 = hc_compose8(lo[q], nb[q], fl[q], emask);
+                hc_apply_escapes(w4, emask, pk.esc_value,
+                                 wb + __ldg(pk.esc_row_group + row * pk.groups_per_row + h * HQ + q) +
+                                     hc_warp_before(__popc(emask)));
+                const Bf16x8 wvq = unpack8(w4);
+#pragma unroll
+                for (int k = 0; k < MAX_T; ++k) {
+                    if (EXACT_T || k < T) {
+                        const float4* pk4 = cur + (size_t) k * (H_TILE / 4);
+                        acc[k] += dot8u(wvq, pk4[j], pk4[H_TILE / 8 + j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, THREADS);
+        gr_cuda_async_group_commit();
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                lo[q] = lonext[q];
+                nb[q] = nbnext[q];
+                fl[q] = flnext[q];
+            }
         }
     }
     if (!active) return;
@@ -1234,6 +1501,11 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
 #endif
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     const bool staged = variant >= kHcStaged;
+    // STRATA_HC_PACK=1: the staged read's packed arm (the staged variant, all three matrices packed).  The
+    // small-CTA and reuse CTAs have their own kernels and stay on the plain bytes.
+    const bool packed = staged && variant == kHcStaged && pack_on() && m.a[0].pack_down.lows != nullptr &&
+                        m.a[0].pack_up.lows != nullptr &&
+                        (m.a[0].w_inject == nullptr || m.a[0].pack_inject.lows != nullptr);
     int tv = 2560;
     const int chunk_tok = down_chunk(staged, &tv);
     const size_t per_tok = (staged ? (size_t) 2 * H_TILE : (size_t) tv) * sizeof(float);
@@ -1303,6 +1575,16 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
                 else if (exact_t && ct == 4) gr_down_register_half_kernel<4, true><<<grid, THREADS, cta_smem, st>>>(c);
                 else gr_down_register_half_kernel<kFusedGrMaxT, false><<<grid, THREADS, cta_smem, st>>>(c);
             }
+        } else if (packed) {
+            // the staged grid, CTA size and shared-memory contract; only the weight bytes arrive packed
+            const size_t cta_smem = (size_t) ct * 2 * H_TILE * sizeof(float);
+            if (exact_t && ct == 1) gr_down_staged_packed_kernel<1, true><<<DOWN_BLOCKS + 1, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 2) gr_down_staged_packed_kernel<2, true><<<DOWN_BLOCKS + 1, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 3) gr_down_staged_packed_kernel<3, true><<<DOWN_BLOCKS + 1, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 4) gr_down_staged_packed_kernel<4, true><<<DOWN_BLOCKS + 1, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 5) gr_down_staged_packed_kernel<5, true><<<DOWN_BLOCKS + 1, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 6) gr_down_staged_packed_kernel<6, true><<<DOWN_BLOCKS + 1, THREADS, cta_smem, st>>>(c);
+            else gr_down_staged_packed_kernel<kFusedGrMaxT, false><<<DOWN_BLOCKS + 1, THREADS, cta_smem, st>>>(c);
         } else if (staged) {
             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
@@ -1327,6 +1609,18 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
 #endif
+    if (packed) {
+        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+            case 1: gr_up_multi_packed_kernel<1, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 2: gr_up_multi_packed_kernel<2, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 3: gr_up_multi_packed_kernel<3, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 4: gr_up_multi_packed_kernel<4, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 5: gr_up_multi_packed_kernel<5, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 6: gr_up_multi_packed_kernel<6, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+            default: gr_up_multi_packed_kernel<kFusedGrMaxT, false><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+        }
+        return;
+    }
     switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
         case 1: gr_up_multi_kernel<1, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
         case 2: gr_up_multi_kernel<2, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
@@ -1357,6 +1651,23 @@ int env_variant() {
 
 // per device: the variant `fused_gr_check` chose (0 = not checked yet)
 std::atomic<int> g_variant[64];
+// `g_pack_check` stores the final self-test decision; `pack_on` consults it outside the self-test. The device-view
+// descriptors themselves travel by value in GrMulti, never as a pointer to host memory.
+std::atomic<int> g_pack_check[64];
+bool env_pack() {
+    const char* e = std::getenv("STRATA_HC_PACK");
+    return e != nullptr && std::atoi(e) != 0;
+}
+bool g_force_pack = false;   // the self-test runs the packed arm whatever the env says
+
+bool pack_on() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (g_force_pack) return true;  // self-test-only: exercise the packed candidate before committing a decision
+    const int checked = dev >= 0 && dev < 64 ? g_pack_check[dev].load() : 0;
+    if (checked != 0) return checked == 1;
+    return env_pack();
+}
 
 
 #if STRATA_GR_FAST_BUILD
@@ -2220,9 +2531,10 @@ namespace {
 /// the plain read bit for bit (and the plain read with the single-token read), and the variants that reuse the
 /// staged tile schedule (5, 6, 7) with the staged read bit for bit.  `why[v]` records the first difference for
 /// a multi variant; false if the check itself could not run.
-bool fused_gr_selftest(bool ok_variant[8], std::string why[8]) {
+bool fused_gr_selftest(bool ok_variant[9], std::string why[9]) {
     constexpr int TM = kFusedGrMaxT;
-    constexpr int NV = 8;   // 0 plain, 1 split, 2 staged, 3 single, 4 small CTA, 5 reuse CTA, 6 register pipe, 7 register half
+    constexpr int NV = 9;   // 0 plain, 1 split, 2 staged, 3 single, 4 small CTA, 5 reuse CTA, 6 register pipe,
+                            // 7 register half, 8 packed staged (STRATA_HC_PACK)
     std::mt19937 rng(20260930u);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     std::vector<uint16_t> h_down((size_t) LR * D), h_up((size_t) D * LR), h_inj((size_t) HC * D);
@@ -2236,8 +2548,32 @@ bool fused_gr_selftest(bool ok_variant[8], std::string why[8]) {
     for (auto& x : h_ip) x = 2.0f * nd(rng);
     for (int v = 0; v < NV; ++v) { ok_variant[v] = v == 1; why[v].clear(); }
 
+    // the packed arm's arenas: built and validated on the CPU from the same BF16 bytes the device reads
+    std::vector<uint8_t> ar_down, ar_up, ar_inj;
+    HcPackedMatrix pm_down, pm_up, pm_inj;
+    bool pack_ok = true;
+    std::string pack_err;
+    auto build_pack = [&](const std::vector<uint16_t>& src, const HcPackGeometry& g, std::vector<uint8_t>& ar,
+                          HcPackedMatrix& p) {
+        if (!pack_ok) return;
+        ar.assign(hc_pack_bytes(g, hc_pack_count_escapes(src.data(), g)), 0);
+        std::string e;
+        if (!hc_pack_build(src.data(), g, ar.data(), ar.size(), &p, &e) ||
+            !hc_pack_validate(src.data(), g, p, ar.data(), &e)) {
+            pack_ok = false;
+            pack_err = e;
+        }
+    };
+    build_pack(h_down, hc_pack_geometry_down(), ar_down, pm_down);
+    build_pack(h_up, hc_pack_geometry_up(), ar_up, pm_up);
+    build_pack(h_inj, hc_pack_geometry_inject(), ar_inj, pm_inj);
+    if (!pack_ok) {
+        ok_variant[kHcPacked] = false;
+        why[kHcPacked] = "packing the check's weights on the CPU: " + pack_err;
+    }
     const size_t n_set = (size_t) TM * (D + D + LR + HC + HC + N);   // R_out, xn, lo, rs, inject, mixed (floats)
-    const size_t bytes = h_down.size() * 2 + h_up.size() * 2 + h_inj.size() * 2 +
+    const size_t bytes = h_down.size() * 2 + h_up.size() * 2 + h_inj.size() * 2 + ar_down.size() + ar_up.size() +
+                         ar_inj.size() +
                          (h_norm.size() + h_R.size() + h_bo.size() + h_ip.size() + NV * n_set) * 4 + 32 * 256;
     uint8_t* base = nullptr;
     if (cudaMalloc((void**) &base, bytes) != cudaSuccess) {
@@ -2250,6 +2586,10 @@ bool fused_gr_selftest(bool ok_variant[8], std::string why[8]) {
     uint16_t* d_down = (uint16_t*) take(h_down.size() * 2);
     uint16_t* d_up = (uint16_t*) take(h_up.size() * 2);
     uint16_t* d_inj = (uint16_t*) take(h_inj.size() * 2);
+    uint8_t *d_pdown = (uint8_t*) take(ar_down.size()), *d_pup = (uint8_t*) take(ar_up.size()),
+            *d_pinj = (uint8_t*) take(ar_inj.size());
+    const HcPackedWeights pk_down = hc_pack_device_view(pm_down, d_pdown), pk_up = hc_pack_device_view(pm_up, d_pup),
+                          pk_inj = hc_pack_device_view(pm_inj, d_pinj);
     float* d_norm = (float*) take(h_norm.size() * 4);
     float* d_R = (float*) take(h_R.size() * 4);
     float* d_bo = (float*) take(h_bo.size() * 4);
@@ -2268,7 +2608,10 @@ bool fused_gr_selftest(bool ok_variant[8], std::string why[8]) {
               cudaMemcpyAsync(d_norm, h_norm.data(), h_norm.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
               cudaMemcpyAsync(d_R, h_R.data(), h_R.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
               cudaMemcpyAsync(d_bo, h_bo.data(), h_bo.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
-              cudaMemcpyAsync(d_ip, h_ip.data(), h_ip.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess;
+              cudaMemcpyAsync(d_ip, h_ip.data(), h_ip.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
+              cudaMemcpyAsync(d_pdown, ar_down.data(), ar_down.size(), cudaMemcpyHostToDevice, st) == cudaSuccess &&
+              cudaMemcpyAsync(d_pup, ar_up.data(), ar_up.size(), cudaMemcpyHostToDevice, st) == cudaSuccess &&
+              cudaMemcpyAsync(d_pinj, ar_inj.data(), ar_inj.size(), cudaMemcpyHostToDevice, st) == cudaSuccess;
     if (!ok) why[0] = "setting up the check failed";
     std::vector<float> h1, h2;
     // true when equal; false with the first difference in `w` (or a read-back failure in `ok`)
@@ -2309,6 +2652,7 @@ bool fused_gr_selftest(bool ok_variant[8], std::string why[8]) {
     // register-tuple variants must match the staged candidate exactly, so those gates isolate the tile schedule
     // and CTA shape, not any pre-existing staged delta.
     ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = ok_variant[6] = ok_variant[7] = ok;
+    if (pack_ok) ok_variant[kHcPacked] = ok;
     bool single_ok = ok;
     for (int inj = 0; inj < 2 && ok; ++inj) {
       for (int apply = 0; apply < 2 && ok; ++apply) {
@@ -2323,6 +2667,10 @@ bool fused_gr_selftest(bool ok_variant[8], std::string why[8]) {
                     x.bo_prev = d_bo + (size_t) k * N; x.inj_prev = d_ip + (size_t) k * HC;
                     x.w_norm = d_norm; x.w_down = d_down; x.w_up = d_up;
                     x.w_inject = inj ? d_inj : nullptr;   // the inject block stays inert without the weights
+                    if (v == kHcPacked && pack_ok) {      // the same weights, arriving packed
+                        x.pack_down = pk_down; x.pack_up = pk_up;
+                        if (inj) x.pack_inject = pk_inj;
+                    }
                     x.eps = 1e-6f;
                     x.lo = set[v].lo + (size_t) k * LR; x.rs = set[v].rs + (size_t) k * HC;
                     x.inject_out = set[v].inj + (size_t) k * HC; x.mixed = set[v].mixed + (size_t) k * N;
@@ -2355,6 +2703,15 @@ bool fused_gr_selftest(bool ok_variant[8], std::string why[8]) {
             half_m.xn = set[7].xn;
             half_m.T = T;
             launch_multi(half_m, kHcRegisterHalf, st, nullptr, 0);
+            if (pack_ok) {   // the packed arm, forced on for the check whatever the env says
+                g_force_pack = true;
+                GrMulti packed_m;
+                for (int k = 0; k < T; ++k) packed_m.a[k] = a[8][k];
+                packed_m.xn = set[8].xn;
+                packed_m.T = T;
+                launch_multi(packed_m, kHcStaged, st, nullptr, 0);
+                g_force_pack = false;
+            }
             if (T == 1) fused_gr_read(a[3][0], st);
             if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) {
                 why[0] = "a kernel of the check failed";
@@ -2367,6 +2724,13 @@ bool fused_gr_selftest(bool ok_variant[8], std::string why[8]) {
             if (ok_variant[5] && !all_same(set[2], set[5], T, apply, inj, why[5])) ok_variant[5] = false;
             if (ok_variant[6] && !all_same(set[2], set[6], T, apply, inj, why[6])) ok_variant[6] = false;
             if (ok_variant[7] && !all_same(set[2], set[7], T, apply, inj, why[7])) ok_variant[7] = false;
+            if (pack_ok && ok_variant[8] && !all_same(set[2], set[8], T, apply, inj, why[8])) ok_variant[8] = false;
+            // Every T above runs one-shot multi-read, but verify windows also exercise the T=1 and T=TM chunks
+            // after down_chunk has split the launch.  Keep both exact endpoints in the device self-test.
+            if (pack_ok && ok_variant[kHcPacked] && T == 1 &&
+                !all_same(set[2], set[kHcPacked], 1, apply, inj, why[kHcPacked])) ok_variant[kHcPacked] = false;
+            if (pack_ok && ok_variant[kHcPacked] && T == TM &&
+                !all_same(set[2], set[kHcPacked], TM, apply, inj, why[kHcPacked])) ok_variant[kHcPacked] = false;
             if (ok && T == 1 && single_ok && !all_same(set[3], set[0], T, apply, inj, why[1])) single_ok = false;
         }
       }
@@ -2387,6 +2751,8 @@ bool fused_gr_selftest(bool ok_variant[8], std::string why[8]) {
 }
 
 }  // namespace
+
+int fused_gr_hc_pack() { return pack_on() ? 1 : 0; }
 
 int fused_gr_variant() {
     int dev = 0;
@@ -2414,11 +2780,13 @@ void fused_gr_check() {
                      dev);
         return;
     }
-    constexpr int NV = 8;                             // the arity fused_gr_selftest writes
+    constexpr int NV = 9;                             // the arity fused_gr_selftest writes
     bool okv[NV];
     std::string why[NV];
     const bool ran = fused_gr_selftest(okv, why);
     int use = kHcPlain;
+    // STRATA_HC_PACK: latch the packed arm on this device only if the check saw it match staged bit for bit
+    const bool pack_use = env_pack() && ran && okv[kHcPacked];
     if (want == kHcRegisterPipe && okv[kHcRegisterPipe]) use = kHcRegisterPipe;
     else if (want == kHcRegisterHalf && okv[kHcRegisterHalf]) use = kHcRegisterHalf;
     else if (want == kHcReuseTwoRows && okv[kHcReuseTwoRows]) use = kHcReuseTwoRows;
@@ -2426,6 +2794,11 @@ void fused_gr_check() {
     else if (want >= kHcStaged && okv[kHcStaged]) use = kHcStaged;
     else if (okv[kHcSplit]) use = kHcSplit;
     g_variant[dev].store(use);
+    if (env_pack() && !pack_use && ran) {
+        std::fprintf(stderr, "strata hc: CUDA%d: the packed read differs from staged - not used: %s\n", dev,
+                     why[kHcPacked].c_str());
+    }
+    if (dev >= 0 && dev < 64) g_pack_check[dev].store(pack_use ? 1 : 2);
     if (!ran)
         std::fprintf(stderr, "strata hc: CUDA%d: the check of split/staged could not run (%s)\n", dev, why[0].c_str());
     static const char* const name[NV] = {"",        "plain",   "split",   "staged",      "small-CTA staged",
@@ -2444,6 +2817,16 @@ void fused_gr_check() {
         "2-row-per-warp staged (four warps per CTA, two rows sharing each activation tile)",
         "register-pipe staged (the staged read with the next tile carried in a register tuple, STRATA_HC_SPLIT=6)",
         "register-half staged (the same with the tuple in two halves, STRATA_HC_SPLIT=7)"};
+    // one std::string, printed with c_str(): a std::string through a varargs %s does not compile
+    const std::string pack_msg =
+        pack_use ? "packed candidate self-test passed (13 bytes per 8 values; a caller must supply packed descriptors; "
+                  "the production loader is not wired yet)"
+                 : env_pack()
+                       ? "as BF16 (STRATA_HC_PACK=1 asked for the packed read, the check rejected "
+                         "it on this card: " +
+                             why[kHcPacked] + ")"
+                       : std::string("as BF16 (STRATA_HC_PACK unset)");
+    std::fprintf(stderr, "strata hc: CUDA%d: the hc weights arrive %s\n", dev, pack_msg.c_str());
     std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
                                    "for the earlier ones)" : "");
