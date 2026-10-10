@@ -158,7 +158,8 @@ int main(int argc, char** argv) {
     const int expect_variant = expect_variant_env != nullptr ? std::atoi(expect_variant_env) : -1;
     const int selected_hc_variant = hc_variant_bench ? K::fused_gr_variant() : 0;
     if (hc_variant_bench && selected_hc_variant != 3 && selected_hc_variant != 4 && selected_hc_variant != 5 &&
-        selected_hc_variant != 6 && selected_hc_variant != 7)
+        selected_hc_variant != 6 && selected_hc_variant != 7 && selected_hc_variant != 9 &&
+        selected_hc_variant != 10 && selected_hc_variant != 11)
         return 2;
     if (expect_reuse_variant && selected_hc_variant != 5) {
         std::fprintf(stderr, "fused_gr_bench: expected two-row reuse variant 5, selected %d\n", selected_hc_variant);
@@ -174,6 +175,9 @@ int main(int argc, char** argv) {
                                    : selected_hc_variant == 4  ? "small-CTA staged"
                                    : selected_hc_variant == 5  ? "2-row-per-warp staged"
                                    : selected_hc_variant == 6  ? "register-pipe staged"
+                                   : selected_hc_variant == 9  ? "row-split staged"
+                                   : selected_hc_variant == 10 ? "LDS-accumulator staged"
+                                   : selected_hc_variant == 11 ? "register-pipe-half staged"
                                                                : "register-half staged";
         std::fprintf(stderr, "fused_gr_bench: selected HC variant %d (%s)\n", selected_hc_variant, variant_name);
         K::fused_gr_set_fast(0);
@@ -194,9 +198,11 @@ int main(int argc, char** argv) {
         // latch to say packed, and stop here - nothing is timed, nothing is printed - if it says otherwise.
         K::fused_gr_check();
         const int variant = K::fused_gr_variant();
-        if (variant != 3) {
-            std::fprintf(stderr, "fused_gr_bench: --mode=%s needs the staged read (variant 3, STRATA_HC_SPLIT=2); "
-                                 "this card selected %d\n", mode_name, variant);
+        if (variant != 3 && variant != 9 && variant != 10) {
+            std::fprintf(stderr, "fused_gr_bench: --mode=%s needs the staged read (variant 3, STRATA_HC_SPLIT=2), "
+                                 "the row split (variant 9, STRATA_HC_SPLIT=8) or the LDS-accumulator read (variant "
+                                 "10, STRATA_HC_SPLIT=9); this card selected %d\n",
+                         mode_name, variant);
             free_base();
             return 2;
         }
@@ -226,8 +232,9 @@ int main(int argc, char** argv) {
         if (phi != t_hi || plo != t_lo)
             std::fprintf(stderr, "fused_gr_bench: --mode=%s runs T %d..%d (asked for %d..%d)\n", mode_name, plo, phi,
                          t_lo, t_hi);
-        std::printf("fused_gr_bench: mode %s | staged read (variant 3) | packed arm %s | iters %d | T %d..%d\n",
-                    mode_name, pack_latched == 1 ? "latched on (fused_gr_hc_pack 1)" : "off (fused_gr_hc_pack 0)",
+        std::printf("fused_gr_bench: mode %s | %s read (variant %d) | packed arm %s | iters %d | T %d..%d\n",
+                    mode_name, variant == 9 ? "row-split" : variant == 10 ? "LDS-accumulator" : "staged", variant,
+                    pack_latched == 1 ? "latched on (fused_gr_hc_pack 1)" : "off (fused_gr_hc_pack 0)",
                     iters, plo, phi);
         std::printf("fused_gr_bench: packed image hc_down %zu escapes / %zu B, hc_up %zu escapes / %zu B, "
                     "hc_inject %zu escapes / %zu B; BF16 beside it %zu + %zu + %zu B\n",
@@ -353,6 +360,144 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // STRATA_HC_BENCH_GRAPH_CHURN=1 (the STRATA_HC_GRAPH promote audit, opt-in, nothing in the engine changes):
+    // the graph cache's three costs, one T per process.  The cache keys on every pointer and flag in the argument
+    // set, so a call whose pointers differ from every cached set captures a new graph.  `steady` is the hit path,
+    // `churn` cycles NSETS sets - one more than the cache's 32 entries - so every call misses, and `capture` is
+    // one cold call on a set the cache has never seen.  STRATA_HC_BENCH_LEGACY_STREAM=1 passes stream nullptr, which
+    // is what a call site with no stream of its own passes (verify.cpp:605 falls back to nullptr when its stream
+    // creation fails), so the capture runs on the legacy stream.
+    if (std::getenv("STRATA_HC_BENCH_GRAPH_CHURN") != nullptr) {
+        constexpr int NSETS = 33;  // one more than graph_cache()'s 32 entries
+        const bool legacy_stream = std::getenv("STRATA_HC_BENCH_LEGACY_STREAM") != nullptr;
+        void* const gs = legacy_stream ? (void*) nullptr : (void*) s;
+        struct GSet { float *R, *bo, *inj, *xn, *lo, *rs, *io, *mix; };
+        auto alloc_set = [&](GSet& g) {
+            cudaMalloc((void**) &g.R, (size_t) TM * D * 4);
+            cudaMalloc((void**) &g.bo, (size_t) TM * N * 4);
+            cudaMalloc((void**) &g.inj, (size_t) TM * HC * 4);
+            cudaMalloc((void**) &g.xn, (size_t) TM * D * 4);
+            cudaMalloc((void**) &g.lo, (size_t) TM * LR * 4);
+            cudaMalloc((void**) &g.rs, (size_t) TM * HC * 4);
+            cudaMalloc((void**) &g.io, (size_t) TM * HC * 4);
+            cudaMalloc((void**) &g.mix, (size_t) TM * N * 4);
+            // The inputs get the same values the default path copies.  Uninitialized R/bo/inj make the kernels
+            // run on denormals and NaN, which costs a few us of GPU time and hides the launch gap the graph removes.
+            cudaMemcpy(g.R, R.data(), (size_t) TM * D * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(g.bo, bo.data(), (size_t) TM * N * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(g.inj, inj.data(), (size_t) TM * HC * 4, cudaMemcpyHostToDevice);
+        };
+        auto free_set = [&](GSet& g) {
+            cudaFree(g.R); cudaFree(g.bo); cudaFree(g.inj); cudaFree(g.xn);
+            cudaFree(g.lo); cudaFree(g.rs); cudaFree(g.io); cudaFree(g.mix);
+        };
+        auto fill_set = [&](K::FusedGrArgs* a, const GSet& g, int T, int apply, int inject) {
+            for (int t = 0; t < T; ++t) {
+                a[t] = K::FusedGrArgs{};
+                a[t].R = g.R + (size_t) t * D; a[t].R_out = g.R + (size_t) t * D; a[t].apply = apply;
+                a[t].bo_prev = g.bo + (size_t) t * N; a[t].inj_prev = g.inj + (size_t) t * HC;
+                a[t].w_norm = dwn; a[t].w_down = dwd; a[t].w_up = dwu; a[t].w_inject = inject ? dwi : nullptr;
+                a[t].lo = g.lo + (size_t) t * LR; a[t].rs = g.rs + (size_t) t * HC;
+                a[t].inject_out = g.io + (size_t) t * HC; a[t].mixed = g.mix + (size_t) t * N;
+            }
+        };
+        K::fused_gr_set_fast(0);
+        std::printf("fused_gr_bench: graph-churn arm, variant %d, NSETS %d, iters %d, stream %s\n",
+                    K::fused_gr_variant(), NSETS, iters, legacy_stream ? "legacy (nullptr)" : "created");
+        // STRATA_HC_BENCH_NESTED=1: the production shape, at t_lo.  Every production call site runs inside the
+        // engine's own stream capture - Verifier::capture (verify.cpp:1685) and MtpDrafter::capture_round/step/
+        // prefill (mtp.cpp:1045/1092/1024/1033) call cudaStreamBeginCapture, then record_window/record_front/
+        // record_rest, which are where fused_gr_read_multi is called.  So the read is captured into a whole-step
+        // graph, and with STRATA_HC_GRAPH=1 the inner graph_replay would capture a stream that is already
+        // capturing.  This arm does that outer capture, instantiate and replay, and prints each step's status.
+        if (std::getenv("STRATA_HC_BENCH_NESTED") != nullptr) {
+            const int T = t_lo;
+            const cudaStream_t ns = (cudaStream_t) gs;
+            K::FusedGrArgs a[TM];
+            GSet fresh{};
+            alloc_set(fresh);
+            fill_set(a, fresh, T, 1, 1);
+            cudaGraph_t g = nullptr;
+            cudaGraphExec_t ex = nullptr;
+            const cudaError_t b = cudaStreamBeginCapture(ns, cudaStreamCaptureModeThreadLocal);
+            K::fused_gr_read_multi(a, T, fresh.xn, gs);
+            const cudaError_t en = cudaStreamEndCapture(ns, &g);
+            cudaError_t in = cudaSuccess;   // left as success when there is nothing to instantiate
+            if (en == cudaSuccess && g != nullptr) in = cudaGraphInstantiate(&ex, g, nullptr, nullptr, 0);
+            std::printf("T %d | nested: begin %s | end %s | instantiate %s\n", T,
+                        cudaGetErrorString(b), cudaGetErrorString(en), cudaGetErrorString(in));
+            double replay_us = -1.0;
+            if (ex != nullptr) {
+                cudaGraphLaunch(ex, ns);
+                cudaStreamSynchronize(ns);
+                float ms2 = 0.0f;
+                cudaEventRecord(e0, s);
+                for (int i = 0; i < iters; ++i) cudaGraphLaunch(ex, ns);
+                cudaEventRecord(e1, s);
+                cudaEventSynchronize(e1);
+                cudaEventElapsedTime(&ms2, e0, e1);
+                replay_us = 1e3 * ms2 / iters;
+                std::printf("T %d | nested: outer-graph replay %6.1f us\n", T, replay_us);
+                (void) replay_us;
+            }
+            if (g) cudaGraphDestroy(g);
+            free_set(fresh);
+            cudaEventDestroy(e0); cudaEventDestroy(e1); cudaStreamDestroy(s);
+            cudaFree(dR); cudaFree(dbo); cudaFree(dinj); cudaFree(dwn); cudaFree(dxn);
+            cudaFree(dlo); cudaFree(drs); cudaFree(dio); cudaFree(dmix);
+            cudaFree(dwd); cudaFree(dwu); cudaFree(dwi);
+            return 0;
+        }
+        for (int T = t_lo; T <= t_hi; ++T) {
+            K::FusedGrArgs a[TM];
+            float ms = 0.0f;
+            // capture: one cold call on a set the cache has never seen, no warmup.
+            GSet fresh{};
+            alloc_set(fresh);
+            fill_set(a, fresh, T, 1, 1);
+            cudaEventRecord(e0, s);
+            K::fused_gr_read_multi(a, T, fresh.xn, gs);
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            cudaEventElapsedTime(&ms, e0, e1);
+            const double capture_us = 1e3 * ms;
+            // steady: that same set warmed, so every call below is a cache hit.
+            for (int i = 0; i < 20; ++i) K::fused_gr_read_multi(a, T, fresh.xn, gs);
+            cudaEventRecord(e0, s);
+            for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(a, T, fresh.xn, gs);
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            cudaEventElapsedTime(&ms, e0, e1);
+            const double steady_us = 1e3 * ms / iters;
+            free_set(fresh);
+            // churn: NSETS sets cycled, so every call's key is one the cache has no room for.
+            std::vector<GSet> sets((size_t) NSETS);
+            for (int i = 0; i < NSETS; ++i) {
+                alloc_set(sets[(size_t) i]);
+                fill_set(a, sets[(size_t) i], T, 1, 1);
+                for (int w = 0; w < 2; ++w) K::fused_gr_read_multi(a, T, sets[(size_t) i].xn, gs);
+            }
+            cudaEventRecord(e0, s);
+            for (int i = 0; i < iters; ++i) {
+                const GSet& g = sets[(size_t) (i % NSETS)];
+                fill_set(a, g, T, 1, 1);
+                K::fused_gr_read_multi(a, T, g.xn, gs);
+            }
+            cudaEventRecord(e1, s);
+            cudaEventSynchronize(e1);
+            cudaEventElapsedTime(&ms, e0, e1);
+            const double churn_us = 1e3 * ms / iters;
+            for (auto& g : sets) free_set(g);
+            std::printf("T %d | steady %6.1f us  churn %6.1f us  capture (1 cold call) %8.1f us\n",
+                        T, steady_us, churn_us, capture_us);
+        }
+        cudaEventDestroy(e0); cudaEventDestroy(e1); cudaStreamDestroy(s);
+        cudaFree(dR); cudaFree(dbo); cudaFree(dinj); cudaFree(dwn); cudaFree(dxn);
+        cudaFree(dlo); cudaFree(drs); cudaFree(dio); cudaFree(dmix);
+        cudaFree(dwd); cudaFree(dwu); cudaFree(dwi);
+        return 0;
+    }
+
     for (int T = t_lo; T <= t_hi; ++T)
         for (int apply = 0; apply < 2; ++apply)
             for (int inject = 0; inject < 2; ++inject) {
@@ -406,6 +551,9 @@ int main(int argc, char** argv) {
                                 : selected_hc_variant == 4  ? "small-CTA staged"
                                 : selected_hc_variant == 5  ? "2-row-per-warp staged"
                                 : selected_hc_variant == 6  ? "register-pipe staged"
+                                : selected_hc_variant == 9  ? "row-split staged"
+                                : selected_hc_variant == 10 ? "LDS-accumulator staged"
+                                : selected_hc_variant == 11 ? "register-pipe-half staged"
                                                             : "register-half staged",
                                 hc_variant_bench ? "timed-only; parity is a separate gate"
                                                  : (same ? "bitwise equal" : "DIFFERS"));

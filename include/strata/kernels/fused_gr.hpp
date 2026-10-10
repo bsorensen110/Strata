@@ -81,10 +81,15 @@ void fused_gr_set_fast(int on);
 /// with and without the pending write, with and without the inject weights) - the tuple variants against the
 /// staged read - before using one. STRATA_HC_SPLIT=0 keeps plain, =1 stops at split, =2 uses staged, =3 opts into
 /// the four-warp staged experiment, =5 opts into the four-warp/two-row-per-warp reuse experiment, =6 opts into the
-/// register-tuple pipeline and =7 into its half-tuple form; any other value takes staged, and a tuple variant
-/// that fails its check falls back to staged. The check runs once per card (Verifier::init calls it) and prints
-/// the selected path. On an unchecked card, `fused_gr_variant` is plain unless STRATA_HC_SPLIT explicitly names
-/// a variant.
+/// register-tuple pipeline and =7 into its half-tuple form, =8 into the row split (four rows per CTA, a warp
+/// pair per row) and =9 into the staged read with its per-token accumulators in dynamic LDS (the same sums in
+/// the same order; a launch carries the accumulator row on top of the two staged tiles, so it slices to fewer
+/// tokens per launch than staged), and =10 into the register pipeline with both register arrays in halves (the
+/// 6/7 combination: the half-tuple activation schedule of 7, with the weight prefetch split the same way); any
+/// other value takes staged, and a tuple variant that fails its check falls back to staged. 10 is the first
+/// two-character value the parser reads - see `env_variant` in the source. The check runs once per card
+/// (Verifier::init calls it) and prints the selected path. On an unchecked card, `fused_gr_variant` is plain
+/// unless STRATA_HC_SPLIT explicitly names a variant.
 void fused_gr_check();
 int fused_gr_variant();
 /// The bench and the loader: 1 when the packed staged arm is selected (STRATA_HC_PACK=1 on a card whose self-test

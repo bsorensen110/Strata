@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -723,6 +724,17 @@ __global__ void __launch_bounds__(THREADS) gr_up_v3_kernel(GrMulti m, const floa
 //    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
 constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3, kHcSmallCta = 4, kHcReuseTwoRows = 5,
               kHcRegisterPipe = 6, kHcRegisterHalf = 7;
+// kHcPacked = 8 is the packed arm of kHcStaged (below); the row split takes the next slot.
+// STRATA_HC_SPLIT=9 (env value 9) selects kHcLdsAccum: the staged down kernel with the per-token accumulators in
+// dynamic LDS.  The env value is one digit and 8 already names the row split (constant 9), so the new variant is
+// the next constant, 10, and env 9 maps to it.
+constexpr int kHcRowSplit = 9;
+constexpr int kHcLdsAccum = 10;
+// STRATA_HC_SPLIT=10 (env value 10, two characters - see env_variant) selects kHcRegisterPipeHalf: the
+// register-tuple pipeline (6) with BOTH of its register arrays split in halves, the schedule the half kernel (7)
+// uses for the activation tuple applied to the weight prefetch as well.  The env parser is one digit and every
+// one-digit value is taken, so this is the first two-character value; it is matched before the one-digit '1'.
+constexpr int kHcRegisterPipeHalf = 11;
 // STRATA_HC_PACK=1 (S27, hc-rdna4-proposals-20261009 3.2): the STAGED read with the weight bytes arriving packed
 // (include/strata/kernels/hc_pack.hpp).  Not a variant of its own - it is kHcStaged with the packed arm latched
 // (the latch lives below launch_multi, so the predicate is declared here).
@@ -1335,6 +1347,312 @@ __global__ void __launch_bounds__(THREADS) gr_down_register_half_kernel(GrMulti 
     }
 }
 
+// Opt-in (STRATA_HC_SPLIT=10): the register-tuple pipeline with BOTH register arrays split in halves.
+//
+// What 6 and 7 actually are, read from the two kernels above: the weight prefetch (`wv` / `wnext`, the double
+// buffer that keeps tile h + 1's weights in flight across tile h's dot) is IDENTICAL in 6 and 7 - 7 is 6 with the
+// activation tuple split in halves and the second half loaded mid-dot.  So the union of 6 and 7 is 7, and the
+// combination worth measuring is the half treatment applied to the register array 7 left whole: the weights.
+// This kernel keeps 7's activation schedule unchanged and splits the weight prefetch the same way - the first
+// half of `wnext` (q < W0) is issued before the barrier, as 6 and 7 do, and the second half is issued mid-dot
+// (at q == W0), so the live range of `wnext[W0, HQ)` starts inside the dot instead of before the barrier.
+//
+// Same grid (DOWN_BLOCKS + 1), same 256-thread CTA, same two-buffer tile schedule, same shared-memory contract
+// as staged, same weights, same dot and the same q-outer / k-inner order: the loads this moves are pure data
+// movement, so the sums and their order are staged's, and the bitwise contract is the pipe and half kernels'
+// (checked against staged at every T by fused_gr_selftest).  The halves cover every slot exactly once and the
+// scatter writes the whole tile before its barrier, as in 7.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS) gr_down_register_pipe_half_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
+    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
+    const int total = T * (H_TILE / 4);
+    constexpr int NS = (MAX_T * (H_TILE / 4) + THREADS - 1) / THREADS;
+    constexpr int H0 = (NS + 1) / 2;                    // activation tuple: slots [0, H0) and [H0, NS)
+    constexpr int W0 = (HQ + 1) / 2;                    // weight prefetch: q [0, W0) and [W0, HQ)
+    static_assert(H0 >= 1 && NS - H0 >= 0, "both tuple halves exist for the widest tile");
+    static_assert(W0 >= 1 && HQ - W0 >= 1, "both weight halves exist");
+    float acc[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
+    uint4 wv[HQ], wnext[HQ];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+    }
+    stage_htile(m, T, 0, hbuf, t, THREADS);
+    gr_cuda_async_group_commit();
+    stage_htile(m, T, 1, hbuf + buf_f4, t, THREADS);
+    gr_cuda_async_group_commit();
+    HcChain<H0 - 1> t0;
+    HcChain<NS - H0 - 1> t1;
+    hc_load_all<0, H0 - 1>(t0, m, 2, t, total);
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        // the first weight half in flight before the barrier (6 and 7 issue all HQ here)
+        if (active && h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < W0; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+        }
+        if (h + 1 < N_HTILES) gr_cuda_async_group_wait1();
+        else gr_cuda_async_group_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                if (q == W0 && h + 1 < N_HTILES)
+#pragma unroll
+                    for (int q2 = W0; q2 < HQ; ++q2)
+                        wnext[q2] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q2);   // in flight during the dot
+                if (q == 2 && h + 2 < N_HTILES)
+                    hc_load_all<H0, NS - H0 - 1>(t1, m, h + 2, t, total);                   // as 7
+                const int j = lane + 32 * q;
+                const Bf16x8 wvq = unpack8(wv[q]);
+#pragma unroll
+                for (int k = 0; k < MAX_T; ++k) {
+                    if (EXACT_T || k < T) {
+                        const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                        acc[k] += dot8u(wvq, pk[j], pk[H_TILE / 8 + j]);
+                    }
+                }
+            }
+        }
+        if (h + 2 < N_HTILES) hc_load_all<H0, NS - H0 - 1>(t1, m, h + 2, t, total);   // the warps that did not dot
+        __syncthreads();
+        if (h + 2 < N_HTILES) {
+            hc_scatter_all<0, H0 - 1>(t0, hbuf + (h & 1) * buf_f4, t, total);
+            hc_scatter_all<H0, NS - H0 - 1>(t1, hbuf + (h & 1) * buf_f4, t, total);
+        }
+        if (h + 3 < N_HTILES) hc_load_all<0, H0 - 1>(t0, m, h + 3, t, total);
+        gr_cuda_async_group_commit();
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[q] = wnext[q];
+        }
+    }
+    if (!active) return;
+    float s[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) s[k] = (EXACT_T || k < T) ? warp_sum(acc[k]) : 0.0f;
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        if ((!EXACT_T && k >= T) || lane != k) continue;
+        if (inject_block) m.a[k].inject_out[row] = s[k];
+        else {
+            const float x = s[k] / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
+// Opt-in (STRATA_HC_SPLIT=8): the staged down projection split over twice the blocks.  The staged read runs the
+// 320 rows on 40 CTAs of 8 warps, one row per warp, and leaves 23 of the 64 CUs idle at every T.  This variant
+// keeps the 256-thread CTA and gives each CTA 4 rows, each row shared by a warp PAIR: the even warp walks the
+// staged lanes 0-15's lane jobs, the odd warp the staged lanes 16-31's, both over the whole tile sequence, so
+// every lane's accumulation order is the staged one.  The pair meets at the warp_sum offset-16 step: the odd
+// warp publishes its raw per-lane sums to shared memory, the even warp adds them to its own and runs the
+// offsets 8,4,2,1 over lanes 0-15 - the staged shuffle tree, bit for bit.  The inject CTA is the staged one.
+constexpr int RS_ROWS_PER_CTA = WARPS / 2;              // 4 rows per 256-thread CTA
+constexpr int RS_BLOCKS = LR / RS_ROWS_PER_CTA;         // 80 down blocks; block 80 = the inject rows
+static_assert(RS_BLOCKS * RS_ROWS_PER_CTA == LR, "the row split covers every down row");
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS) gr_down_row_split_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const bool inject_block = blockIdx.x == RS_BLOCKS;
+    const int pair = warp >> 1;                                   // the row pair within the CTA
+    const int row = inject_block ? warp : blockIdx.x * RS_ROWS_PER_CTA + pair;
+    const bool active = inject_block ? (m.a[0].w_inject != nullptr && warp < HC) : lane < 16;
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) row * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    // the inject CTA walks whole rows on 32 lanes (the staged mapping); the pair split is the down warps'
+    const int j = inject_block ? lane : (warp & 1) * 16 + lane;    // the staged lane job this thread walks
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
+    float acc[MAX_T];
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) acc[k] = 0.0f;
+    uint4 wv[HQ], wnext[HQ];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + j + 32 * q);
+    }
+    stage_htile(m, T, 0, hbuf, t, THREADS);
+    gr_cuda_async_group_commit();
+    stage_htile(m, T, 1, hbuf + buf_f4, t, THREADS);
+    gr_cuda_async_group_commit();
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (active && h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + j + 32 * q);
+        }
+        if (h + 1 < N_HTILES) gr_cuda_async_group_wait1();
+        else gr_cuda_async_group_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int jj = j + 32 * q;
+                const Bf16x8 wvq = unpack8(wv[q]);
+#pragma unroll
+                for (int k = 0; k < MAX_T; ++k) {
+                    if (EXACT_T || k < T) {
+                        const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                        acc[k] += dot8u(wvq, pk[jj], pk[H_TILE / 8 + jj]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, THREADS);
+        gr_cuda_async_group_commit();
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[q] = wnext[q];
+        }
+    }
+    if (inject_block) {                                          // the staged inject CTA, unchanged
+        if (!active) return;
+        float s[MAX_T];
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) s[k] = (EXACT_T || k < T) ? warp_sum(acc[k]) : 0.0f;
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) {
+            if ((!EXACT_T && k >= T) || lane != k) continue;
+            m.a[k].inject_out[row] = s[k];
+        }
+        return;
+    }
+    // The pair's meeting.  The odd warp publishes the raw per-lane sums of the staged lanes 16-31; the even
+    // warp adds its own (the staged lanes 0-15's) - the warp_sum offset-16 step - and runs the offsets 8,4,2,1
+    // over lanes 0-15.  Per-lane sums staged, tree staged, bits staged.  The tiles are consumed: the exchange
+    // reuses their space (4 pairs x MAX_T x 16 floats <= 512 floats, the first tile buffer holds 1280).
+    float* exch = reinterpret_cast<float*>(hbuf);
+    __syncthreads();
+    if ((warp & 1) && lane < 16) {
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k)
+            if (EXACT_T || k < T) exch[(pair * MAX_T + k) * 16 + lane] = acc[k];
+    }
+    __syncthreads();
+    const bool lead = !(warp & 1) && lane < 16;   // the even warp's lanes 0-15 finish the row
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        if (!EXACT_T && k >= T) continue;
+        float v = 0.0f;
+        if (lead) v = acc[k] + exch[(pair * MAX_T + k) * 16 + lane];   // the offset-16 step
+        // The offsets 8,4,2,1 pair lanes within 0-15, so a full-mask shuffle is the staged tree for the
+        // lead lanes (the others carry 0 and their sums are discarded).  A partial mask with the odd
+        // warp's lanes already exited faults on gfx1201: the shfl emulation converges the whole warp.
+#pragma unroll
+        for (int o = 8; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        if (lead && lane == k) {
+            const float x = v / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
+// gr_down_staged_kernel with the per-token accumulators in dynamic LDS (opt-in STRATA_HC_SPLIT=9): the same grid,
+// the same 256-thread CTA, the same two-buffer tile schedule and stage_htile calls, the same weight prefetch, the
+// same q-outer / k-inner loop and the same dot8u per (q, k).  Only where the running sums live: staged keeps
+// `acc[MAX_T]` and `s[MAX_T]` in the thread's registers (measured on gfx1201: 112 VGPR at T=1, 152 at T>=3,
+// RESULTS.md), and this kernel keeps one per-token sum per thread in a dynamic-LDS row - THREADS*MAX_T floats on
+// top of the two staged tiles - so the array is not live across the tile loop.  The row is addressed as
+// t*MAX_T + k with k a compile-time constant; a runtime k lowers to per-thread private scratch on gfx1201 (the
+// HcChain note above), which is the thing this form avoids.
+//
+// The per-token addition order is staged's exactly: for each token, the chunks enter in ascending q, and the
+// epilogue warp-sums the same per-thread sum.  The sums are bitwise the same as staged's.
+//
+// LDS cost: the row adds THREADS*MAX_T bytes*4 to the staged 2*T*H_TILE floats, so a launch of ct tokens needs
+// ct*(2*H_TILE + THREADS)*4 bytes - 11264 B per token on this geometry.  The 64 KiB cards fit ct <= 5; the
+// dispatch below keeps larger launches on staged.
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS) gr_down_lds_accum_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    constexpr int CTA_WARPS = THREADS / 32;
+    constexpr int CTA_BLOCKS = LR / CTA_WARPS;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const bool inject_block = blockIdx.x == CTA_BLOCKS;
+    const int row = inject_block ? warp : blockIdx.x * CTA_WARPS + warp;
+    const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
+    const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
+    const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
+    const size_t buf_f4 = (size_t) T * (H_TILE / 4);
+    float* const lacc = reinterpret_cast<float*>(hbuf + 2 * buf_f4) + (size_t) t * MAX_T;
+    if (active) {
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) lacc[k] = 0.0f;
+    }
+    uint4 wv[HQ], wnext[HQ];
+    if (active) {
+#pragma unroll
+        for (int q = 0; q < HQ; ++q) wv[q] = __ldg(w4 + lane + 32 * q);
+    }
+    stage_htile(m, T, 0, hbuf, t, THREADS);
+    gr_cuda_async_group_commit();
+    stage_htile(m, T, 1, hbuf + buf_f4, t, THREADS);
+    gr_cuda_async_group_commit();
+#pragma unroll 1
+    for (int h = 0; h < N_HTILES; ++h) {
+        if (active && h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wnext[q] = __ldg(w4 + (h + 1) * (H_TILE / 8) + lane + 32 * q);
+        }
+        if (h + 1 < N_HTILES) gr_cuda_async_group_wait1();
+        else gr_cuda_async_group_wait0();
+        __syncthreads();
+        const float4* cur = hbuf + (h & 1) * buf_f4;
+        if (active) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) {
+                const int j = lane + 32 * q;
+                const Bf16x8 wvq = unpack8(wv[q]);
+#pragma unroll
+                for (int k = 0; k < MAX_T; ++k) {
+                    if (EXACT_T || k < T) {
+                        const float4* pk = cur + (size_t) k * (H_TILE / 4);
+                        lacc[k] += dot8u(wvq, pk[j], pk[H_TILE / 8 + j]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+        if (h + 2 < N_HTILES) stage_htile(m, T, h + 2, hbuf + (h & 1) * buf_f4, t, THREADS);
+        gr_cuda_async_group_commit();
+        if (h + 1 < N_HTILES) {
+#pragma unroll
+            for (int q = 0; q < HQ; ++q) wv[q] = wnext[q];
+        }
+    }
+    if (!active) return;
+    // Converged, as staged: every lane warp-sums every token's sum, and only lane k keeps it.  Guarding the
+    // warp sum itself (only lane k running it) leaves __shfl_xor_sync(0xffffffff) with lanes already exited,
+    // which the shfl emulation on gfx1201 answers with the wrong bits - the row-split kernel's note above.
+#pragma unroll
+    for (int k = 0; k < MAX_T; ++k) {
+        const float s = (EXACT_T || k < T) ? warp_sum(lacc[k]) : 0.0f;
+        if ((!EXACT_T && k >= T) || lane != k) continue;
+        if (inject_block) m.a[k].inject_out[row] = s;
+        else {
+            const float x = s / (float) HC;
+            m.a[k].lo[row] = x / (1.0f + __expf(-x));
+        }
+    }
+}
+
 // the current device is Volta (sm_70): the fast norm/up is its default
 bool cur_dev_volta() {
 #if defined(__HIPCC__)
@@ -1352,6 +1670,10 @@ bool cur_dev_volta() {
     return per_dev[dev] == 2;
 #endif
 }
+
+// tokens the LDS-accumulator down kernel (STRATA_HC_SPLIT=9) may carry in one launch on each card; filled with
+// the shared-memory opt-in in down_chunk below.
+static int chunk_lds[64] = {};
 
 // The tokens a down kernel may carry in one launch on the current card, and the plain read's tile: the plain read
 // stages n_tok * TILEV floats (1280 on sm_75, 2560 elsewhere), staged two tiles of n_tok * H_TILE.  The shared-memory
@@ -1440,6 +1762,37 @@ int down_chunk(bool staged, int* tile_out) {
         set_staged_attr(gr_down_register_half_kernel<3, true>, 3);
         set_staged_attr(gr_down_register_half_kernel<4, true>, 4);
         set_staged_attr(gr_down_register_half_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
+        // The pipe+half combination (env 10) stages the same two tiles: the same shared-memory contract, and the
+        // same instantiations the dispatch uses (exact 1..4, generic past that).
+        set_staged_attr(gr_down_register_pipe_half_kernel<1, true>, 1);
+        set_staged_attr(gr_down_register_pipe_half_kernel<2, true>, 2);
+        set_staged_attr(gr_down_register_pipe_half_kernel<3, true>, 3);
+        set_staged_attr(gr_down_register_pipe_half_kernel<4, true>, 4);
+        set_staged_attr(gr_down_register_pipe_half_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
+        // The row split (8) stages the same two tiles per CTA: the same shared-memory contract.
+        set_staged_attr(gr_down_row_split_kernel<1, true>, 1);
+        set_staged_attr(gr_down_row_split_kernel<2, true>, 2);
+        set_staged_attr(gr_down_row_split_kernel<3, true>, 3);
+        set_staged_attr(gr_down_row_split_kernel<4, true>, 4);
+        set_staged_attr(gr_down_row_split_kernel<5, true>, 5);
+        set_staged_attr(gr_down_row_split_kernel<6, true>, 6);
+        set_staged_attr(gr_down_row_split_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
+        // The LDS-accumulator down kernel (STRATA_HC_SPLIT=9): the two staged tiles PLUS the per-token
+        // accumulator row (THREADS floats per token of MAX_T), so its opt-in is larger than staged's.
+        auto set_lds_accum_attr = [&](auto kernel, int max_t) {
+            int ws = (int) (max_t * (2 * H_TILE + THREADS) * sizeof(float));
+            if (optin > 0 && ws > optin) ws = optin;
+            if (ws > 48 * 1024)
+                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, ws);
+            cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+        };
+        set_lds_accum_attr(gr_down_lds_accum_kernel<1, true>, 1);
+        set_lds_accum_attr(gr_down_lds_accum_kernel<2, true>, 2);
+        set_lds_accum_attr(gr_down_lds_accum_kernel<3, true>, 3);
+        set_lds_accum_attr(gr_down_lds_accum_kernel<4, true>, 4);
+        set_lds_accum_attr(gr_down_lds_accum_kernel<5, true>, 5);
+        set_lds_accum_attr(gr_down_lds_accum_kernel<6, true>, 6);
+        set_lds_accum_attr(gr_down_lds_accum_kernel<kFusedGrMaxT, false>, kFusedGrMaxT);
         cudaGetLastError();      // drop any error the attempt left behind
         // The opt-in is a promise a pre-Volta card does not keep: an sm_60 answers 65536 and accepts the
         // cudaFuncSetAttribute for 61440 B, then fails the LAUNCH with "invalid argument".  What such a card
@@ -1458,10 +1811,24 @@ int down_chunk(bool staged, int* tile_out) {
         chunk[dev] = capacity < 1 ? 1 : (capacity > kFusedGrMaxT ? kFusedGrMaxT : capacity);
         const int capacity_staged = usable / (int) (2 * H_TILE * sizeof(float));
         chunk_staged[dev] = capacity_staged < 1 ? 1 : (capacity_staged > kFusedGrMaxT ? kFusedGrMaxT : capacity_staged);
+        // the LDS-accumulator kernel stages 2*H_TILE + THREADS floats per token (the two tiles plus its own
+        // accumulator row), so it slices earlier than staged: 5 tokens on a 64 KiB card, 8 on a 96 KiB one.
+        const int capacity_lds = usable / (int) ((2 * H_TILE + THREADS) * sizeof(float));
+        chunk_lds[dev] = capacity_lds < 1 ? 1 : (capacity_lds > kFusedGrMaxT ? kFusedGrMaxT : capacity_lds);
         attr[dev] = true;
     }
     *tile_out = tile[dev] ? tile[dev] : 2560;
     return staged ? chunk_staged[dev] : chunk[dev];
+}
+
+// The tokens the LDS-accumulator down kernel (STRATA_HC_SPLIT=9) carries in one launch on the current card.  The
+// card's opt-in is read by down_chunk, so this is called after it.  A card that cannot fit even one token of the
+// kernel's shape answers 0 and the launch takes staged.
+int down_chunk_lds() {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return kFusedGrMaxT;
+    return chunk_lds[dev];
 }
 
 // The multi read as `variant` (kHcPlain, kHcSplit or kHcStaged): the norm, the down projection in launches of as
@@ -1507,7 +1874,11 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
                         m.a[0].pack_up.lows != nullptr &&
                         (m.a[0].w_inject == nullptr || m.a[0].pack_inject.lows != nullptr);
     int tv = 2560;
-    const int chunk_tok = down_chunk(staged, &tv);
+    const int chunk_tok_base = down_chunk(staged, &tv);
+    // The LDS-accumulator kernel (STRATA_HC_SPLIT=9) carries more LDS per token than staged, so its launches
+    // slice to what the card fits for its own shape (5 tokens on a 64 KiB card).
+    const int lds_cap = variant == kHcLdsAccum ? down_chunk_lds() : chunk_tok_base;
+    const int chunk_tok = lds_cap < chunk_tok_base ? lds_cap : chunk_tok_base;
     const size_t per_tok = (staged ? (size_t) 2 * H_TILE : (size_t) tv) * sizeof(float);
     static const bool no_multi_gr = [] {
         const char* no = std::getenv("STRATA_NO_MULTI_GR");
@@ -1552,10 +1923,13 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
                 else if (exact_t && ct == 7) gr_down_staged_kernel<7, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
                 else gr_down_staged_kernel<8, true, HC_SMALL_CTA_THREADS><<<grid, HC_SMALL_CTA_THREADS, cta_smem, st>>>(c);
             }
-        } else if (staged && (variant == kHcRegisterPipe || variant == kHcRegisterHalf)) {
-            // opt-in (STRATA_HC_SPLIT=6/7): the staged grid, CTA size and shared-memory contract; the tile
-            // schedule is the kernel's own.  A launch of exactly ct tokens is its own instantiation, as staged.
+        } else if (staged && (variant == kHcRegisterPipe || variant == kHcRegisterHalf ||
+                              variant == kHcRegisterPipeHalf)) {
+            // opt-in (STRATA_HC_SPLIT=6/7, env 10 for the combination): the staged grid, CTA size and
+            // shared-memory contract; the tile schedule is the kernel's own.  A launch of exactly ct tokens is its
+            // own instantiation, as staged.
             const bool pipe = variant == kHcRegisterPipe;
+            const bool pipe_half = variant == kHcRegisterPipeHalf;
             const unsigned grid = DOWN_BLOCKS + 1;
             const size_t cta_smem = (size_t) ct * 2 * H_TILE * sizeof(float);
             // A launch of ct <= 4 tokens is its own instantiation; past that the tuple's live slots push the
@@ -1568,6 +1942,12 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
                 else if (exact_t && ct == 3) gr_down_register_pipe_kernel<3, true><<<grid, THREADS, cta_smem, st>>>(c);
                 else if (exact_t && ct == 4) gr_down_register_pipe_kernel<4, true><<<grid, THREADS, cta_smem, st>>>(c);
                 else gr_down_register_pipe_kernel<kFusedGrMaxT, false><<<grid, THREADS, cta_smem, st>>>(c);
+            } else if (pipe_half) {
+                if (exact_t && ct == 1) gr_down_register_pipe_half_kernel<1, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 2) gr_down_register_pipe_half_kernel<2, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 3) gr_down_register_pipe_half_kernel<3, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else if (exact_t && ct == 4) gr_down_register_pipe_half_kernel<4, true><<<grid, THREADS, cta_smem, st>>>(c);
+                else gr_down_register_pipe_half_kernel<kFusedGrMaxT, false><<<grid, THREADS, cta_smem, st>>>(c);
             } else {
                 if (exact_t && ct == 1) gr_down_register_half_kernel<1, true><<<grid, THREADS, cta_smem, st>>>(c);
                 else if (exact_t && ct == 2) gr_down_register_half_kernel<2, true><<<grid, THREADS, cta_smem, st>>>(c);
@@ -1575,6 +1955,30 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
                 else if (exact_t && ct == 4) gr_down_register_half_kernel<4, true><<<grid, THREADS, cta_smem, st>>>(c);
                 else gr_down_register_half_kernel<kFusedGrMaxT, false><<<grid, THREADS, cta_smem, st>>>(c);
             }
+        } else if (staged && variant == kHcRowSplit) {
+            // opt-in (STRATA_HC_SPLIT=8): the row split over 81 blocks; the same shared-memory contract as staged
+            const unsigned grid = RS_BLOCKS + 1;
+            const size_t cta_smem = (size_t) ct * 2 * H_TILE * sizeof(float);
+            if (exact_t && ct == 1) gr_down_row_split_kernel<1, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 2) gr_down_row_split_kernel<2, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 3) gr_down_row_split_kernel<3, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 4) gr_down_row_split_kernel<4, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 5) gr_down_row_split_kernel<5, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 6) gr_down_row_split_kernel<6, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else gr_down_row_split_kernel<kFusedGrMaxT, false><<<grid, THREADS, cta_smem, st>>>(c);
+        } else if (staged && variant == kHcLdsAccum) {
+            // opt-in (STRATA_HC_SPLIT=9): the staged grid, CTA size and tile schedule; the per-token sums live in
+            // dynamic LDS.  The launch carries the accumulator row (THREADS floats per token) on top of the two
+            // staged tiles, and the chunk loop above sliced ct to what the card fits for that shape.
+            const unsigned grid = DOWN_BLOCKS + 1;
+            const size_t cta_smem = (size_t) ct * (2 * H_TILE + THREADS) * sizeof(float);
+            if (exact_t && ct == 1) gr_down_lds_accum_kernel<1, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 2) gr_down_lds_accum_kernel<2, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 3) gr_down_lds_accum_kernel<3, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 4) gr_down_lds_accum_kernel<4, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 5) gr_down_lds_accum_kernel<5, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else if (exact_t && ct == 6) gr_down_lds_accum_kernel<6, true><<<grid, THREADS, cta_smem, st>>>(c);
+            else gr_down_lds_accum_kernel<kFusedGrMaxT, false><<<grid, THREADS, cta_smem, st>>>(c);
         } else if (packed) {
             // the staged grid, CTA size and shared-memory contract; only the weight bytes arrive packed
             const size_t cta_smem = (size_t) ct * 2 * H_TILE * sizeof(float);
@@ -1633,21 +2037,123 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
 }
 
 /// STRATA_HC_SPLIT: unset or 2 = staged, 1 = split, 3 = small CTA, 5 = 2 rows/warp (4-warp CTA), 0 = plain,
-/// 6 = staged with the next tile in a register tuple, 7 = the same with the tuple in two halves.  6 and 7 are
-/// opt-in and self-checked against staged before use.  Any other value takes the staged default: the first
-/// software-pipeline attempt (a runtime-indexed slot array) is not dispatched - it lowers to per-thread
-/// private scratch on gfx1201, not the VGPR slots it meant to use.
+/// 6 = staged with the next tile in a register tuple, 7 = the same with the tuple in two halves, 8 = the row
+/// split, 9 = staged with the per-token accumulators in dynamic LDS, 10 = the register pipeline with both
+/// register arrays in halves (the 6/7 combination).  6, 7, 8, 9 and 10 are opt-in and self-checked against
+/// staged before use.  Any other value takes the staged default: the first software-pipeline attempt (a
+/// runtime-indexed slot array) is not dispatched - it lowers to per-thread private scratch on gfx1201, not the
+/// VGPR slots it meant to use.
+///
+/// Syntax: the parser reads the value's leading characters, so every one-digit value above is one character.
+/// 10 is the first two-character value: it is matched as the exact string "10" (the two leading characters, so
+/// "10x" reads as 10) BEFORE the one-digit '1', which would otherwise win.  A value that matches nothing takes
+/// the staged default, as before.
 int env_variant() {
     const char* e = std::getenv("STRATA_HC_SPLIT");
     if (e == nullptr || e[0] == '\0') return kHcStaged;
+    if (e[0] == '1' && e[1] == '0') return kHcRegisterPipeHalf;   // two characters, checked before the '1' below
     if (e[0] == '0') return kHcPlain;
     if (e[0] == '1') return kHcSplit;
     if (e[0] == '3') return kHcSmallCta;
     if (e[0] == '5') return kHcReuseTwoRows;
     if (e[0] == '6') return kHcRegisterPipe;
     if (e[0] == '7') return kHcRegisterHalf;
+    if (e[0] == '8') return kHcRowSplit;
+    if (e[0] == '9') return kHcLdsAccum;
     return kHcStaged;
 }
+
+// The pipe+half combination (STRATA_HC_SPLIT=10) is clamped the same way, with its own boundary.  The clamp's
+// reference is the default read it would fall back to, so the boundary answers "above which T does this variant
+// stop beating staged": measured at T=1..8 (paired fresh processes, 200 iters, two rounds, RESULTS.md P5) it
+// beats staged at T=2..8 (-1.6 to -3.6 us) and ties at T=1, so the boundary is kFusedGrMaxT and the clamp is a
+// no-op safety net, as variant 7's.  (How it ranks against variant 7 is a promote question, not a clamp
+// question; P5 records it - the combination does not beat 7, so 7 stays the promote candidate.)  The boundary is
+// a dispatch choice only - the self-test is not clamped, so latching on 10 still means "bit for bit equal to
+// staged at every T".
+constexpr int kHcPipeHalfWinMaxT = kFusedGrMaxT;
+int variant_for_T(int v, int T) {
+    if (v == kHcRegisterPipeHalf && T > kHcPipeHalfWinMaxT) return kHcStaged;
+    return v;
+}
+
+// P2 opt-in (STRATA_HC_GRAPH=1): replay the norm->down->up launch sequence as a captured HIP graph.  The graph is
+// keyed by everything the launches read (variant, token count, the scratch/stream/stamp identities, and every
+// per-token pointer and flag), so a replay runs exactly the same kernels on exactly the same arguments - the same
+// bits.  A key is captured once and replayed on repeats; keys that never repeat (the production shape, where the
+// token buffers move every call) fill the cache to its cap and the plain launch takes over, so the gate is a
+// bench/loop tool, not a production default.  Gate off: the launch path is byte-identical to before.
+namespace {
+bool hc_graph_env() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_HC_GRAPH"); return e != nullptr && std::atoi(e) != 0; }();
+    return on;
+}
+struct GraphEntry { unsigned long long key; cudaGraphExec_t exec; };
+std::vector<GraphEntry>& graph_cache() { static std::vector<GraphEntry> v; return v; }
+std::mutex& graph_mu() { static std::mutex mu; return mu; }
+unsigned long long args_key(const GrMulti& m, int variant, const unsigned long long* stamp_buf, int stamp_i0) {
+    unsigned long long h = 1469598125493960393ull;
+    auto mix = [&h](unsigned long long v) { h = (h ^ v) * 1099511628211ull; };
+    mix((unsigned long long) variant);
+    mix((unsigned long long) m.T);
+#if STRATA_GR_FAST_BUILD
+    mix((unsigned long long) gr_fast());   // the fast arm launches different kernels under the same pointers
+#endif   // the fast arm launches different kernels under the same pointers
+    mix((unsigned long long) (uintptr_t) m.xn);
+    mix((unsigned long long) (uintptr_t) stamp_buf);
+    mix((unsigned long long) stamp_i0);
+    for (int t = 0; t < m.T; ++t) {
+        const FusedGrArgs& a = m.a[t];
+        mix((unsigned long long) (uintptr_t) a.R);      mix((unsigned long long) (uintptr_t) a.R_out);
+        mix((unsigned long long) a.apply);               mix((unsigned long long) (uintptr_t) a.bo_prev);
+        mix((unsigned long long) (uintptr_t) a.inj_prev); mix((unsigned long long) (uintptr_t) a.w_norm);
+        mix((unsigned long long) (uintptr_t) a.w_down); mix((unsigned long long) (uintptr_t) a.w_up);
+        mix((unsigned long long) (uintptr_t) a.w_inject); mix((unsigned long long) (uintptr_t) a.lo);
+        mix((unsigned long long) (uintptr_t) a.rs);     mix((unsigned long long) (uintptr_t) a.inject_out);
+        mix((unsigned long long) (uintptr_t) a.mixed);
+        // the packed arm reads the same matrices through the pack pointers - they belong in the key too
+        mix((unsigned long long) (uintptr_t) a.pack_down.lows);
+        mix((unsigned long long) (uintptr_t) a.pack_up.lows);
+        mix((unsigned long long) (uintptr_t) a.pack_inject.lows);
+    }
+    return h;
+}
+// true: the read is enqueued (replayed, or captured-and-launched on this first call).  false: capture is not
+// available for this call - the caller must plain-launch.  A capture failure latches the gate off for good.
+bool graph_replay(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+    const unsigned long long key = args_key(m, variant, stamp_buf, stamp_i0);
+    std::lock_guard<std::mutex> lk(graph_mu());
+    auto& cache = graph_cache();
+    for (const GraphEntry& e : cache)
+        if (e.key == key) return cudaGraphLaunch(e.exec, st) == cudaSuccess;
+    static std::atomic<bool> broken{false};
+    if (broken.load() || cache.size() >= 32) return false;   // keys never repeat here: plain launches
+    cudaGraph_t g = nullptr;
+    cudaError_t e = cudaStreamBeginCapture(st, cudaStreamCaptureModeThreadLocal);
+    if (e == cudaSuccess) {
+        launch_multi(m, variant, st, stamp_buf, stamp_i0);
+        e = cudaStreamEndCapture(st, &g);
+    }
+    if (e != cudaSuccess || g == nullptr) {
+        if (g) cudaGraphDestroy(g);
+        cudaGetLastError();   // clear the stale error so the caller's own check sees this call, not the capture
+        if (!broken.exchange(true))
+            std::fprintf(stderr, "fused_gr: STRATA_HC_GRAPH capture failed (%s); plain launches from here on\n",
+                         cudaGetErrorString(e));
+        return false;
+    }
+    cudaGraphExec_t exec = nullptr;
+    e = cudaGraphInstantiate(&exec, g, nullptr, nullptr, 0);
+    cudaGraphDestroy(g);
+    if (e != cudaSuccess || exec == nullptr) {
+        cudaGetLastError();
+        broken.store(true);
+        return false;
+    }
+    cache.push_back({key, exec});
+    return cudaGraphLaunch(exec, st) == cudaSuccess;
+}
+}  // namespace
 
 // per device: the variant `fused_gr_check` chose (0 = not checked yet)
 std::atomic<int> g_variant[64];
@@ -2492,7 +2998,11 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     }
 #endif
     // the default read (STRATA_GR_V3 unset): v1, or the bitwise-equal v2 / v3 this card's check accepted
-    launch_multi(m, fused_gr_variant(), st, stamp_buf, stamp_i0);
+    const int gv = variant_for_T(fused_gr_variant(), m.T);
+    // STRATA_HC_GRAPH=1: replay the launch sequence as a captured graph when this key has been seen before;
+    // capture failure (or a key that never repeats) falls through to the plain launch below.
+    if (!(hc_graph_env() && graph_replay(m, gv, st, stamp_buf, stamp_i0)))
+        launch_multi(m, gv, st, stamp_buf, stamp_i0);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
@@ -2531,10 +3041,11 @@ namespace {
 /// the plain read bit for bit (and the plain read with the single-token read), and the variants that reuse the
 /// staged tile schedule (5, 6, 7) with the staged read bit for bit.  `why[v]` records the first difference for
 /// a multi variant; false if the check itself could not run.
-bool fused_gr_selftest(bool ok_variant[9], std::string why[9]) {
+bool fused_gr_selftest(bool ok_variant[12], std::string why[12]) {
     constexpr int TM = kFusedGrMaxT;
-    constexpr int NV = 9;   // 0 plain, 1 split, 2 staged, 3 single, 4 small CTA, 5 reuse CTA, 6 register pipe,
-                            // 7 register half, 8 packed staged (STRATA_HC_PACK)
+    constexpr int NV = 12;  // 0 plain, 1 split, 2 staged, 3 single, 4 small CTA, 5 reuse CTA, 6 register pipe,
+                            // 7 register half, 8 packed staged (STRATA_HC_PACK), 9 row split, 10 LDS accumulators
+                            // (STRATA_HC_SPLIT=9), 11 register pipe+half (STRATA_HC_SPLIT=10)
     std::mt19937 rng(20260930u);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     std::vector<uint16_t> h_down((size_t) LR * D), h_up((size_t) D * LR), h_inj((size_t) HC * D);
@@ -2652,6 +3163,9 @@ bool fused_gr_selftest(bool ok_variant[9], std::string why[9]) {
     // register-tuple variants must match the staged candidate exactly, so those gates isolate the tile schedule
     // and CTA shape, not any pre-existing staged delta.
     ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = ok_variant[6] = ok_variant[7] = ok;
+    ok_variant[kHcRowSplit] = ok;
+    ok_variant[kHcLdsAccum] = ok;
+    ok_variant[kHcRegisterPipeHalf] = ok;
     if (pack_ok) ok_variant[kHcPacked] = ok;
     bool single_ok = ok;
     for (int inj = 0; inj < 2 && ok; ++inj) {
@@ -2703,6 +3217,21 @@ bool fused_gr_selftest(bool ok_variant[9], std::string why[9]) {
             half_m.xn = set[7].xn;
             half_m.T = T;
             launch_multi(half_m, kHcRegisterHalf, st, nullptr, 0);
+            GrMulti row_split_m;
+            for (int k = 0; k < T; ++k) row_split_m.a[k] = a[kHcRowSplit][k];
+            row_split_m.xn = set[kHcRowSplit].xn;
+            row_split_m.T = T;
+            launch_multi(row_split_m, kHcRowSplit, st, nullptr, 0);
+            GrMulti lds_accum_m;
+            for (int k = 0; k < T; ++k) lds_accum_m.a[k] = a[kHcLdsAccum][k];
+            lds_accum_m.xn = set[kHcLdsAccum].xn;
+            lds_accum_m.T = T;
+            launch_multi(lds_accum_m, kHcLdsAccum, st, nullptr, 0);
+            GrMulti pipe_half_m;
+            for (int k = 0; k < T; ++k) pipe_half_m.a[k] = a[kHcRegisterPipeHalf][k];
+            pipe_half_m.xn = set[kHcRegisterPipeHalf].xn;
+            pipe_half_m.T = T;
+            launch_multi(pipe_half_m, kHcRegisterPipeHalf, st, nullptr, 0);
             if (pack_ok) {   // the packed arm, forced on for the check whatever the env says
                 g_force_pack = true;
                 GrMulti packed_m;
@@ -2725,6 +3254,13 @@ bool fused_gr_selftest(bool ok_variant[9], std::string why[9]) {
             if (ok_variant[6] && !all_same(set[2], set[6], T, apply, inj, why[6])) ok_variant[6] = false;
             if (ok_variant[7] && !all_same(set[2], set[7], T, apply, inj, why[7])) ok_variant[7] = false;
             if (pack_ok && ok_variant[8] && !all_same(set[2], set[8], T, apply, inj, why[8])) ok_variant[8] = false;
+            if (ok_variant[kHcRowSplit] && !all_same(set[2], set[kHcRowSplit], T, apply, inj, why[kHcRowSplit]))
+                ok_variant[kHcRowSplit] = false;
+            if (ok_variant[kHcLdsAccum] && !all_same(set[2], set[kHcLdsAccum], T, apply, inj, why[kHcLdsAccum]))
+                ok_variant[kHcLdsAccum] = false;
+            if (ok_variant[kHcRegisterPipeHalf] &&
+                !all_same(set[2], set[kHcRegisterPipeHalf], T, apply, inj, why[kHcRegisterPipeHalf]))
+                ok_variant[kHcRegisterPipeHalf] = false;
             // Every T above runs one-shot multi-read, but verify windows also exercise the T=1 and T=TM chunks
             // after down_chunk has split the launch.  Keep both exact endpoints in the device self-test.
             if (pack_ok && ok_variant[kHcPacked] && T == 1 &&
@@ -2736,8 +3272,10 @@ bool fused_gr_selftest(bool ok_variant[9], std::string why[9]) {
       }
     }
     if (!single_ok && ok) {                            // the plain read itself disagrees with the single-token read
-        why[2] = why[3] = why[4] = why[5] = why[6] = why[7] = "the plain read differs from the single-token read: " + why[1];
-        ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = ok_variant[6] = ok_variant[7] = false;
+        why[2] = why[3] = why[4] = why[5] = why[6] = why[7] = why[kHcRowSplit] = why[kHcLdsAccum] =
+            "the plain read differs from the single-token read: " + why[1];
+        ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = ok_variant[6] = ok_variant[7] =
+            ok_variant[kHcRowSplit] = ok_variant[kHcLdsAccum] = ok_variant[kHcRegisterPipeHalf] = false;
     }
     if (st != nullptr) {
         cudaStreamSynchronize(st);
@@ -2745,8 +3283,10 @@ bool fused_gr_selftest(bool ok_variant[9], std::string why[9]) {
     }
     cudaFree(base);
     cudaGetLastError();
-    if (!ok)
-        ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = ok_variant[6] = ok_variant[7] = false;
+    if (!ok) {
+        ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = ok_variant[6] = ok_variant[7] =
+            ok_variant[kHcRowSplit] = ok_variant[kHcLdsAccum] = ok_variant[kHcRegisterPipeHalf] = false;
+    }
     return ok;
 }
 
@@ -2764,7 +3304,8 @@ int fused_gr_variant() {
     if (e != nullptr && e[0] != '0') return env_variant();
     // not checked on this card: the plain read, unless STRATA_HC_SPLIT names a variant (a test such as gr_parity)
     e = std::getenv("STRATA_HC_SPLIT");
-    return e != nullptr && (e[0] == '1' || e[0] == '2' || e[0] == '3' || e[0] == '5' || e[0] == '6' || e[0] == '7')
+    return e != nullptr && (e[0] == '1' || e[0] == '2' || e[0] == '3' || e[0] == '5' || e[0] == '6' || e[0] == '7' ||
+                            e[0] == '8' || e[0] == '9')
                ? env_variant()
                : kHcPlain;
 }
@@ -2780,14 +3321,17 @@ void fused_gr_check() {
                      dev);
         return;
     }
-    constexpr int NV = 9;                             // the arity fused_gr_selftest writes
+    constexpr int NV = 12;                            // the arity fused_gr_selftest writes
     bool okv[NV];
     std::string why[NV];
     const bool ran = fused_gr_selftest(okv, why);
     int use = kHcPlain;
     // STRATA_HC_PACK: latch the packed arm on this device only if the check saw it match staged bit for bit
     const bool pack_use = env_pack() && ran && okv[kHcPacked];
-    if (want == kHcRegisterPipe && okv[kHcRegisterPipe]) use = kHcRegisterPipe;
+    if (want == kHcRegisterPipeHalf && okv[kHcRegisterPipeHalf]) use = kHcRegisterPipeHalf;
+    else if (want == kHcLdsAccum && okv[kHcLdsAccum]) use = kHcLdsAccum;
+    else if (want == kHcRowSplit && okv[kHcRowSplit]) use = kHcRowSplit;
+    else if (want == kHcRegisterPipe && okv[kHcRegisterPipe]) use = kHcRegisterPipe;
     else if (want == kHcRegisterHalf && okv[kHcRegisterHalf]) use = kHcRegisterHalf;
     else if (want == kHcReuseTwoRows && okv[kHcReuseTwoRows]) use = kHcReuseTwoRows;
     else if (want == kHcSmallCta && okv[kHcSmallCta]) use = kHcSmallCta;
@@ -2802,8 +3346,10 @@ void fused_gr_check() {
     if (!ran)
         std::fprintf(stderr, "strata hc: CUDA%d: the check of split/staged could not run (%s)\n", dev, why[0].c_str());
     static const char* const name[NV] = {"",        "plain",   "split",   "staged",      "small-CTA staged",
-                                          "2-row-per-warp staged", "register-pipe staged", "register-half staged"};
-    for (int v = kHcRegisterHalf; v >= kHcSplit; --v)
+                                          "2-row-per-warp staged", "register-pipe staged", "register-half staged",
+                                          "packed staged", "row-split staged", "LDS-accumulator staged",
+                                          "register-pipe-half staged"};
+    for (int v = kHcRegisterPipeHalf; v >= kHcSplit; --v)
         if (v <= want && !okv[v] && ran) {
             const char* against = v >= kHcReuseTwoRows ? "the staged read" : "the plain read";
             std::fprintf(stderr, "strata hc: CUDA%d: the %s read differs from %s on this card - not used: %s\n",
@@ -2816,7 +3362,13 @@ void fused_gr_check() {
         "small-CTA staged (the norm per token and stream, four-warps-per-block staged down projection)",
         "2-row-per-warp staged (four warps per CTA, two rows sharing each activation tile)",
         "register-pipe staged (the staged read with the next tile carried in a register tuple, STRATA_HC_SPLIT=6)",
-        "register-half staged (the same with the tuple in two halves, STRATA_HC_SPLIT=7)"};
+        "register-half staged (the same with the tuple in two halves, STRATA_HC_SPLIT=7)",
+        "packed staged (the staged read with the weights arriving packed, STRATA_HC_PACK=1)",
+        "row-split staged (four rows per CTA, a warp pair per row, 81 blocks, STRATA_HC_SPLIT=8)",
+        "LDS-accumulator staged (the staged read with the per-token sums in dynamic LDS, STRATA_HC_SPLIT=9)",
+        ("register-pipe-half staged (the register pipeline with the activation tuple AND the weight prefetch in "
+         "two halves, STRATA_HC_SPLIT=10)")
+    };
     // one std::string, printed with c_str(): a std::string through a varargs %s does not compile
     const std::string pack_msg =
         pack_use ? "packed candidate self-test passed (13 bytes per 8 values; a caller must supply packed descriptors; "
