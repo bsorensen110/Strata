@@ -2036,7 +2036,9 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     }
 }
 
-/// STRATA_HC_SPLIT: unset or 2 = staged, 1 = split, 3 = small CTA, 5 = 2 rows/warp (4-warp CTA), 0 = plain,
+/// STRATA_HC_SPLIT: 2 = staged (the promote escape hatch), unset = the promoted default - the register-half
+/// read (7) on a card whose check latched it, staged on a card that did not; see fused_gr_check.
+/// 1 = split, 3 = small CTA, 5 = 2 rows/warp (4-warp CTA), 0 = plain,
 /// 6 = staged with the next tile in a register tuple, 7 = the same with the tuple in two halves, 8 = the row
 /// split, 9 = staged with the per-token accumulators in dynamic LDS, 10 = the register pipeline with both
 /// register arrays in halves (the 6/7 combination).  6, 7, 8, 9 and 10 are opt-in and self-checked against
@@ -2063,6 +2065,13 @@ int env_variant() {
     return kHcStaged;
 }
 
+// The half-tuple down kernel (STRATA_HC_SPLIT=7) is clamped per token count: T <= kHcHalfWinMaxT runs the half
+// kernel, T above it runs staged.  Measured on the R9700 at T=1..8 (paired fresh processes, 200 iters, RESULTS.md),
+// the half kernel wins or ties at every T, so the boundary is kFusedGrMaxT and the clamp is a no-op safety net:
+// it only matters if kFusedGrMaxT ever grows past the measured range.  Only variant 7 is clamped, so the staged
+// default and every other opt-in path are returned unchanged.  The self-test is NOT clamped - it still checks the
+// half kernel against staged at every T.
+constexpr int kHcHalfWinMaxT = kFusedGrMaxT;
 // The pipe+half combination (STRATA_HC_SPLIT=10) is clamped the same way, with its own boundary.  The clamp's
 // reference is the default read it would fall back to, so the boundary answers "above which T does this variant
 // stop beating staged": measured at T=1..8 (paired fresh processes, 200 iters, two rounds, RESULTS.md P5) it
@@ -2073,6 +2082,7 @@ int env_variant() {
 // staged at every T".
 constexpr int kHcPipeHalfWinMaxT = kFusedGrMaxT;
 int variant_for_T(int v, int T) {
+    if (v == kHcRegisterHalf && T > kHcHalfWinMaxT) return kHcStaged;
     if (v == kHcRegisterPipeHalf && T > kHcPipeHalfWinMaxT) return kHcStaged;
     return v;
 }
@@ -3310,11 +3320,19 @@ int fused_gr_variant() {
                : kHcPlain;
 }
 
+int fused_gr_variant_for_T(int T) { return variant_for_T(fused_gr_variant(), T); }
+
 void fused_gr_check() {
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 0 || dev >= 64 || g_variant[dev].load() > 0) return;
     const int want = env_variant();
+    // Promote-to-default (RESULTS.md P4): with STRATA_HC_SPLIT unset the default read is the register-half
+    // variant (7) on a card whose check latched it - the latch publishes only on a bit-for-bit match with the
+    // staged read at every T - and staged on a card that did not.  STRATA_HC_SPLIT=2 stays the escape hatch:
+    // an explicit 2 latches staged even on a card that latched 7.
+    const char* const split_env = std::getenv("STRATA_HC_SPLIT");
+    const bool env_unset = split_env == nullptr || split_env[0] == '\0';
     if (want == kHcPlain) {
         g_variant[dev].store(kHcPlain);
         std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as the plain one (STRATA_HC_SPLIT=0)\n",
@@ -3335,6 +3353,7 @@ void fused_gr_check() {
     else if (want == kHcRegisterHalf && okv[kHcRegisterHalf]) use = kHcRegisterHalf;
     else if (want == kHcReuseTwoRows && okv[kHcReuseTwoRows]) use = kHcReuseTwoRows;
     else if (want == kHcSmallCta && okv[kHcSmallCta]) use = kHcSmallCta;
+    else if (env_unset && want == kHcStaged && okv[kHcRegisterHalf]) use = kHcRegisterHalf;   // promote-to-default
     else if (want >= kHcStaged && okv[kHcStaged]) use = kHcStaged;
     else if (okv[kHcSplit]) use = kHcSplit;
     g_variant[dev].store(use);
@@ -3379,9 +3398,15 @@ void fused_gr_check() {
                              why[kHcPacked] + ")"
                        : std::string("as BF16 (STRATA_HC_PACK unset)");
     std::fprintf(stderr, "strata hc: CUDA%d: the hc weights arrive %s\n", dev, pack_msg.c_str());
-    std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
+    // With the promote, the unset-env latch line names the effective variant and says it is the default.
+    const std::string promote_msg =
+        (env_unset && use == kHcRegisterHalf)
+            ? " (the promoted default on this card; STRATA_HC_SPLIT=2 keeps the staged read)"
+            : std::string();
+    std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s%s\n", dev, what[use],
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
-                                   "for the earlier ones)" : "");
+                                   "for the earlier ones)" : "",
+                 promote_msg.c_str());
 }
 
 

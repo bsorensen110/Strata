@@ -79,7 +79,9 @@ void fused_gr_set_fast(int on);
 /// activation tile in a register tuple (the full tuple, and the tuple split in two halves). `fused_gr_check`
 /// compares the variants against the plain read on the current card with random weights and inputs (1..8 tokens,
 /// with and without the pending write, with and without the inject weights) - the tuple variants against the
-/// staged read - before using one. STRATA_HC_SPLIT=0 keeps plain, =1 stops at split, =2 uses staged, =3 opts into
+/// staged read - before using one. Leaving STRATA_HC_SPLIT unset takes the promoted default: the register-half
+/// read (=7) on a card whose check latched it (bit-for-bit equal to staged at every T), staged on a card that
+/// did not; =2 forces staged on every card (the escape hatch). =0 keeps plain, =1 stops at split, =2 uses staged, =3 opts into
 /// the four-warp staged experiment, =5 opts into the four-warp/two-row-per-warp reuse experiment, =6 opts into the
 /// register-tuple pipeline and =7 into its half-tuple form, =8 into the row split (four rows per CTA, a warp
 /// pair per row) and =9 into the staged read with its per-token accumulators in dynamic LDS (the same sums in
@@ -92,6 +94,11 @@ void fused_gr_set_fast(int on);
 /// unless STRATA_HC_SPLIT explicitly names a variant.
 void fused_gr_check();
 int fused_gr_variant();
+/// The path a launch of `T` tokens actually takes: the latched variant, except that the half-tuple read (7) and
+/// the pipe+half read (10) are clamped to staged above their own measured boundary
+/// (`kHcHalfWinMaxT` / `kHcPipeHalfWinMaxT`, both kFusedGrMaxT on the card they were measured on).  Every other
+/// variant is returned unchanged.
+int fused_gr_variant_for_T(int T);
 /// The bench and the loader: 1 when the packed staged arm is selected (STRATA_HC_PACK=1 on a card whose self-test
 /// passed it), 0 otherwise.  Latched per device with the variant, and logged by fused_gr_check.
 int fused_gr_hc_pack();

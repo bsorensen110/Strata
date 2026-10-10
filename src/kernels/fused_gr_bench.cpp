@@ -156,6 +156,9 @@ int main(int argc, char** argv) {
     const bool expect_reuse_variant = expect_reuse_env != nullptr && expect_reuse_env[0] != '0';
     const char* expect_variant_env = std::getenv("STRATA_HC_EXPECT_VARIANT");
     const int expect_variant = expect_variant_env != nullptr ? std::atoi(expect_variant_env) : -1;
+    // With the promote-to-default, the arm a direct bench runs is the latched one, not the env's bare number:
+    // latch first (idempotent - a checked card returns at once), then read what the card picked.
+    if (hc_variant_bench) K::fused_gr_check();
     const int selected_hc_variant = hc_variant_bench ? K::fused_gr_variant() : 0;
     if (hc_variant_bench && selected_hc_variant != 3 && selected_hc_variant != 4 && selected_hc_variant != 5 &&
         selected_hc_variant != 6 && selected_hc_variant != 7 && selected_hc_variant != 9 &&
@@ -498,6 +501,10 @@ int main(int argc, char** argv) {
         return 0;
     }
 
+    // The default arm is the promoted default: latch it before timing (the check prints the card's parity
+    // line and the effective variant), so the startup names the variant every launch below really takes.
+    K::fused_gr_check();
+
     for (int T = t_lo; T <= t_hi; ++T)
         for (int apply = 0; apply < 2; ++apply)
             for (int inject = 0; inject < 2; ++inject) {
@@ -546,15 +553,16 @@ int main(int argc, char** argv) {
                         cudaEventElapsedTime(&ms, e0, e1);
                         kernel_us = std::fmin(kernel_us, 1e3 * ms / iters);
                     }
+                    const int eff_variant = K::fused_gr_variant_for_T(T);   // what this launch really ran
                     std::printf("T %d apply %d inject %d | HC-read %6.1f us (%s) | %s\n", T, apply, inject, kernel_us,
-                                selected_hc_variant == 3    ? "staged"
-                                : selected_hc_variant == 4  ? "small-CTA staged"
-                                : selected_hc_variant == 5  ? "2-row-per-warp staged"
-                                : selected_hc_variant == 6  ? "register-pipe staged"
-                                : selected_hc_variant == 9  ? "row-split staged"
-                                : selected_hc_variant == 10 ? "LDS-accumulator staged"
-                                : selected_hc_variant == 11 ? "register-pipe-half staged"
-                                                            : "register-half staged",
+                                eff_variant == 3    ? "staged"
+                                : eff_variant == 4  ? "small-CTA staged"
+                                : eff_variant == 5  ? "2-row-per-warp staged"
+                                : eff_variant == 6  ? "register-pipe staged"
+                                : eff_variant == 9  ? "row-split staged"
+                                : eff_variant == 10 ? "LDS-accumulator staged"
+                                : eff_variant == 11 ? "register-pipe-half staged"
+                                                    : "register-half staged",
                                 hc_variant_bench ? "timed-only; parity is a separate gate"
                                                  : (same ? "bitwise equal" : "DIFFERS"));
                     if (!same) ++failures;
