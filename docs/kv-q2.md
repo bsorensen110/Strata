@@ -169,9 +169,52 @@ scales. That is the next lever, with the FP16 window and sinks carrying the rece
 
 Order from here:
 
-1. Lloyd-Max 4-level K and V in the kernel (RMS scale, fixed level table); re-measure.
-2. Finer scale granularity: 16-value blocks, then KIVI's per-channel + per-token split for K.
+1. Lloyd-Max 4-level K and V in the kernel (RMS scale, fixed level table); re-measure. **Done.**
+2. Finer scale granularity: 16-value blocks, then KIVI's per-channel + per-token split for K. **Measured, and the
+   first half is wrong** — see the next section.
 3. Wire `--kv q2` through `layer.cpp` / `qsa_decode_attn` / `verify.cpp` / `conversation_snapshot.cpp` with the
-   FP16 window and sinks on by default.
+   FP16 window and sinks on by default. **Done** (mode 4 in the fused attention, streaming movers, drafter ring,
+   snapshot restore).
+
+## Scale placement — measured, and it splits the two metrics
+
+Same 2 bits, same Lloyd-Max codebook, same 80 B per cell and head; only WHAT the fp16 scale measures changes:
+
+| scale over | K | V | attention output |
+|---|---|---|---|
+| 32 values of one cell (shipping) | 33.381% | 33.413% | 19.928% |
+| 16 values of one cell (12 B per 32 values, not 10) | 32.586% | 32.604% | **37.228%** |
+| 32 cells of one dimension (KIVI-style, same 80 B) | 44.414% | 44.524% | **7.150%** |
+
+Two findings, and they point in opposite directions:
+
+**Halving the block does not pay.** A 16-value scale moves K and V by 2% and makes the attention output 1.87x
+WORSE. A shorter block estimates the scale from 16 samples instead of 32, and estimator noise lands on every code
+in the block; nothing in the data pays for it. The gate pins this (`the 16-value scale does not beat 32 on the
+attention output`) so nobody adopts a finer block because finer sounds better.
+
+**Per-channel scaling is the lever, and the two metrics disagree on purpose.** Per-channel is 33% WORSE per
+element (44.4% against 33.4%) and 2.8x BETTER on the attention output (7.15% against 19.93%) at the same byte
+cost. The reason is what attention does with the error: a scale shared across cells makes K's quantization error
+largely common-mode across cells, and softmax is invariant to a common-mode shift of the scores, so that error
+cancels where it is measured. A per-cell scale produces errors that differ cell to cell, which move the RELATIVE
+scores, and the relative scores are the whole output. Per-element RMS counts error that cancels and ignores error
+that does not.
+
+So the metric for this feature is the attention output (and, downstream, the logits) — not per-element RMS. The
+gate's per-element rows stay in the table as diagnostics, labelled as such.
+
+Caveat to keep: this gate's cache is i.i.d. Gaussian with a 3x per-cell magnitude spread. That spread is exactly
+what penalizes a shared channel scale per element, and the data has no channel-aligned outliers, the structure
+KIVI's gain rests on. The 2.8x is therefore a floor on the win, measured on data that is unkind to it — and the
+real number needs a real cache.
+
+Order from here:
+
+1. Per-channel 2-bit layout (codes packed per dimension across 32 cells, one fp16 scale per dimension per group,
+   80 B per cell and head) in the kernel and the fused attention read path; re-measure end to end.
+2. Real cache statistics: dump a layer's FP16 K/V from a served prompt and run the same comparison on it, so the
+   per-channel number is measured on data with the outlier structure the method targets.
+3. Keep the FP16 window and sinks carrying the recent and sink positions exactly.
 4. End-to-end suite on the real model: `q4_0` vs `q2` vs `q2`+window, exact-copy probes at 4K-131K.
 5. Only after 1-4: the entropy-coded 1.5-bit V, which buys 288 B/cell (7.1x) on top.
