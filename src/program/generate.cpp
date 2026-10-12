@@ -332,6 +332,18 @@ struct Options {
     float top_p = 0.95f;
     float temperature = 1.0f;
     std::string dump_logits;          // one line of logits per generated position
+    /// **`--dump-prompt-logits`: one logits row per PROMPT position, teacher-forced, from the PREFILL.**
+    ///
+    /// `--dump-logits` yields one row per GENERATED token and, on a native (IQ) pack, no prompt rows at all:
+    /// the per-token loop breaks on its first iteration there, `--no-capture` refuses (no CPU expert-pool hook),
+    /// and the eager path does not support native layouts.  The prompt positions' distributions therefore have
+    /// to come from the prefill, where the chunk's residual stream already exists - see
+    /// `Prefill::on_prompt_logits`.  The last prompt position is the decode path's, and is written from there,
+    /// so the file holds positions 0..n_prompt-1.
+    ///
+    /// This is the input of the KV-cache precision table (top-1 agreement with a reference arm, mean KL,
+    /// perplexity, nats/token): a measurement path, not a fast path.
+    std::string dump_prompt_logits;
     int64_t logits_stride = 1;        // storage selection; all prompt tokens remain conditioned
     /// **THE RESIDUAL, SO THE HEAD CAN BE CHECKED WITHOUT THE LAYERS.**
     ///
@@ -759,6 +771,14 @@ void usage() {
                  "  --seed S             enable sampling with this Philox seed\n"
                  "  --top-k N --top-p F --temperature F\n"
                  "  --dump-logits PATH   write one line of raw logits per position\n"
+                 "  --dump-prompt-logits PATH   one logits row per PROMPT position, teacher-forced: the head is\n"
+                 "                       run over every position of every prefill chunk, so row k is the\n"
+                 "                       distribution the model had at position k with the KV state as it stood\n"
+                 "                       there (row k predicts token k+1).  For measuring the precision cost of\n"
+                 "                       a KV format - top-1 agreement, KL, perplexity, nats/token - against a\n"
+                 "                       reference arm.  Works on a native (IQ) pack, where --dump-logits has no\n"
+                 "                       prompt rows.  MEASUREMENT PATH, NOT A FAST PATH: one head GEMV per\n"
+                 "                       position.  Same file format as --dump-logits.\n"
                  "  --logits-stride N    store every Nth row plus final input (default 1); N>1 requires --max-new 1\n"
                  "  --dump-residual PATH write the final R (hc x n_embd, f32) for head bisection\n"
                  "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
@@ -1798,6 +1818,7 @@ int main(int argc, char** argv) {
         else if (a == "--top-p") o.top_p = (float) std::atof(next("--top-p"));
         else if (a == "--temperature") o.temperature = (float) std::atof(next("--temperature"));
         else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
+        else if (a == "--dump-prompt-logits") o.dump_prompt_logits = next("--dump-prompt-logits");
         else if (a == "--logits-stride") {
             if (have_logits_stride) { std::fprintf(stderr, "--logits-stride must be supplied only once\n"); return 2; }
             if (!strata::program::logits_selection::parse_stride(next("--logits-stride"), o.logits_stride)) {
@@ -2474,8 +2495,18 @@ int main(int argc, char** argv) {
         // Plan v0.3 (24 Sep): the CPU experts stay on the VNNI kernel.  The llama.cpp-CPU-exact q8_0 contract
         // cost 27.0 vs 17.2 ms/token of pool time and G-C does not need it; `--cpu-oracle-q8-0` still selects it.
     }
-    if (o.logits_stride > 1 && (o.max_new != 1 || o.dump_logits.empty())) {
-        std::fprintf(stderr, "strata generate: --logits-stride > 1 requires --max-new 1 and --dump-logits\n");
+    if (o.logits_stride > 1 && (o.max_new != 1 || (o.dump_logits.empty() && o.dump_prompt_logits.empty()))) {
+        std::fprintf(stderr, "strata generate: --logits-stride > 1 requires --max-new 1 and --dump-logits "
+                             "(or --dump-prompt-logits)\n");
+        return 2;
+    }
+    // The prompt rows are written by the non-serve prompt path (`Prefill::on_prompt_logits`, wired where the
+    // batched prefill runs).  `--serve` has its own prefill per request and no sink, so accepting the flag
+    // there would produce a file of 0 bytes with a header on it - the exact defect the 2026-10-11 KV write-up
+    // reports for `--dump-logits` on this configuration.  Refuse instead.
+    if (o.serve && !o.dump_prompt_logits.empty()) {
+        std::fprintf(stderr, "strata generate: --dump-prompt-logits is written by the non-serve prompt path; "
+                             "--serve has no sink for it. Run one prompt per process without --serve.\n");
         return 2;
     }
     if (o.no_ple && !o.ple_gguf.empty()) {
@@ -5700,6 +5731,45 @@ int main(int argc, char** argv) {
                                                                                             o.logits_stride);
         hdr[0] = n_vocab; hdr[1] = n_rows;
     }
+
+    // ---- **`--dump-prompt-logits`: one row per PROMPT position, 0..n_prompt-1, teacher-forced.**
+    //
+    // The rows come from two places, and the split is the engine's own: the prefill covers the conditioning
+    // positions [0, n_prompt - 1) and the LAST prompt position is the decode path's first window (its prediction
+    // is the first generated token).  So the prefill sink writes 0..n_prompt-2 and the token/speculative loop
+    // writes n_prompt-1 - the same row `--dump-logits` writes at `--max-new 1`, which is what makes the two
+    // paths comparable at that position.
+    //
+    // Same file format as --dump-logits: int32 n_vocab, int32 n_rows, then n_rows rows of n_vocab float32.
+    // The header is written WITH THE FIRST ROW, for the same reason as above: a header promising rows that
+    // were never written is a defect, and a prompt that never reaches the prefill (one token) writes its
+    // single row from the decode path.
+    std::FILE* dump_prompt = nullptr;
+    int32_t phdr[2] = {0, 0};
+    bool phdr_written = false;
+    int64_t prompt_rows = 0;
+    const int64_t prompt_positions = (int64_t) o.tokens.size();   // positions 0..n_prompt-1
+    if (!o.dump_prompt_logits.empty()) {
+        if (prompt_positions > INT32_MAX || n_vocab > INT32_MAX) {
+            std::fprintf(stderr, "strata generate: prompt logits dump dimensions exceed int32\n");
+            return 2;
+        }
+        dump_prompt = std::fopen(o.dump_prompt_logits.c_str(), "wb");
+        if (dump_prompt == nullptr) {
+            std::fprintf(stderr, "strata generate: cannot write %s\n", o.dump_prompt_logits.c_str());
+            return 1;
+        }
+        phdr[0] = n_vocab;
+        phdr[1] = (int32_t) strata::program::logits_selection::row_count(prompt_positions, o.logits_stride);
+    }
+    // The header rides on the first row; every writer of a prompt row goes through this.
+    auto write_prompt_row = [&](const float* row) -> bool {
+        if (!phdr_written && std::fwrite(phdr, sizeof phdr, 1, dump_prompt) != 1) return false;
+        phdr_written = true;
+        if (std::fwrite(row, sizeof(float), (size_t) n_vocab, dump_prompt) != (size_t) n_vocab) return false;
+        ++prompt_rows;
+        return true;
+    };
 
     // ---- THE C1 ORACLE: ONE RESIDUAL SNAPSHOT PER LAYER PER POSITION, so the engine can be bisected against
     // `llama-debug`'s `l_last-<il>` node instead of against a single end-to-end perplexity.  The buffer is
@@ -12187,6 +12257,24 @@ int main(int argc, char** argv) {
             kvg_start(xcache.slots());
             if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
         }
+        // **`--dump-prompt-logits`: the prefill's rows, positions 0..n_batched-1.**  The sink is set only when
+        // the flag is set, so a normal prompt never allocates the head's row buffer and never runs the head.
+        // The selection is the same `logits_selection` the decode path uses, so `--logits-stride` picks the
+        // same positions on both paths.
+        if (dump_prompt != nullptr) {
+            // **THE HEAD THE DUMP RUNS IS THE HEAD THE DECODE PATH RUNS.**  On a native (IQ) pack `output.weight`
+            // has no canonical planes - the loader skipped them (Plan v0.3 P1) and the head is the GGUF blocks the
+            // `NativeHead` owns - so the prefill needs the same pointer the verify window gets in this same path
+            // (`ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, ...)`, below) and the same
+            // one `run_head` uses.  Left null here, the dump would call the canonical head over a tensor with no
+            // planes.  Null is what a canonical pack gets, and the canonical head is what runs then.
+            if (native_head.loaded()) prefill.set_native_head(&native_head);
+            prefill.on_prompt_logits = [&](const float* row, int64_t pos, std::string& e) -> bool {
+                if (!strata::program::logits_selection::selected(pos, prompt_positions, o.logits_stride)) return true;
+                if (!write_prompt_row(row)) { e = "cannot write the prompt logits row"; return false; }
+                return true;
+            };
+        }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -12362,7 +12450,13 @@ int main(int argc, char** argv) {
         }
         const bool emit_logits = dump != nullptr &&
             strata::program::logits_selection::selected(pos, dump_positions, o.logits_stride);
-        const bool read_logits = !o.stream_token || o.check_logits || emit_logits;
+        // `--dump-prompt-logits`: the prompt positions this loop owns.  With the batched prefill on, that is the
+        // LAST prompt position only (the prefill wrote 0..n_prompt-2, and this position's row is the one
+        // `--dump-logits --max-new 1` writes, so the two paths agree there).  With `--prefill-until` it is the
+        // tail from there, and with no prefill it is every position.
+        const bool emit_prompt_logits = dump_prompt != nullptr && pos < prompt_positions &&
+            strata::program::logits_selection::selected(pos, prompt_positions, o.logits_stride);
+        const bool read_logits = !o.stream_token || o.check_logits || emit_logits || emit_prompt_logits;
         if (read_logits && (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4,
                                            cudaMemcpyDeviceToHost, (cudaStream_t) token_stream) != cudaSuccess ||
                             cudaStreamSynchronize((cudaStream_t) token_stream) != cudaSuccess)) {
@@ -12389,6 +12483,12 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (emit_logits) ++rows_written;
+        // `--dump-prompt-logits`: the header rides on the first row (see `write_prompt_row`).
+        if (emit_prompt_logits && !write_prompt_row(logits.data())) {
+            std::fprintf(stderr, "strata generate: cannot write prompt logits at position %lld\n", (long long) pos);
+            std::fclose(dump_prompt);
+            return 1;
+        }
         {
             // **993 KB OF SYNCHRONOUS D2H AND A 248,320-FLOAT HOST SCAN, EVERY TOKEN.**  (The review's notes
             // say 151,936 floats; the artifact's `output.weight` is 248,320 rows, so the real figure is 1.6x
@@ -12669,8 +12769,12 @@ int main(int argc, char** argv) {
         // **--dump-logits CAN ONLY BE SERVED FROM THIS LOOP ON A NATIVE (IQ) PACK** - see the dump site in the
         // acceptance loop below for why.  The row buffer is allocated only for that case, so a run without
         // --dump-logits, and a non-native run (which the per-token loop already covers), pay nothing.
+        // **--dump-prompt-logits IS SERVED FROM HERE TOO, for the last prompt position.**  On a native pack the
+        // prefill wrote positions 0..n_prompt-2 and the first verify window (p = n_prompt - 1, slot 0) is the
+        // row for position n_prompt - 1 - the same row --dump-logits writes at --max-new 1.
         const bool dump_logits_spec = dump != nullptr && native_pack;
-        std::vector<float> spec_row(dump_logits_spec ? (size_t) n_vocab : 0);
+        const bool dump_prompt_spec = dump_prompt != nullptr && native_pack;
+        std::vector<float> spec_row((dump_logits_spec || dump_prompt_spec) ? (size_t) n_vocab : 0);
         std::vector<int32_t> drafts((size_t) o.spec, 0);
         std::vector<float> dprob((size_t) o.spec, 1.0f);
         std::vector<int64_t> window_hist((size_t) o.spec + 1, 0);
@@ -12859,25 +12963,37 @@ int main(int argc, char** argv) {
                 // positions on both paths.  A row of the WRONG distribution is worse than a missing row: if
                 // `copy_logits` cannot give slot i the row is SKIPPED and the header is repaired to the rows
                 // actually written (see the close of `dump`).
-                if (dump_logits_spec &&
-                    strata::program::logits_selection::selected(p + i, dump_positions, o.logits_stride)) {
+                // `--dump-prompt-logits`: on a native pack the prefill wrote 0..n_prompt-2, so the only prompt
+                // row this loop can produce is the first window's slot 0, at position n_prompt - 1.
+                const bool emit_prompt_spec = dump_prompt_spec && (p + i) < prompt_positions &&
+                    strata::program::logits_selection::selected(p + i, prompt_positions, o.logits_stride);
+                const bool emit_spec = dump_logits_spec &&
+                    strata::program::logits_selection::selected(p + i, dump_positions, o.logits_stride);
+                if (emit_spec || emit_prompt_spec) {
                     if (!ver.copy_logits(i, spec_row.data())) {
                         std::fprintf(stderr, "strata generate: --dump-logits: the verify window at position %lld "
                                              "(T=%d) cannot give slot %d; the row for position %lld is SKIPPED\n",
                                      (long long) p, T, i, (long long) (p + i));
-                    } else if (!hdr_written && std::fwrite(hdr, sizeof hdr, 1, dump) != 1) {
+                    } else if (emit_spec && !hdr_written && std::fwrite(hdr, sizeof hdr, 1, dump) != 1) {
                         std::fprintf(stderr, "strata generate: cannot write logits header\n");
                         std::fclose(dump);
                         return 1;
                     } else {
-                        hdr_written = true;
-                        if (std::fwrite(spec_row.data(), sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
+                        if (emit_spec) hdr_written = true;
+                        if (emit_spec &&
+                            std::fwrite(spec_row.data(), sizeof(float), (size_t) n_vocab, dump) != (size_t) n_vocab) {
                             std::fprintf(stderr, "strata generate: cannot write logits at position %lld\n",
                                          (long long) (p + i));
                             std::fclose(dump);
                             return 1;
                         }
-                        ++rows_written;
+                        if (emit_spec) ++rows_written;
+                        if (emit_prompt_spec && !write_prompt_row(spec_row.data())) {
+                            std::fprintf(stderr, "strata generate: cannot write prompt logits at position %lld\n",
+                                         (long long) (p + i));
+                            std::fclose(dump_prompt);
+                            return 1;
+                        }
                     }
                 }
                 if (sfx_on) sfx.append(outv[(size_t) i]);
@@ -13018,6 +13134,30 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: cannot finish logits dump\n");
             return 1;
         }
+    }
+    if (dump_prompt != nullptr) {
+        // **THE HEADER MUST NEVER PROMISE ROWS THE FILE DOES NOT CONTAIN** - the same rule as `dump` above.
+        // The count is computed up front from the positions the two writers are expected to emit; if the
+        // prefill stopped early, or a verify window refused its slot, the file is shorter, so the count is
+        // repaired to what was actually written.
+        if (phdr_written && prompt_rows != (int64_t) phdr[1]) {
+            std::fprintf(stderr, "strata generate: --dump-prompt-logits: the header promised %lld rows, %lld "
+                                 "were written; rewriting it to %lld\n", (long long) phdr[1],
+                         (long long) prompt_rows, (long long) prompt_rows);
+            phdr[1] = (int32_t) prompt_rows;
+            if (std::fseek(dump_prompt, 0, SEEK_SET) != 0 || std::fwrite(phdr, sizeof phdr, 1, dump_prompt) != 1) {
+                std::fprintf(stderr, "strata generate: cannot rewrite the prompt logits header\n");
+                std::fclose(dump_prompt);
+                return 1;
+            }
+        }
+        if (std::fclose(dump_prompt) != 0) {
+            std::fprintf(stderr, "strata generate: cannot finish the prompt logits dump\n");
+            return 1;
+        }
+        std::printf("%-24s %s (%lld rows, positions 0..%lld of %lld prompt tokens)\n", "prompt logits dumped",
+                    o.dump_prompt_logits.c_str(), (long long) prompt_rows,
+                    (long long) (prompt_rows > 0 ? prompt_positions - 1 : -1), (long long) prompt_positions);
     }
     if (layer_dump != nullptr) {
         std::fclose(layer_dump);
