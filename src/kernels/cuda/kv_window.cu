@@ -97,16 +97,19 @@ __global__ void __launch_bounds__(THREADS) window_write_batch_kernel(uint16_t* _
 
 // q2 (kv_q2.hpp): the 4-level Lloyd-Max dequantization `kv_gather_q2_kernel` writes with `v3level = false`, the
 // shipping setting for K and V, so a restored window holds exactly what the decode attention reads from the bulk.
-__device__ __forceinline__ float bulk_q2(const uint8_t* pool, long long row, int d) {
-    constexpr int BYTES = (256 / Q2_0) * sizeof(block_q2_0);
-    const block_q2_0* blk = reinterpret_cast<const block_q2_0*>(pool + row * BYTES) + d / Q2_0;
-    const int rem = d % Q2_0;
-    const int code = (blk->qs[rem >> 2] >> (2 * (rem & 3))) & 3;
+// Per-channel scales: the cell's code lives in the slot (group, head, dim) of its 32-cell group, the group being
+// 32 consecutive cells OF THE POOL - the same decomposition `load8_q2` and `load_v1` do, from the same row.
+__device__ __forceinline__ float bulk_q2(const uint8_t* pool, long long row, int d, int kv_heads, int page_size) {
+    const long long cell = (row / ((long long) kv_heads * page_size)) * page_size + (row % page_size);
+    const int h = (int) ((row / page_size) % kv_heads);
+    const block_q2c_0* blk = q2c_slot(pool, cell / Q2_0, h, d, kv_heads, 256);
+    const int idx = (int) (cell % Q2_0);
+    const int code = (blk->qs[idx >> 2] >> (2 * (idx & 3))) & 3;
     return q2_lm4_level(code) * f32_from_f16(blk->d);
 }
 
 template <int KV_MODE>
-__device__ __forceinline__ float bulk_k(const QsaAttnPools& p, long long row, int d) {
+__device__ __forceinline__ float bulk_k(const QsaAttnPools& p, long long row, int d, int n_head_kv, int page_size) {
     if constexpr (KV_MODE == 0) {
         return f32_from_f16(p.k_pool[row * 256 + d]);
     } else if constexpr (KV_MODE == 2) {
@@ -116,7 +119,7 @@ __device__ __forceinline__ float bulk_k(const QsaAttnPools& p, long long row, in
         const int nib = rem < 16 ? (blk->qs[rem] & 0x0F) : (blk->qs[rem - 16] >> 4);
         return (float) (nib - 8) * __half2float(__ushort_as_half(blk->d));
     } else if constexpr (KV_MODE == 4) {
-        return bulk_q2(p.k_q2, row, d);
+        return bulk_q2(p.k_q2, row, d, n_head_kv, page_size);
     } else {
         const float sc = __half2float(__ushort_as_half(p.k_scale[row * (256 / KV_Q8_GROUP) + d / KV_Q8_GROUP]));
         return (float) p.k_q[row * 256 + d] * sc;
@@ -124,14 +127,14 @@ __device__ __forceinline__ float bulk_k(const QsaAttnPools& p, long long row, in
 }
 
 template <int KV_MODE>
-__device__ __forceinline__ float bulk_v(const QsaAttnPools& p, long long row, int d) {
+__device__ __forceinline__ float bulk_v(const QsaAttnPools& p, long long row, int d, int n_head_kv, int page_size) {
     if constexpr (KV_MODE == 0) {
         return f32_from_f16(p.v_pool[row * 256 + d]);
     } else if constexpr (KV_MODE == 1) {
         const float sc = __half2float(__ushort_as_half(p.v_scale[row * (256 / KV_Q8_GROUP) + d / KV_Q8_GROUP]));
         return (float) p.v_q[row * 256 + d] * sc;
     } else if constexpr (KV_MODE == 4) {
-        return bulk_q2(p.v_q2, row, d);
+        return bulk_q2(p.v_q2, row, d, n_head_kv, page_size);
     } else {   // modes 2 and 3: V is q4_0
         constexpr int BYTES = (256 / QK4_0) * sizeof(block_q4_0);
         const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * BYTES) + d / QK4_0;
@@ -157,8 +160,8 @@ __global__ void __launch_bounds__(THREADS) window_restore_kernel(uint16_t* __res
     const long long row = (page * n_head_kv + kvh) * page_size + (long long) (cell % page_size);
     const int64_t dst = ((int64_t) slot * n_head_kv + kvh) * head_dim;
     for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
-        kw[dst + d] = win_half(bulk_k<KV_MODE>(p, row, d));
-        vw[dst + d] = win_half(bulk_v<KV_MODE>(p, row, d));
+        kw[dst + d] = win_half(bulk_k<KV_MODE>(p, row, d, n_head_kv, page_size));
+        vw[dst + d] = win_half(bulk_v<KV_MODE>(p, row, d, n_head_kv, page_size));
     }
 }
 

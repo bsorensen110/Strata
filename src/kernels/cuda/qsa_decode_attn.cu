@@ -74,25 +74,35 @@ __device__ __forceinline__ void load8_q4(const QsaAttnPools& p, bool value, long
         for (int k = 0; k < 8; ++k) out[k] = (float) ((int)(bytes[k] >> 4) - 8) * d;
     }
 }
-// q2 (kv_q2.hpp): 32 2-bit codes in 8 bytes, element j in bits [2*(j%4), +2) of qs[j/4], times the block's fp16
-// scale and the Lloyd-Max level of the code - the same expression `kv_gather_q2_kernel` writes into its FP16
-// scratch with `v3level = false`, the shipping setting (4-level codebook for K and V), so the fused read and the
-// gathered read of the same block give the same fp16 bits.  `d` is read with `f32_from_f16`, the gather kernel's
-// own converter, not `__half2float`: the two must agree on a subnormal scale bit for bit.
-__device__ __forceinline__ void load8_q2(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
-    constexpr int bytes_per_head = (HD / Q2_0) * sizeof(block_q2_0);
-    const int b = d0 / Q2_0;
-    const int rem = d0 % Q2_0;
-    const block_q2_0* blk = reinterpret_cast<const block_q2_0*>((value ? p.v_q2 : p.k_q2) + row * bytes_per_head) + b;
+// q2 (kv_q2.hpp): PER-CHANNEL 2-bit codes. The pool is one 10-byte slot per (32-cell group, KV head, dimension);
+// the cell's code is the two bits at 2*(idx%4) of qs[idx/4], where idx is the cell's index inside its group, and
+// the scale is the group's fp16 RMS for that dimension. Eight consecutive dimensions are eight slots 10 bytes
+// apart, and the lanes walk d0 = 0, 8, 16, ... so a warp reads consecutive slots.
+//
+// The expression is the one `kv_gather_q2_kernel` writes into its FP16 scratch with `v3level = false`, the
+// shipping setting (4-level codebook for K and V), so the fused read and the gathered read of the same cell give
+// the same fp16 bits. `d` is read with `f32_from_f16`, the gather kernel's own converter, not `__half2float`: the
+// two must agree on a subnormal scale bit for bit.
+//
+// The group is 32 consecutive cells OF THE POOL, so it is computed from the pool row, not from the sequence
+// position: row = (slot_page * kv_heads + head) * page_size + slot, and the pool cell is slot_page * page_size +
+// slot. That is what keeps the page table's indirection from splitting a group.
+__device__ __forceinline__ void load8_q2(const QsaAttnPools& p, bool value, long long row, int d0, float* out,
+                                         int kv_heads, int page_size) {
+    const long long slot_page = row / ((long long) kv_heads * page_size);
+    const long long cell = slot_page * page_size + (row % page_size);
+    const int h = (int) ((row / page_size) % kv_heads);
+    const block_q2c_0* blk = q2c_slot(value ? p.v_q2 : p.k_q2, cell / Q2_0, h, d0, kv_heads, HD);
     const float d = f32_from_f16(blk->d);
-    // d0 is a multiple of 8 and so of 4, so the eight elements split into exactly two packed bytes: qs[rem/4]
-    // holds rem..rem+3 and qs[rem/4 + 1] holds rem+4..rem+7, each at bit offsets 0, 2, 4, 6.
-    const uint8_t* bytes = blk->qs + (rem >> 2);
+    const int idx = (int) (cell % Q2_0);
+    const int shift = 2 * (idx & 3);
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(blk) + 2 + (idx >> 2);   // the slot stride is 10 B
 #pragma unroll
-    for (int k = 0; k < 8; ++k) out[k] = q2_lm4_level((bytes[k >> 2] >> (2 * (k & 3))) & 3) * d;
+    for (int k = 0; k < 8; ++k) out[k] = q2_lm4_level((bytes[10 * k] >> shift) & 3) * d;
 }
 template <int KV_MODE>
-__device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
+__device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long long row, int d0, float* out,
+                                      int kv_heads, int page_size) {
     if (p.win_cells > 0 && row >= p.bulk_rows) {   // FP16 overlay row (kv_window.hpp)
         const uint16_t* pool = (value ? p.v_win : p.k_win) + (row - p.bulk_rows) * HD + d0;
 #pragma unroll
@@ -106,7 +116,7 @@ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long lo
         // reads the Q4_0 pool instead of dereferencing the null v_q (no call site does today; PR review)
         if (value) load8_q4(p, value, row, d0, out);
         else load8_q8(p, value, row, d0, out);
-    } else if constexpr (KV_MODE == 4) load8_q2(p, value, row, d0, out);
+    } else if constexpr (KV_MODE == 4) load8_q2(p, value, row, d0, out, kv_heads, page_size);
     else load8_q4(p, value, row, d0, out);
 }
 
@@ -208,7 +218,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
 #pragma unroll
             for (int l = 0; l < 32; ++l) {
                 float k8[8];
-                load8<KV_MODE>(p, false, srow[c], l * 8, k8);
+                load8<KV_MODE>(p, false, srow[c], l * 8, k8, n_kv_heads, page_size);
 #pragma unroll
                 for (int j = 0; j < HPT; ++j) {
                     const float4 qa = *reinterpret_cast<const float4*>(&sq[h0 + j][l * 8]);
@@ -236,7 +246,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         }
         if constexpr (REDUCE12) {
         float k8[8];
-        load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+        load8<KV_MODE>(p, false, srow[c], lane * 8, k8, n_kv_heads, page_size);
         float part[16];
 #pragma unroll
         for (int h = 0; h < G; ++h) {
@@ -254,7 +264,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         if ((lane & 1) == 0 && head < G) sp[head][c] = score * scale;
         } else {
         float k8[8];
-        load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+        load8<KV_MODE>(p, false, srow[c], lane * 8, k8, n_kv_heads, page_size);
 #pragma unroll
         for (int h = 0; h < G; ++h) {
             const int qflip = QUERY_SWIZZLE ? (lane & 4) : 0;
@@ -294,14 +304,16 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
         } else if constexpr (KV_MODE == 1) {
             const float sc = __half2float(__ushort_as_half(p.v_scale[srow[c] * (HD / KV_Q8_GROUP) + t / KV_Q8_GROUP]));
             v = (float) p.v_q[srow[c] * HD + t] * sc;
-        } else if constexpr (KV_MODE == 4) {   // q2: V is rotated 2-bit (kv_q2.hpp); the caller rotates the output back
-            constexpr int bytes_per_head = (HD / Q2_0) * sizeof(block_q2_0);
-            const int b = t / Q2_0;
-            const int rem = t % Q2_0;
-            const block_q2_0* blk = reinterpret_cast<const block_q2_0*>(p.v_q2 + srow[c] * bytes_per_head) + b;
-            const float d = f32_from_f16(blk->d);
-            const int code = (blk->qs[rem >> 2] >> (2 * (rem & 3))) & 3;
-            v = q2_lm4_level(code) * d;
+        } else if constexpr (KV_MODE == 4) {   // q2: V is rotated 2-bit with per-channel scales (kv_q2.hpp);
+            // the caller rotates the output back. Thread t owns dimension t, so consecutive threads read
+            // consecutive 10-byte slots of the cell's group - a coalesced walk.
+            const long long r = srow[c];
+            const long long cell = (r / ((long long) n_kv_heads * page_size)) * page_size + (r % page_size);
+            const int h = (int) ((r / page_size) % n_kv_heads);
+            const block_q2c_0* blk = q2c_slot(p.v_q2, cell / Q2_0, h, t, n_kv_heads, HD);
+            const int idx = (int) (cell % Q2_0);
+            const int code = (blk->qs[idx >> 2] >> (2 * (idx & 3))) & 3;
+            v = q2_lm4_level(code) * f32_from_f16(blk->d);
         } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
             constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
             const int b = t / QK4_0;
@@ -386,7 +398,7 @@ __device__ __forceinline__ int head_of_lane(int lane) {
 
 // One V element of pool row `row`, dimension `d` (the value loop's own thread index), per KV format.
 template <int KV_MODE>
-__device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, int d) {
+__device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, int d, int kv_heads, int page_size) {
     if (p.win_cells > 0 && row >= p.bulk_rows)   // FP16 overlay row (kv_window.hpp)
         return __half2float(__ushort_as_half(__ldg(p.v_win + (row - p.bulk_rows) * HD + d)));
     if constexpr (KV_MODE == 0) {
@@ -394,14 +406,15 @@ __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, i
     } else if constexpr (KV_MODE == 1) {
         const float sc = __half2float(__ushort_as_half(p.v_scale[row * (HD / KV_Q8_GROUP) + d / KV_Q8_GROUP]));
         return (float) p.v_q[row * HD + d] * sc;
-    } else if constexpr (KV_MODE == 4) {   // q2: V is rotated 2-bit (kv_q2.hpp); the caller rotates the output back
-        constexpr int bytes_per_head = (HD / Q2_0) * sizeof(block_q2_0);
-        const int b = d / Q2_0;
-        const int rem = d % Q2_0;
-        const block_q2_0* blk = reinterpret_cast<const block_q2_0*>(p.v_q2 + row * bytes_per_head) + b;
-        const float dd = f32_from_f16(blk->d);
-        const int code = (blk->qs[rem >> 2] >> (2 * (rem & 3))) & 3;
-        return q2_lm4_level(code) * dd;
+    } else if constexpr (KV_MODE == 4) {   // q2: V is rotated 2-bit with per-channel scales (kv_q2.hpp); the
+        // caller rotates the output back. The group is 32 consecutive cells of the POOL, so it comes from the
+        // row, exactly as load8_q2 computes it - the two must agree bit for bit.
+        const long long cell = (row / ((long long) kv_heads * page_size)) * page_size + (row % page_size);
+        const int h = (int) ((row / page_size) % kv_heads);
+        const block_q2c_0* blk = q2c_slot(p.v_q2, cell / Q2_0, h, d, kv_heads, HD);
+        const int idx = (int) (cell % Q2_0);
+        const int code = (blk->qs[idx >> 2] >> (2 * (idx & 3))) & 3;
+        return q2_lm4_level(code) * f32_from_f16(blk->d);
     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
         const int b = d / QK4_0;
@@ -482,7 +495,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
         if (all_ok) {
             float kk[NC][8];
 #pragma unroll
-            for (int j = 0; j < NC; ++j) load8<KV_MODE>(p, false, srow[cc[j]], lane * 8, kk[j]);
+            for (int j = 0; j < NC; ++j)
+                load8<KV_MODE>(p, false, srow[cc[j]], lane * 8, kk[j], n_kv_heads, page_size);
             float pp[NC][16];
 #pragma unroll
             for (int h = 0; h < G; ++h) {
@@ -508,7 +522,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
                     continue;
                 }
                 float k8[8];
-                load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+                load8<KV_MODE>(p, false, srow[c], lane * 8, k8, n_kv_heads, page_size);
                 float part[16];
 #pragma unroll
                 for (int h = 0; h < G; ++h) {
@@ -559,8 +573,10 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
     for (; c + 4 <= n_here; c += 4) {
         const long long r0 = srow[c], r1 = srow[c + 1], r2 = srow[c + 2], r3 = srow[c + 3];
         if ((r0 | r1 | r2 | r3) < 0) break;
-        const float v0 = load_v1<KV_MODE>(p, r0, t), v1 = load_v1<KV_MODE>(p, r1, t);
-        const float v2 = load_v1<KV_MODE>(p, r2, t), v3 = load_v1<KV_MODE>(p, r3, t);
+        const float v0 = load_v1<KV_MODE>(p, r0, t, n_kv_heads, page_size),
+                    v1 = load_v1<KV_MODE>(p, r1, t, n_kv_heads, page_size);
+        const float v2 = load_v1<KV_MODE>(p, r2, t, n_kv_heads, page_size),
+                    v3 = load_v1<KV_MODE>(p, r3, t, n_kv_heads, page_size);
         fold(c, v0);
         fold(c + 1, v1);
         fold(c + 2, v2);
@@ -568,7 +584,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel_pre75(const float* 
     }
     for (; c < n_here; ++c) {
         if (srow[c] < 0) continue;   // masked above, weight 0
-        fold(c, load_v1<KV_MODE>(p, srow[c], t));
+        fold(c, load_v1<KV_MODE>(p, srow[c], t, n_kv_heads, page_size));
     }
 #pragma unroll
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
