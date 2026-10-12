@@ -17,10 +17,14 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <random>
+#include <string>
 #include <vector>
 
 namespace k = strata::kernels;
@@ -42,6 +46,105 @@ template <typename T> T* dalloc(size_t n) {
     ck(cudaMalloc(&p, n * sizeof(T) + 64), "malloc");
     ck(cudaMemset(p, 0, n * sizeof(T) + 64), "memset");
     return p;
+}
+
+/// A REAL KV cache replaces the synthetic one when STRATA_KV_PROBE_CACHE names a file - the SDKV dump
+/// `--dump-kv` writes (header: magic, version, n_layers, n_cells, n_head_kv, head_dim, layer ids, then per
+/// layer K then V as fp16 in (cell, head, dim) order). That element order is the order these arrays use, so
+/// a real cache drops straight in, and it is the STORED cache - rotated, post-RoPE, post-norm - which is
+/// exactly what the quantizers are being asked about. STRATA_KV_PROBE_LAYER picks the layer.
+///
+/// This exists because the synthetic cache is structurally blind to per-channel scaling: i.i.d. Gaussian
+/// noise gives every channel the same RMS, and KIVI's per-channel result (arXiv 2402.02750) exists to
+/// exploit a handful of channels being far larger than the rest. Every per-channel number measured on the
+/// synthetic cache is a floor, not the number.
+bool load_real_cache(const char* path, int want_layer, int H, int D, int max_cells, int& n_out,
+                     std::vector<float>& K, std::vector<float>& V, int& layer_out, std::string& err) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (f == nullptr) { err = std::string("probe cache: cannot open ") + path; return false; }
+    int hdr[6] = {0, 0, 0, 0, 0, 0};
+    if (std::fread(hdr, 4, 6, f) != 6 || hdr[0] != 0x564B4453 || hdr[1] != 1) {
+        std::fclose(f);
+        err = "probe cache: not an SDKV v1 dump (write one with --dump-kv)";
+        return false;
+    }
+    const int n_layers = hdr[2], n_cells = hdr[3], n_head_kv = hdr[4], head_dim = hdr[5];
+    if (n_head_kv != H || head_dim != D) {
+        std::fclose(f);
+        err = "probe cache: " + std::to_string(n_head_kv) + " heads x " + std::to_string(head_dim) +
+              " dims does not match this model's " + std::to_string(H) + " x " + std::to_string(D);
+        return false;
+    }
+    std::vector<int> ids(n_layers, -1);
+    if (n_layers <= 0 || n_cells <= 0 || std::fread(ids.data(), 4, n_layers, f) != (size_t) n_layers) {
+        std::fclose(f);
+        err = "probe cache: short layer id table";
+        return false;
+    }
+    int slot = -1;
+    for (int i = 0; i < n_layers; ++i)
+        if (ids[i] == want_layer) slot = i;
+    if (slot < 0) {
+        std::fclose(f);
+        err = "probe cache: layer " + std::to_string(want_layer) + " is not in the dump";
+        return false;
+    }
+    const size_t plane = (size_t) n_cells * (size_t) H * (size_t) D;
+    std::vector<uint16_t> buf(plane);
+    for (int i = 0; i < slot; ++i)                    // skip the layers before the one we want
+        if (std::fread(buf.data(), 2, plane, f) != plane || std::fread(buf.data(), 2, plane, f) != plane) {
+            std::fclose(f);
+            err = "probe cache: file is shorter than its header claims";
+            return false;
+        }
+    std::vector<float> k((size_t) n_cells * H * D), v((size_t) n_cells * H * D);
+    if (std::fread(buf.data(), 2, plane, f) != plane) { std::fclose(f); err = "probe cache: short K plane"; return false; }
+    for (size_t i = 0; i < plane; ++i) k[i] = k::f32_from_f16(buf[i]);
+    if (std::fread(buf.data(), 2, plane, f) != plane) { std::fclose(f); err = "probe cache: short V plane"; return false; }
+    std::fclose(f);
+    for (size_t i = 0; i < plane; ++i) v[i] = k::f32_from_f16(buf[i]);
+    for (size_t i = 0; i < plane; ++i)
+        if (!std::isfinite(k[i]) || !std::isfinite(v[i])) {
+            err = "probe cache: a non-finite value in the dump";
+            return false;
+        }
+    // Whole 32-cell groups only: the group is the per-channel scale's unit, so a tail that does not fill one
+    // would be quantized half a scale at a time.
+    const int usable = (n_cells / 32) * 32;
+    n_out = usable < max_cells ? usable : max_cells;
+    K.assign(k.begin(), k.begin() + (size_t) n_out * H * D);
+    V.assign(v.begin(), v.begin() + (size_t) n_out * H * D);
+    layer_out = want_layer;
+    return true;
+}
+
+/// The statistics the synthetic cache cannot have, printed so the reader of the table knows what the data is.
+/// Per-channel scaling exists to exploit the first ratio (a channel's RMS varying across the cache) and the
+/// second (a few channels carrying most of the variance); if both are flat, per-channel scaling has nothing
+/// to exploit and the per-token scale is the honest choice.
+void channel_stats(const std::vector<float>& X, int n_cells, int H, int D, const char* name) {
+    const int nd = H * D;
+    std::vector<double> chan((size_t) nd, 0.0), cell((size_t) n_cells, 0.0);
+    for (int c = 0; c < n_cells; ++c)
+        for (int i = 0; i < nd; ++i) {
+            const double x = X[(size_t) c * nd + i];
+            chan[i] += x * x;
+            cell[c] += x * x;
+        }
+    std::vector<double> cv((size_t) nd);
+    double total = 0.0;
+    for (int i = 0; i < nd; ++i) { chan[i] = std::sqrt(chan[i] / n_cells); cv[i] = chan[i] * chan[i]; total += cv[i]; }
+    for (int c = 0; c < n_cells; ++c) cell[c] = std::sqrt(cell[c] / nd);
+    std::sort(cv.begin(), cv.end());
+    std::sort(cell.begin(), cell.end());
+    double top8 = 0.0;
+    for (size_t i = cv.size() - 8; i < cv.size(); ++i) top8 += cv[i];
+    const double cmed = cv[cv.size() / 2], cmax = cv.back(), cmin = cv.front();
+    const double lmed = cell[cell.size() / 2], lmax = cell.back(), lmin = cell.front();
+    std::printf("  %s: channel RMS min %.4f median %.4f max %.4f (max/median %.2fx), top-8 channels carry %.1f%% "
+                "of the variance; cell RMS min %.4f median %.4f max %.4f (max/median %.2fx)\n",
+                name, cmin, cmed, cmax, cmed > 0.0 ? cmax / cmed : 0.0, total > 0.0 ? 100.0 * top8 / total : 0.0,
+                lmin, lmed, lmax, lmed > 0.0 ? lmax / lmed : 0.0);
 }
 
 /// The host reference quantizer: the same warp rule as the kernel, run serially. d is the block's scale from the
@@ -168,6 +271,107 @@ void quant_1bit(const float* x, int n_cells, int n_heads, int D, bool per_channe
     }
 }
 
+/// KIVI-style ASYMMETRIC quantization (arXiv 2402.02750): scale AND A ZERO-POINT from the group's extremes,
+/// `z = min`, `s = (max - min) / 3`, levels z, z+s, z+2s, z+3s. SKVQ (arXiv 2405.06219) clips those extremes
+/// first; `clip_sigma > 0` does the same (mean +- clip_sigma * sd). `per_channel` groups 32 cells of one
+/// dimension, `per_token` groups one cell's head_dim.
+///
+/// This is the scheme both published 2-bit methods use and ours does not: we store a symmetric RMS scale with
+/// no zero-point. It costs two fp16 per group (scale + zero-point) - 32 B per cell and head per-channel,
+/// 4 B per cell and head per-token - so 96 B per cell and head for a per-channel 2-bit K, against 80 B for
+/// the symmetric block.
+void quant_asym(const float* x, int n_cells, int n_heads, int D, bool per_channel, float clip_sigma, float* out) {
+    const int stride = n_heads * D;
+    auto qz = [&](const float* v, int n, float* o) {
+        float lo = v[0], hi = v[0], ss = 0.f, s1 = 0.f;
+        for (int i = 0; i < n; ++i) {
+            if (v[i] < lo) lo = v[i];
+            if (v[i] > hi) hi = v[i];
+            ss += v[i] * v[i];
+            s1 += v[i];
+        }
+        const float mean = s1 / (float) n;
+        const float sd = std::sqrt(std::max(0.0f, ss / (float) n - mean * mean));
+        if (clip_sigma > 0.0f) {
+            lo = std::max(lo, mean - clip_sigma * sd);
+            hi = std::min(hi, mean + clip_sigma * sd);
+        }
+        float s = (hi - lo) / 3.0f;
+        if (!(s > 0.0f)) s = 1e-8f;
+        const float ds = k::f32_from_f16(k::f16_from_f32(s));       // stored as the device would store it
+        const float dz = k::f32_from_f16(k::f16_from_f32(lo));
+        for (int i = 0; i < n; ++i) {
+            float q = std::nearbyintf((v[i] - dz) / ds);
+            q = q < 0.f ? 0.f : (q > 3.f ? 3.f : q);
+            o[i] = dz + q * ds;
+        }
+    };
+    std::vector<float> tmp(512), tmpo(512);
+    if (per_channel) {
+        for (int h = 0; h < n_heads; ++h)
+            for (int d = 0; d < D; ++d)
+                for (int g = 0; g < n_cells; g += 32) {
+                    for (int i = 0; i < 32; ++i) tmp[i] = x[(size_t) (g + i) * stride + h * D + d];
+                    qz(tmp.data(), 32, tmpo.data());
+                    for (int i = 0; i < 32; ++i) out[(size_t) (g + i) * stride + h * D + d] = tmpo[i];
+                }
+    } else {
+        for (int c = 0; c < n_cells; ++c)
+            for (int h = 0; h < n_heads; ++h) {
+                const size_t base = (size_t) c * stride + h * D;
+                qz(x + base, D, out + base);
+            }
+    }
+}
+
+/// JOINT per-channel x per-token scaling (the Coupled-Quantization / SKVQ direction): a value's scale is the
+/// PRODUCT of a channel scale and a token scale, so one 2-bit code carries both structures at once instead of
+/// choosing one axis. Costs the per-channel fp16 (16 B per cell and head) plus one fp16 per cell and head
+/// (2 B): 82 B per cell and head at 2 bits, against 80 B for the single-axis per-channel block.
+void quant_joint(const float* x, int n_cells, int n_heads, int D, float* out) {
+    const int stride = n_heads * D;
+    const int ngroups = n_cells / 32;
+    std::vector<float> a((size_t) ngroups * stride, 1.0f), b((size_t) n_cells * n_heads, 1.0f);
+    for (int h = 0; h < n_heads; ++h)
+        for (int d = 0; d < D; ++d)
+            for (int g = 0; g < ngroups; ++g) {
+                float ss = 0.f;
+                for (int i = 0; i < 32; ++i) {
+                    const float v = x[(size_t) (g * 32 + i) * stride + h * D + d];
+                    ss += v * v;
+                }
+                a[(size_t) g * stride + h * D + d] = std::sqrt(ss / 32.0f);
+            }
+    // The token scale is measured with the channel scale divided out, then normalized to mean 1 so the two
+    // factors cannot both claim the same variance.
+    std::vector<float> tr((size_t) n_cells * n_heads, 0.f);
+    double acc = 0.0;
+    for (int c = 0; c < n_cells; ++c)
+        for (int h = 0; h < n_heads; ++h) {
+            float ss = 0.f;
+            for (int d = 0; d < D; ++d) {
+                const size_t idx = (size_t) c * stride + h * D + d;
+                const float g = a[(size_t) (c / 32) * stride + h * D + d];
+                const float r = g > 0.f ? x[idx] / g : 0.f;
+                ss += r * r;
+            }
+            tr[(size_t) c * n_heads + h] = std::sqrt(ss / (float) D);
+            acc += tr[(size_t) c * n_heads + h];
+        }
+    const double mean = acc / ((double) n_cells * n_heads);
+    for (size_t i = 0; i < tr.size(); ++i) b[i] = mean > 0.0 ? (float) (tr[i] / mean) : 1.0f;
+    for (int c = 0; c < n_cells; ++c)
+        for (int h = 0; h < n_heads; ++h) {
+            const float bs = k::f32_from_f16(k::f16_from_f32(b[(size_t) c * n_heads + h]));
+            for (int d = 0; d < D; ++d) {
+                const size_t idx = (size_t) c * stride + h * D + d;
+                const float as = k::f32_from_f16(k::f16_from_f32(a[(size_t) (c / 32) * stride + h * D + d]));
+                const float s = as * bs;
+                out[idx] = s > 0.f ? k::q2_value_lm4(k::q2_code_lm4(x[idx], s), s) : 0.f;
+            }
+        }
+}
+
 /// Relative RMS of `got` against `ref`, over the whole vector: the same units the window work reports in.
 double rel_rms(const std::vector<float>& got, const std::vector<float>& ref) {
     double se = 0.0, ss = 0.0;
@@ -221,23 +425,46 @@ int main() {
     k::QsaShapes s = k::qsa_real_shapes();
     s.page_size = 4;
     const int H = (int) s.n_head_kv, D = (int) s.head_dim, P = (int) s.page_size;
-    const int N = 1024;                                  // cells in the cache
-    const int pages = N / P;
-    const int rows = N * H;                              // identity layout: one row per (cell, kv head)
+    int N = 1024;                                        // cells in the cache (the loader may set a smaller one)
+    int pages = 0, rows = 0;                             // derived from N below, once N is final
 
     std::mt19937 rng(23);
     std::normal_distribution<float> nd(0.f, 1.f);
-    // Mild per-cell magnitude spread on purpose: a cache where every cell has the same scale flatters every
-    // quantizer, because the softmax weights barely move. 25x spikes were tried first and made the probe useless -
-    // they hand the whole softmax to a handful of cells, so flipping which one wins (which 4 bits can do) moves
-    // the entire output, and q4_0 measured worse than a 2-bit cache. 3x is the regime a real rotated cache has.
-    std::vector<float> K((size_t) N * H * D), V((size_t) N * H * D);
-    for (int cell = 0; cell < N; ++cell) {
-        const float sc = (cell % 17 == 0) ? 3.0f : (cell % 23 == 0 ? 0.1f : 1.0f);
-        for (int i = 0; i < H * D; ++i) {
-            K[(size_t) cell * H * D + i] = nd(rng) * sc;
-            V[(size_t) cell * H * D + i] = nd(rng) * sc;
+    std::vector<float> K, V;
+    bool real_cache = false;
+    if (const char* e = std::getenv("STRATA_KV_PROBE_CACHE")) {
+        int want = 0, layer_out = 0;
+        if (const char* l = std::getenv("STRATA_KV_PROBE_LAYER")) want = std::atoi(l);
+        std::string cerr;
+        if (!load_real_cache(e, want, H, D, 1024, N, K, V, layer_out, cerr)) {
+            std::fprintf(stderr, "strata kv_q2_parity: %s\n", cerr.c_str());
+            return 2;
         }
+        real_cache = true;
+        std::printf("REAL CACHE (stored, rotated): %s layer %d - %d cells x %d kv heads x %d dims\n",
+                    e, layer_out, N, H, D);
+        channel_stats(K, N, H, D, "K");
+        channel_stats(V, N, H, D, "V");
+    }
+    pages = N / P;
+    rows = N * H;                                        // identity layout: one row per (cell, kv head)
+    if (!real_cache) {
+        K.assign((size_t) N * H * D, 0.f);
+        V.assign((size_t) N * H * D, 0.f);
+        // Mild per-cell magnitude spread on purpose: a cache where every cell has the same scale flatters every
+        // quantizer, because the softmax weights barely move. 25x spikes were tried first and made the probe
+        // useless - they hand the whole softmax to a handful of cells, so flipping which one wins (which 4 bits
+        // can do) moves the entire output, and q4_0 measured worse than a 2-bit cache. 3x is the regime a real
+        // rotated cache has.
+        for (int cell = 0; cell < N; ++cell) {
+            const float sc = (cell % 17 == 0) ? 3.0f : (cell % 23 == 0 ? 0.1f : 1.0f);
+            for (int i = 0; i < H * D; ++i) {
+                K[(size_t) cell * H * D + i] = nd(rng) * sc;
+                V[(size_t) cell * H * D + i] = nd(rng) * sc;
+            }
+        }
+        std::printf("SYNTHETIC CACHE: i.i.d. Gaussian, 3x per-cell spread - blind to channel structure, so "
+                    "every per-channel number here is a floor\n");
     }
 
     std::vector<int32_t> table(pages);
@@ -376,6 +603,19 @@ int main() {
     quant_1bit(Vref.data(), N, H, D, false, h_v_1t.data());   // V 1-bit, per-token scale (KIVI's V arm)
     quant_1bit(Kref.data(), N, H, D, true, h_k_1c.data());    // K 1-bit, per-channel scale
     const double r_v_1c = rel_rms(h_v_1c, Vref), r_v_1t = rel_rms(h_v_1t, Vref), r_k_1c = rel_rms(h_k_1c, Kref);
+    // ---- The published schemes' QUANTIZER, not ours: asymmetric min/max with a zero-point (KIVI,
+    // arXiv 2402.02750), with SKVQ's clipping (arXiv 2405.06219), and the joint per-channel x per-token scale.
+    // Same 2 bits, a different scale geometry - this is the arm the "near lossless" claim rests on.
+    std::vector<float> h_k_ac(Kref.size()), h_v_ac(Vref.size()), h_v_at(Vref.size()), h_k_ac3(Kref.size()),
+                       h_k_j(Kref.size()), h_v_j(Vref.size());
+    quant_asym(Kref.data(), N, H, D, true, 0.0f, h_k_ac.data());    // KIVI: per-channel, z = min
+    quant_asym(Kref.data(), N, H, D, true, 3.0f, h_k_ac3.data());   // the same, SKVQ-clipped
+    quant_asym(Vref.data(), N, H, D, true, 0.0f, h_v_ac.data());
+    quant_asym(Vref.data(), N, H, D, false, 0.0f, h_v_at.data());   // KIVI's V axis: per-token
+    quant_joint(Kref.data(), N, H, D, h_k_j.data());
+    quant_joint(Vref.data(), N, H, D, h_v_j.data());
+    const double r_k_ac = rel_rms(h_k_ac, Kref), r_v_ac = rel_rms(h_v_ac, Vref), r_v_at = rel_rms(h_v_at, Vref);
+    const double r_k_ac3 = rel_rms(h_k_ac3, Kref), r_k_j = rel_rms(h_k_j, Kref), r_v_j = rel_rms(h_v_j, Vref);
     std::printf("\nError against an FP16 cache (rotated), relative RMS:\n");
     std::printf("  %-26s %8s %8s\n", "format", "K", "V");
     std::printf("  (per-element diagnostics - the decision metric is the attention output table below)\n");
@@ -409,7 +649,8 @@ int main() {
     std::vector<int> cells(N);
     for (int i = 0; i < N; ++i) cells[i] = i;
     std::vector<float> out_ref, out_lm3, out_lm4, out_q4, out_uni4, out_uni3, out_lm16, out_kivi, out_lmt,
-                       out_k2v4, out_k4v2, out_k2v1c, out_k2v1t, out_k2c2t, out_k2t2c, out_k1v1;
+                       out_k2v4, out_k4v2, out_k2v1c, out_k2v1t, out_k2c2t, out_k2t2c, out_k1v1,
+                       out_ac, out_acat, out_acatc, out_jj, out_jat;
     attention(q, Kref, Vref, D, cells, out_ref);
     attention(q, h_k2, h_v2_3, D, cells, out_lm3);       // device pools (per-channel), Lloyd-Max 3-level V
     attention(q, h_k2, h_v2_4, D, cells, out_lm4);       // device pools (per-channel), Lloyd-Max 4-level V
@@ -427,6 +668,14 @@ int main() {
     attention(q, h_k_kivi, h_v_lmt4, D, cells, out_k2c2t);  // K per-channel 2-bit, V per-token 2-bit
     attention(q, h_k_lmt, h_v_kivi, D, cells, out_k2t2c);   // K per-token 2-bit, V per-channel 2-bit
     attention(q, h_k_1c, h_v_1c, D, cells, out_k1v1);       // 1-bit both, per-channel
+    attention(q, h_k_ac, h_v_ac, D, cells, out_ac);         // KIVI's quantizer, per-channel on both
+    attention(q, h_k_ac, h_v_at, D, cells, out_acat);       // KIVI's exact split: K per-channel, V per-token
+    attention(q, h_k_ac3, h_v_at, D, cells, out_acatc);     // the same with SKVQ clipping on K
+    attention(q, h_k_j, h_v_j, D, cells, out_jj);           // joint channel x token scales on both
+    attention(q, h_k_j, h_v_at, D, cells, out_jat);         // joint K, per-token asymmetric V
+    const double e_ac = out_err(out_ac, out_ref, Vref), e_acat = out_err(out_acat, out_ref, Vref);
+    const double e_acatc = out_err(out_acatc, out_ref, Vref), e_jj = out_err(out_jj, out_ref, Vref);
+    const double e_jat = out_err(out_jat, out_ref, Vref);
     const double e_k2v4 = out_err(out_k2v4, out_ref, Vref), e_k4v2 = out_err(out_k4v2, out_ref, Vref);
     const double e_k2v1c = out_err(out_k2v1c, out_ref, Vref), e_k2v1t = out_err(out_k2v1t, out_ref, Vref);
     const double e_k2c2t = out_err(out_k2c2t, out_ref, Vref), e_k2t2c = out_err(out_k2t2c, out_ref, Vref);
@@ -463,6 +712,30 @@ int main() {
     std::printf("  %-34s %7.3f%%  %4d B   both 1-bit per-channel\n", "K1c + V1c", 100 * e_k1v1, 2 * B1c);
     std::printf("  reference rows: symmetric q2c %7.3f%% (%4d B), q4_0 %7.3f%% (%4d B)\n",
                 100 * e_lm4, 2 * B2, 100 * e_q4, 2 * B4);
+    // The published quantizers, at their own byte costs (per-channel asymmetric: 64 B codes + 2 fp16 per
+    // dimension per 32 cells = 96 B; per-token asymmetric: 64 B codes + 2 fp16 = 68 B; joint: 64 + 16 + 2 = 82).
+    std::printf("\n  the published quantizers (asymmetric min/max + zero-point, joint scales):\n");
+    std::printf("  %-34s %7.3f%%  %4d B   KIVI's quantizer, per-channel on K and V\n", "asym-c K+V", 100 * e_ac, 2 * 96);
+    std::printf("  %-34s %7.3f%%  %4d B   KIVI's split: K per-channel, V per-token\n", "asym-c K + asym-t V", 100 * e_acat, 96 + 68);
+    std::printf("  %-34s %7.3f%%  %4d B   the same, K clipped at 3 sd (SKVQ)\n", "asym-c3 K + asym-t V", 100 * e_acatc, 96 + 68);
+    std::printf("  %-34s %7.3f%%  %4d B   joint channel x token scales on K and V\n", "joint K+V", 100 * e_jj, 2 * 82);
+    std::printf("  %-34s %7.3f%%  %4d B   joint K, per-token asymmetric V\n", "joint K + asym-t V", 100 * e_jat, 82 + 68);
+    std::printf("  per-element: asym-c K %.3f%% (symmetric %.3f%%), asym-t V %.3f%%, joint K %.3f%%, joint V %.3f%%\n",
+                100 * r_k_ac, 100 * r_k_kivi, 100 * r_v_at, 100 * r_k_j, 100 * r_v_j);
+    check(e_ac > 0.0 && e_jj > 0.0, "the published quantizers are live in this probe");
+    // Measured, and it is the largest single lever found in this work: the ZERO-POINT, not the bit count.
+    // Same 2 bits, same per-channel group; a min/max scale with an offset instead of a symmetric RMS scale
+    // moves the attention output 7.150% -> 3.777% for 12% more bytes (96 B against 80 B per cell and head).
+    check(e_ac < e_lm4, "the asymmetric zero-point quantizer beats the symmetric RMS block on the attention output");
+    check(e_acatc < e_acat, "clipping the group extremes helps (SKVQ's clipping, measured on K)");
+    // Joint scales are the one arm that is clearly WORSE here, and the reason is the data, not the scheme: on
+    // i.i.d. Gaussian noise a channel factor is estimator noise from 32 samples, and multiplying it into the
+    // token scale spreads that noise over every code. It has to be re-measured on a cache with real channel
+    // structure before it is dismissed - which is what STRATA_KV_PROBE_CACHE is for.
+    check(e_jj > e_lm4, "joint scales lose on data with no channel structure (the channel factor is noise there); re-measure on a real cache");
+    std::printf("  zero-point lever: %.3f%% against the shipping symmetric block's %.3f%% (%.2fx better, 96 B vs 80 B); "
+                "clipping %.3f%%; joint scales %.3f%% (worse here - no channel structure to exploit)\n",
+                100 * e_ac, 100 * e_lm4, e_lm4 / e_ac, 100 * e_acatc, 100 * e_jj);
     check(e_k2v4 > 0.0 && e_k1v1 > 0.0, "the asymmetric arms are live (the probe responds to K and V separately)");
     // Measured, and it reproduces KIVI's two placement findings (arXiv 2402.02750) on our rotated cache:
     // K wants a per-CHANNEL scale, V wants a per-TOKEN one.  The gain is real and it is small.
