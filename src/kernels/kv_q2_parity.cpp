@@ -41,6 +41,15 @@ void check(bool ok, const char* what) {
     std::printf("%s %s\n", ok ? "ok  " : "FAIL", what);
     if (!ok) ++g_fail;
 }
+/// A directional finding is a property of the DATA as much as of the scheme. Running this gate on a real
+/// cache dump (STRATA_KV_PROBE_CACHE) REVERSED six of the rankings pinned below, so each one is pinned in
+/// BOTH directions with its data source named. Quoting any of these numbers without saying which cache it
+/// was measured on is exactly how this table becomes a lie.
+void check_data(bool real_cache, bool synthetic_holds, bool real_holds, const char* synthetic_claim,
+                const char* real_claim) {
+    if (real_cache) check(real_holds, real_claim);
+    else check(synthetic_holds, synthetic_claim);
+}
 template <typename T> T* dalloc(size_t n) {
     T* p = nullptr;
     ck(cudaMalloc(&p, n * sizeof(T) + 64), "malloc");
@@ -639,9 +648,14 @@ int main() {
     std::printf("  Lloyd-Max gain over uniform at 2 bits: K %.2fx, V %.2fx\n", r_k_uni / r_k_lm, r_v_uni4 / r_v_lm4);
     // The two metrics split, and the split is the finding: per-channel is lossier per element than the per-token
     // block scale and better on the attention output. Both halves are pinned so neither can be quoted alone.
-    check(r_k_kivi > r_k_lmt, "per-channel is the lossier per-element row (stated, not glossed)");
-    std::printf("  per-channel vs per-token, per element: K %.2fx worse, V %.2fx worse "
-                "(the attention table below is where it wins)\n", r_k_kivi / r_k_lmt, r_v_kivi / r_v_lmt4);
+    check_data(real_cache, r_k_kivi > r_k_lmt, r_k_kivi <= r_k_lmt,
+               "per-element, SYNTHETIC: per-channel is the lossier row (no channel outliers for it to exploit)",
+               "per-element, REAL CACHE: per-channel is the better row (the channel outliers are what it exploits)");
+    std::printf("  per-channel vs per-token, per element: K %.2fx %s, V %.2fx %s\n",
+                r_k_kivi > r_k_lmt ? r_k_kivi / r_k_lmt : r_k_lmt / r_k_kivi,
+                r_k_kivi > r_k_lmt ? "worse" : "better",
+                r_v_kivi > r_v_lmt4 ? r_v_kivi / r_v_lmt4 : r_v_lmt4 / r_v_kivi,
+                r_v_kivi > r_v_lmt4 ? "worse" : "better");
 
     // 3. the attention-output error, one head, over the whole cache
     std::vector<float> q(D);
@@ -727,33 +741,42 @@ int main() {
     // Same 2 bits, same per-channel group; a min/max scale with an offset instead of a symmetric RMS scale
     // moves the attention output 7.150% -> 3.777% for 12% more bytes (96 B against 80 B per cell and head).
     check(e_ac < e_lm4, "the asymmetric zero-point quantizer beats the symmetric RMS block on the attention output");
-    check(e_acatc < e_acat, "clipping the group extremes helps (SKVQ's clipping, measured on K)");
-    // Joint scales are the one arm that is clearly WORSE here, and the reason is the data, not the scheme: on
-    // i.i.d. Gaussian noise a channel factor is estimator noise from 32 samples, and multiplying it into the
-    // token scale spreads that noise over every code. It has to be re-measured on a cache with real channel
-    // structure before it is dismissed - which is what STRATA_KV_PROBE_CACHE is for.
-    check(e_jj > e_lm4, "joint scales lose on data with no channel structure (the channel factor is noise there); re-measure on a real cache");
-    std::printf("  zero-point lever: %.3f%% against the shipping symmetric block's %.3f%% (%.2fx better, 96 B vs 80 B); "
-                "clipping %.3f%%; joint scales %.3f%% (worse here - no channel structure to exploit)\n",
+    check_data(real_cache, e_acatc < e_acat, e_acatc >= e_acat,
+               "SYNTHETIC: clipping the group extremes helps (SKVQ's clipping)",
+               "REAL CACHE: clipping the group extremes does not help (min/max already IS the outlier scale there)");
+    // Joint scales: on i.i.d. Gaussian noise a channel factor is estimator noise from 32 samples, multiplied
+    // into every code, so it loses. On a real cache the channel factor carries structure and it does not.
+    check_data(real_cache, e_jj > e_lm4, e_jj <= e_lm4,
+               "SYNTHETIC: joint scales lose - with no channel structure the channel factor is estimator noise",
+               "REAL CACHE: joint scales do not lose - the channel factor carries real structure to carry");
+    std::printf("  zero-point lever: %.3f%% against the shipping symmetric block's %.3f%% (%.2fx, 96 B vs 80 B); "
+                "clipping %.3f%%; joint scales %.3f%%\n",
                 100 * e_ac, 100 * e_lm4, e_lm4 / e_ac, 100 * e_acatc, 100 * e_jj);
     check(e_k2v4 > 0.0 && e_k1v1 > 0.0, "the asymmetric arms are live (the probe responds to K and V separately)");
-    // Measured, and it reproduces KIVI's two placement findings (arXiv 2402.02750) on our rotated cache:
-    // K wants a per-CHANNEL scale, V wants a per-TOKEN one.  The gain is real and it is small.
-    check(e_k2c2t < e_lm4, "KIVI's split (K per-channel, V per-token, both 2b) beats symmetric per-channel (measured)");
+    // Measured, and the two data sources disagree on three of these four - which is the finding. KIVI's
+    // placement claims (arXiv 2402.02750) rest on channel outliers; the synthetic cache has none, the real
+    // rotated cache has them (K max/median channel RMS 5.8x, V 13.6x), and the V-side claims flip.
+    check_data(real_cache, e_k2c2t < e_lm4, e_k2c2t >= e_lm4,
+               "SYNTHETIC: KIVI's split (K per-channel, V per-token) beats symmetric per-channel",
+               "REAL CACHE: KIVI's split loses - rotation left V's channel structure in place, so V wants a per-channel scale too");
     check(e_k2t2c > e_lm4, "a per-TOKEN K scale is the lossy side - K is the tensor that needs per-channel scaling");
-    check(e_k2v1t < e_k2v1c, "1-bit V wants a per-token scale, not a per-channel one (KIVI's V finding)");
-    check(e_k4v2 < e_k2v4, "at 2 bits the V side is the sensitive one: coarse V costs less than coarse K here");
-    std::printf("  asymmetry: KIVI's split %.3f%% vs symmetric per-channel %.3f%% (%.2fx better, same 160 B); "
+    check_data(real_cache, e_k2v1t < e_k2v1c, e_k2v1t >= e_k2v1c,
+               "SYNTHETIC: 1-bit V wants a per-token scale (KIVI's V finding)",
+               "REAL CACHE: 1-bit V wants the per-channel scale (V's channel outliers survive the rotation)");
+    check_data(real_cache, e_k4v2 < e_k2v4, e_k4v2 >= e_k2v4,
+               "SYNTHETIC: the V side is the sensitive one (coarse V costs less than coarse K)",
+               "REAL CACHE: the K side is the sensitive one (coarse K costs more than coarse V) - KIVI's premise, confirmed on real data");
+    std::printf("  asymmetry: KIVI's split %.3f%% vs symmetric per-channel %.3f%% (%.2fx, same 160 B); "
                 "the best 224 B arm is %.3f%% against q4_0's %.3f%% - asymmetry narrows the gap, it does not close it\n",
                 100 * e_k2c2t, 100 * e_lm4, e_lm4 / e_k2c2t, 100 * e_k4v2, 100 * e_q4);
-    // The probe's own limit, stated where it can be seen: 1-bit on both tensors at 96 B measures only 13% worse
-    // than 2-bit on both at 160 B.  Averaging the output over 1024 cells with a diffuse softmax washes coarse
-    // quantization out; this table ranks schemes against each other, it is not an absolute quality bar.  The
-    // absolute bar is the logit-level harness (bench/results/2026-10-12-kv-precision).
-    std::printf("  probe limit: 1-bit both (%d B) measures %.3f%% against 2-bit both (%d B) at %.3f%% - a diffuse\n"
-                "  softmax over %d cells averages coarse quantization away, so this table RANKS schemes; the\n"
-                "  absolute bar is the logit-level KL/top-1 table.\n",
-                2 * B1c, 100 * e_k1v1, 2 * B2, 100 * e_lm4, N);
+    // The probe's own limit, stated where it can be seen: the gap between 1-bit both and 2-bit both is small
+    // on the synthetic cache and large on a real one, because a diffuse softmax averaging over N cells washes
+    // coarse quantization away. This table RANKS schemes against each other; it is not an absolute quality
+    // bar. The absolute bar is the logit-level harness (bench/results/2026-10-12-kv-precision).
+    std::printf("  probe limit: 1-bit both (%d B) %.3f%% vs 2-bit both (%d B) at %.3f%% (%.2fx) over %d cells\n"
+                "  - a diffuse softmax averages coarse quantization away, so this table RANKS schemes;\n"
+                "  the absolute bar is the logit-level KL/top-1 table.\n",
+                2 * B1c, 100 * e_k1v1, 2 * B2, 100 * e_lm4, e_k1v1 / e_lm4, N);
     // On i.i.d. Gaussian data every channel's RMS is the same number, so per-channel scaling can only show that
     // it does no harm here.  The gain KIVI claims comes from outliers aligned to dimensions, which this probe's
     // data does not have - the number that decides it has to come from a real cache.
@@ -771,7 +794,9 @@ int main() {
     // estimator noise lands on every code in the block; nothing here pays for it.  The gate pins the finding so a
     // future change cannot quietly adopt a finer block because finer sounds better.  Pinned against both the
     // per-token arm it was measured against and the shipping per-channel pools.
-    check(e_lm16 > e_lmt, "the 16-value scale does not beat 32 on the attention output (measured; the block stays 32)");
+    check_data(real_cache, e_lm16 > e_lmt, e_lm16 <= e_lmt,
+               "SYNTHETIC: the 16-value scale does not beat 32 on the attention output (estimator noise from 16 samples)",
+               "REAL CACHE: the 16-value scale does beat 32 (a finer scale tracks the channel structure) - the block size is a data question, not a law");
     check(e_lm16 > e_lm4, "the 16-value scale does not beat the shipping per-channel pools either");
     check(e_lm4 > 0.0 && e_q4 > 0.0, "both quantized caches move the attention output (the probe is live)");
     check(e_lm4 < e_uni4 && e_lm3 < e_uni3, "the Lloyd-Max codebook moves the attention output less than the grid");
