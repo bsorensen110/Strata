@@ -134,6 +134,40 @@ void quant_kivi(const float* x, int n_cells, int n_heads, int D, bool three_leve
             }
 }
 
+/// 1-bit (two-level) quantization: the levels are the Lloyd-Max optimal pair for a Gaussian, +-sqrt(2/pi)*sigma,
+/// and the code is the sign.  `per_channel` puts the scale on a (dimension, 32-cell) group like quant_kivi;
+/// `per_token` puts one fp16 scale on the whole head_dim of a cell.  KIVI's V arm is the per-token one, and the
+/// point of the arm is that V is quantized differently from K, not harder than K.
+void quant_1bit(const float* x, int n_cells, int n_heads, int D, bool per_channel, float* out) {
+    const float lm2 = 0.7978845608028654f;                       // sqrt(2/pi)
+    const int stride = n_heads * D;
+    if (per_channel) {
+        for (int h = 0; h < n_heads; ++h)
+            for (int d = 0; d < D; ++d)
+                for (int g = 0; g < n_cells; g += 32) {
+                    float ss = 0.0f;
+                    for (int i = 0; i < 32; ++i) {
+                        const float v = x[(size_t) (g + i) * stride + h * D + d];
+                        ss += v * v;
+                    }
+                    const float ds = k::f32_from_f16(k::f16_from_f32(sqrtf(ss * (1.0f / 32.0f))));
+                    for (int i = 0; i < 32; ++i) {
+                        const size_t idx = (size_t) (g + i) * stride + h * D + d;
+                        out[idx] = x[idx] >= 0.0f ? lm2 * ds : -lm2 * ds;
+                    }
+                }
+    } else {
+        for (int c = 0; c < n_cells; ++c)
+            for (int h = 0; h < n_heads; ++h) {
+                const size_t base = (size_t) c * stride + h * D;
+                float ss = 0.0f;
+                for (int i = 0; i < D; ++i) ss += x[base + i] * x[base + i];
+                const float ds = k::f32_from_f16(k::f16_from_f32(sqrtf(ss * (1.0f / (float) D))));
+                for (int i = 0; i < D; ++i) out[base + i] = x[base + i] >= 0.0f ? lm2 * ds : -lm2 * ds;
+            }
+    }
+}
+
 /// Relative RMS of `got` against `ref`, over the whole vector: the same units the window work reports in.
 double rel_rms(const std::vector<float>& got, const std::vector<float>& ref) {
     double se = 0.0, ss = 0.0;
@@ -334,6 +368,14 @@ int main() {
             quant_lm(Vref.data() + base, k::Q2_0, false, h_v_lmt4.data() + base);
         }
     const double r_k_lmt = rel_rms(h_k_lmt, Kref), r_v_lmt4 = rel_rms(h_v_lmt4, Vref);
+    // ---- Asymmetric K/V bit widths (the KIVI line of work: K and V are not equally sensitive, so they are
+    // quantized DIFFERENTLY, not at the same bit width).  Host-side arms composed from the same dequantized
+    // arrays the device pools produce, so each arm's byte cost is stated and the comparison is like for like.
+    std::vector<float> h_v_1c(Vref.size()), h_v_1t(Vref.size()), h_k_1c(Kref.size());
+    quant_1bit(Vref.data(), N, H, D, true, h_v_1c.data());    // V 1-bit, per-channel scale
+    quant_1bit(Vref.data(), N, H, D, false, h_v_1t.data());   // V 1-bit, per-token scale (KIVI's V arm)
+    quant_1bit(Kref.data(), N, H, D, true, h_k_1c.data());    // K 1-bit, per-channel scale
+    const double r_v_1c = rel_rms(h_v_1c, Vref), r_v_1t = rel_rms(h_v_1t, Vref), r_k_1c = rel_rms(h_k_1c, Kref);
     std::printf("\nError against an FP16 cache (rotated), relative RMS:\n");
     std::printf("  %-26s %8s %8s\n", "format", "K", "V");
     std::printf("  (per-element diagnostics - the decision metric is the attention output table below)\n");
@@ -366,7 +408,8 @@ int main() {
     for (auto& x : q) x = nd(rng);
     std::vector<int> cells(N);
     for (int i = 0; i < N; ++i) cells[i] = i;
-    std::vector<float> out_ref, out_lm3, out_lm4, out_q4, out_uni4, out_uni3, out_lm16, out_kivi, out_lmt;
+    std::vector<float> out_ref, out_lm3, out_lm4, out_q4, out_uni4, out_uni3, out_lm16, out_kivi, out_lmt,
+                       out_k2v4, out_k4v2, out_k2v1c, out_k2v1t, out_k2c2t, out_k2t2c, out_k1v1;
     attention(q, Kref, Vref, D, cells, out_ref);
     attention(q, h_k2, h_v2_3, D, cells, out_lm3);       // device pools (per-channel), Lloyd-Max 3-level V
     attention(q, h_k2, h_v2_4, D, cells, out_lm4);       // device pools (per-channel), Lloyd-Max 4-level V
@@ -376,6 +419,18 @@ int main() {
     attention(q, h_k_lm16, h_v_lm16, D, cells, out_lm16);
     attention(q, h_k_kivi, h_v_kivi, D, cells, out_kivi);   // the host per-channel arm: out_lm4's own number
     attention(q, h_k_lmt, h_v_lmt4, D, cells, out_lmt);     // the per-token layout, host-only
+    // The asymmetric arms: same attention probe, K and V quantized at different widths / scale placements.
+    attention(q, h_k_kivi, h_vq4, D, cells, out_k2v4);      // K 2-bit per-channel, V 4-bit
+    attention(q, h_k4, h_v_kivi, D, cells, out_k4v2);       // K 4-bit, V 2-bit per-channel
+    attention(q, h_k_kivi, h_v_1c, D, cells, out_k2v1c);    // K 2-bit, V 1-bit per-channel
+    attention(q, h_k_kivi, h_v_1t, D, cells, out_k2v1t);    // K 2-bit, V 1-bit per-token (KIVI's split)
+    attention(q, h_k_kivi, h_v_lmt4, D, cells, out_k2c2t);  // K per-channel 2-bit, V per-token 2-bit
+    attention(q, h_k_lmt, h_v_kivi, D, cells, out_k2t2c);   // K per-token 2-bit, V per-channel 2-bit
+    attention(q, h_k_1c, h_v_1c, D, cells, out_k1v1);       // 1-bit both, per-channel
+    const double e_k2v4 = out_err(out_k2v4, out_ref, Vref), e_k4v2 = out_err(out_k4v2, out_ref, Vref);
+    const double e_k2v1c = out_err(out_k2v1c, out_ref, Vref), e_k2v1t = out_err(out_k2v1t, out_ref, Vref);
+    const double e_k2c2t = out_err(out_k2c2t, out_ref, Vref), e_k2t2c = out_err(out_k2t2c, out_ref, Vref);
+    const double e_k1v1 = out_err(out_k1v1, out_ref, Vref);
     const double e_lm3 = out_err(out_lm3, out_ref, Vref), e_lm4 = out_err(out_lm4, out_ref, Vref);
     const double e_q4 = out_err(out_q4, out_ref, Vref);
     const double e_uni4 = out_err(out_uni4, out_ref, Vref), e_uni3 = out_err(out_uni3, out_ref, Vref);
@@ -393,6 +448,39 @@ int main() {
     std::printf("  %-26s %7.3f%%\n", "q2 Lloyd-Max, per-channel", 100 * e_kivi);
     std::printf("  (the V 4-level / V 3-level rows are the DEVICE pools read through the real gather kernel; the\n");
     std::printf("   per-channel row is the host reference for the same pools. THIS IS THE DECISION METRIC.)\n");
+    // ---- Asymmetric K/V.  The published 2-bit schemes do not spend the same bits on K and V, so the arms differ
+    // in WHICH tensor is coarse, not only in how many bits.  Byte cost per cell and KV head at head_dim 256:
+    // q4_0 288, q2 per-channel 80, 1-bit per-channel 48, 1-bit per-token 34.
+    const int B4 = (int) k::kv_q4_bytes_per_head(D), B2 = (int) k::kv_q2_bytes_per_head(D);
+    const int B1c = D / 8 + 2 * D / 32, B1t = D / 8 + 2;
+    std::printf("\n  asymmetric K/V arms (attention output; bytes per cell and KV head):\n");
+    std::printf("  %-34s %7.3f%%  %4d B   K 2b per-channel, V 4-bit\n", "K2c + V4", 100 * e_k2v4, B2 + B4);
+    std::printf("  %-34s %7.3f%%  %4d B   K 4-bit, V 2b per-channel\n", "K4 + V2c", 100 * e_k4v2, B4 + B2);
+    std::printf("  %-34s %7.3f%%  %4d B   K 2b per-channel, V 1b per-channel\n", "K2c + V1c", 100 * e_k2v1c, B2 + B1c);
+    std::printf("  %-34s %7.3f%%  %4d B   K 2b per-channel, V 1b per-token (KIVI's split)\n", "K2c + V1t", 100 * e_k2v1t, B2 + B1t);
+    std::printf("  %-34s %7.3f%%  %4d B   K per-channel, V per-token, both 2b\n", "K2c + V2t", 100 * e_k2c2t, 2 * B2);
+    std::printf("  %-34s %7.3f%%  %4d B   K per-token, V per-channel, both 2b\n", "K2t + V2c", 100 * e_k2t2c, 2 * B2);
+    std::printf("  %-34s %7.3f%%  %4d B   both 1-bit per-channel\n", "K1c + V1c", 100 * e_k1v1, 2 * B1c);
+    std::printf("  reference rows: symmetric q2c %7.3f%% (%4d B), q4_0 %7.3f%% (%4d B)\n",
+                100 * e_lm4, 2 * B2, 100 * e_q4, 2 * B4);
+    check(e_k2v4 > 0.0 && e_k1v1 > 0.0, "the asymmetric arms are live (the probe responds to K and V separately)");
+    // Measured, and it reproduces KIVI's two placement findings (arXiv 2402.02750) on our rotated cache:
+    // K wants a per-CHANNEL scale, V wants a per-TOKEN one.  The gain is real and it is small.
+    check(e_k2c2t < e_lm4, "KIVI's split (K per-channel, V per-token, both 2b) beats symmetric per-channel (measured)");
+    check(e_k2t2c > e_lm4, "a per-TOKEN K scale is the lossy side - K is the tensor that needs per-channel scaling");
+    check(e_k2v1t < e_k2v1c, "1-bit V wants a per-token scale, not a per-channel one (KIVI's V finding)");
+    check(e_k4v2 < e_k2v4, "at 2 bits the V side is the sensitive one: coarse V costs less than coarse K here");
+    std::printf("  asymmetry: KIVI's split %.3f%% vs symmetric per-channel %.3f%% (%.2fx better, same 160 B); "
+                "the best 224 B arm is %.3f%% against q4_0's %.3f%% - asymmetry narrows the gap, it does not close it\n",
+                100 * e_k2c2t, 100 * e_lm4, e_lm4 / e_k2c2t, 100 * e_k4v2, 100 * e_q4);
+    // The probe's own limit, stated where it can be seen: 1-bit on both tensors at 96 B measures only 13% worse
+    // than 2-bit on both at 160 B.  Averaging the output over 1024 cells with a diffuse softmax washes coarse
+    // quantization out; this table ranks schemes against each other, it is not an absolute quality bar.  The
+    // absolute bar is the logit-level harness (bench/results/2026-10-12-kv-precision).
+    std::printf("  probe limit: 1-bit both (%d B) measures %.3f%% against 2-bit both (%d B) at %.3f%% - a diffuse\n"
+                "  softmax over %d cells averages coarse quantization away, so this table RANKS schemes; the\n"
+                "  absolute bar is the logit-level KL/top-1 table.\n",
+                2 * B1c, 100 * e_k1v1, 2 * B2, 100 * e_lm4, N);
     // On i.i.d. Gaussian data every channel's RMS is the same number, so per-channel scaling can only show that
     // it does no harm here.  The gain KIVI claims comes from outliers aligned to dimensions, which this probe's
     // data does not have - the number that decides it has to come from a real cache.
