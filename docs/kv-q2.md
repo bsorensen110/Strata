@@ -212,7 +212,12 @@ real number needs a real cache.
 Order from here:
 
 1. Per-channel 2-bit layout (codes packed per dimension across 32 cells, one fp16 scale per dimension per group,
-   80 B per cell and head) in the kernel and the fused attention read path; re-measure end to end.
+   80 B per cell and head) in the kernel and the fused attention read path; re-measure end to end. **Done** —
+   `block_q2c_0` (10 B per dimension per 32-cell group), group-granular append with an atomic word-masked path
+   for partial groups, mode 4 in the fused attention, window restore, snapshot format guard. The gate's device
+   rows read the new pools through the real gather kernel and match the host reference bit for bit:
+   **attention output 7.150% against the per-token layout's 19.913% (2.78x better), per-element 44.414% against
+   33.381% (1.33x worse)** — the split the table above predicts.
 2. Real cache statistics: dump a layer's FP16 K/V from a served prompt and run the same comparison on it, so the
    per-channel number is measured on data with the outlier structure the method targets.
 3. Keep the FP16 window and sinks carrying the recent and sink positions exactly.

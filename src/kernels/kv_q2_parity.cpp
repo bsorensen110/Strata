@@ -103,10 +103,18 @@ void quant_lm16(const float* x, int n, float* out) {
 /// KIVI-style per-channel scaling (arXiv 2402.02750): one scale per (dimension, 32-cell group) instead of one per
 /// (cell, 32-value block).  It costs the same 80 B per cell and head - 256 dims x 2 bits = 64 B of codes, plus
 /// 256 dims x 2 B of scale per 32 cells = 16 B - so this is a like-for-like swap of WHAT the scale measures, not
-/// of how many bits are spent.  Caveat the reader must keep: this gate's cache is i.i.d. Gaussian, so every
-/// channel's RMS is the same number; per-channel scaling cannot show its gain here, only that it does no harm.
-/// The structure it exploits - outliers aligned to dimensions - has to come from a real cache.
-void quant_kivi(const float* x, int n_cells, int n_heads, int D, float* out) {
+/// of how many bits are spent.
+///
+/// THIS IS THE REFERENCE THE DEVICE HAS TO MATCH BIT FOR BIT.  kv_q2.cu's group kernel sums `ss += v*v` over the
+/// group's 32 cells in cell order and takes `sqrtf(ss / 32)`; this sums the same 32 numbers in the same order and
+/// takes the same square root, then rounds the scale to fp16 and quantizes with the full-precision scale while
+/// writing back with the stored one.  Every one of those choices is the kernel's, because an ulp in the scale
+/// flips a code at a threshold.
+///
+/// Caveat the reader must keep: this gate's cache is i.i.d. Gaussian, so every channel's RMS is the same number;
+/// per-channel scaling cannot show its gain here beyond the 2.8x on the attention output that it does show.  The
+/// structure KIVI's gain rests on - outliers aligned to dimensions - has to come from a real cache.
+void quant_kivi(const float* x, int n_cells, int n_heads, int D, bool three_level, float* out) {
     const int stride = n_heads * D;
     for (int h = 0; h < n_heads; ++h)
         for (int d = 0; d < D; ++d)
@@ -120,7 +128,8 @@ void quant_kivi(const float* x, int n_cells, int n_heads, int D, float* out) {
                 const float ds = k::f32_from_f16(k::f16_from_f32(s));
                 for (int i = 0; i < 32; ++i) {
                     const size_t idx = (size_t) (g + i) * stride + h * D + d;
-                    out[idx] = k::q2_value_lm4(k::q2_code_lm4(x[idx], s), ds);
+                    out[idx] = three_level ? k::q2_value_lm3(k::q2_code_lm3(x[idx], s), ds)
+                                           : k::q2_value_lm4(k::q2_code_lm4(x[idx], s), ds);
                 }
             }
 }
@@ -181,7 +190,6 @@ int main() {
     const int N = 1024;                                  // cells in the cache
     const int pages = N / P;
     const int rows = N * H;                              // identity layout: one row per (cell, kv head)
-    const int groups = D / k::Q2_0;                      // 8 blocks of 32 per head
 
     std::mt19937 rng(23);
     std::normal_distribution<float> nd(0.f, 1.f);
@@ -251,25 +259,23 @@ int main() {
     ck(cudaMemcpy(h_v.data(), v_scr, h_v.size() * 2, cudaMemcpyDeviceToHost), "v back");
     ck(cudaMemcpy(h_v4.data(), v_scr4, h_v4.size() * 2, cudaMemcpyDeviceToHost), "v4 back");
 
-    // 1. the device quantizer equals the host codebook, bit for bit, over every block
+    // 1. the device quantizer equals the PER-CHANNEL host reference, bit for bit, over every (dimension, group).
+    // quant_kivi is the reference; the per-token Lloyd-Max arm (quant_lm) is a comparison now, not the parity
+    // target - the device no longer writes per-token blocks.
+    std::vector<float> ref_k(Kref.size()), ref_v3(Vref.size()), ref_v4(Vref.size());
+    quant_kivi(Kref.data(), N, H, D, false, ref_k.data());     // K: 4-level Lloyd-Max, per-channel scale
+    quant_kivi(Vref.data(), N, H, D, true, ref_v3.data());     // V: the 3-level codebook, same scale
+    quant_kivi(Vref.data(), N, H, D, false, ref_v4.data());    // V: the 4-level, same scale
     bool bit_exact = true;
-    for (int cell = 0; cell < N && bit_exact; ++cell)
-        for (int h = 0; h < H && bit_exact; ++h)
-            for (int g = 0; g < groups && bit_exact; ++g) {
-                const size_t base = ((size_t) cell * H + h) * D + (size_t) g * k::Q2_0;
-                float ref_k4[k::Q2_0], ref_v3[k::Q2_0], ref_v4[k::Q2_0];
-                quant_lm(Kref.data() + base, k::Q2_0, false, ref_k4);   // K: the 4-level Lloyd-Max codebook
-                quant_lm(Vref.data() + base, k::Q2_0, true, ref_v3);    // V: the 3-level Lloyd-Max codebook
-                quant_lm(Vref.data() + base, k::Q2_0, false, ref_v4);   // V: the 4-level, same block
-                for (int i = 0; i < k::Q2_0; ++i) {
-                    // The gathered values are fp16 bits straight off the device; the reference is quantized on the
-                    // host and rounded the same way, so an unequal bit pattern is a real writer/reader drift.
-                    if (h_k[base + i] != k::f16_from_f32(ref_k4[i])) bit_exact = false;
-                    if (h_v[base + i] != k::f16_from_f32(ref_v3[i])) bit_exact = false;
-                    if (h_v4[base + i] != k::f16_from_f32(ref_v4[i])) bit_exact = false;
-                }
-            }
-    check(bit_exact, "the device quantizer reproduces the host codebook bitwise (K 4-level, V 3-level and 4-level)");
+    for (size_t i = 0; i < h_k.size() && bit_exact; ++i) {
+        // The gathered values are fp16 bits straight off the device; the reference is quantized on the host and
+        // rounded the same way, so an unequal bit pattern is a real writer/reader drift.
+        if (h_k[i] != k::f16_from_f32(ref_k[i])) bit_exact = false;
+        if (h_v[i] != k::f16_from_f32(ref_v3[i])) bit_exact = false;
+        if (h_v4[i] != k::f16_from_f32(ref_v4[i])) bit_exact = false;
+    }
+    check(bit_exact, "the device quantizer reproduces the per-channel host reference bitwise (K 4-level, "
+                     "V 3-level and 4-level)");
 
     // 2. the cost of 2 bits, in the same units as the window work
     std::vector<float> h_k2(h_k.size()), h_v2_3(h_v.size()), h_v2_4(h_v4.size()), h_k4(rows * D), h_vq4(rows * D);
@@ -308,13 +314,26 @@ int main() {
         quant_lm16(Vref.data() + row * D, D, h_v_lm16.data() + row * D);
     }
     const double r_k_lm16 = rel_rms(h_k_lm16, Kref), r_v_lm16 = rel_rms(h_v_lm16, Vref);
-    // KIVI per-channel scaling, same 2 bits and the same 80 B per cell and head.
+    // KIVI per-channel scaling, same 2 bits and the same 80 B per cell and head: the host arm of the row the
+    // device fills, so the table's per-channel row and the device's Lloyd-Max rows are the same measurement by
+    // two paths (and check 1 says they agree bit for bit).
     std::vector<float> h_k_kivi(Kref.size()), h_v_kivi(Vref.size());
-    quant_kivi(Kref.data(), N, H, D, h_k_kivi.data());
-    quant_kivi(Vref.data(), N, H, D, h_v_kivi.data());
+    quant_kivi(Kref.data(), N, H, D, false, h_k_kivi.data());
+    quant_kivi(Vref.data(), N, H, D, false, h_v_kivi.data());
     const double r_k_kivi = rel_rms(h_k_kivi, Kref), r_v_kivi = rel_rms(h_v_kivi, Vref);
-    // h_k2 / h_v2_4 / h_v2_3 are the device's Lloyd-Max pools, read back through the real gather kernel.
+    // h_k2 / h_v2_4 / h_v2_3 are the device's PER-CHANNEL pools, read back through the real gather kernel.
     const double r_k_lm = r_k2, r_v_lm4 = r_v2_4, r_v_lm3 = r_v2_3;
+    // The per-token Lloyd-Max layout this format had before: host-only now (the device writes per-channel
+    // groups), kept because the scale-placement measurement is stated against it - 33.4% per element against
+    // 44.4%, and 19.9% of the attention output against 7.15%.
+    std::vector<float> h_k_lmt(Kref.size()), h_v_lmt4(Vref.size());
+    for (size_t row = 0; row < rows; ++row)
+        for (int b = 0; b < D / k::Q2_0; ++b) {
+            const size_t base = row * D + (size_t) b * k::Q2_0;
+            quant_lm(Kref.data() + base, k::Q2_0, false, h_k_lmt.data() + base);
+            quant_lm(Vref.data() + base, k::Q2_0, false, h_v_lmt4.data() + base);
+        }
+    const double r_k_lmt = rel_rms(h_k_lmt, Kref), r_v_lmt4 = rel_rms(h_v_lmt4, Vref);
     std::printf("\nError against an FP16 cache (rotated), relative RMS:\n");
     std::printf("  %-26s %8s %8s\n", "format", "K", "V");
     std::printf("  (per-element diagnostics - the decision metric is the attention output table below)\n");
@@ -324,34 +343,45 @@ int main() {
     std::printf("  %-26s %7.3f%% %7.3f%%\n", "q2 Lloyd-Max, V 4-level", 100 * r_k_lm, 100 * r_v_lm4);
     std::printf("  %-26s %7.3f%% %7.3f%%\n", "q2 Lloyd-Max, V 3-level", 100 * r_k_lm, 100 * r_v_lm3);
     std::printf("  %-26s %7.3f%% %7.3f%%\n", "q2 Lloyd-Max, 16-value scale", 100 * r_k_lm16, 100 * r_v_lm16);
+    std::printf("  %-26s %7.3f%% %7.3f%%\n", "q2 Lloyd-Max, per-token (host)", 100 * r_k_lmt, 100 * r_v_lmt4);
     std::printf("  %-26s %7.3f%% %7.3f%%\n", "q2 Lloyd-Max, per-channel", 100 * r_k_kivi, 100 * r_v_kivi);
+    std::printf("  (the two Lloyd-Max V rows are the DEVICE pools; the per-channel row is the same pools quantized\n");
+    std::printf("   on the host, which check 1 says agree bit for bit. Per-channel is the WORSE per-element row\n");
+    std::printf("   and the better attention row - see the note under the second table.)\n");
 
     check(r_k_lm > r_k4, "2-bit K is worse than 4-bit K (the table is not measuring the same thing twice)");
     check(r_v_lm3 > r_v_lm4, "the 3-level V is lossier than the 4-level V (so the codebook is a real choice)");
     std::printf("  ratio 2-bit K / 4-bit K: %.2fx\n", r_k_lm / r_k4);
-    check(r_k_lm < 8.0 * r_k4, "2-bit K's error stays under 8x the 4-bit error (the per-token block scale is not collapsing)");
+    check(r_k_lm < 8.0 * r_k4, "2-bit K's error stays under 8x the 4-bit error (the 2-bit cache is not collapsing)");
     check(r_k_lm < r_k_uni && r_v_lm4 < r_v_uni4, "the Lloyd-Max codebook beats the uniform one at the same 2 bits");
     std::printf("  Lloyd-Max gain over uniform at 2 bits: K %.2fx, V %.2fx\n", r_k_uni / r_k_lm, r_v_uni4 / r_v_lm4);
+    // The two metrics split, and the split is the finding: per-channel is lossier per element than the per-token
+    // block scale and better on the attention output. Both halves are pinned so neither can be quoted alone.
+    check(r_k_kivi > r_k_lmt, "per-channel is the lossier per-element row (stated, not glossed)");
+    std::printf("  per-channel vs per-token, per element: K %.2fx worse, V %.2fx worse "
+                "(the attention table below is where it wins)\n", r_k_kivi / r_k_lmt, r_v_kivi / r_v_lmt4);
 
     // 3. the attention-output error, one head, over the whole cache
     std::vector<float> q(D);
     for (auto& x : q) x = nd(rng);
     std::vector<int> cells(N);
     for (int i = 0; i < N; ++i) cells[i] = i;
-    std::vector<float> out_ref, out_lm3, out_lm4, out_q4, out_uni4, out_uni3, out_lm16, out_kivi;
+    std::vector<float> out_ref, out_lm3, out_lm4, out_q4, out_uni4, out_uni3, out_lm16, out_kivi, out_lmt;
     attention(q, Kref, Vref, D, cells, out_ref);
-    attention(q, h_k2, h_v2_3, D, cells, out_lm3);       // device Lloyd-Max K, Lloyd-Max 3-level V
-    attention(q, h_k2, h_v2_4, D, cells, out_lm4);       // device Lloyd-Max K, Lloyd-Max 4-level V
+    attention(q, h_k2, h_v2_3, D, cells, out_lm3);       // device pools (per-channel), Lloyd-Max 3-level V
+    attention(q, h_k2, h_v2_4, D, cells, out_lm4);       // device pools (per-channel), Lloyd-Max 4-level V
     attention(q, h_k4, h_vq4, D, cells, out_q4);
     attention(q, h_k_uni, h_v_uni4, D, cells, out_uni4);
     attention(q, h_k_uni, h_v_uni3, D, cells, out_uni3);
     attention(q, h_k_lm16, h_v_lm16, D, cells, out_lm16);
-    attention(q, h_k_kivi, h_v_kivi, D, cells, out_kivi);
+    attention(q, h_k_kivi, h_v_kivi, D, cells, out_kivi);   // the host per-channel arm: out_lm4's own number
+    attention(q, h_k_lmt, h_v_lmt4, D, cells, out_lmt);     // the per-token layout, host-only
     const double e_lm3 = out_err(out_lm3, out_ref, Vref), e_lm4 = out_err(out_lm4, out_ref, Vref);
     const double e_q4 = out_err(out_q4, out_ref, Vref);
     const double e_uni4 = out_err(out_uni4, out_ref, Vref), e_uni3 = out_err(out_uni3, out_ref, Vref);
     const double e_lm16 = out_err(out_lm16, out_ref, Vref);
     const double e_kivi = out_err(out_kivi, out_ref, Vref);
+    const double e_lmt = out_err(out_lmt, out_ref, Vref);
     std::printf("\nAttention output against the FP16 cache, relative RMS:\n");
     std::printf("  %-26s %7.3f%%\n", "q4_0 (the format in use)", 100 * e_q4);
     std::printf("  %-26s %7.3f%%\n", "q2 uniform, V 4-level", 100 * e_uni4);
@@ -359,18 +389,29 @@ int main() {
     std::printf("  %-26s %7.3f%%\n", "q2 Lloyd-Max, V 4-level", 100 * e_lm4);
     std::printf("  %-26s %7.3f%%\n", "q2 Lloyd-Max, V 3-level", 100 * e_lm3);
     std::printf("  %-26s %7.3f%%\n", "q2 Lloyd-Max, 16-value scale", 100 * e_lm16);
+    std::printf("  %-26s %7.3f%%\n", "q2 Lloyd-Max, per-token (host)", 100 * e_lmt);
     std::printf("  %-26s %7.3f%%\n", "q2 Lloyd-Max, per-channel", 100 * e_kivi);
+    std::printf("  (the V 4-level / V 3-level rows are the DEVICE pools read through the real gather kernel; the\n");
+    std::printf("   per-channel row is the host reference for the same pools. THIS IS THE DECISION METRIC.)\n");
     // On i.i.d. Gaussian data every channel's RMS is the same number, so per-channel scaling can only show that
     // it does no harm here.  The gain KIVI claims comes from outliers aligned to dimensions, which this probe's
     // data does not have - the number that decides it has to come from a real cache.
     check(e_kivi < 1.10 * e_lm4, "per-channel scaling does no harm on this data (its gain needs real cache statistics)");
+    // The two arms of the scale-placement measurement, on the metric that decides it. Per-channel is 33% worse
+    // per element and 2.8x better here; the reason is in the header of kv_q2.hpp.
+    check(e_lm4 < e_lmt, "per-channel beats the per-token block scale on the attention output (the shipping choice)");
+    std::printf("  per-channel over per-token, attention output: %.2fx better (%.3f%% against %.3f%%), while being\n"
+                "  %.2fx WORSE per element - the metrics disagree on purpose, see docs/kv-q2.md\n",
+                e_lmt / e_lm4, 100 * e_lm4, 100 * e_lmt, r_k_kivi / r_k_lmt);
     std::printf("  16-value scale gain over 32-value: K %.2fx, V %.2fx, attention %.2fx "
-                "(12 B per 32 values, not 10)\n", r_k_lm / r_k_lm16, r_v_lm4 / r_v_lm16, e_lm4 / e_lm16);
+                "(12 B per 32 values, not 10)\n", r_k_lmt / r_k_lm16, r_v_lmt4 / r_v_lm16, e_lmt / e_lm16);
     // Measured, not assumed: a 16-value scale moves K and V by 2% and makes the attention output 1.87x WORSE
     // (37.2% against 19.9%).  A shorter block estimates the scale from 16 samples instead of 32, and that
     // estimator noise lands on every code in the block; nothing here pays for it.  The gate pins the finding so a
-    // future change cannot quietly adopt a finer block because finer sounds better.
-    check(e_lm16 > e_lm4, "the 16-value scale does not beat 32 on the attention output (measured; the block stays 32)");
+    // future change cannot quietly adopt a finer block because finer sounds better.  Pinned against both the
+    // per-token arm it was measured against and the shipping per-channel pools.
+    check(e_lm16 > e_lmt, "the 16-value scale does not beat 32 on the attention output (measured; the block stays 32)");
+    check(e_lm16 > e_lm4, "the 16-value scale does not beat the shipping per-channel pools either");
     check(e_lm4 > 0.0 && e_q4 > 0.0, "both quantized caches move the attention output (the probe is live)");
     check(e_lm4 < e_uni4 && e_lm3 < e_uni3, "the Lloyd-Max codebook moves the attention output less than the grid");
 
