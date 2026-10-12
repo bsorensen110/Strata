@@ -68,6 +68,11 @@ ARMS = [
     dict(name="q2", kv="q2", env=dict()),
     dict(name="q2+window", kv="q2", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8")),
     dict(name="q4_0+window", kv="q4_0", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8")),
+    # Window-size sweep. A window at least as long as the prompt covers every scored position, so the sweep
+    # only means anything with texts LONGER than the largest window - pass --max-tokens above that.
+    dict(name="q2+win512", kv="q2", env=dict(STRATA_KV_WINDOW="512", STRATA_KV_SINK="8")),
+    dict(name="q2+win1024", kv="q2", env=dict(STRATA_KV_WINDOW="1024", STRATA_KV_SINK="8")),
+    dict(name="q4_0+win512", kv="q4_0", env=dict(STRATA_KV_WINDOW="512", STRATA_KV_SINK="8")),
 ]
 REFERENCE = "fp16"
 CODE_AGENT = """Task: add a KV cache parity check to the engine and make the suite run in CI.

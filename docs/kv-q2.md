@@ -289,3 +289,77 @@ Order from here, by expected gain per unit of work:
 4. **Window policy at the logit level**: sweep the FP16 window (128 -> 1024) in `kv_precision_compare.py`;
    the papers' near-lossless is largely this device, and we have never measured its size.
 5. Channel reordering (SKVQ) as the alternative to rotation, if the real-cache dump shows the outliers.
+
+## Real cache: the dump, the statistics, and six rankings that flipped
+
+`--dump-kv PATH` (engine) writes the stored KV cache of every QSA layer after the prefill - rotated,
+post-RoPE, exactly the tensors the attention kernels read (`st.k_pool`/`st.v_pool`, the same pointers
+`kv_gather_step` and `qsa_attn_pools` use). `tools/kv_cache_dump.py` reads it and prints the statistics;
+`STRATA_KV_PROBE_CACHE` + `STRATA_KV_PROBE_LAYER` feed it to the parity gate, which now runs the whole
+table on real data.
+
+Statistics from an 890-token document prompt, layer 3, per (kv head, dimension):
+
+| tensor | channel RMS min/median/max | max/median | top-8 channel variance share | cell RMS max/median |
+|---|---|---:|---:|---:|
+| K | 0.029 / 1.424 / 8.310 | **5.84x** | 5.4% | 1.03x |
+| V | 0.043 / 0.159 / 2.164 | **13.60x** | 9.6% | 1.22x |
+
+**Channel structure survives the Hadamard rotation** - K channels span 5.8x and V channels 13.6x in RMS -
+while K's per-cell spread is flat (1.03x). So per-channel scaling has real structure to exploit on our
+cache, and a per-token K scale has almost nothing, which is why per-token K measured 1.42x worse.
+
+The same gate, run on that cache (attention output, relative RMS vs the FP16 cache):
+
+| arm | synthetic | real cache | B/cell/head |
+|---|---:|---:|---:|
+| q4_0 | 2.052% | **0.888%** | 288 |
+| q2 Lloyd-Max per-channel (ships) | 7.150% | **3.508%** | 160 |
+| K 2-bit per-channel + V 4-bit | 5.710% | **1.911%** | 224 |
+| K 4-bit + V 2-bit per-channel | 4.768% | 3.171% | 224 |
+| KIVI's split (K per-channel, V per-token) | 6.226% | 5.188% | 160 |
+| K per-token + V per-channel | 10.134% | 4.234% | 160 |
+| 1-bit V per-channel | 7.773% | 9.682% | 128 |
+| 1-bit V per-token (KIVI's V) | 7.057% | 14.427% | 114 |
+| asymmetric K+V (zero-point, per-channel) | 3.777% | 3.227% | 192 |
+| joint channel x token scales, K+V | 36.947% | **3.219%** | 164 |
+| 16-value scale (vs 32, per-token) | 37.228% | 5.329% (beats 5.524%) | - |
+
+Six of the synthetic-pinned rankings reverse on real data, and the gate now pins each claim with its data
+source (`check_data`) so neither can be quoted as the other's law:
+
+1. **Our shipping q2 is 2.0x better on real data than the synthetic floor said** (3.508% vs 7.150%). The
+   gate was pessimistic in exactly the predicted direction.
+2. **KIVI's premise is confirmed on K**: coarse K costs more than coarse V (K4+V2c 3.171% vs K2c+V4
+   1.911%) - K is the tensor that needs the bits.
+3. **KIVI's V finding is refuted on our cache**: V wants the per-channel scale, not per-token (V2c 3.508%
+   vs V2t 5.188%; 1-bit V 9.682% per-channel vs 14.427% per-token). The reason is in the statistics -
+   rotation left V with the strongest channel structure in the cache (13.6x).
+4. **Joint channel x token scales, terrible on synthetic data (36.9%), are competitive on real data
+   (3.219%)** - on flat data the channel factor is estimator noise, on real data it is signal.
+5. **The zero-point lever shrinks to 1.09x** on real data (3.227% vs 3.508%) - real, modest, not the 1.89x
+   the synthetic probe showed.
+6. **The 16-value scale beats 32 on real data** (5.329% vs 5.524% on the per-token arm): block size is a
+   data question, not a law.
+
+Best measured point: **K 2-bit per-channel + V 4-bit = 1.911% at 224 B per cell and head (448 B per cell
+for 2 KV heads, 22% under q4_0) at 2.2x q4_0's attention error.** That is the shape of the next format
+candidate: asymmetric bits, not a symmetric 2-bit block.
+
+## The FP16 window's scope, measured
+
+The window overlay is *written* by the prefill (`prefill.cpp:1504`, `2785`) and *read* by the decode
+attention. It therefore cannot change teacher-forced prompt-position logits, and the logit harness
+measures the prefill path. Measured, 890-token document, logit level:
+
+| arm | top-1 vs fp16 | mean KL | nats/token vs fp16 |
+|---|---:|---:|---:|
+| q2 | 79.2% | 0.2329 | +0.111 +- 0.025 |
+| q2 + window 128 | 77.6% | 0.2335 | +0.143 +- 0.026 |
+| q2 + window 512 | 78.3% | 0.2317 | +0.132 +- 0.028 |
+| q4_0 + window 512 | 92.5% | 0.0295 | -0.001 +- 0.009 |
+
+No window effect at 128 or 512 - by construction, not by luck. The window's benefit is a decode-path
+effect (the 5K recall probe: 2/3 short answers plain, 3/3 with the window). Measuring it at the logit
+level needs decode-path logits: greedy-generate N tokens per arm with `--dump-logits` and compare the
+per-step distributions. That harness is the next measurement step.
