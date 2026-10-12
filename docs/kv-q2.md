@@ -363,3 +363,40 @@ No window effect at 128 or 512 - by construction, not by luck. The window's bene
 effect (the 5K recall probe: 2/3 short answers plain, 3/3 with the window). Measuring it at the logit
 level needs decode-path logits: greedy-generate N tokens per arm with `--dump-logits` and compare the
 per-step distributions. That harness is the next measurement step.
+
+## Decode-path logits: the window's real domain, and what it measures
+
+`tools/kv_precision_compare.py --decode N --repeat R` is that measurement. Each arm greedy-generates N
+tokens with `--dump-logits`; row i is the distribution that produced generated token i. Arms are
+compared over the **agreement prefix** (the steps where both emitted the same token - after a greedy
+divergence the two arms are conditioned on different contexts), and **KL @ 0** is reported separately
+because it is always comparable: same context, the last prompt position, decode path.
+
+**Greedy decode on this engine is not reproducible run to run.** The same command gave q4_0 a 6/64
+identical prefix in one run and 1/64 in the next; across 5 repeats the prefix spread is 0-17. QSA
+top-k tie-breaks and the atomic partial-group KV writes are order-sensitive, so a single run per arm
+is a sample, not a measurement. Every decode-path number below is a mean over 5 runs with its spread.
+
+890-token document, 64 generated tokens, 5 runs per arm, reference `--kv fp16`:
+
+| arm | identical prefix (mean, min-max) | mean KL on prefix | KL @ 0 (mean, min-max) |
+|---|---|---:|---|
+| q4_0 | 7.4 (0-17) | 0.0462 | 0.2032 (0.105-0.307) |
+| q4_0 + window 128 | 5.0 (0-9) | 0.0607 | 0.1956 (0.123-0.370) |
+| q2 | 2.0 (0-10) | 0.0074 | 0.4087 (0.304-0.630) |
+| q2 + window 128 | 0.0 (0-0) | 0.0000 | 0.4713 (0.334-0.605) |
+| q2 + window 512 | 0.2 (0-1) | 0.1289 | 0.4764 (0.362-0.645) |
+
+Two findings:
+
+1. **The window has no logit-level effect on the decode path either.** q4_0 0.2032 vs 0.1956, q2 0.4087
+   vs 0.4713 - inside the run-to-run spread, and the prefix means (7.4 vs 5.0, 2.0 vs 0.0) are noise at
+   n=5. The single-run 42/64 that looked like a window win in the first sweep did not survive repeats.
+   The window's measured benefit stays behavioral: the 5K recall probe's short answers, 2/3 plain, 3/3
+   with the window.
+2. **The decode path is where KV quantization actually bites.** q4_0's KL at the last prompt position
+   through the decode path is 0.2032 nats - 7x its teacher-forced mean KL of 0.0276. Prefill runs full
+   chunk attention; the first decode step runs sparse QSA attention over the quantized bulk, and that
+   is where the quantized cache is read. A format that looks like the noise floor in prefill is not at
+   the noise floor in decode, which is why the recall probe - not prefill perplexity - is the bar that
+   tracks what users see.

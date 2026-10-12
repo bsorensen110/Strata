@@ -26,8 +26,8 @@ METRICS (per arm, against the --kv fp16 reference on the same text)
                           "indistinguishable" when the absolute delta is under 2 SE
 
 THE ARMS
-  fp16 (the reference), int8, q4_0, q2, q2 with STRATA_KV_WINDOW=128 STRATA_KV_SINK=8, and q4_0 with the
-  same window environment.
+  fp16 (the reference), int8, q4_0, q2, q2k (K 2-bit per-channel + V 4-bit, 448 B/cell for 2 KV heads), q2 and
+  q2k with STRATA_KV_WINDOW=128 STRATA_KV_SINK=8, and q4_0 with the same window environment.
 
 COST, STATED PLAINLY
   strata generate (non-serve) takes ONE prompt per process and the engine takes about 40 s to load, so the
@@ -66,7 +66,12 @@ ARMS = [
     dict(name="int8", kv="int8", env=dict()),
     dict(name="q4_0", kv="q4_0", env=dict()),
     dict(name="q2", kv="q2", env=dict()),
+    # q2k: K 2-bit per-channel + V 4-bit (448 B/cell for 2 KV heads, against q2's 320 and q4_0's 576). It sits
+    # between the two by construction, and the point of the arm is to check that on logits, not on the parity
+    # probe's softmax: expect it under q2's top-1 loss and over q4_0's.
+    dict(name="q2k", kv="q2k", env=dict()),
     dict(name="q2+window", kv="q2", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8")),
+    dict(name="q2k+window", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8")),
     dict(name="q4_0+window", kv="q4_0", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8")),
     # Window-size sweep. A window at least as long as the prompt covers every scored position, so the sweep
     # only means anything with texts LONGER than the largest window - pass --max-tokens above that.
@@ -372,14 +377,19 @@ def lib_dirs(cfg: dict, exe: str) -> list[str]:
     return list(cfg.get("lib_dirs") or [])
 
 
-def run_engine(cfg: dict, exe: str, arm: dict, tokens: list[int], out: Path, log: Path) -> int:
+def run_engine(cfg: dict, exe: str, arm: dict, tokens: list[int], out: Path, log: Path,
+               max_new: int = 1, mode: str = "prompt") -> int:
     tok_file = out.with_suffix(".tokens.txt")
     tok_file.write_text(",".join(str(t) for t in tokens), encoding="utf-8")
+    # mode="prompt": teacher-forced rows, one per prompt position (the prefill path).
+    # mode="decode": one row per GENERATED token, from the speculative acceptance loop - the decode path,
+    # which is where the FP16 window overlay and the quantized bulk actually act.
+    dump_flag = "--dump-prompt-logits" if mode == "prompt" else "--dump-logits"
     cmd = [exe] + engine_args(cfg, arm["kv"]) + [
         "--tokens-file", str(tok_file),
-        "--max-new", "1",
+        "--max-new", str(max_new),
         "--greedy",
-        "--dump-prompt-logits", str(out),
+        dump_flag, str(out),
     ]
     env = dict(os.environ)
     env.update(arm["env"])
@@ -410,6 +420,51 @@ def first_generated(log: Path) -> int | None:
     return int(ids[0]) if ids else None
 
 
+def generated_tokens(log: Path) -> list[int]:
+    """All of the run's `output :` line: the tokens the engine emitted, in order."""
+    m = re.search(r"^output\s*:\s*(.*)$", log.read_text(encoding="utf-8", errors="replace"), re.M)
+    if not m:
+        return []
+    return [int(t) for t in m.group(1).split() if t.lstrip("-").isdigit()]
+
+
+def compare_decode(ref_path: Path, ref_tokens: list[int], arm_path: Path, arm_tokens: list[int]) -> dict:
+    """Decode-path comparison. Row i of a --dump-logits file is the distribution that produced generated
+    token i, so the two files are compared step by step - the path the FP16 window overlay and the
+    quantized bulk actually act on (prefill writes the overlay; decode attention reads it).
+
+    Greedy arms diverge: once an arm emits a different token, its later rows are conditioned on a
+    different prefix, and comparing them compares different contexts. So the KL runs over the AGREEMENT
+    PREFIX only, and the prefix length is itself the headline number - how far an arm generates
+    identically to the reference before it departs.
+    """
+    nv_r, nr_r = read_header(ref_path)
+    nv_a, nr_a = read_header(arm_path)
+    n = min(len(ref_tokens), len(arm_tokens), nr_r, nr_a)
+    agree = 0
+    while agree < n and ref_tokens[agree] == arm_tokens[agree]:
+        agree += 1
+    kl: list[float] = []
+    kl0 = None
+    with open(ref_path, "rb") as fr, open(arm_path, "rb") as fa:
+        for r0 in range(0, max(agree, 1), 16):
+            nr = min(16, max(agree, 1) - r0)
+            xr = block(fr, nv_r, r0, nr).astype(np.float64)
+            xa = block(fa, nv_a, r0, nr).astype(np.float64)
+            lr, la = log_softmax(xr), log_softmax(xa)
+            step = np.sum(np.exp(lr) * (lr - la), axis=1).tolist()
+            kl.extend(step[:nr] if r0 < agree else [])
+            if r0 == 0:
+                kl0 = step[0]
+    return dict(agree=agree, requested=n, generated=len(arm_tokens), rows_ref=nr_r, rows_arm=nr_a,
+                mean_kl=float(np.mean(kl)) if kl else 0.0,
+                max_kl=float(np.max(kl)) if kl else 0.0,
+                kl_first_step=kl0,
+                diverged_at=agree if agree < n else -1,
+                ref_token=ref_tokens[agree] if agree < len(ref_tokens) else None,
+                arm_token=arm_tokens[agree] if agree < len(arm_tokens) else None)
+
+
 # ------------------------------------------------------------------ main
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -426,6 +481,15 @@ def main() -> int:
                          "the first-token check)")
     ap.add_argument("--token-limit", type=int, default=0,
                     help="with --write-tokens, truncate to this many tokens instead of --max-tokens")
+    ap.add_argument("--decode", type=int, default=0,
+                    help="decode-path mode: greedy-generate this many tokens per arm with --dump-logits and "
+                         "compare the per-step distributions over the agreement prefix. This is the path the "
+                         "FP16 window overlay acts on (prefill writes it, decode attention reads it), so it "
+                         "is the only logit-level measurement a window change can move. Skips the "
+                         "teacher-forced pass.")
+    ap.add_argument("--repeat", type=int, default=3,
+                    help="with --decode: runs per arm. Greedy decode is not reproducible run to run on this "
+                         "engine, so decode-path numbers are means over repeats with their spread.")
     a = ap.parse_args()
 
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
@@ -470,6 +534,65 @@ def main() -> int:
     if not prompts:
         print("no texts selected")
         return 2
+
+    if a.decode > 0:
+        # Greedy decode on this engine is NOT reproducible run to run: the same command gave q4_0 6/64
+        # identical tokens in one run and 1/64 in the next (QSA top-k tie-breaks and the atomic partial-
+        # group KV writes are order-sensitive). So each arm is run --repeat times and the numbers are
+        # means with their spread; a single run per arm is a sample, not a measurement.
+        reps = max(1, a.repeat)
+        dec: dict[str, dict[str, list]] = dict((name, dict((an, []) for an in arms)) for name in prompts)
+        for name, ids in prompts.items():
+            tag = re.sub("[^a-z0-9]+", "-", name.lower())
+            for rep in range(reps):
+                dfiles: dict[str, Path] = dict()
+                dtoks: dict[str, list[int]] = dict()
+                for an in arms:
+                    out = tmp / ("%s-%s.r%d.decode.bin" % (tag, an, rep))
+                    log = tmp / ("%s-%s.r%d.decode.log" % (tag, an, rep))
+                    if run_engine(cfg, exe, arm_of[an], ids, out, log, max_new=a.decode, mode="decode") != 0:
+                        return 1
+                    dfiles[an] = out
+                    dtoks[an] = generated_tokens(log)
+                for an in arms:
+                    dec[name][an].append(
+                        compare_decode(dfiles[REFERENCE], dtoks[REFERENCE], dfiles[an], dtoks[an]))
+                if not a.keep_logits:
+                    for p in dfiles.values():
+                        p.unlink(missing_ok=True)
+        print()
+        print("Decode-path precision from --dump-logits: row i is the distribution that produced generated")
+        print("token %d, %d runs per arm (greedy decode is not reproducible run to run on this engine, so" % (a.decode, reps))
+        print("these are means with min-max spread). KL runs over the agreement prefix - the steps where")
+        print("both arms emitted the same token - and KL @ 0 is always comparable (same context, the last")
+        print("prompt position), which is the number to read when arms diverge immediately.")
+        print("This is the path the FP16 window overlay acts on: prefill writes it, decode attention reads it.")
+        print()
+        print("| %-14s | %-12s | %15s | %15s | %15s | %15s |"
+              % ("Text", "KV", "Identical prefix", "Mean KL", "Max KL", "KL @ 0"))
+        print("|" + "---|" * 5)
+        for name in prompts:
+            for an in arms:
+                rs = dec[name][an]
+                def stat(key):
+                    vals = [r[key] for r in rs if r[key] is not None]
+                    return (sum(vals) / len(vals), min(vals), max(vals)) if vals else (0.0, 0.0, 0.0)
+                pa, pmin, pmax = stat("agree")
+                ma, mmin, mmax = stat("mean_kl")
+                xa, xmin, xmax = stat("max_kl")
+                k0, k0min, k0max = stat("kl_first_step")
+                print("| %-14s | %-12s | %7.1f %5.0f-%-4.0f | %7.4f %4.3f-%-4.3f | %6.4f %4.3f-%-4.3f | %7.4f %4.3f-%-4.3f |"
+                      % (name if an == arms[0] else "", an, pa, pmin, pmax, ma, mmin, mmax,
+                         xa, xmin, xmax, k0, k0min, k0max))
+        payload = dict(engine=exe, config=str(a.config), reference=REFERENCE, mode="decode",
+                       max_new=a.decode, repeats=reps,
+                       arms=[dict(name=an, kv=arm_of[an]["kv"], env=arm_of[an]["env"]) for an in arms],
+                       texts=dict((n, dict(n_tokens=len(ids))) for n, ids in prompts.items()),
+                       metrics=dict((an, dict((n, dec[n][an]) for n in prompts)) for an in arms))
+        Path(a.json).write_text(json.dumps(payload, indent=1), encoding="utf-8")
+        print()
+        print("wrote %s" % a.json)
+        return 0
 
     results: dict[str, dict[str, dict]] = dict((an, dict()) for an in arms)
     firsts: dict[str, dict[str, int]] = dict()
