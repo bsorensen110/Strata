@@ -38,10 +38,10 @@ Block layout for the 2-bit tier, mirroring `block_q4_0` so the append/gather ker
 ```
 #pragma pack(push, 1)
 struct block_q2_0 {           // 32 values, 10 bytes: 2.5 bits/value stored, 2 bits of code
-    uint16_t d;               // fp16 scale
-    uint8_t  qs[4];           // 32 2-bit codes; element j in bits [2*(j%4), +2) of qs[j/4]
+    uint16_t d;               // fp16 scale (the block's RMS for the shipping Lloyd-Max codebook)
+    uint8_t  qs[8];           // 32 2-bit codes; element j in bits [2*(j%4), +2) of qs[j/4]
 };
-#pragma pack(pop)             // 6 bytes -> 8 blocks per head per cell = 48 B of codes + 16 B of scales = 64 B
+#pragma pack(pop)             // 10 bytes -> 8 blocks per head per cell = 64 B of codes + 16 B of scales = 80 B
 ```
 
 With 32-value blocks the scale bytes are 25% of the payload, which is why the table says 80 B and not 64 B:

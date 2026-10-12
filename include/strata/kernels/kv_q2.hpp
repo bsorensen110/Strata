@@ -8,12 +8,13 @@
 // FP16 sliding window + attention sinks of kv_window.hpp: the `sinks` leading cells and the `window` most recent
 // cells stay exact, and only the bulk is 2-bit.
 //
-// Codes are 2 bits per value in 32-value blocks: an fp16 scale plus 4 bytes of codes (6 B per block, 8 blocks per
-// head per cell -> 48 B of codes + 16 B of scales = 80 B per head per cell, vs 144 B for q4_0 and 512 B for fp16).
-// K uses the symmetric 4-level codebook {-3,-1,+1,+3} * d, with no zero point. V uses the 3-level codebook
-// {-1,0,+1} * d, stored in the same 2 bits with the 4th code left unused - the reserved code is what makes
-// entropy coding (the "1.5-bit V" of SKVQ, arXiv 2405.06219) a writer/reader change later rather than a layout
-// change now. 2 bits stored is not 1.5 bits stored, and nothing here claims otherwise.
+// Codes are 2 bits per value in 32-value blocks: an fp16 scale plus 8 bytes of codes (10 B per block, 8 blocks per
+// head per cell -> 64 B of codes + 16 B of scales = 80 B per head per cell, vs 144 B for q4_0 and 512 B for fp16).
+// The shipping codebook is the 4-level Lloyd-Max grid (q2_lm4_level) scaled by the block's RMS, for K AND V: the
+// parity gate measured it 1.80x better than a uniform grid over the block max on both, and better than the 3-level
+// grid on both per-element RMS and attention output. The 3-level grid (q2_lm3_level) is kept because the gate
+// compares the two and because the entropy-coded "1.5-bit V" of SKVQ (arXiv 2405.06219) is a writer/reader change
+// later, not a layout change now. 2 bits stored is not 1.5 bits stored, and nothing here claims otherwise.
 //
 // With KV streaming (--kv-resident) the codes live in the host copy and the resident slots like q4_0's (KvHostPools
 // k_q2/v_q2, the same per-cell granule), so both options combine.
@@ -101,8 +102,9 @@ STRATA_HD inline int q2_code_lm3(float x, float s) {
 STRATA_HD inline float q2_value_lm3(int code, float s) { return s * q2_lm3_level(code); }
 
 /// Append the (already rotated) cell at step[kStepPos]. With a host copy (KV streaming) it is written there too,
-/// and to VRAM only if its block is resident. `v3level` selects the codebook: false for K's 4-level, true for V's
-/// 3-level; the two pools are appended by separate calls so each gets its own.
+/// and to VRAM only if its block is resident. `v3level` selects V's codebook; K is always the 4-level one. The
+/// engine appends BOTH pools in one call with v3level = false, the shipping setting (4-level Lloyd-Max for K and
+/// V). True is used only by the parity gate, which measures the 3-level grid against it.
 void kv_append_q2_step(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table, const int32_t* step,
                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                        const KvHostPools* host = nullptr, bool v3level = true);
