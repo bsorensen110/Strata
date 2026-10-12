@@ -57,6 +57,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q2.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/f16_bits.hpp"   // --dump-kv: the fp16 bits the cache holds, decoded on the host
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
@@ -427,6 +428,32 @@ struct Options {
     /// candidate VRAM expert cache is computed from, and it needs no new kernels - the doorbell already
     /// publishes exactly this much to pinned memory.
     std::string dump_routing;
+    /// **`--dump-kv PATH`: the prompt's stored KV cache, every layer that has one, as the engine keeps it.**
+    ///
+    /// The 2-bit work is measured on synthetic data today (`src/kernels/kv_q2_parity.cpp`): i.i.d. Gaussian
+    /// noise with a 3x per-cell spread.  Per-channel scaling exists to exploit a handful of channels being far
+    /// larger than the rest (KIVI, arXiv 2402.02750), and data with every channel at the same RMS cannot show
+    /// that structure, so every per-channel number measured on it is a floor.  The cache is also
+    /// Hadamard-rotated for the quantized formats, and rotation is supposed to EQUALIZE channel variance -
+    /// whether any channel structure survives it is a question the synthetic cache cannot answer at all.
+    ///
+    /// So this writes the cache the model actually stored - post-RoPE, post-rms-norm, whatever the engine
+    /// keeps - read back through the engine's own fp16 gather, in the (cell, head, dim) order the gate's
+    /// arrays already use.  No de-rotation, no re-rotation, no re-derived copy.
+    ///
+    /// ONE HONEST CAVEAT, and it is the one that decides what the numbers mean: the fp16 pools are NOT
+    /// Hadamard-rotated.  `QsaState::kv_rot` is `kv_q4 || kv_q2 || (kv_int8 && STRATA_KV_ROT)` (layer.cpp),
+    /// so the rotation the 2-bit format is quantized through is applied on the way INTO the quantized pools,
+    /// and `--dump-kv` requires `--kv fp16`, whose pools are unrotated.  The dump is therefore the cache the
+    /// rotation is applied TO - which is the cache whose channel variance the rotation is supposed to
+    /// equalize.  Reading the ratios of the ROTATED cache would mean running the WHT in the reader, and the
+    /// task says no re-rotation, so the file is the pre-rotation reference and says so.
+    ///
+    /// `--kv fp16` only: the point is a REFERENCE cache.  The gather kernels dequantize, so a dump taken with
+    /// a quantized `--kv` would silently be a measurement of that format.  SDKV v1; the reader is
+    /// `tools/kv_cache_dump.py` and the gate's is `load_real_cache` in `src/kernels/kv_q2_parity.cpp`
+    /// (env `STRATA_KV_PROBE_CACHE`).  MEASUREMENT PATH, NOT A FAST PATH.
+    std::string dump_kv;
     bool no_capture = false;          // run the layers directly instead of replaying graphs
     bool no_pool = false;             // skip the CPU expert pool: the GPU-only floor
     bool sync_every_layer = false;
@@ -784,6 +811,14 @@ void usage() {
                  "  --dump-layers PATH   write R after EVERY layer, per position: the C1 bisection ladder\n"
                  "  --dump-halves PATH   write both halves' block_out and inject per layer: the half bisection\n"
                  "  --dump-routing PATH  write the routed expert ids and weights per layer per position (P0.S8)\n"
+                 "  --dump-kv PATH       write the prompt's stored KV cache, every layer that has one: the cache\n"
+                 "                       as the engine keeps it (post-RoPE, post-rms-norm - the fp16 pools are\n"
+                 "                       NOT Hadamard-rotated; that rotation happens on the way into the q4_0/\n"
+                 "                       q2 pools), read back through the engine's own fp16 gather, in (cell,\n"
+                 "                       head, dim) order.  REQUIRES --kv fp16 - the gather kernels dequantize,\n"
+                 "                       so a dump taken on a quantized cache measures that format and not a\n"
+                 "                       reference.  SDKV v1; read it with tools/kv_cache_dump.py, or feed it to\n"
+                 "                       the 2-bit parity gate with STRATA_KV_PROBE_CACHE.  MEASUREMENT PATH.\n"
                  "  --no-capture         run the layers directly instead of replaying graphs\n"
                  "  --shared-late        A/B: shared expert after the CPU pool (default: overlapped with it)\n"
                  "  --keep-canonical     A/B: also load canonical copies of natively served tensors (more VRAM)\n"
@@ -1685,6 +1720,181 @@ struct PcieAuto {
     }
 };
 
+// ============ `--dump-kv`: the prompt's stored KV cache, read back through the engine's own gather ============
+//
+// THE FILE IS SDKV v1, little-endian, and it is exactly the format the 2-bit parity gate already reads with
+// STRATA_KV_PROBE_CACHE (`load_real_cache` in src/kernels/kv_q2_parity.cpp):
+//
+//   int32 magic 0x564B4453 ("SDKV"), int32 version = 1, int32 n_layers, int32 n_cells, int32 n_head_kv,
+//   int32 head_dim, int32 layer_ids[n_layers]
+//   then for each dumped layer, in layer_ids order: K, then V, each n_cells*n_head_kv*head_dim uint16 (fp16 bits)
+//
+// `n_layers` is the number of DUMPED layers and every layer that HAS a KV cache is dumped: the QSA layers
+// (3, 7, ... n_layers-1).  A GDN layer has no KV cache - its state is a recurrence plus a conv history - so
+// there is no plane to write for it, and the header's count is the count of planes the file contains.
+//
+// WHY THE GATHER AND NOT A RAW POOL COPY.  The pools are paged, `[page][kv_head][page_size][head_dim]`, and
+// the logical-cell -> pool-row mapping is the page table's.  `kv_gather` is the function the attention
+// kernels' K/V comes from, so gathering through an identity page table over cells 0..n_cells-1 produces
+// exactly the (cell, head, dim) array the gate's arrays use - the same read path the model reads, no new
+// kernel, and no layout transcribed by hand at the call site.
+//
+// WHY IT RUNS AFTER THE DECODE LOOP.  The prompt's cells are append-only: the prefill writes cells
+// 0..n_prompt-2, the last prompt position's forward writes cell n_prompt-1, and nothing after that touches a
+// prompt cell.  So the bytes of cells 0..n_prompt-1 are the same at every moment after cell n_prompt-1 lands,
+// and reading them once at the end of the run puts no launch, no sync, no allocation and no host traffic
+// between a layer run and the sampler - the flag cannot move the first generated token, which is the property
+// the measurement depends on.  "Generation has not started" is what the dump needs (no generated cell in the
+// file); the cell RANGE is what delivers it, not the wall-clock moment.
+//
+// WHAT IT REFUSES: a non-fp16 state (the caller's `--kv` check already covers the flag, this is the belt), a
+// streamed/ringed state (its page table is not an identity and its authoritative copy is in host memory -
+// gathering through an identity table over it would read the wrong pages), a state whose pools are shorter
+// than the prompt, and a non-finite value (named by layer, cell and dimension: a NaN that lands in a file
+// reads like data).
+bool dump_kv_cache(const std::string& path, const strata::core::ModelGeometry& g, const strata::core::SessionState& ss,
+                   int64_t n_cells, cudaStream_t stream, std::string& err, int64_t* n_dumped_out = nullptr) {
+    using namespace strata::kernels;
+    const QsaShapes s = [&] {
+        QsaShapes t = qsa_real_shapes();
+        t.n_head = g.n_head; t.n_head_kv = g.n_head_kv; t.head_dim = g.head_dim;
+        t.idx_n_head = g.idx_q_heads; t.idx_dim = g.idx_key_dim;
+        return t;
+    }();
+    const int64_t H = s.n_head_kv, D = s.head_dim, P = s.page_size;
+    if (n_cells <= 0) { err = "--dump-kv: the prompt has no cells to dump"; return false; }
+    if (H <= 0 || D <= 0 || P <= 0) { err = "--dump-kv: the KV geometry is not set up"; return false; }
+
+    // Every layer this session runs that has a KV cache, in layer order.  The session's QSA states are
+    // indexed by GLOBAL QSA ordinal (`qsa_ord0 .. qsa_ord0 + qsa_alloc`), and layer l's ordinal is
+    // `l / qsa_interval` - the same derivation `is_qsa_layer` and `session_init`'s carve use.
+    std::vector<int32_t> layer_ids;
+    std::vector<const strata::core::QsaState*> states;
+    const int64_t I = std::max<int64_t>(g.qsa_interval, 1);   // session_init's guard, transcribed
+    for (int64_t l = ss.layer_lo; l < ss.layer_hi; ++l) {
+        if (!strata::core::is_qsa_layer(g, l)) continue;
+        const int64_t ord = l / I;
+        if (ord < ss.qsa_ord0 || ord >= ss.qsa_ord0 + ss.qsa_alloc) continue;   // a range carve: not this session's
+        const strata::core::QsaState& st = ss.qsa_states[ord];
+        if (st.kv_int8 || st.kv_q4 || st.kv_q2 || st.kv_hybrid) {
+            err = "--dump-kv: layer " + std::to_string(l) + "'s cache is not fp16, so the gather would hand back "
+                  "dequantized codes, not a reference cache (run --dump-kv with --kv fp16)";
+            return false;
+        }
+        if (st.k_pool == nullptr || st.v_pool == nullptr) {
+            err = "--dump-kv: layer " + std::to_string(l) + " has no fp16 K/V pools";
+            return false;
+        }
+        if (st.kv_mode != 0) {
+            err = "--dump-kv: layer " + std::to_string(l) + " is streamed or ringed (kv_mode " +
+                  std::to_string(st.kv_mode) + "): its page table is not an identity and its authoritative copy "
+                  "is in host memory, so an identity-table gather over the VRAM slots is not the prompt's cache. "
+                  "Dump with --kv-resident 0.";
+            return false;
+        }
+        if (st.page_table == nullptr) {
+            err = "--dump-kv: layer " + std::to_string(l) + " has no page table to gather through";
+            return false;
+        }
+        if (st.max_cells < n_cells) {
+            err = "--dump-kv: layer " + std::to_string(l) + " holds " + std::to_string(st.max_cells) +
+                  " cells, the prompt needs " + std::to_string(n_cells);
+            return false;
+        }
+        layer_ids.push_back((int32_t) l);
+        states.push_back(&st);
+    }
+    if (states.empty()) { err = "--dump-kv: this run has no layer with a KV cache"; return false; }
+
+    const int64_t n_pages = (n_cells + P - 1) / P;
+    const size_t plane = (size_t) n_cells * (size_t) H * (size_t) D;      // uint16 elements per K (and per V)
+
+    // The identity page table and the identity id list are the same for every layer: upload once.
+    std::vector<int32_t> h_table((size_t) n_pages), h_ids((size_t) n_cells);
+    for (int64_t i = 0; i < n_pages; ++i) h_table[(size_t) i] = (int32_t) i;
+    for (int64_t i = 0; i < n_cells; ++i) h_ids[(size_t) i] = (int32_t) i;
+    int32_t *d_table = nullptr, *d_ids = nullptr;
+    uint16_t *d_k = nullptr, *d_v = nullptr;
+    const auto unmap = [&] { cudaFree(d_table); cudaFree(d_ids); cudaFree(d_k); cudaFree(d_v); };
+    if (cudaMalloc(&d_table, h_table.size() * sizeof(int32_t)) != cudaSuccess ||
+        cudaMalloc(&d_ids, h_ids.size() * sizeof(int32_t)) != cudaSuccess ||
+        cudaMalloc(&d_k, plane * sizeof(uint16_t)) != cudaSuccess ||
+        cudaMalloc(&d_v, plane * sizeof(uint16_t)) != cudaSuccess) {
+        unmap();
+        err = "--dump-kv: allocating the gather's staging buffers failed";
+        return false;
+    }
+    // The gather's own step buffer is a module-level static that `kv_gather` uploads with a SYNCHRONOUS copy
+    // on the legacy default stream, which is not ordered against this non-blocking stream.  Draining the
+    // stream first is what makes that copy safe: nothing already queued can still be reading it.
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        unmap();
+        err = "--dump-kv: draining the compute stream failed";
+        return false;
+    }
+    if (cudaMemcpyAsync(d_table, h_table.data(), h_table.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream) !=
+            cudaSuccess ||
+        cudaMemcpyAsync(d_ids, h_ids.data(), h_ids.size() * sizeof(int32_t), cudaMemcpyHostToDevice, stream) !=
+            cudaSuccess ||
+        cudaStreamSynchronize(stream) != cudaSuccess) {
+        unmap();
+        err = "--dump-kv: uploading the identity page table failed";
+        return false;
+    }
+
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (f == nullptr) { unmap(); err = "--dump-kv: cannot write " + path; return false; }
+    const int32_t hdr[6] = {0x564B4453, 1, (int32_t) layer_ids.size(), (int32_t) n_cells, (int32_t) H, (int32_t) D};
+    bool io = std::fwrite(hdr, sizeof hdr, 1u, f) == 1u &&
+              std::fwrite(layer_ids.data(), sizeof(int32_t), layer_ids.size(), f) == layer_ids.size();
+    if (!io) { std::fclose(f); unmap(); err = "--dump-kv: writing " + path + " failed"; return false; }
+
+    std::vector<uint16_t> h_plane(plane);
+    for (size_t i = 0; i < states.size(); ++i) {
+        // One layer at a time: the gather's scratch is one buffer, so the read-back has to land before the
+        // next layer's gather is launched.  This is a measurement path; it is not worth 12 layers of scratch.
+        kv_gather(states[i]->k_pool, states[i]->v_pool, d_table, d_ids, n_cells, s, d_k, d_v, (void*) stream);
+        if (cudaStreamSynchronize(stream) != cudaSuccess) {
+            std::fclose(f); unmap();
+            err = "--dump-kv: gathering layer " + std::to_string(layer_ids[i]) + " failed";
+            return false;
+        }
+        for (int which = 0; which < 2; ++which) {
+            const uint16_t* dsrc = which == 0 ? d_k : d_v;
+            if (cudaMemcpy(h_plane.data(), dsrc, plane * sizeof(uint16_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                std::fclose(f); unmap();
+                err = "--dump-kv: reading layer " + std::to_string(layer_ids[i]) + "'s " + (which ? "V" : "K") +
+                      " back failed";
+                return false;
+            }
+            // A non-finite value in a file reads like data, so it never gets here.  Named by layer, cell and
+            // dimension - the element order is (cell, head, dim), so dim = i % head_dim.
+            for (size_t e = 0; e < plane; ++e) {
+                if (std::isfinite(f32_from_f16(h_plane[e]))) continue;
+                const size_t hd = (size_t) H * (size_t) D;
+                std::fprintf(stderr, "strata generate: --dump-kv: layer %d %s cell %zu head %zu dim %zu is %s\n",
+                             (int) layer_ids[i], which ? "V" : "K", e / hd, (e / (size_t) D) % (size_t) H, e % (size_t) D,
+                             "non-finite");
+                std::fclose(f); unmap();
+                err = "--dump-kv: layer " + std::to_string(layer_ids[i]) + " " + (which ? "V" : "K") +
+                      " has a non-finite value at cell " + std::to_string(e / hd) + " dim " +
+                      std::to_string(e % (size_t) D);
+                return false;
+            }
+            if (std::fwrite(h_plane.data(), sizeof(uint16_t), plane, f) != plane) {
+                std::fclose(f); unmap();
+                err = "--dump-kv: writing layer " + std::to_string(layer_ids[i]) + "'s " + (which ? "V" : "K") +
+                      " plane failed";
+                return false;
+            }
+        }
+    }
+    unmap();
+    if (std::fflush(f) != 0 || std::fclose(f) != 0) { err = "--dump-kv: finishing " + path + " failed"; return false; }
+    if (n_dumped_out != nullptr) *n_dumped_out = (int64_t) layer_ids.size();
+    return true;
+}
+
 }  // namespace
 
 // #1425 #1549 #1629: --ple-io direct (the default) does unbuffered random reads of the n-gram table; on some drives
@@ -1831,6 +2041,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-layers") o.dump_layers = next("--dump-layers");
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
         else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
+        else if (a == "--dump-kv") o.dump_kv = next("--dump-kv");
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") { o.ple_io = next("--ple-io"); o.ple_io_explicit = true; }
@@ -2417,6 +2628,23 @@ int main(int argc, char** argv) {
     if (o.kv == "q4") o.kv = "q4_0";
     if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "q2") {
         std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4 or q2\n");
+        return 2;
+    }
+    // **`--dump-kv` IS A REFERENCE-CACHE DUMP, SO IT ONLY MEANS SOMETHING ON THE FP16 CACHE.**  The gather
+    // kernels dequantize: `kv_gather` on a q4_0 pool hands back fp16 BITS OF DEQUANTIZED CODES, so a dump
+    // taken with a quantized `--kv` would be a measurement of that format wearing a reference's name.  Refuse
+    // by name rather than write a file that reads like fp16.
+    if (!o.dump_kv.empty() && o.kv != "fp16") {
+        std::fprintf(stderr, "strata generate: --dump-kv requires --kv fp16: the dump is the REFERENCE cache, "
+                             "and the gather kernels dequantize, so a --dump-kv taken with --kv %s would "
+                             "silently be a measurement of q4_0/int8/q2, not of fp16\n", o.kv.c_str());
+        return 2;
+    }
+    // `--serve` ends the program inside its request loop (the `save_profile("exit")` return), so it never
+    // reaches the dump site.  Say so rather than print "kv cache dumped" over a file that was never opened.
+    if (o.serve && !o.dump_kv.empty()) {
+        std::fprintf(stderr, "strata generate: --dump-kv is written by the prompt path of a single `generate` "
+                             "run; --serve has no such end, so it is not served there\n");
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
@@ -13176,6 +13404,23 @@ int main(int argc, char** argv) {
         drive.routing = nullptr;
         std::printf("%-24s %s (%lld records of layer, k, ids, weights)\n", "routing dumped",
                     o.dump_routing.c_str(), (long long) drive.calls);
+    }
+    // ---- **`--dump-kv`: the prompt's stored KV cache.**  Gated on the flag: with it absent this is one
+    // `empty()` test, so the fast path pays no launch, no sync, no allocation and no host traffic.  It runs
+    // AFTER the decode loop for the reason recorded at `dump_kv_cache`: the prompt's cells are append-only,
+    // so the bytes of cells 0..n_prompt-1 are fixed the moment the last prompt position's forward lands, and
+    // reading them here cannot move the first generated token.  See that comment for the format.
+    if (!o.dump_kv.empty()) {
+        std::string kv_err;
+        int64_t kv_layers = 0;
+        if (!dump_kv_cache(o.dump_kv, g, ss, n_prompt, main_stream, kv_err, &kv_layers)) {
+            std::fprintf(stderr, "strata generate: %s\n", kv_err.c_str());
+            return 1;
+        }
+        std::printf("%-24s %s (%lld layers with a KV cache x %lld cells x %lld kv heads x %lld dims, "
+                    "K and V, fp16, (cell, head, dim))\n",
+                    "kv cache dumped", o.dump_kv.c_str(), (long long) kv_layers, (long long) n_prompt,
+                    (long long) g.n_head_kv, (long long) g.head_dim);
     }
     if (o.stage_timing) strata::core::stage_timing_report(g.n_layers);
 
