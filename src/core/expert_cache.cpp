@@ -739,16 +739,16 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
     return true;
 }
 
-bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err) {
+bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err, int64_t bytes) {
     uint8_t* dst = device_slot(slot);
-    if (dst == nullptr || parts == nullptr || n <= 0) {
-        err = "ExpertCache::fill_slot_queued_parts: slot outside the arena or no pieces";
+    if (dst == nullptr) {
+        err = "ExpertCache::fill_slot_queued_parts: slot outside the arena";
         return false;
     }
-    uint64_t total = 0;
-    for (int i = 0; i < n; ++i) total += parts[i].n;
-    if (total > (uint64_t) blob_) {
-        err = "ExpertCache::fill_slot_queued_parts: the pieces are larger than a slot";
+    const uint64_t slot_bytes = off_.empty() ? (uint64_t) blob_ : off_[(size_t) slot + 1] - off_[(size_t) slot];
+    const uint64_t expected_bytes = bytes > 0 ? (uint64_t) bytes : 0;
+    if (!detail::validate_blob_parts(parts, n, slot_bytes, expected_bytes, err)) {
+        err = std::string("ExpertCache::fill_slot_queued_parts: ") + err;
         return false;
     }
     for (int i = 0; i < n; ++i) {

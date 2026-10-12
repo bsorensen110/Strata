@@ -736,7 +736,7 @@ namespace {
 // over three dense shapes: IQ4_XS 2.98x/1.60x and Q6_K 2.69x/1.21x win everywhere, while Q5_K (47.5% of the
 // dense FLOPs) measures 0.93x/0.76x, IQ3_S 0.85x/0.70x and Q4_K 0.87x/0.75x.  Gating by type turns a 0.95x
 // global flip into the ~2.7-3.0x on the ~35% of dense work that gains.
-// STRATA_DENSE_MMQ_TYPES=iq4_xs,q6_k overrides the list without a rebuild.
+// STRATA_DENSE_MMQ_TYPES=iq4_xs,q6_K overrides the list without a rebuild.
 bool dense_mmq_type_allowed(int type) {
     static const std::vector<int> allowed = [] {
         std::vector<int> out;

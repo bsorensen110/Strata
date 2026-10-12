@@ -47,6 +47,44 @@ void require(bool ok, const std::string& message) {
     if (!ok) throw std::runtime_error(message);
 }
 
+void test_blob_parts_validation() {
+    const uint8_t data[8]{};
+    std::string err;
+    const strata::core::BlobPart good[] = {{data + 3, 3, 3}, {data, 2, 0}, {data + 2, 1, 2}};
+    require(strata::core::detail::validate_blob_parts(good, 3, 8, 6, err), "valid pieces did not tile a smaller slot: " + err);
+    require(err.empty(), "valid piece list retained an error");
+
+    const strata::core::BlobPart overlap[] = {{data, 4, 0}, {data + 3, 3, 3}};
+    require(!strata::core::detail::validate_blob_parts(overlap, 2, 8, 6, err) && err.find("overlap") != std::string::npos,
+            "overlapping pieces were accepted");
+
+    const strata::core::BlobPart gap[] = {{data, 2, 0}, {data + 3, 3, 3}};
+    require(!strata::core::detail::validate_blob_parts(gap, 2, 8, 6, err) && err.find("tile") != std::string::npos,
+            "gapped pieces were accepted");
+
+    const strata::core::BlobPart outside[] = {{data + 5, 2, 5}};
+    require(!strata::core::detail::validate_blob_parts(outside, 1, 8, 6, err) && err.find("outside") != std::string::npos,
+            "out-of-range piece was accepted");
+
+    require(!strata::core::detail::validate_blob_parts(nullptr, 1, 8, 6, err), "null piece list was accepted");
+    const strata::core::BlobPart null_source[] = {{nullptr, 6, 0}};
+    require(!strata::core::detail::validate_blob_parts(null_source, 1, 8, 6, err), "null source was accepted");
+
+    const strata::core::BlobPart zero_length[] = {{data, 0, 0}};
+    require(!strata::core::detail::validate_blob_parts(zero_length, 1, 8, 6, err), "zero-length piece was accepted");
+    require(!strata::core::detail::validate_blob_parts(good, 0, 8, 6, err), "zero piece count was accepted");
+    require(!strata::core::detail::validate_blob_parts(good, -1, 8, 6, err), "negative piece count was accepted");
+
+    const strata::core::BlobPart too_many[] = {{data, 1, 0}, {data + 1, 1, 1}, {data + 2, 1, 2}, {data + 3, 3, 3}};
+    require(!strata::core::detail::validate_blob_parts(too_many, 4, 8, 6, err), "more than three pieces were accepted");
+    const strata::core::BlobPart huge_length[] = {{data, std::numeric_limits<uint64_t>::max(), 0}};
+    require(!strata::core::detail::validate_blob_parts(huge_length, 1, 8, 6, err), "UINT64_MAX piece length was accepted");
+    const strata::core::BlobPart huge_offset[] = {{data, 1, std::numeric_limits<uint64_t>::max()}};
+    require(!strata::core::detail::validate_blob_parts(huge_offset, 1, 8, 6, err), "UINT64_MAX piece offset was accepted");
+    require(!strata::core::detail::validate_blob_parts(good, 3, 5, 6, err), "blob larger than slot was accepted");
+    require(!strata::core::detail::validate_blob_parts(good, 3, 8, 0, err), "zero-byte blob was accepted");
+}
+
 struct TempDirectory {
     fs::path path;
 
@@ -741,6 +779,7 @@ void test_rotating_source(bool rotate, bool pin) {
 
 int main(int argc, char** argv) {
     try {
+        test_blob_parts_validation();
         test_complement_plan();
         test_resident_lend_region();
         test_split_lend_regions();

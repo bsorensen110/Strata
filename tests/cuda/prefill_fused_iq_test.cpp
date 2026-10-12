@@ -77,14 +77,23 @@ struct Geo {
     }
 };
 
-// random blocks with a sane fp16 scale `d` at each block's start (every format here begins with it): scales chosen so
-// STRATA_PF_F16=1: the covered formats run on F16 weights (moe_f16_kq.cu, native_f16_kernel), not the int8 kernels
+// F16 tolerance applies only when the gfx11 F16 device kernels can actually be selected. Do not loosen gfx12's
+// int8-path check merely because the cross-architecture CTest sets STRATA_PF_F16=1.
 bool f16_on() {
+#if defined(__HIPCC__)
     const char* v = std::getenv("STRATA_PF_F16");
-    return v != nullptr && v[0] == '1';
+    if (v == nullptr || v[0] != '1') return false;
+    int dev = 0;
+    cudaDeviceProp prop{};
+    return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+           std::strncmp(prop.gcnArchName, "gfx11", 5) == 0;
+#else
+    return false;
+#endif
 }
 
-// that the weights' typical size is that of a 2-3 bit expert (a few hundredths)
+// Random blocks with a sane fp16 scale `d` at each block's start (every format here begins with it): scales chosen so
+// that the weights' typical size is that of a 2-3 bit expert (a few hundredths).
 void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt19937& rng) {
     const size_t bs = ggml_type_size(t), nb = (size_t) rows * (size_t) (cols / ggml_blck_size(t));
     std::uniform_int_distribution<int> byte(0, 255);

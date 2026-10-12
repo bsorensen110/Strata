@@ -81,6 +81,53 @@ size_t device_free_bytes();
 /// One piece of an expert blob that lives contiguously in a source's own memory: `n` bytes at `p`, to land `at` bytes into the blob.
 struct BlobPart { const uint8_t* p; uint64_t n; uint64_t at; };
 
+namespace detail {
+/// Validate the small piece list before queuing DMA. The parts must be non-null, non-overlapping, within the
+/// expected blob, and tile it exactly; the expected blob itself must fit in the slot.
+inline bool validate_blob_parts(const BlobPart* parts, int n, uint64_t slot_bytes, uint64_t expected_bytes,
+                                std::string& err) {
+    err.clear();
+    if (parts == nullptr || n <= 0 || n > 3) {
+        err = "piece list is null or has a count outside 1..3";
+        return false;
+    }
+    if (expected_bytes == 0 || expected_bytes > slot_bytes) {
+        err = "expected blob size is zero or exceeds the slot";
+        return false;
+    }
+    uint64_t total = 0;
+    for (int i = 0; i < n; ++i) {
+        const BlobPart& part = parts[i];
+        if (part.p == nullptr || part.n == 0) {
+            err = "piece has a null source or zero length";
+            return false;
+        }
+        if (part.at > expected_bytes || part.n > expected_bytes - part.at) {
+            err = "piece range lies outside the expected blob";
+            return false;
+        }
+        const uint64_t end = part.at + part.n;  // in range, so this cannot overflow
+        for (int j = 0; j < i; ++j) {
+            const uint64_t previous_end = parts[j].at + parts[j].n;  // prior piece was already validated
+            if (part.at < previous_end && parts[j].at < end) {
+                err = "piece ranges overlap";
+                return false;
+            }
+        }
+        if (total > expected_bytes - part.n) {
+            err = "piece lengths exceed the expected blob size";
+            return false;
+        }
+        total += part.n;
+    }
+    if (total != expected_bytes) {
+        err = "piece ranges do not tile the expected blob";
+        return false;
+    }
+    return true;
+}
+}  // namespace detail
+
 class ExpertCache {
 public:
     ExpertCache() = default;
@@ -195,8 +242,8 @@ public:
     /// with one `sync_queued` at the end instead of a wait per slot. Same ordering against earlier work, same bytes.
     bool fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes = 0);
     /// `fill_slot_queued` for a blob that is not in one piece: each `parts[i].n` bytes at `parts[i].p` go to byte `parts[i].at`
-    /// of the slot (the pieces tile the blob).  Same queue, same `sync_queued`.
-    bool fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err);
+    /// of the slot. `bytes` is the exact blob size; pieces must tile it without gaps or overlap. Same queue, same `sync_queued`.
+    bool fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err, int64_t bytes);
     bool sync_queued(std::string& err);
 
     /// Reads `slot` back to the host and compares it to `host_blob`, byte for byte.  **THE ONLY THING THAT SAYS

@@ -1,9 +1,10 @@
 // Opt-in HIP smoke test for the calibrated hipBLASLt prefill route; it needs STRATA_HIPBLASLT_TUNING (SKIP otherwise).
-// It checks that the table loads for this device and hipBLASLt version, that the two rows it uses exist (bf16
-// N=48 K=2560 ldy=96 and f16 N=512 K=2560 ldy=512, T bucket 4096), and that Gemm's output matches hipBLASEx on those
-// two rows. It does NOT check the other rows, and it does not check that hipBLASLt ran the table's solution: an id
-// the library rejects falls back to hipBLASEx and the test still passes. Set STRATA_HIPBLASLT_VERBOSE=1 to read the
-// "hipBLASLt summary launches=... fallbacks=..." line.
+// On gfx1201, use the test-only gfx1201-hipblaslt-100500-2bucket.txt profile: the current 14-row production table
+// lacks the BF16 N=48 K=2560 ldy=96 shape, while the alternate 32-row table includes it and F16 N=512 K=2560 ldy=512.
+// This checks those two shapes at T=4096 and T=2049 (within the 4096 row's factor-of-two window), plus asserts T=37
+// is outside. It does NOT check other rows or prove the selected solution ID ran; unsupported IDs fall back to
+// hipBLASEx and the output comparison still passes. In v0.1.43, STRATA_HIPBLASLT_VERBOSE=1 emits per-call
+// `Lt solution=` and fallback records; inspect those to confirm the tuned route actually ran.
 #include <cuda_runtime.h>
 #include <hip/hip_bfloat16.h>
 #include <hip/hip_fp16.h>
@@ -161,8 +162,12 @@ int main() {
         return 1;
     }
     if (!table.closest(strata::prefill::hipblaslt::InputType::bf16, 48, 2560, 96, 4096) ||
-        !table.closest(strata::prefill::hipblaslt::InputType::f16, 512, 2560, 512, 4096)) {
-        std::fprintf(stderr, "tuning table lacks the rows this smoke test uses (bf16 N=48 K=2560 ldy=96, f16 N=512 K=2560 ldy=512)\n");
+        !table.closest(strata::prefill::hipblaslt::InputType::f16, 512, 2560, 512, 4096) ||
+        !table.closest(strata::prefill::hipblaslt::InputType::bf16, 48, 2560, 96, 2049) ||
+        !table.closest(strata::prefill::hipblaslt::InputType::f16, 512, 2560, 512, 2049) ||
+        table.closest(strata::prefill::hipblaslt::InputType::bf16, 48, 2560, 96, 37) ||
+        table.closest(strata::prefill::hipblaslt::InputType::f16, 512, 2560, 512, 37)) {
+        std::fprintf(stderr, "tuning table coverage/window check failed for bf16 N=48 K=2560 ldy=96 and f16 N=512 K=2560 ldy=512 (expected T=4096/2049 in, T=37 out)\n");
         return 1;
     }
 
@@ -181,12 +186,12 @@ int main() {
         HIPBLAS_CHECK(hipblasCreate(&blas));
         HIPBLAS_CHECK(hipblasSetStream(blas, stream));
 
-        // T=4096 is an exact calibrated bucket; T=37 resolves to the same T=4096 row (the closest bucket), validates the
-        // actual shape before launch, and tests a non-tile-multiple tail. So the four cases use two table rows.
+        // T=4096 is an exact calibrated bucket; T=2049 is just inside its factor-of-two window and exercises a tail.
+        // T=37 is asserted outside that window above, so it must not silently resolve to the 4096 row.
         ok &= run_case(gemm, blas, stream, true, 4096, 48, 2560, 96, 0, 0.0f, 101);
-        ok &= run_case(gemm, blas, stream, true, 37, 48, 2560, 96, 48, 1.0f, 102);
+        ok &= run_case(gemm, blas, stream, true, 2049, 48, 2560, 96, 48, 1.0f, 102);
         ok &= run_case(gemm, blas, stream, false, 4096, 512, 2560, 512, 0, 0.0f, 103);
-        ok &= run_case(gemm, blas, stream, false, 37, 512, 2560, 512, 7, 1.0f, 104);
+        ok &= run_case(gemm, blas, stream, false, 2049, 512, 2560, 512, 7, 1.0f, 104);
         HIPBLAS_CHECK(hipblasDestroy(blas));
     }
     HIP_CHECK(hipStreamDestroy(stream));
