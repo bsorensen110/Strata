@@ -26,6 +26,7 @@
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q2.hpp"
 #include "strata/kernels/kv_window.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/native_head.hpp"
@@ -843,6 +844,9 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
     } else if (q0.kv_q4) {
         st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
         st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+    } else if (q0.kv_q2) {
+        st.k_q2 = o.take<uint8_t>(rows * strata::kernels::kv_q2_bytes_per_head((int) s.head_dim), ok);
+        st.v_q2 = o.take<uint8_t>(rows * strata::kernels::kv_q2_bytes_per_head((int) s.head_dim), ok);
     } else if (q0.kv_int8) {
         st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
         st.v_q = o.take<int8_t>(rows * s.head_dim, ok);
@@ -857,6 +861,7 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
     strata::kernels::QsaAttnPools p;
     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
     p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
+    p.k_q2 = h.k_q2; p.v_q2 = h.v_q2;   // q2 (kv_q2.hpp): take_stage() carves them, so the readers must see them
     p.page_table = table;
     return p;
 }
@@ -1448,6 +1453,11 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
         }
         if (st.kv_q4) {
             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host);
+        } else if (st.kv_q2) {
+            strata::kernels::kv_append_q2(st.k_q2, st.v_q2, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host,
+                                          nullptr, /*v3level*/ false);
+        }
+        if (st.kv_q4 || st.kv_q2) {
             // the FP16 sliding window + attention sinks (kv_window.hpp); the drafter's ring state has none
             if (st.k_win != nullptr)
                 strata::kernels::kv_window_write_batch(
@@ -2654,6 +2664,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (st.kv_q4)
                             strata::kernels::kv_append_q4(st.k_q4, st.v_q4, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
                                                           host_w, staged ? &m.stage : nullptr);
+                        else if (st.kv_q2)   // 2-bit, 4-level Lloyd-Max for K and V (kv_q2.hpp, the parity gate's choice)
+                            strata::kernels::kv_append_q2(st.k_q2, st.v_q2, st.page_table, p0, T, m.Kc, m.Vc, s, m.cs,
+                                                          host_w, staged ? &m.stage : nullptr, /*v3level*/ false);
                         else
                             kv_append(m.Kc, m.Vc, T, p0, st.page_table, s.page_size, st.kv_int8 ? nullptr : st.k_pool,
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,

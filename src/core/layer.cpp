@@ -8,6 +8,7 @@
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q2.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_window.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -177,7 +178,7 @@ if (!w.wants_q8k()) {        s_gemv_q8_0_split(x80, p.codes, p.scales, p.offset,
 void layer_set_native_bf16(bool enabled) { native_bf16_projections = enabled; }
 void layer_set_native_flash_attn_short(bool enabled) { native_flash_attn_short = enabled; }
 namespace {
-bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_int8_rot = false;
+bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_int8_rot = false, g_kv_q2 = false;
 /// The FP16 sliding window + attention sinks of kv_window.hpp: the last `g_kv_window` cells and the first
 /// `g_kv_sinks` ones are also kept in FP16. 0: off (the default).
 int64_t g_kv_window = 0, g_kv_sinks = 8;
@@ -206,7 +207,8 @@ void kv_window_env() {
 /// the block movers never see an arena the rest of the engine does not know about.
 bool kv_window_wanted(int64_t ring_cells) {
     kv_window_env();
-    return g_kv_window > 0 && ring_cells <= 0 && (g_kv_q4 || (g_kv_int8 && !g_kv_q4));
+    return g_kv_window > 0 && ring_cells <= 0 &&
+           (g_kv_q4 || g_kv_q2 || (g_kv_int8 && !g_kv_q4 && !g_kv_q2));
 }
 strata::kernels::KvWindowShape kv_window_shape() {
     return strata::kernels::KvWindowShape{(int32_t) g_kv_window, (int32_t) g_kv_sinks};
@@ -217,6 +219,8 @@ void qsa_set_kv_int8_rotate(bool enabled) { g_kv_int8_rot = enabled; }
 bool qsa_kv_int8() { return g_kv_int8; }
 void qsa_set_kv_q4(bool enabled) { g_kv_q4 = enabled; }
 bool qsa_kv_q4() { return g_kv_q4; }
+void qsa_set_kv_q2(bool enabled) { g_kv_q2 = enabled; }
+bool qsa_kv_q2() { return g_kv_q2; }
 void qsa_set_kv_window(int64_t window, int64_t sinks) {
     g_kv_window_asked = true;
     g_kv_window = window > 0 ? window : 0;
@@ -700,6 +704,7 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
                rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim) + 64;
     }
     if (g_kv_q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
+    if (g_kv_q2) return (uint64_t) pages * s.page_size * strata::kernels::kv_q2_bytes_per_cell(s) + 64;
     return int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
                 : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
 }
@@ -737,8 +742,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
-    st.kv_int8 = g_kv_int8 && !g_kv_q4;
-    st.kv_q4 = g_kv_q4;
+    st.kv_int8 = g_kv_int8 && !g_kv_q4 && !g_kv_q2;
+    st.kv_q4 = g_kv_q4 && !g_kv_q2;   // q2 wins a request that sets both: it is the smaller format
+    st.kv_q2 = g_kv_q2;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
     // mtp.cpp). A streamed one keeps its host copy in the same three runs (kv_stream.cu, kKvHybrid).
     if (g_kv_hybrid && ring_cells <= 0) {
@@ -746,11 +752,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         st.kv_int8 = false;
         st.kv_q4 = false;
     }
-    st.kv_rot = st.kv_q4 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
+    st.kv_rot = st.kv_q4 || st.kv_q2 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    const uint64_t q2_row = strata::kernels::kv_q2_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
     if (g_kv_elastic && p.mode == 0) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
@@ -759,6 +766,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         std::vector<uint64_t> per;   // bytes per page slot of each array, in the order they are assigned below
         if (st.kv_hybrid) per = {slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * q4_row};
         else if (st.kv_q4) per = {slot_rows * q4_row, slot_rows * q4_row};
+        else if (st.kv_q2) per = {slot_rows * q2_row, slot_rows * q2_row};
         else if (st.kv_int8) per = {slot_rows * s.head_dim, slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * scale_row};
         else per = {slot_rows * s.head_dim * 2, slot_rows * s.head_dim * 2};
         auto pool = std::make_unique<ElasticPool>();
@@ -779,6 +787,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         const uint64_t* o = pool->off.data();
         if (st.kv_hybrid) { st.k_q = (int8_t*) (b + o[0]); st.k_scale = (uint16_t*) (b + o[1]); st.v_q4 = b + o[2]; }
         else if (st.kv_q4) { st.k_q4 = b + o[0]; st.v_q4 = b + o[1]; }
+        else if (st.kv_q2) { st.k_q2 = b + o[0]; st.v_q2 = b + o[1]; }
         else if (st.kv_int8) {
             st.k_q = (int8_t*) (b + o[0]);
             st.v_q = (int8_t*) (b + o[1]);
@@ -794,6 +803,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     } else if (st.kv_q4) {
         st.k_q4 = c.take<uint8_t>(rows * q4_row);
         st.v_q4 = c.take<uint8_t>(rows * q4_row);
+    } else if (st.kv_q2) {
+        st.k_q2 = c.take<uint8_t>(rows * q2_row);
+        st.v_q2 = c.take<uint8_t>(rows * q2_row);
     } else if (st.kv_int8) {   // st, not the global: the drafter's ring is INT8 under --kv k8v4 too
         st.k_q = c.take<int8_t>(rows * s.head_dim);
         st.v_q = c.take<int8_t>(rows * s.head_dim);
@@ -883,6 +895,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         } else if (st.kv_q4) {
             st.host.k_q4 = hc.take<uint8_t>(hrows * q4_row);
             st.host.v_q4 = hc.take<uint8_t>(hrows * q4_row);
+        } else if (st.kv_q2) {
+            st.host.k_q2 = hc.take<uint8_t>(hrows * q2_row);
+            st.host.v_q2 = hc.take<uint8_t>(hrows * q2_row);
         } else if (st.kv_int8) {
             st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
             st.host.v_q = hc.take<int8_t>(hrows * s.head_dim);
@@ -935,6 +950,9 @@ void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     } else if (st.kv_q4) {
         cudaMemsetAsync(st.k_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
         cudaMemsetAsync(st.v_q4, 0, rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), cs);
+    } else if (st.kv_q2) {
+        cudaMemsetAsync(st.k_q2, 0, rows * strata::kernels::kv_q2_bytes_per_head((int) s.head_dim), cs);
+        cudaMemsetAsync(st.v_q2, 0, rows * strata::kernels::kv_q2_bytes_per_head((int) s.head_dim), cs);
     } else if (st.kv_int8) {
         cudaMemsetAsync(st.k_q, 0, rows * s.head_dim, cs);
         cudaMemsetAsync(st.v_q, 0, rows * s.head_dim, cs);
@@ -965,6 +983,7 @@ strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st) {
     pools.page_table = st.page_table;
     if (st.kv_hybrid) { pools.k_q = st.k_q; pools.k_scale = st.k_scale; pools.v_q4 = st.v_q4; }
     else if (st.kv_q4) { pools.k_q4 = st.k_q4; pools.v_q4 = st.v_q4; }
+    else if (st.kv_q2) { pools.k_q2 = st.k_q2; pools.v_q2 = st.v_q2; }
     else if (st.kv_int8) { pools.k_q = st.k_q; pools.v_q = st.v_q; pools.k_scale = st.k_scale; pools.v_scale = st.v_scale; }
     else { pools.k_pool = st.k_pool; pools.v_pool = st.v_pool; }
     // the FP16 sliding window + attention sinks (kv_window.hpp): the readers read a sink or a window cell from here
@@ -1175,6 +1194,9 @@ if (st.kv_rot) {   // rotated K and V (kv_q4.hpp): Q4_0, and INT8 with STRATA_KV
 }
 if (st.kv_q4) {
     strata::kernels::kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);
+} else if (st.kv_q2) {   // 4-level Lloyd-Max for K and V, the codebook the parity gate picked on both measures
+    strata::kernels::kv_append_q2_step(st.k_q2, st.v_q2, st.page_table, st.step, b.kcur, b.vcur, s, stream,
+                                       &st.host, /*v3level*/ false);
 } else if (st.kv_int8) kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host);    else kv_append_step(st.k_pool, st.v_pool, st.page_table, st.step, b.kcur, b.vcur, s, stream, &st.host); } /* not K8V4 */
     // the FP16 sliding window + attention sinks (kv_window.hpp): mirror the cell the append just stored, from the
     // same (already rotated) K/V it quantized, so a reader of a sink or of one of the last `kv_window` cells gets
@@ -1230,6 +1252,7 @@ int64_t max_blocks = (st.max_cells / s.idx_block) + 2;
                                            b.v_scratch, b.v_scratch, stream);
     }
     else if (st.kv_q4) strata::kernels::kv_gather_q4_step(st.k_q4, st.v_q4, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream);
+    else if (st.kv_q2) strata::kernels::kv_gather_q2_step(st.k_q2, st.v_q2, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch, stream, /*v3level*/ false);
     else if (st.kv_int8) kv_gather_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, b.ids, st.step, cap, s,                                 b.k_scratch, b.v_scratch, stream);
     else kv_gather_step(st.k_pool, st.v_pool, st.page_table, b.ids, st.step, cap, s, b.k_scratch, b.v_scratch,                   stream);
     if (native_flash_attn_short) {

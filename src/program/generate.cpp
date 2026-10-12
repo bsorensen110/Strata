@@ -55,6 +55,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q2.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
@@ -705,6 +706,10 @@ void usage() {
                  "                       slightly lower precision (see bench/results/2026-09-27-kv-q4)\n"
                  "  --kv k8v4            hybrid: INT8 K (exact attention scores) + rotated Q4_0 V, 816 B/cell\n"
                  "                       (vs int8's 1,056); streams with --kv-resident too\n"
+                 "  --kv q2              2-bit K/V after the same Hadamard rotation (kv_q2.hpp): 320 B/cell, 1.8x\n"
+                 "                       below q4_0. Lloyd-Max codebook scaled by block RMS; NOT near-lossless yet\n"
+                 "                       (33% per-element RMS vs q4_0's 8.6%) - pair it with --kv-window, which\n"
+                 "                       keeps the recent and sink cells exact. See docs/kv-q2.md\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -2389,12 +2394,13 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0 or k8v4\n");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "q2") {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4 or q2\n");
         return 2;
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+    strata::core::qsa_set_kv_q2(o.kv == "q2");     // 2-bit codes, same rotation (kv_q2.hpp): 320 B/cell, 4 KV heads
     // FP16 sliding window + attention sinks (kv_window.hpp): the last o.kv_window cells and the first o.kv_sink
     // ones are also kept in FP16 and read from there. Only when asked: --kv-window wins over STRATA_KV_WINDOW,
     // and with neither the overlay is off (bit for bit what this build did before it existed).
@@ -11821,6 +11827,9 @@ int main(int argc, char** argv) {
                     if (st.kv_q4) {
                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q4 : st.k_q4, q4b}, {h ? st.host.v_q4 : st.v_q4, q4b}};
+                    } else if (st.kv_q2) {
+                        const int64_t q2b = (int64_t) strata::kernels::kv_q2_bytes_per_head((int) qs.head_dim);
+                        a = {{h ? st.host.k_q2 : st.k_q2, q2b}, {h ? st.host.v_q2 : st.v_q2, q2b}};
                     } else if (st.kv_hybrid) {
                         const int64_t q4b = (int64_t) strata::kernels::kv_q4_bytes_per_head((int) qs.head_dim);
                         a = {{h ? st.host.k_q : st.k_q, kvb}, {h ? st.host.v_q4 : st.v_q4, q4b},
