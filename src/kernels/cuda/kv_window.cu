@@ -9,6 +9,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_window.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/kv_q2.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 
@@ -94,6 +95,16 @@ __global__ void __launch_bounds__(THREADS) window_write_batch_kernel(uint16_t* _
 
 // ---- restore: dequantize one element of a cell from the identity (un-resident) layout of the bulk pools ----
 
+// q2 (kv_q2.hpp): the 4-level Lloyd-Max dequantization `kv_gather_q2_kernel` writes with `v3level = false`, the
+// shipping setting for K and V, so a restored window holds exactly what the decode attention reads from the bulk.
+__device__ __forceinline__ float bulk_q2(const uint8_t* pool, long long row, int d) {
+    constexpr int BYTES = (256 / Q2_0) * sizeof(block_q2_0);
+    const block_q2_0* blk = reinterpret_cast<const block_q2_0*>(pool + row * BYTES) + d / Q2_0;
+    const int rem = d % Q2_0;
+    const int code = (blk->qs[rem >> 2] >> (2 * (rem & 3))) & 3;
+    return q2_lm4_level(code) * f32_from_f16(blk->d);
+}
+
 template <int KV_MODE>
 __device__ __forceinline__ float bulk_k(const QsaAttnPools& p, long long row, int d) {
     if constexpr (KV_MODE == 0) {
@@ -104,6 +115,8 @@ __device__ __forceinline__ float bulk_k(const QsaAttnPools& p, long long row, in
         const int rem = d % QK4_0;
         const int nib = rem < 16 ? (blk->qs[rem] & 0x0F) : (blk->qs[rem - 16] >> 4);
         return (float) (nib - 8) * __half2float(__ushort_as_half(blk->d));
+    } else if constexpr (KV_MODE == 4) {
+        return bulk_q2(p.k_q2, row, d);
     } else {
         const float sc = __half2float(__ushort_as_half(p.k_scale[row * (256 / KV_Q8_GROUP) + d / KV_Q8_GROUP]));
         return (float) p.k_q[row * 256 + d] * sc;
@@ -117,6 +130,8 @@ __device__ __forceinline__ float bulk_v(const QsaAttnPools& p, long long row, in
     } else if constexpr (KV_MODE == 1) {
         const float sc = __half2float(__ushort_as_half(p.v_scale[row * (256 / KV_Q8_GROUP) + d / KV_Q8_GROUP]));
         return (float) p.v_q[row * 256 + d] * sc;
+    } else if constexpr (KV_MODE == 4) {
+        return bulk_q2(p.v_q2, row, d);
     } else {   // modes 2 and 3: V is q4_0
         constexpr int BYTES = (256 / QK4_0) * sizeof(block_q4_0);
         const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * BYTES) + d / QK4_0;
@@ -197,6 +212,7 @@ void kv_window_restore(const KvWindowPools& w, const KvWindowShape& shape, const
             case 2: window_restore_kernel<2><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, 0); break;
             case 1: window_restore_kernel<1><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, 0); break;
             case 3: window_restore_kernel<3><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, 0); break;
+            case 4: window_restore_kernel<4><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, 0); break;
             default: window_restore_kernel<0><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, 0); break;
         }
     }
@@ -208,6 +224,7 @@ void kv_window_restore(const KvWindowPools& w, const KvWindowShape& shape, const
             case 2: window_restore_kernel<2><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, ws); break;
             case 1: window_restore_kernel<1><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, ws); break;
             case 3: window_restore_kernel<3><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, ws); break;
+            case 4: window_restore_kernel<4><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, ws); break;
             default: window_restore_kernel<0><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, ws); break;
         }
     }
