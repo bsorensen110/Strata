@@ -53,8 +53,15 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
     // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.
     //  q2 is the same case: kv_q2.hpp reuses q4_0's 256-point Hadamard unchanged, so a q2 state is always rotated.)
+    //
+    // q2 carries +8 as well, for the same reason in its own way: its 2-bit layout is PER CHANNEL (one fp16 scale
+    // per dimension per 32-cell group, kv_q2.hpp) and the per-token layout it replaced put the scale per 32
+    // values of one cell. Same 80 B per cell and head, same codebook, and not one byte of the payload means the
+    // same thing. A snapshot taken with the per-token layout (format 4) must never restore into per-channel
+    // pools (format 12), and the reverse; `conversation_kv_validate` compares this number and refuses.
     const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_q2 && !st.kv_hybrid ? 16 : 0;
-    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
+    const int q2_layout = st.kv_q2 ? 8 : 0;
+    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated + q2_layout, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
     using conversation_detail::product;
     if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
         !product(l.scales, {(uint64_t) cells, (uint64_t) g.n_head_kv,

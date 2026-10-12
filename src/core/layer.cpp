@@ -688,11 +688,21 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     static const bool ring_off = std::getenv("STRATA_KV_RING_OFF") != nullptr;
     static const bool main_off = std::getenv("STRATA_KV_MAIN_OFF") != nullptr;
     if (ring_cells > 0 ? ring_off : main_off) return p;
+    // q2's residency unit is a GROUP of 32/page_size = 8 pages (its per-channel scale is shared by the whole
+    // group, kv_stream.hpp), so the slot count is rounded up to whole groups and to at least one sweep step of
+    // them (the resolve block's 1,024 threads each look at one group). Every other format has unit 1 and is
+    // untouched by this.
+    const int64_t unit = g_kv_q2 ? (int64_t) strata::kernels::kv_stream_unit_blocks(s, strata::kernels::kKvQ2) : 1;
+    const int64_t unit_min = unit * 1024;
+    const auto round_unit = [unit, unit_min](int64_t r) {
+        r = ((r + unit - 1) / unit) * unit;
+        return unit == 1 ? r : std::max(r, unit_min);
+    };
     if (ring_cells > 0) {
-        const int64_t r = (ring_cells + s.page_size - 1) / s.page_size;
+        const int64_t r = round_unit((ring_cells + s.page_size - 1) / s.page_size);
         if (r < p.pages) { p.mode = 2; p.slots = r; p.pooled_rows = 2; }   // the drafter has no indexer
     } else {
-        const int64_t r = (std::max(g_kv_resident, qsa_kv_resident_min()) + s.page_size - 1) / s.page_size;
+        const int64_t r = round_unit((std::max(g_kv_resident, qsa_kv_resident_min()) + s.page_size - 1) / s.page_size);
         if (r < p.pages) { p.mode = 1; p.slots = r; }
     }
     return p;
@@ -931,7 +941,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     } else if (p.mode == 1) {
         strata::kernels::kv_stream_reset(st.map, nullptr);
     } else {
-        strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
+        // A q2 ring is a ring of slot GROUPS (kv_stream.hpp: kv_stream_unit_blocks), because a q2 group's 8
+        // pages share one per-channel scale. Every other format gets unit 1, i.e. `block % n_slots`.
+        strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr,
+                                       strata::kernels::kv_stream_unit_blocks(s, qsa_kv_format(st)));
     }
     cudaDeviceSynchronize();
     return c.used;
