@@ -223,3 +223,69 @@ Order from here:
 3. Keep the FP16 window and sinks carrying the recent and sink positions exactly.
 4. End-to-end suite on the real model: `q4_0` vs `q2` vs `q2`+window, exact-copy probes at 4K-131K.
 5. Only after 1-4: the entropy-coded 1.5-bit V, which buys 288 B/cell (7.1x) on top.
+
+## Why the published "near lossless at 2 bits" does not transfer to our numbers
+
+Checked against the sources (2026-10-12), not against summaries. What the papers actually specify:
+
+- **KIVI** (Liu et al., arXiv 2402.02750): key cache quantized **per-channel**, value cache **per-token**,
+  **asymmetric** quantization (`z = min(X)`, `s = (max-min)/(2^B-1)`), group size 32, and a **residual of 128
+  recent tokens kept in FP16**. Their "near-lossless" is perplexity/QA at 512-1024-token contexts with that
+  residual in place. The paper's own text says the fake 2-bit (K per-channel, V per-token) result is
+  "significantly worse" on hard generation tasks such as GSM8K.
+- **SKVQ** (Duanmu et al., arXiv **2405.06219**, COLM 2024 - not 2505.22301): **channel reordering** (a
+  transform-invariant permutation that groups channels with similar statistics), **clipped dynamic
+  quantization** (per-group min/max, dynamic, i.e. asymmetric with a zero-point), and a **sliding window of
+  recent tokens kept in high precision**. Headline: K 2-bit, V 1.5-bit, "almost no accuracy drop".
+- The 2-bit-K / 1-bit-V split (1.5-bit average) is **AsymKV** (Zhang et al., arXiv 2411.17034), not KIVI's
+  main configuration.
+
+Five reasons our measurement is worse than their claim, in the order they bite:
+
+1. **Our gate data cannot show the gain per-channel scaling exists to capture.** KIVI's whole per-channel
+   result rests on K having a few channels with far larger magnitude than the rest. The gate's cache is i.i.d.
+   Gaussian: every channel's RMS is the same number, so a per-channel scale has nothing to exploit. Our 2.8x
+   is a floor measured on data that is structurally blind to the mechanism.
+2. **We quantize a Hadamard-rotated cache; they do not.** Rotation equalizes channel variance - that is its
+   job for weight quantization - and it removes exactly the channel outliers KIVI's per-channel scaling
+   exploits. SKVQ's answer to the same problem is the opposite: reorder channels so similar ones group
+   together, keeping the structure. We are the only one of the three with the structure rotated away.
+3. **We are symmetric with no zero-point and no clipping.** Our block stores an fp16 RMS scale and a symmetric
+   Lloyd-Max codebook. KIVI and SKVQ both use asymmetric min/max with a zero-point, and SKVQ clips. On
+   outlier-heavy data, an RMS scale over a group is dominated by the outliers, so the non-outlier values get
+   the coarse end of a 4-level codebook.
+4. **Our scales are never joint.** KIVI applies per-channel to K and per-token to V *at the same time*. Our
+   formats pick one axis per tensor. Measured in the gate: K per-channel + V per-token at 2 bits is
+   **6.226% against the shipping symmetric per-channel 7.150%** (1.15x, same 160 B per cell and head).
+5. **Their bar is a window bar and a perplexity bar.** KIVI's 128-token FP16 residual and SKVQ's FP16 sliding
+   window carry the positions that dominate short-context perplexity, and perplexity hides the loss that
+   top-1 agreement and KL show. Our bar is 511 teacher-forced positions of KL/top-1 plus a 5K buried-fact
+   probe, which is stricter than what "near lossless" claims in those papers.
+
+What the asymmetric experiment settled (gate, same probe, bytes per cell and KV head):
+
+| arm | attention output | B |
+|---|---:|---:|
+| K 4-bit + V 2-bit per-channel | 4.768% | 224 |
+| K 2-bit per-channel + V 4-bit | 5.710% | 224 |
+| K per-channel + V per-token, both 2b | 6.226% | 160 |
+| K 2-bit + V 1-bit per-token | 7.057% | 114 |
+| K per-token + V per-channel, both 2b | 10.134% | 160 |
+| 1-bit both, per-channel | 8.106% | 96 |
+| q2 per-channel (ships) | 7.150% | 160 |
+| q4_0 | 2.052% | 288 |
+
+KIVI's placement findings reproduce on our rotated cache (K wants per-channel: per-token K is 1.42x worse; V
+wants per-token: 1.15x better than per-channel V). Asymmetry narrows the gap and does not close it - the best
+224 B arm is still 2.3x q4_0's error.
+
+Order from here, by expected gain per unit of work:
+
+1. **Real-cache statistics** (step 2 above) - without it every per-channel number stays a floor measured on
+   blind data, and the rotation question cannot be answered at all.
+2. **Asymmetric quantizer with a zero-point and clipping** in the gate, KIVI-style, measured against the
+   symmetric Lloyd-Max on that real data.
+3. **K per-channel + V per-token** as a format (measured 1.15x at identical bytes).
+4. **Window policy at the logit level**: sweep the FP16 window (128 -> 1024) in `kv_precision_compare.py`;
+   the papers' near-lossless is largely this device, and we have never measured its size.
+5. Channel reordering (SKVQ) as the alternative to rotation, if the real-cache dump shows the outliers.
