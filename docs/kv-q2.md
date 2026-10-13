@@ -528,6 +528,31 @@ ranks the formats.
 buys back the behavioral loss the 2-bit cache had, at 448 B per cell against q4_0's 576 and at 87% of
 q4_0's decode speed.
 
+### q2k under the engine's append patterns (after the PR #2318 review fixes)
+
+The device arm above appends all cells in one call - whole groups - which never runs the partial-group scale rule.
+The engine does: decode appends into the group a prompt ended in, speculative verify appends 2-5-cell windows
+through the batch path (each new group first written from 1-3 cells), and after a reused conversation prefix the
+2048-cell prefill chunk boundaries fall mid-group. `kv_q2_parity` now runs those patterns on the real dump
+(attention output vs FP16; "old" = the pre-fix kernel, which divided a fresh partial group's sum by 32):
+
+| layer | q4_0 | q2k one-shot | chunked (100-cell chunks) old -> new | spec verify (3-cell windows) old -> new | prompt + decode |
+|---|---:|---:|---:|---:|---:|
+| L3 | 0.888% | 1.910% | 3.631% -> 2.076% | 1.978% -> 1.912% | 1.910% |
+| L11 | 0.740% | 2.002% | 3.617% -> 2.727% | 2.030% -> 2.011% | 2.002% |
+| L23 | 0.941% | 2.211% | 3.767% -> 2.509% | 2.895% -> 2.667% | 2.211% |
+| L47 | 1.040% | 1.648% | 1.438% -> 1.346% | 1.457% -> 1.799% | 1.648% |
+| synthetic | 2.052% | 5.710% | 6.164% -> 5.859% | 5.710% -> 5.710% | 5.710% |
+
+- Prompt + decode lands exactly on the one-shot row (pinned).
+- The fix removes most of the chunk-boundary damage (L3 3.63% -> 2.08%, about 4.1x -> 2.3x q4_0's error) and cuts
+  the verify-window cost on L23 (+31% -> +21% over one-shot).
+- Not closed: a group first written from a few cells keeps that small-sample RMS for life - unbiased now, but
+  noisy (chunked +9..36%, verify up to +21% on L23). On the extreme-outlier layer 47 an undersized scale acts as
+  clipping and measures better, which is why the old kernel looks better there.
+- Real prefill chunks are 2048 cells, aligned from position 0, so the 100-cell chunked row is a stress case; the
+  verify row is what every speculative decode does at each group boundary.
+
 ## `--kv q2t`: the top-q lever shipped, and what it bought
 
 q2t gives the loudest quarter of K's channels a 16-level Lloyd-Max codebook (4-bit codes, 18 B per
