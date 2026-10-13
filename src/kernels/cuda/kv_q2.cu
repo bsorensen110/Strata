@@ -556,7 +556,7 @@ __global__ void kv_append_q2t_group_kernel(uint8_t* __restrict__ k_q2t, uint8_t*
     // The scale: q2's rule, word for word. A complete group is the RMS of its 32 values; a partial group keeps
     // the scale its slot already carries; a slot with no scale takes the RMS of the cells the call has, or for
     // a single-cell append the previous group's scale.
-    float s = sqrtf(ss * (1.0f / (float) Q2_0));
+    float s = sqrtf(ss * (1.0f / (float) n));
     bool fresh = false;
     if (n < Q2_0) {
         const float stored = q2t_scale_at(q2t_slot(sp, g, h, off, kv_heads, head_dim));
