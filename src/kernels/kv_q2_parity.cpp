@@ -546,6 +546,123 @@ void quant_kivi_topq_fixed(const float* x, int n_cells, int n_heads, int D, floa
     }
 }
 
+/// A FIXED Lloyd-Max codebook for L levels, fitted once from 1M Gaussian samples and shared by every group -
+/// the shippable form of an L-level channel (a per-group fit is an encoder ceiling when L approaches the
+/// sample count). Self-seeded and deterministic; runs to convergence (last move < 1e-5). cb ascending,
+/// thr the L-1 decision boundaries.
+void fit_lm_grid(int L, std::vector<float>& cb, std::vector<float>& thr) {
+    std::mt19937 rng(20260713u);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<float> samp((size_t) 1 << 20);
+    for (auto& x : samp) x = nd(rng);
+    std::sort(samp.begin(), samp.end());
+    cb.assign(L, 0.f);
+    for (int j = 0; j < L; ++j) cb[j] = -4.f + 8.f * (float) j / (float) (L - 1);
+    for (int it = 0; it < 500; ++it) {
+        double sum[64] = {0};
+        int cnt[64] = {0};
+        int j = 0;
+        for (const float x : samp) {
+            while (j + 1 < L && x > 0.5f * (cb[j] + cb[j + 1])) ++j;
+            sum[j] += (double) x;
+            cnt[j]++;
+        }
+        float delta = 0.f;
+        for (int m = 0; m < L; ++m) {
+            if (!cnt[m]) continue;
+            const float n = (float) (sum[m] / (double) cnt[m]);
+            delta = std::max(delta, std::fabs(n - cb[m]));
+            cb[m] = n;
+        }
+        if (delta < 1e-5f) break;
+    }
+    thr.assign(L - 1, 0.f);
+    for (int j = 0; j + 1 < L; ++j) thr[j] = 0.5f * (cb[j] + cb[j + 1]);
+}
+
+/// Per-channel FIXED-codebook quantization: every (channel, 32-cell group) quantizes against the same L-level
+/// grid scaled by the group's fp16-rounded RMS - the form a device kernel burns in. cb ascending, thr the
+/// L-1 boundaries between consecutive levels.
+void quant_per_channel_grid(const float* x, int n_cells, int n_heads, int D,
+                            const std::vector<float>& cb, const std::vector<float>& thr, float* out) {
+    const int stride = n_heads * D;
+    const int nthr = (int) thr.size();
+    for (int h = 0; h < n_heads; ++h)
+        for (int d = 0; d < D; ++d)
+            for (int g = 0; g < n_cells; g += 32) {
+                double ss = 0.0;
+                for (int i = 0; i < 32; ++i) {
+                    const float v = x[(size_t) (g + i) * stride + h * D + d];
+                    ss += (double) v * v;
+                }
+                const float s = (float) std::sqrt(ss / 32.0);
+                const float ds = k::f32_from_f16(k::f16_from_f32(s));
+                const float inv = s > 0.f ? 1.0f / s : 0.f;
+                for (int i = 0; i < 32; ++i) {
+                    const float a = x[(size_t) (g + i) * stride + h * D + d] * inv;
+                    int code = 0;
+                    while (code < nthr && a >= thr[code]) ++code;
+                    out[(size_t) (g + i) * stride + h * D + d] = cb[code] * ds;
+                }
+            }
+}
+
+/// The top-q K arm against FIXED grids: the loudest top_frac of channels per head quantize against loud_cb
+/// (loud_thr), the rest against the quiet grid - the shippable twin of quant_kivi_topq, whose per-group fit
+/// is an encoder ceiling. Both grids scale by the group's fp16-rounded RMS.
+void quant_topq_grid(const float* x, int n_cells, int n_heads, int D, float top_frac,
+                     const std::vector<float>& loud_cb, const std::vector<float>& loud_thr, float* out) {
+    const int stride = n_heads * D;
+    std::vector<float> rms((size_t) n_heads * D, 0.f);
+    for (int h = 0; h < n_heads; ++h)
+        for (int d = 0; d < D; ++d) {
+            double ss = 0.0;
+            for (int c = 0; c < n_cells; ++c) {
+                const float v = x[(size_t) c * stride + h * D + d];
+                ss += (double) v * v;
+            }
+            rms[(size_t) h * D + d] = (float) std::sqrt(ss / (double) n_cells);
+        }
+    const int nloud = (int) std::lround(top_frac * (double) D);
+    std::vector<float> tmpo(32);
+    for (int h = 0; h < n_heads; ++h) {
+        std::vector<float> sorted(rms.begin() + (size_t) h * D, rms.begin() + (size_t) (h + 1) * D);
+        std::sort(sorted.begin(), sorted.end());
+        const float thr = nloud > 0 ? sorted[(size_t) D - nloud] : 1e30f;
+        for (int d = 0; d < D; ++d) {
+            const bool loud = rms[(size_t) h * D + d] >= thr;
+            for (int g = 0; g < n_cells; g += 32) {
+                double ss = 0.0;
+                for (int i = 0; i < 32; ++i) {
+                    const float v = x[(size_t) (g + i) * stride + h * D + d];
+                    ss += (double) v * v;
+                }
+                const float s = (float) std::sqrt(ss / 32.0);
+                const float ds = k::f32_from_f16(k::f16_from_f32(s));
+                const float inv = s > 0.f ? 1.0f / s : 0.f;
+                for (int i = 0; i < 32; ++i) {
+                    const float a = x[(size_t) (g + i) * stride + h * D + d] * inv;
+                    if (loud) {
+                        int code = 0;
+                        while (code < (int) loud_thr.size() && a >= loud_thr[code]) ++code;
+                        out[(size_t) (g + i) * stride + h * D + d] = loud_cb[code] * ds;
+                    } else {
+                        tmpo[i] = 0.f;   // quiet path below uses the device lm4 via the existing helper
+                    }
+                }
+                if (!loud) {
+                    const float* src = x + (size_t) g * stride + h * D + d;
+                    for (int i = 0; i < 32; ++i) {
+                        const float v = src[(size_t) i * stride];
+                        const int code = k::q2_code_lm4(v, s);
+                        out[(size_t) (g + i) * stride + h * D + d] = k::q2_lm4_level(code) * ds;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The level bitmap quant_kivi_topq's rule IMPLIES, in the layout the device stores it in: per (KV head,
 /// dimension), bit set = loud, the loud set being the top `nloud` channels by RMS over `n_cells` cells with the
 /// threshold `sorted[D - nloud]` - the same ranking, the same `>=`, the same per-head split. The device's
@@ -1221,6 +1338,38 @@ int main() {
                 100 * r_k_t8_16, 100 * r_k_t4_16, 100 * r_k_t8_6, 100 * r_k_t4_6, 100 * r_k_kivi, 100 * r_k_6c);
     std::printf("  reference rows: q2c %.3f%% (160 B), q2k %.3f%% (%d B)\n",
                 100 * e_lm4, 100 * e_k2v4_dev, B2 + B4);
+
+    // ---- THE LOW-BYTE COMBOS: K2V2 is the shipping q2 (320 B/cell); the question is what K2.5 and V1.5 buy.
+    // Every arm here uses FIXED codebooks (the form a format ships): a converged 1M-sample Lloyd-Max grid per
+    // level count, scaled by the group's fp16-rounded RMS. No per-group fits - the top-q section showed those
+    // are an encoder ceiling. V1.5's byte accounting is stated both ways: 3 levels at 2-bit storage (80 B per
+    // cell and head, same bytes as 4-level) and tight 5-trits-per-byte packing (3^5 = 243 <= 256, 7 B of codes
+    // per 32 values, 72 B).
+    std::vector<float> cb6, thr6, cb3, thr3;
+    fit_lm_grid(6, cb6, thr6);
+    fit_lm_grid(3, cb3, thr3);
+    std::vector<float> h_k25c(Kref.size()), h_v3c(Vref.size());
+    quant_topq_grid(Kref.data(), N, H, D, 0.25f, cb6, thr6, h_k25c.data());    // K 2.5-bit: loud 1/4 at 6 levels
+    quant_per_channel_grid(Vref.data(), N, H, D, cb3, thr3, h_v3c.data());     // V 1.5-bit: 3 levels per-channel
+    const double r_k25c = rel_rms(h_k25c, Kref), r_v3c = rel_rms(h_v3c, Vref);
+    std::vector<float> out_k25_v3, out_k2_v3, out_k25_v2;
+    attention(q, h_k25c, h_v3c, D, cells, out_k25_v3);
+    attention(q, h_k_kivi, h_v3c, D, cells, out_k2_v3);
+    attention(q, h_k25c, h_v_kivi, D, cells, out_k25_v2);
+    const double e_k25_v3 = out_err(out_k25_v3, out_ref, Vref);
+    const double e_k2_v3 = out_err(out_k2_v3, out_ref, Vref);
+    const double e_k25_v2 = out_err(out_k25_v2, out_ref, Vref);
+    std::printf("\n  low-byte combos (attention output; FIXED grids; bytes per cell and KV head):\n");
+    std::printf("  %-30s %7.3f%%  %4d B   K2c + V3c (V1.5 at 2-bit storage / 72 B tight-trit)\n",
+                "K2c + V3c", 100 * e_k2_v3, 160);
+    std::printf("  %-30s %7.3f%%  %4d B   K 2.5-bit (loud 1/4 at 6 levels) + V3c\n",
+                "K2.5c + V3c", 100 * e_k25_v3, 168);
+    std::printf("  %-30s %7.3f%%  %4d B   K 2.5-bit + V 2-bit per-channel\n",
+                "K2.5c + V2c", 100 * e_k25_v2, 168);
+    std::printf("  per element: K2.5c %.3f%% (4-level %.3f%%), V3c %.3f%% (4-level %.3f%%)\n",
+                100 * r_k25c, 100 * r_k_kivi, 100 * r_v3c, 100 * r_v_kivi);
+    std::printf("  reference rows: q2c %.3f%% (160 B), q2k %.3f%% (%d B), q4_0 %.3f%% (%d B)\n",
+                100 * e_lm4, 100 * e_k2v4_dev, B2 + B4, 100 * e_q4, 2 * B4);
 
     // ==================== THE q2t DEVICE ARM (`--kv q2t`) ====================
     //
