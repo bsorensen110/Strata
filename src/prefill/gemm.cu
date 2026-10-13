@@ -217,6 +217,16 @@ std::unique_ptr<HipLtState> create_hipblaslt_state(void* workspace, size_t works
     }
     std::fprintf(stderr, "prefill gemm: hipBLASLt tuning enabled (%zu rows, %s, version %d)\n",
                  state->table.rows().size(), arch.c_str(), version);
+    // The token window decides which token counts a row may answer (hipblaslt_window.hpp).  Said once, here:
+    // the forced-off case changes which rows the prefill route can use at all.
+    const double window = strata::prefill::hipblaslt::token_window();
+    if (window > 0.0) {
+        std::fprintf(stderr, "prefill gemm: hipBLASLt token window %.3gx (%s)\n", window,
+                     strata::prefill::hipblaslt::token_window_source());
+    } else {
+        std::fprintf(stderr, "prefill gemm: hipBLASLt token window off (%s): the nearest row answers any token count\n",
+                     strata::prefill::hipblaslt::token_window_source());
+    }
     return state;
 }
 

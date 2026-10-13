@@ -62,6 +62,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/hipblaslt_window.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
@@ -2497,6 +2498,9 @@ int main(int argc, char** argv) {
     if (kv_rot != nullptr && kv_rot[0] == '1' && o.kv == "int8")
         std::fprintf(stderr, "strata generate: STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation (opt-in)\n");
     strata::core::qsa_set_kv_hybrid(o.kv == "k8v4");   // K8V4: INT8 K + rotated Q4_0 V, 816 B/cell
+    // A KV cache below int8/q8 (q4_0, k8v4) forces the hipBLASLt token window off, STRATA_HIPBLASLT_WINDOW
+    // included: the nearest tuned row answers whatever the call (hipblaslt_window.hpp).
+    strata::prefill::hipblaslt::set_low_precision_kv(o.kv == "q4_0" || o.kv == "k8v4");
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
         return 2;

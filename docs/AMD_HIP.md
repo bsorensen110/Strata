@@ -551,6 +551,18 @@ The file's second line names the architecture and version (`STRATA_HIPBLASLT_TUN
 as `tools/hip/<arch>-hipblaslt-<version>.txt` for setup, or point `STRATA_HIPBLASLT_TUNING` at it. Compare the
 prompt speed with and without it before keeping it.
 
+A row answers a call only inside a window around the bucket it was measured at: a factor of two, so a bucket the
+tuner dropped is not answered by a row measured 25x away (that measured slower than hipBLASEx), and a call
+outside every row's window runs plain hipBLASEx. Two knobs move that window. `STRATA_HIPBLASLT_WINDOW=<factor>`
+sets the factor; `0`, a negative value, `off`, `none` or `no` remove the window entirely, so the nearest row of
+the shape answers whatever the token count, and an unparsable value keeps the measured 2x default rather than
+opening the table wide. Separately, a KV cache below int8/q8 (`--kv q4_0`, and `--kv k8v4`, whose cells carry
+4-bit codes - 816 B/cell against int8's 1056) forces the window off whatever the variable says, since the
+extrapolation the window guards against was measured on the wider caches. The engine says which at start-up:
+`prefill gemm: hipBLASLt token window 2x (default)`, `... token window 4x (STRATA_HIPBLASLT_WINDOW)` or
+`... token window off (KV cache below int8/q8): the nearest row answers any token count`. `hipblaslt_window_test`
+covers the default, both directions of the variable and the forced case, synthetic tables and no GPU.
+
 Shipped tables:
 
 - `gfx1100-hipblaslt-100100.txt`, `gfx1100-hipblaslt-100200.txt`: RX 7900 XTX.

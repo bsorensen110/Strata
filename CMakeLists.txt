@@ -261,8 +261,14 @@ if(STRATA_BUILD_TESTS)
   # the hipBLASLt tuning header's architecture gate: RDNA4 siblings share solution IDs, RDNA3 siblings share
   # theirs, cross-family pairs and version mismatches stay rejected (synthetic tables: no model, no GPU)
   add_executable(tuning_header_arch_family_test tests/prefill/tuning_header_arch_family_test.cpp)
-  target_include_directories(tuning_header_arch_family_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
+  target_include_directories(tuning_header_arch_family_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill" include)
   add_test(NAME tuning_header_arch_family_test COMMAND tuning_header_arch_family_test)
+
+  # the tuning table's token window: the measured 2x default, STRATA_HIPBLASLT_WINDOW (0/off removes it), and the
+  # forced-off case for a KV cache below int8/q8 (q4_0, k8v4) that the variable cannot reopen (no model, no GPU)
+  add_executable(hipblaslt_window_test tests/prefill/hipblaslt_window_test.cpp)
+  target_include_directories(hipblaslt_window_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill" include)
+  add_test(NAME hipblaslt_window_test COMMAND hipblaslt_window_test)
 
   # A parity-passing P4 candidate may not bypass the staged implementation's own reference check (no GPU).
   add_executable(fused_gr_p4_policy_test tests/kernels/fused_gr_p4_policy_test.cpp)
@@ -701,7 +707,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     list(APPEND _strata_hip_tests hip_prompt_attn_wmma)
     if(STRATA_HIPBLASLT_AVAILABLE AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/prefill_hipblaslt_gemm.cpp")
       add_executable(hip_prefill_hipblaslt_gemm tests/hip/prefill_hipblaslt_gemm.cpp)
-      target_include_directories(hip_prefill_hipblaslt_gemm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
+      target_include_directories(hip_prefill_hipblaslt_gemm PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill" include)
       target_link_libraries(hip_prefill_hipblaslt_gemm PRIVATE strata_prefill strata_hip_runtime roc::hipblaslt roc::hipblas)
       add_test(NAME hip_prefill_hipblaslt_gemm COMMAND hip_prefill_hipblaslt_gemm)
       set_tests_properties(hip_prefill_hipblaslt_gemm PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
