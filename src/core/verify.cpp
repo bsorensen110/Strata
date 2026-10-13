@@ -1134,15 +1134,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // the per-token GEMVs / norms / RoPEs / copies of this layer as one launch over the
                 // window's rows each - row-wise identical arithmetic (STRATA_DEC_BATCH=0: token by token)
                 // STRATA_DF_QB_Q4 (opt-in: STRATA_DF_QB_Q4=1): a Q4_0 KV cache too - its one per-token extra, the query's rotation, is
-                // row-wise and the batched path rotates (270650e); 0: Q4_0 token by token, as before.  q2 is the same
-                // case for the same reason - it rotates K, V and the query (kv_q2.hpp reuses q4_0's Hadamard), so the
-                // gate treats it exactly as it treats Q4_0 and STRATA_DF_QB_Q4 opts both in.
+                // row-wise and the batched path rotates (270650e); 0: Q4_0 token by token, as before.  q2, q2k and q2t are the
+                // same case for the same reason - they rotate K, V and the query (kv_q2.hpp reuses q4_0's Hadamard), so the
+                // gate treats them exactly as it treats Q4_0 and STRATA_DF_QB_Q4 opts all of them in.
                 static const bool qb_q4 = [] {
                     const char* e = std::getenv("STRATA_DF_QB_Q4");
                     return e != nullptr && std::atoi(e) != 0;
                 }();
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() &&
-                                ((!st.kv_q4 && !st.kv_q2 && !st.kv_q2k) || qb_q4);
+                                ((!st.kv_q4 && !st.kv_q2 && !st.kv_q2k && !st.kv_q2t) || qb_q4);
                 if (!q8_attn) native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 // STRATA_DF_BRANCH: the query side (q and its norm/RoPE/rotation on side 0, the indexer query on side 1)
                 // beside the K/V side; the indexer query joins before the block scores, the query before attention
@@ -1198,6 +1198,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                            kc_b, kc_b, (int) (NKV * HD), n, s, cs, mirror ? &hk : nullptr);
                         kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, n, vc_b, vc_b, s, cs,
                                            mirror ? &hv : nullptr);
+                    } else if (st.kv_q2t) {   // q2t: K through the q2t group kernel (whole groups plain, the
+                        // batch's tail through the word-masked atomics - 2 bits for a quiet cell, 4 for a loud
+                        // one), V through the q4 batch kernel. One plane each, by the hybrid fold, and the
+                        // frozen level map travels with the K call.
+                        const KvHostPools hk = kv_q2t_k_half(st.host), hv = kv_q2k_v_half(st.host);
+                        const bool mirror = st.host.present();
+                        const KvLevelMap lm{st.kv_levels, st.kv_level_off, st.kv_level_frozen};
+                        strata::kernels::kv_append_q2t_steps(st.k_q2, st.k_q2, st.page_table, step_b, kStepCount, n,
+                                                             kc_b, kc_b, s, cs, mirror ? &hk : nullptr, lm);
+                        kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, n, vc_b, vc_b, s, cs,
+                                           mirror ? &hv : nullptr);
                     } else if (st.kv_q2k) {   // q2k: K through the q2 group kernel (whole groups plain, the batch's
                         // tail through the word-masked atomics), V through the q4 batch kernel. One plane each, by
                         // the hybrid fold (the same pool and the same tensor twice) - layer.cpp's decode arm.
@@ -1238,6 +1249,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         const bool mirror = st.host.present();   // streamed: the host copy too
                         kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t,
                                           kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs, mirror ? &hk : nullptr);
+                        kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
+                                          vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
+                    } else if (st.kv_q2t) {   // q2t, one cell: the q2t partial-group atomic path for K (the
+                        // channel's class decides the code width and the plane), the q4 append for V
+                        const KvHostPools hk = kv_q2t_k_half(st.host), hv = kv_q2k_v_half(st.host);
+                        const bool mirror = st.host.present();
+                        const KvLevelMap lm{st.kv_levels, st.kv_level_off, st.kv_level_frozen};
+                        strata::kernels::kv_append_q2t_step(st.k_q2, st.k_q2, st.page_table, step_t,
+                                                            kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs,
+                                                            mirror ? &hk : nullptr, lm);
                         kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vcur_ + t * NKV * HD,
                                           vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
                     } else if (st.kv_q2k) {   // q2k, one cell: the q2 partial-group atomic path for K, the q4

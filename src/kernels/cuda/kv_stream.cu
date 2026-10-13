@@ -60,6 +60,15 @@ Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const 
         r.src[0] = (const uint8_t*) host.k_q2; r.dst[0] = (uint8_t*) slots.k_q2; r.len[0] = bytes;
         r.src[1] = (const uint8_t*) host.v_q2; r.dst[1] = (uint8_t*) slots.v_q2; r.len[1] = bytes;
         r.n = 2;
+    } else if (fmt == kKvQ2T) {  // q2t (`--kv q2t`): K's mixed-level per-channel run (the quiet slots and the
+                                 // loud slots live in the SAME (group, head) block, quiet first, so a group's
+                                 // K bytes are one contiguous run) and V's q4_0 run, in ONE unit of
+                                 // blocks_per_unit() blocks - the q2 group, whose scale both planes share.
+        const int kb = rows * (int) kv_q2t_bytes_per_head((int) s.head_dim) * r.unit;
+        const int vb = rows * (int) kv_q4_bytes_per_head((int) s.head_dim) * r.unit;
+        r.src[0] = (const uint8_t*) host.k_q2; r.dst[0] = (uint8_t*) slots.k_q2; r.len[0] = kb;
+        r.src[1] = (const uint8_t*) host.v_q4; r.dst[1] = (uint8_t*) slots.v_q4; r.len[1] = vb;
+        r.n = 2;
     } else if (fmt == kKvQ2K) {  // q2k (`--kv q2k`): K's q2 per-channel run and V's q4_0 run, in ONE unit of
                                  // blocks_per_unit() blocks. The unit is the q2 group, because K's scale is shared
                                  // by it (see blocks_per_unit); V's run is 8 self-contained q4_0 blocks per head,
@@ -251,6 +260,10 @@ uint64_t kv_block_bytes(const QsaShapes& s, int fmt) {
     // q2k: K's 80 B per cell and head + V's 144 = 224, 448 per cell for 2 KV heads (q2: 320, q4_0: 576)
     if (fmt == kKvQ2K)
         return rows * (kv_q2_bytes_per_head((int) s.head_dim) + kv_q4_bytes_per_head((int) s.head_dim));
+    // q2t: K's 96 B per cell and head (192 quiet slots of 10 B + 64 loud slots of 18 B per 32-cell group) +
+    // V's 144 = 240, 480 per cell for 2 KV heads
+    if (fmt == kKvQ2T)
+        return rows * (kv_q2t_bytes_per_head((int) s.head_dim) + kv_q4_bytes_per_head((int) s.head_dim));
     return fmt == kKvInt8 ? rows * (uint64_t) s.head_dim * 2 + rows * (uint64_t) (s.head_dim / KV_Q8_GROUP) * 2 * 2
                 : rows * (uint64_t) s.head_dim * 2 * 2;
 }

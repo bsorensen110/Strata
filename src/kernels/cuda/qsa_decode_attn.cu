@@ -106,6 +106,40 @@ __device__ __forceinline__ void load8_q2(const QsaAttnPools& p, bool value, long
 #pragma unroll
     for (int k = 0; k < 8; ++k) out[k] = q2_lm4_level((bytes[10 * k] >> shift) & 3) * d;
 }
+// q2t (kv_q2.hpp): the K side of `--kv q2t`, per-channel with the level split. Eight consecutive dimensions
+// are eight slots that may sit in DIFFERENT PLANES: a quiet channel's slot is the q2 slot (10 B, the code at
+// 2*(idx%4) of qs[idx/4], the lm4 codebook), a loud one's is the loud plane's (18 B, the code at 4*(idx%2) of
+// qs[idx/2], the lm16 codebook). The class and the slot's offset inside the (group, head) block come from the
+// frozen level map - one __ldg each, so the reader scans no bits - and `d0` is a multiple of 8, so the eight
+// dims of one lane always fall in one bitmap word.
+//
+// MODE 6 IS A K-SIDE MODE. It names the pool the K side uses; the V side of a q2t cache is q4_0, so the pair
+// is (6, 2) and no instantiation ever calls this with value = true.
+__device__ __forceinline__ void load8_q2t(const QsaAttnPools& p, long long row, int d0, float* out, int kv_heads,
+                                          int page_size) {
+    const long long slot_page = row / ((long long) kv_heads * page_size);
+    const long long cell = slot_page * page_size + (row % page_size);
+    const int h = (int) ((row / page_size) % kv_heads);
+    const int words = HD / 32;
+    const long long g = cell / Q2_0;
+    const int idx = (int) (cell % Q2_0);
+    const int qbyte = idx >> 2, qshift = 2 * (idx & 3);
+    const int lbyte = idx >> 1, lshift = 4 * (idx & 1);
+    const uint8_t* base = p.k_q2t + (size_t) (((long long) g * kv_heads + h) * (long long) q2t_block_bytes(HD));
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int d = d0 + k;
+        const uint8_t* slot = base + (int) __ldg(p.k_level_off + h * HD + d);
+        const uint32_t bit = __ldg(p.k_levels + h * words + (d >> 5));
+        if ((bit >> (d & 31)) & 1u) {
+            const int code = (slot[2 + lbyte] >> lshift) & 0xF;
+            out[k] = q2_lm16_level(code) * q2t_scale_at(slot);
+        } else {
+            const int code = (slot[2 + qbyte] >> qshift) & 3;
+            out[k] = q2_lm4_level(code) * q2t_scale_at(slot);
+        }
+    }
+}
 template <int MODE>
 __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long long row, int d0, float* out,
                                       int kv_heads, int page_size) {
@@ -124,6 +158,7 @@ __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long lo
         if (value) load8_q4(p, value, row, d0, out);
         else load8_q8(p, value, row, d0, out);
     } else if constexpr (MODE == 4) load8_q2(p, value, row, d0, out, kv_heads, page_size);
+    else if constexpr (MODE == 6) load8_q2t(p, row, d0, out, kv_heads, page_size);
     else load8_q4(p, value, row, d0, out);
 }
 
@@ -342,13 +377,13 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __rest
 }
 
 // The (K side, V side) pairs this file instantiates a kernel for: fp16 (0,0), int8 (1,1), q4_0 (2,2), q2 (4,4),
-// K8V4 (1,2) and q2k (4,2). A pair outside this list is a cache the engine does not build - a K/q4 + V/q2
-// state, say - and sending it to the nearest pair would read a pool the state never carved (a null V pool, or
-// V's q4_0 bytes as 2-bit slots). Named and refused, not guessed at.
+// K8V4 (1,2), q2k (4,2) and q2t (6,2). A pair outside this list is a cache the engine does not build - a K/q4 +
+// V/q2 state, say - and sending it to the nearest pair would read a pool the state never carved (a null V pool,
+// or V's q4_0 bytes as 2-bit slots). Named and refused, not guessed at.
 bool attn_modes_supported(int k_mode, int v_mode) {
     switch (k_mode * 8 + v_mode) {
         case 0 * 8 + 0: case 1 * 8 + 1: case 2 * 8 + 2: case 4 * 8 + 4:
-        case 1 * 8 + 2: case 4 * 8 + 2:
+        case 1 * 8 + 2: case 4 * 8 + 2: case 6 * 8 + 2:
             return true;
         default:
             return false;
@@ -701,7 +736,7 @@ bool pre75_attn() {
 #endif
 }
 // The chunk kernel for one (K side, V side) mode pair. Every format names both halves, so the pair is the
-// dispatch key: (0,0) fp16, (1,1) int8, (2,2) q4_0, (4,4) q2, (1,2) K8V4, (4,2) q2k.
+// dispatch key: (0,0) fp16, (1,1) int8, (2,2) q4_0, (4,4) q2, (1,2) K8V4, (4,2) q2k, (6,2) q2t.
 #if defined(__HIPCC__)
 #define STRATA_ATTN_CHUNK(KM, VM) (pre75_attn() ? attn_chunk_kernel_pre75<KM, VM, 8, true> : attn_chunk_kernel<KM, VM>)
 #else
@@ -722,12 +757,13 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         std::exit(1);
     }
     // THE TWO SIDES, READ OFF THE POOLS. A mixed-width cache has a format per side, so the mode is a pair and
-    // each half is derived from the pointer that side's pool carries: 4 = q2 per-channel (kv_q2.hpp), 2 = q4_0
-    // (kv_q4.hpp), 1 = int8, 0 = fp16. qsa_attn_pools fills exactly the pointers a format uses, so a q2k state
-    // (k_q2 set, v_q2 null, v_q4 set) reads as (4, 2) and a q2 state as (4, 4) - the pairs are what the pools
+    // each half is derived from the pointer that side's pool carries: 6 = q2t's mixed-level per-channel K
+    // (kv_q2.hpp), 4 = q2 per-channel, 2 = q4_0 (kv_q4.hpp), 1 = int8, 0 = fp16. qsa_attn_pools fills exactly
+    // the pointers a format uses, so a q2k state (k_q2 set, v_q2 null, v_q4 set) reads as (4, 2), a q2t state
+    // (k_q2t + the level map set, v_q4 set) as (6, 2) and a q2 state as (4, 4) - the pairs are what the pools
     // say, not a guess from one side. K8V4, which used to be the single mode 3, is (1, 2): its K is INT8 and
     // its V is Q4_0, which is what its pools are.
-    const int k_mode = pools.k_q2 != nullptr ? 4 : (pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr ? 1 : 0));
+    const int k_mode = pools.k_q2t != nullptr ? 6 : (pools.k_q2 != nullptr ? 4 : (pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr ? 1 : 0)));
     const int v_mode = pools.v_q2 != nullptr ? 4 : (pools.v_q4 != nullptr ? 2 : (pools.v_q != nullptr ? 1 : 0));
     if (!attn_modes_supported(k_mode, v_mode)) {
         std::fprintf(stderr, "qsa_decode_attn_batch: KV pool pair (K %d, V %d) is not a format this build has a "
@@ -763,7 +799,8 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
                          part_l, n_chunks
 #define STRATA_ATTN_LC(KM, VM) attn_chunk_kernel<KM, VM, true><<<grid, THREADS, 0, st>>>(STRATA_ATTN_ARGS, (int) cap, stride)
     if (lane_cell) {
-        if (k_mode == 4) { if (v_mode == 2) STRATA_ATTN_LC(4, 2); else STRATA_ATTN_LC(4, 4); }
+        if (k_mode == 6) STRATA_ATTN_LC(6, 2);
+        else if (k_mode == 4) { if (v_mode == 2) STRATA_ATTN_LC(4, 2); else STRATA_ATTN_LC(4, 4); }
         else if (k_mode == 2) STRATA_ATTN_LC(2, 2);
         else if (k_mode == 1) { if (v_mode == 2) STRATA_ATTN_LC(1, 2); else STRATA_ATTN_LC(1, 1); }
         else STRATA_ATTN_LC(0, 0);
@@ -800,8 +837,10 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     } else
 #endif
     // The (K side, V side) pair decides the instantiation. A mixed pair is one of the pairs, named the way the
-    // single-format ones are: (1, 2) is K8V4, (4, 2) is q2k.
-    if (k_mode == 4 && v_mode == 2)
+    // single-format ones are: (1, 2) is K8V4, (4, 2) is q2k, (6, 2) is q2t.
+    if (k_mode == 6 && v_mode == 2)
+        STRATA_ATTN_CHUNK(6, 2)<<<grid, THREADS, 0, st>>>(STRATA_ATTN_ARGS, (int) cap, stride);
+    else if (k_mode == 4 && v_mode == 2)
         STRATA_ATTN_CHUNK(4, 2)<<<grid, THREADS, 0, st>>>(STRATA_ATTN_ARGS, (int) cap, stride);
     else if (k_mode == 4)
         STRATA_ATTN_CHUNK(4, 4)<<<grid, THREADS, 0, st>>>(STRATA_ATTN_ARGS, (int) cap, stride);
@@ -836,10 +875,12 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     }
     // The same pair as the batch path, and the same guard stated per side: a mixed cache must have BOTH of its
     // halves present, which is the check that catches a q2k state whose V pool was never carved (the old guard
-    // could not see that one - it looked at one mode for the whole cache).
-    const int k_mode = pools.k_q2 != nullptr ? 4 : (pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr ? 1 : 0));
+    // could not see that one - it looked at one mode for the whole cache). q2t's K side needs its level map
+    // with it: a pool with no bitmap would read every channel as quiet, which is a q2 read of a q2t pool.
+    const int k_mode = pools.k_q2t != nullptr ? 6 : (pools.k_q2 != nullptr ? 4 : (pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr ? 1 : 0)));
     const int v_mode = pools.v_q2 != nullptr ? 4 : (pools.v_q4 != nullptr ? 2 : (pools.v_q != nullptr ? 1 : 0));
-    const bool k_ok = k_mode == 4 ? (pools.k_q2 != nullptr)
+    const bool k_ok = k_mode == 6 ? (pools.k_q2t != nullptr && pools.k_levels != nullptr && pools.k_level_off != nullptr)
+                    : k_mode == 4 ? (pools.k_q2 != nullptr)
                     : k_mode == 2 ? (pools.k_q4 != nullptr)
                     : k_mode == 1 ? (pools.k_q != nullptr && pools.k_scale != nullptr)
                                   : (pools.k_pool != nullptr);
@@ -861,7 +902,8 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     cudaStream_t st = (cudaStream_t) stream;
 #define STRATA_ATTN_STEP(KM, VM) STRATA_ATTN_CHUNK(KM, VM)<<<grid, THREADS, 0, st>>>( \
     q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, 0, 0)
-    if (k_mode == 4 && v_mode == 2) STRATA_ATTN_STEP(4, 2);
+    if (k_mode == 6 && v_mode == 2) STRATA_ATTN_STEP(6, 2);
+    else if (k_mode == 4 && v_mode == 2) STRATA_ATTN_STEP(4, 2);
     else if (k_mode == 4) STRATA_ATTN_STEP(4, 4);
     else if (k_mode == 2) STRATA_ATTN_STEP(2, 2);
     else if (k_mode == 1 && v_mode == 2) STRATA_ATTN_STEP(1, 2);

@@ -877,6 +877,15 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
                               // V mode 2), the pair the fused attention uses for this format.
         st.k_q2 = o.take<uint8_t>(rows * strata::kernels::kv_q2_bytes_per_head((int) s.head_dim), ok);
         st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+    } else if (q0.kv_q2t) {   // q2t: the staging pool is the identity layout, so the same two runs the state
+                              // carves - K at the q2t width (96 B per cell and head), V at the q4_0 one - and
+                              // the state's own level map, which is what places a channel's slot in this copy
+                              // too. pools_of() then reads (K mode 6, V mode 2), the pair the fused attention
+                              // uses for this format.
+        st.k_q2 = o.take<uint8_t>(rows * strata::kernels::kv_q2t_bytes_per_head((int) s.head_dim), ok);
+        st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+        st.k_levels = q0.kv_levels;
+        st.k_level_off = q0.kv_level_off;
     } else if (q0.kv_q4) {
         st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
         st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
@@ -898,6 +907,11 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
     p.k_q4 = h.k_q4; p.v_q4 = h.v_q4;
     p.k_q2 = h.k_q2; p.v_q2 = h.v_q2;   // q2 (kv_q2.hpp): take_stage() carves them, so the readers must see them
+    // q2t (kv_q2.hpp): the staging pool carries the level map, and a pool that carries it IS a q2t pool - the
+    // K side reads as mode 6, with the bitmap and the offsets it needs to place each channel's slot.
+    p.k_q2t = h.k_levels != nullptr ? h.k_q2 : nullptr;
+    p.k_levels = h.k_levels;
+    p.k_level_off = h.k_level_off;
     p.page_table = table;
     return p;
 }
@@ -1497,7 +1511,20 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             strata::kernels::fwht256_inplace_cuda(Kc, nb * g.n_head_kv, m.cs);
             strata::kernels::fwht256_inplace_cuda(Vc, nb * g.n_head_kv, m.cs);
         }
-        if (st.kv_q2k) {   // q2k (the drafter's ring in --kv q2k): K through the q2 group kernel - whole groups
+        if (st.kv_q2t) {   // q2t (the drafter's ring in --kv q2t): K through the q2t group kernel with the
+            // bitmap frozen from the ring's own first prompt batch (the ring state is a state of its own, so it
+            // freezes on its own first chunk - the same rule as the main layers), V through the q4 prompt
+            // kernel, each half folded onto its own pool as the hybrid and q2k arms do.
+            const strata::kernels::KvHostPools hk = strata::kernels::kv_q2t_k_half(st.host),
+                                               hv = strata::kernels::kv_q2k_v_half(st.host);
+            const bool mirror = st.host.present();
+            const strata::kernels::KvLevelMap lm{st.kv_levels, st.kv_level_off, st.kv_level_frozen};
+            strata::kernels::kv_append_q2t(st.k_q2, st.k_q2, st.page_table, c0, nb, Kc, Kc, s, m.cs,
+                                           mirror ? &hk : nullptr, nullptr, lm, /*freeze*/ true);
+            strata::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, c0, nb, Vc, Vc, s, m.cs,
+                                          mirror ? &hv : nullptr, nullptr);
+        }
+        else if (st.kv_q2k) {   // q2k (the drafter's ring in --kv q2k): K through the q2 group kernel - whole groups
             // plain, the chunk's first and last group through the atomics - and V through the q4 prompt kernel,
             // each called with its pool and tensor twice (the hybrid fold: the q4 prompt kernel launches both of
             // its planes, so a null second pool is not an option here, and the duplicate write is what the
@@ -1516,7 +1543,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
             strata::kernels::kv_append_q2(st.k_q2, st.v_q2, st.page_table, c0, nb, Kc, Vc, s, m.cs, &st.host,
                                           nullptr, /*v3level*/ false);
         }
-        if (st.kv_q4 || st.kv_q2 || st.kv_q2k) {
+        if (st.kv_q4 || st.kv_q2 || st.kv_q2k || st.kv_q2t) {
             // the FP16 sliding window + attention sinks (kv_window.hpp); the drafter's ring state has none
             if (st.k_win != nullptr)
                 strata::kernels::kv_window_write_batch(
@@ -2785,7 +2812,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             strata::kernels::fwht256_inplace_cuda(m.Kc, T * 2, m.cs);
                             strata::kernels::fwht256_inplace_cuda(m.Vc, T * 2, m.cs);
                         }
-                        if (st.kv_q2k) {   // q2k: K on the q2 group path (whole groups plain, the chunk's first
+                        if (st.kv_q2t) {   // q2t: K on the q2t group path (whole groups plain, the chunk's first
+                            // and last group on the atomics), V on the q4_0 prompt path. `freeze` is on for
+                            // every chunk: the freeze kernel returns at once once the bitmap exists, so the
+                            // first chunk of the prompt takes the classes and the rest of the session reads
+                            // them (kv_q2.cu, "THE FREEZE").
+                            const strata::kernels::KvHostPools hk = strata::kernels::kv_q2t_k_half(st.host),
+                                                               hv = strata::kernels::kv_q2k_v_half(st.host),
+                                                               sk = strata::kernels::kv_q2t_k_half(m.stage),
+                                                               sv = strata::kernels::kv_q2k_v_half(m.stage);
+                            const bool mirror = st.host.present();
+                            const strata::kernels::KvLevelMap lm{st.kv_levels, st.kv_level_off,
+                                                                 st.kv_level_frozen};
+                            strata::kernels::kv_append_q2t(st.k_q2, st.k_q2, st.page_table, p0, T, m.Kc, m.Kc, s,
+                                                          m.cs, mirror && !host_by_dma ? &hk : nullptr,
+                                                          staged ? &sk : nullptr, lm, /*freeze*/ true);
+                            strata::kernels::kv_append_q4(st.v_q4, st.v_q4, st.page_table, p0, T, m.Vc, m.Vc, s,
+                                                          m.cs, mirror && !host_by_dma ? &hv : nullptr,
+                                                          staged ? &sv : nullptr);
+                        }
+                        else if (st.kv_q2k) {   // q2k: K on the q2 group path (whole groups plain, the chunk's first
                             // and last group on the atomics), V on the q4_0 prompt path. Each half writes its own
                             // pool, its own part of the host copy and its own part of the staging pool - the
                             // halves kv_q2k_*_half are the shape of, and the same fold the hybrid arm above uses.

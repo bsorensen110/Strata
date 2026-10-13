@@ -239,6 +239,25 @@ struct QsaState {
     /// `qsa_kv_format()` answers kKvQ2K. A reader told "q2" would read V's 18-byte q4_0 blocks as 10-byte
     /// per-channel slots; one told "q4" would read K's slots as blocks. Both are silent.
     bool kv_q2k = false;
+    /// MIXED LEVEL `--kv q2t` (kv_q2.hpp): K on the q2 per-channel path with the LOUD CHANNELS AT 16 LEVELS -
+    /// the loudest head_dim/4 channels of each KV head, ranked by RMS over the FIRST prefill batch and frozen,
+    /// carry 4-bit codes against a 16-level Gaussian Lloyd-Max codebook in an 18-byte slot; the rest keep the
+    /// 4-level codebook at 2 bits in the q2 slot they already have. V is the rotated q4_0 pool, exactly q2k's.
+    /// 96 B per cell and KV head for K, 240 with V, 480 per cell for 2 KV heads (q2k: 224/448, q4_0: 288/576).
+    ///
+    /// The K pool is `k_q2` - the same pointer q2 and q2k use, a DIFFERENT layout inside it (the two planes
+    /// live in one block per (32-cell group, KV head), quiet slots first). Alongside it: the frozen level
+    /// bitmap, its prefix sum as per-channel slot offsets, and the freeze flag. All three are device arrays at
+    /// fixed addresses (the append kernels read them inside captured graphs), and the bitmap is part of a
+    /// conversation snapshot - a restored session resumes with the classes it was saved with, not a re-rank.
+    ///
+    /// It is NOT a q2 state: `kv_q2`, `kv_q4` and `kv_q2k` are all false and `qsa_kv_format()` answers kKvQ2T.
+    /// A reader told "q2" would read the loud channels' 18-byte slots as 10-byte ones, and a mover told "q2"
+    /// would move 80 of every block's 96 bytes per cell and head. Both are silent, both are wrong.
+    bool kv_q2t = false;
+    uint32_t* kv_levels = nullptr;      ///< (n_head_kv * head_dim / 32) words: bit set = loud (16 levels, 4-bit)
+    int32_t* kv_level_off = nullptr;    ///< (n_head_kv * head_dim) byte offsets of each channel's slot in its block
+    int32_t* kv_level_frozen = nullptr; ///< 0: the bitmap has not been computed (every channel quiet = the q2 layout)
     /// K and V go through kv_q4.hpp's Walsh-Hadamard rotation before they are stored, the queries too, the output
     /// back: always for Q4_0, for INT8 by qsa_set_kv_int8_rotate (spreads outlier channels over the scale groups)
     bool kv_rot = false;
@@ -359,14 +378,22 @@ bool qsa_kv_hybrid();
 /// cell for 2 KV heads, against q2's 320 and q4_0's 576. Set before sizing and initializing the session.
 void qsa_set_kv_q2k(bool enabled);
 bool qsa_kv_q2k();
+/// Mixed level `--kv q2t` (kv_q2.hpp): K on the q2 per-channel path with the loudest head_dim/4 channels per
+/// head at a 16-level Lloyd-Max codebook (4-bit codes), the rest at the 4-level one (2-bit), V on the rotated
+/// q4_0 path - 240 B per cell and KV head, 480 per cell for 2 KV heads. Set before sizing and initializing
+/// the session.
+void qsa_set_kv_q2t(bool enabled);
+bool qsa_kv_q2t();
 /// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid /
-/// kKvQ2 / kKvQ2K). THE MIXED FORMATS ARE NAMED AS MIXED: kKvHybrid is "int8 K + q4_0 V" and kKvQ2K is
-/// "q2-per-channel K + q4_0 V", each with its own runs in kv_stream.cu. Answering one of the two single-format
-/// numbers for a mixed state would tell a mover that V's q4_0 bytes are 2-bit slots (or that K's per-channel
-/// slots are q4_0 blocks), and it would move them without complaining.
+/// kKvQ2 / kKvQ2K / kKvQ2T). THE MIXED FORMATS ARE NAMED AS MIXED: kKvHybrid is "int8 K + q4_0 V", kKvQ2K is
+/// "q2-per-channel K + q4_0 V" and kKvQ2T is "q2t mixed-level K + q4_0 V", each with its own runs in
+/// kv_stream.cu. Answering one of the two single-format numbers for a mixed state would tell a mover that V's
+/// q4_0 bytes are 2-bit slots (or that K's per-channel slots are q4_0 blocks), and it would move them without
+/// complaining; answering kKvQ2 for a q2t state would move 80 of its 96 bytes per cell and head.
 inline int qsa_kv_format(const QsaState& st) {
     if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
     if (st.kv_q2k) return strata::kernels::kKvQ2K;         // q2k: K's group run + V's q4_0 run (kv_stream.cu)
+    if (st.kv_q2t) return strata::kernels::kKvQ2T;         // q2t: K's mixed-level group run + V's q4_0 run
     if (st.kv_q2) return strata::kernels::kKvQ2;
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }

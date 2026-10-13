@@ -37,7 +37,7 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     const auto s = strata::kernels::qsa_real_shapes();
     const bool int8_keys = st.kv_int8 || st.kv_hybrid;
     if (g.n_head_kv <= 0 || g.head_dim <= 0 || g.head_dim > INT32_MAX || g.idx_key_dim <= 0 ||
-        ((st.kv_q4 || st.kv_q2 || st.kv_q2k) && g.head_dim % 32) ||
+        ((st.kv_q4 || st.kv_q2 || st.kv_q2k || st.kv_q2t) && g.head_dim % 32) ||
         (int8_keys && !st.kv_q4 && !st.kv_q2 && g.head_dim % 64)) {
         error = "conversation snapshot: invalid K/V geometry";
         return false;
@@ -48,6 +48,7 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     const size_t per = st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
                               : st.kv_q2 ? (size_t) strata::kernels::kv_q2_bytes_per_head((int) g.head_dim)
                               : st.kv_q2k ? (size_t) strata::kernels::kv_q2_bytes_per_head((int) g.head_dim)
+                              : st.kv_q2t ? (size_t) strata::kernels::kv_q2t_bytes_per_head((int) g.head_dim)
                               : (size_t) g.head_dim * (int8_keys ? 1 : 2);
     // Include the moving spare row, not only completed blocks. The checkpoint
     // restore reconstructs that row when rewinding to an earlier prefix.
@@ -63,13 +64,17 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     // values of one cell. Same 80 B per cell and head, same codebook, and not one byte of the payload means the
     // same thing. A snapshot taken with the per-token layout (format 4) must never restore into per-channel
     // pools (format 12), and the reverse; `conversation_kv_validate` compares this number and refuses.
-    const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_q2 && !st.kv_q2k && !st.kv_hybrid ? 16 : 0;
+    const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_q2 && !st.kv_q2k && !st.kv_q2t && !st.kv_hybrid ? 16 : 0;
     // q2k carries the +8 too: its K side IS the per-channel q2 layout, so a snapshot whose K bytes are
     // per-token-layout slots must not restore into it either. Its format number is 5 (kKvQ2K), so the marker
-    // is 13 - not 4 or 12 (q2), not 2 (q4_0), not 3 (K8V4). `conversation_kv_validate` compares this number
-    // and refuses a mismatch, which is the point: a q2k image restoring into a q4 state would write 80-byte
-    // K rows into 144-byte K blocks and call it a day.
-    const int q2_layout = (st.kv_q2 || st.kv_q2k) ? 8 : 0;
+    // is 13 - not 4 or 12 (q2), not 2 (q4_0), not 3 (K8V4). q2t carries the +8 for the same reason and from
+    // the same half - its K is the q2 per-channel layout with the loud channels split into their own plane -
+    // and its format number is 6 (kKvQ2T), so its marker is 14: distinct from q2k's 13, q2's 12/4, q4_0's 2
+    // and K8V4's 3. `conversation_kv_validate` compares this number and refuses a mismatch, which is the
+    // point: a q2k image restoring into a q2t state would write 80-byte K rows into 96-byte blocks, and a q2t
+    // image restoring into a q2k state would write 96-byte rows into 80-byte blocks. Both are silent, both
+    // destroy the cache.
+    const int q2_layout = (st.kv_q2 || st.kv_q2k || st.kv_q2t) ? 8 : 0;
     l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated + q2_layout, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
     using conversation_detail::product;
     if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
@@ -79,9 +84,22 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
         error = "conversation snapshot: K/V byte count overflow";
         return false;
     }
+    // q2t's `scales` slot carries the LEVEL BITMAP, not scales: n_head_kv * head_dim bits, stored ONCE per
+    // layer, not per cell. A restored session resumes with the classes it was saved with - the bitmap is
+    // frozen state, exactly like the codes it ranks, and re-deriving it from the restored cells would give a
+    // resumed session a different K layout than the one its bytes were written with. The offsets are derived
+    // from it (their prefix sum), so they are not in the image.
+    if (st.kv_q2t) {
+        size_t lv = 0;
+        if (!product(lv, {(uint64_t) g.n_head_kv, (uint64_t) ((g.head_dim + 31) / 32), sizeof(uint32_t)})) {
+            error = "conversation snapshot: q2t level bitmap size overflow";
+            return false;
+        }
+        l.scales = lv;
+    }
     l.value_data = l.data;
     l.value_scales = l.scales;
-    if (st.kv_hybrid || st.kv_q2k) {   // both put V in rotated q4_0, so V's row width is q4's, not `per`'s
+    if (st.kv_hybrid || st.kv_q2k || st.kv_q2t) {   // all three put V in rotated q4_0, so V's row width is q4's, not `per`'s
         if (!product(l.value_data, {(uint64_t) cells, (uint64_t) g.n_head_kv,
                                    (uint64_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)})) {
             error = "conversation snapshot: mixed-width (K8V4/q2k) V byte count overflow";
@@ -101,6 +119,12 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
         return {host ? st.host.k_q4 : st.k_q4, host ? st.host.v_q4 : st.v_q4, nullptr, nullptr, st.idx_pooled};
     if (st.kv_q2k)   // K's per-channel pool and V's q4_0 pool - the two halves, in the image's K, V slots
         return {host ? st.host.k_q2 : st.k_q2, host ? st.host.v_q4 : st.v_q4, nullptr, nullptr, st.idx_pooled};
+    if (st.kv_q2t) {   // the same two halves at the q2t width, plus the frozen level bitmap in the scales slot.
+                       // The bitmap is one device array (the host copy carries the same pointers), so it is
+                       // never the `host ?` choice the pools above make.
+        return {host ? st.host.k_q2 : st.k_q2, host ? st.host.v_q4 : st.v_q4, st.kv_levels, nullptr,
+                st.idx_pooled};
+    }
     if (st.kv_q2)
         return {host ? st.host.k_q2 : st.k_q2, host ? st.host.v_q2 : st.v_q2, nullptr, nullptr, st.idx_pooled};
     if (st.kv_int8)
@@ -128,6 +152,7 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     if (st.kv_mode == 2 && (!st.page_table ||
         (st.kv_q4 ? !st.k_q4 || !st.v_q4
                   : st.kv_q2k ? !st.k_q2 || !st.v_q4
+                  : st.kv_q2t ? !st.k_q2 || !st.v_q4 || !st.kv_levels || !st.kv_level_off
                   : st.kv_q2 ? !st.k_q2 || !st.v_q2
                   : st.kv_int8 ? !st.k_q || !st.v_q || !st.k_scale || !st.v_scale
                                : !st.k_pool || !st.v_pool))) {
@@ -237,6 +262,16 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
             })) return false;
+    // q2t: the bitmap came back with the bytes, so re-derive its prefix sum - the per-channel slot offsets
+    // every reader and every append uses to place a channel. The offsets are never in the image: they are a
+    // function of the bitmap, and a second copy of that function could disagree with it.
+    if (st.kv_q2t && st.kv_levels != nullptr) {
+        auto lv_shapes = strata::kernels::qsa_real_shapes();
+        lv_shapes.n_head_kv = g.n_head_kv;
+        lv_shapes.head_dim = g.head_dim;
+        strata::kernels::kv_q2t_levels_from_bits(st.kv_levels, st.kv_level_off, st.kv_level_frozen, lv_shapes,
+                                                 nullptr);
+    }
     // The FP16 sliding window + attention sinks (kv_window.hpp) are not part of the image: the restored quantized
     // bulk is COMPLETE, so the overlay is rebuilt from it.  A restored window comes back at bulk precision instead
     // of exact, which is correct - leaving it would have the new conversation reading the previous one's K/V.
@@ -253,6 +288,12 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
             bulk.v_q4 = (const uint8_t*) src2[1];
         } else if (st.kv_q2k) {   // K through bulk_q2, V through the q4_0 arm (kv_window.cu, mode 5)
             bulk.k_q2 = (const uint8_t*) src2[0];
+            bulk.v_q4 = (const uint8_t*) src2[1];
+        } else if (st.kv_q2t) {   // K through bulk_q2t - the restored bitmap travels with the restored bytes,
+                                  // which is the whole point of storing it - V through the q4_0 arm (mode 6)
+            bulk.k_q2t = (const uint8_t*) src2[0];
+            bulk.k_levels = st.kv_levels;
+            bulk.k_level_off = st.kv_level_off;
             bulk.v_q4 = (const uint8_t*) src2[1];
         } else if (st.kv_q2) {
             bulk.k_q2 = (const uint8_t*) src2[0];
@@ -272,7 +313,7 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         strata::kernels::kv_window_restore(
             {const_cast<uint16_t*>(st.k_win), const_cast<uint16_t*>(st.v_win)},
             strata::kernels::KvWindowShape{(int32_t) st.kv_window, (int32_t) st.kv_sinks}, bulk,
-            st.kv_q4 ? 2 : (st.kv_hybrid ? 3 : (st.kv_q2k ? 5 : (st.kv_q2 ? 4 : (st.kv_int8 ? 1 : 0)))),
+            st.kv_q4 ? 2 : (st.kv_hybrid ? 3 : (st.kv_q2k ? 5 : (st.kv_q2t ? 6 : (st.kv_q2 ? 4 : (st.kv_int8 ? 1 : 0))))),
             upto, shapes, nullptr);
     }
     // VRAM slots still contain the outgoing conversation. Resolve must refill

@@ -108,12 +108,36 @@ __device__ __forceinline__ float bulk_q2(const uint8_t* pool, long long row, int
     return q2_lm4_level(code) * f32_from_f16(blk->d);
 }
 
+// q2t (kv_q2.hpp): the K side of `--kv q2t`, the same class-dispatched dequantization `load8_q2t` and
+// `kv_gather_q2t_kernel` do - the frozen bitmap says which plane a channel's slot is in, the offsets say where
+// it is, and the codebook follows the plane. A restored window therefore holds exactly what the decode
+// attention reads from the bulk, which is the rule every mode of this file follows.
+__device__ __forceinline__ float bulk_q2t(const QsaAttnPools& p, long long row, int d, int kv_heads,
+                                          int page_size) {
+    const long long cell = (row / ((long long) kv_heads * page_size)) * page_size + (row % page_size);
+    const int h = (int) ((row / page_size) % kv_heads);
+    constexpr int words = 256 / 32;
+    const long long g = cell / Q2_0;
+    const int idx = (int) (cell % Q2_0);
+    const uint8_t* slot = p.k_q2t + (size_t) (((long long) g * kv_heads + h) * (long long) q2t_block_bytes(256) +
+                                              (int) p.k_level_off[h * 256 + d]);
+    if ((p.k_levels[h * words + (d >> 5)] >> (d & 31)) & 1u) {
+        const int code = (slot[2 + (idx >> 1)] >> (4 * (idx & 1))) & 0xF;
+        return q2_lm16_level(code) * q2t_scale_at(slot);
+    }
+    const int code = (slot[2 + (idx >> 2)] >> (2 * (idx & 3))) & 3;
+    return q2_lm4_level(code) * q2t_scale_at(slot);
+}
+
 // KV_MODE names the cache being restored, and the two halves pick their own dequantization out of it: mode 5
-// (q2k) is K's per-channel q2 here and V's q4_0 in bulk_v below, which is the pair the decode attention reads.
+// (q2k) is K's per-channel q2 here and V's q4_0 in bulk_v below, which is the pair the decode attention reads;
+// mode 6 (q2t) is K's mixed-level plane and the same q4_0 V.
 template <int KV_MODE>
 __device__ __forceinline__ float bulk_k(const QsaAttnPools& p, long long row, int d, int n_head_kv, int page_size) {
     if constexpr (KV_MODE == 0) {
         return f32_from_f16(p.k_pool[row * 256 + d]);
+    } else if constexpr (KV_MODE == 6) {
+        return bulk_q2t(p, row, d, n_head_kv, page_size);
     } else if constexpr (KV_MODE == 2) {
         constexpr int BYTES = (256 / QK4_0) * sizeof(block_q4_0);
         const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.k_q4 + row * BYTES) + d / QK4_0;
@@ -137,7 +161,7 @@ __device__ __forceinline__ float bulk_v(const QsaAttnPools& p, long long row, in
         return (float) p.v_q[row * 256 + d] * sc;
     } else if constexpr (KV_MODE == 4) {
         return bulk_q2(p.v_q2, row, d, n_head_kv, page_size);
-    } else {   // modes 2, 3 and 5: V is q4_0 (3 = K8V4, 5 = q2k, whose V IS the q4_0 pool)
+    } else {   // modes 2, 3, 5 and 6: V is q4_0 (3 = K8V4, 5 = q2k and 6 = q2t, whose V IS the q4_0 pool)
         constexpr int BYTES = (256 / QK4_0) * sizeof(block_q4_0);
         const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * BYTES) + d / QK4_0;
         const int rem = d % QK4_0;
@@ -219,6 +243,7 @@ void kv_window_restore(const KvWindowPools& w, const KvWindowShape& shape, const
             case 3: window_restore_kernel<3><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, 0); break;
             case 4: window_restore_kernel<4><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, 0); break;
             case 5: window_restore_kernel<5><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, 0); break;   // q2k
+            case 6: window_restore_kernel<6><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, 0); break;   // q2t
             default: window_restore_kernel<0><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, 0); break;
         }
     }
@@ -232,6 +257,7 @@ void kv_window_restore(const KvWindowPools& w, const KvWindowShape& shape, const
             case 3: window_restore_kernel<3><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, ws); break;
             case 4: window_restore_kernel<4><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, ws); break;
             case 5: window_restore_kernel<5><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, ws); break;   // q2k
+            case 6: window_restore_kernel<6><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, ws); break;   // q2t
             default: window_restore_kernel<0><<<grid, THREADS, 0, st>>>(w.k, w.v, shape.window, shape.sinks, n_kv, bulk, nh, (int) s.head_dim, ps, ws); break;
         }
     }

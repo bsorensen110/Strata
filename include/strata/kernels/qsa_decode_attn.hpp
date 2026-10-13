@@ -31,6 +31,12 @@ struct QsaAttnPools {
     const uint8_t* v_q4 = nullptr;
     const uint8_t* k_q2 = nullptr;      ///< q2 block_q2c_0 (kv_q2.hpp): per-channel slots, [(cell/32) * kv_head + head][head_dim * 10]
     const uint8_t* v_q2 = nullptr;
+    /// `--kv q2t` (kv_q2.hpp): K's mixed-level per-channel pool - the quiet slots (the q2 layout) and the loud
+    /// channels' 18-byte slots, inside one block per (32-cell group, KV head). Set together with the two level
+    /// arrays below; a pool that carries them is a q2t pool, and the K side reads as mode 6.
+    const uint8_t* k_q2t = nullptr;
+    const uint32_t* k_levels = nullptr;      ///< the frozen level bitmap: bit set = loud (16 levels, 4-bit codes)
+    const int32_t* k_level_off = nullptr;    ///< the per-(head, dim) byte offset of the channel's slot in its block
     const int32_t* page_table = nullptr;
     /// FP16 sliding window + attention sinks (kv_window.hpp): the `win_sinks` cells at the head of the sequence and
     /// the `win_cells` most recent ones are read from this FP16 overlay instead of the quantized pool.  Zero when

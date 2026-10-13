@@ -755,6 +755,16 @@ void usage() {
                  "                       sensitive one, so the bits go on V - 1.911% attention-output RMS against\n"
                  "                       q2's 3.508% for 40% more bytes, at 2.2x q4_0's 0.888% for 22% less memory\n"
                  "                       (kv_q2_parity, K2c + V4). Streams and rings like q2; --kv-window applies\n"
+                 "  --kv q2t             K top-q mixed-level + V 4-bit, 480 B/cell for 2 KV heads (q2k: 448,\n"
+                 "                       q4_0: 576). K keeps q2's per-channel 2-bit path for 3/4 of its channels;\n"
+                 "                       the loudest 1/4 of each head's channels - ranked by RMS over the first\n"
+                 "                       prefill batch, frozen for the session - get 4-bit codes against a 16-level\n"
+                 "                       Gaussian Lloyd-Max codebook, because K's channel RMS spans 5.8x to 74.9x\n"
+                 "                       after the rotation and the loud ones eat the whole per-group scale. V is\n"
+                 "                       q2k's rotated q4_0. 1.4-2.1x better than q2k on the attention output for\n"
+                 "                       7% more bytes, and better than q4_0 on the layer with the widest channel\n"
+                 "                       spread (kv_q2_parity, K-top1/4@16b + V4). Streams and rings like q2;\n"
+                 "                       --kv-window applies\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -1782,7 +1792,7 @@ bool dump_kv_cache(const std::string& path, const strata::core::ModelGeometry& g
         const int64_t ord = l / I;
         if (ord < ss.qsa_ord0 || ord >= ss.qsa_ord0 + ss.qsa_alloc) continue;   // a range carve: not this session's
         const strata::core::QsaState& st = ss.qsa_states[ord];
-        if (st.kv_int8 || st.kv_q4 || st.kv_q2 || st.kv_q2k || st.kv_hybrid) {
+        if (st.kv_int8 || st.kv_q4 || st.kv_q2 || st.kv_q2k || st.kv_q2t || st.kv_hybrid) {
             err = "--dump-kv: layer " + std::to_string(l) + "'s cache is not fp16, so the gather would hand back "
                   "dequantized codes, not a reference cache (run --dump-kv with --kv fp16)";
             return false;
@@ -2632,8 +2642,9 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (o.kv == "q4") o.kv = "q4_0";
-    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "q2" && o.kv != "q2k") {
-        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4, q2 or q2k\n");
+    if (o.kv != "fp16" && o.kv != "int8" && o.kv != "q4_0" && o.kv != "k8v4" && o.kv != "q2" && o.kv != "q2k" &&
+        o.kv != "q2t") {
+        std::fprintf(stderr, "strata generate: --kv must be fp16, int8, q4_0, k8v4, q2, q2k or q2t\n");
         return 2;
     }
     // **`--dump-kv` IS A REFERENCE-CACHE DUMP, SO IT ONLY MEANS SOMETHING ON THE FP16 CACHE.**  The gather
@@ -2643,7 +2654,7 @@ int main(int argc, char** argv) {
     if (!o.dump_kv.empty() && o.kv != "fp16") {
         std::fprintf(stderr, "strata generate: --dump-kv requires --kv fp16: the dump is the REFERENCE cache, "
                              "and the gather kernels dequantize, so a --dump-kv taken with --kv %s would "
-                             "silently be a measurement of q4_0/int8/q2/q2k, not of fp16\n", o.kv.c_str());
+                             "silently be a measurement of q4_0/int8/q2/q2k/q2t, not of fp16\n", o.kv.c_str());
         return 2;
     }
     // `--serve` ends the program inside its request loop (the `save_profile("exit")` return), so it never
@@ -2671,6 +2682,10 @@ int main(int argc, char** argv) {
     // head, 448 per cell for 2 KV heads, against q2's 320 and q4_0's 576. Measured on a real cache dump: the
     // K side is the sensitive one, so the bits go on V (kv_q2_parity's K2c + V4 arm).
     strata::core::qsa_set_kv_q2k(o.kv == "q2k");
+    // q2t: the same shape as q2k (K on a q2-family per-channel path, V on the q4_0 one) with the K side's
+    // per-channel level split - the loudest 1/4 of each head's channels at 16 levels / 4-bit codes, the rest
+    // at 4 levels / 2-bit. 96 B per cell and KV head for K, 240 with V, 480 per cell for 2 KV heads.
+    strata::core::qsa_set_kv_q2t(o.kv == "q2t");
     if (o.kv_resident < 0) {
         std::fprintf(stderr, "strata generate: --kv-resident must be >= 0\n");
         return 2;

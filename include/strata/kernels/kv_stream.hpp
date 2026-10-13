@@ -40,6 +40,12 @@ struct KvHostPools {
     uint8_t* v_q4 = nullptr;
     uint8_t* k_q2 = nullptr;      ///< q2 mode (kv_q2.hpp): block_q2c_0 per-channel slots, 80 B per cell and head
     uint8_t* v_q2 = nullptr;
+    /// `--kv q2t` (kv_q2.hpp): the FROZEN LEVEL MAP of the K side - the per-(head, dim) level bitmap and its
+    /// prefix sum, the per-channel slot offsets. These are NOT host memory: they are the state's own device
+    /// arrays, carried here because the staging pool is the state's identity layout and reads with the same
+    /// bitmap. A pool that carries them is a q2t pool; a pool that does not is a q2 pool.
+    uint32_t* k_levels = nullptr;
+    int32_t* k_level_off = nullptr;
     bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr || k_q2 != nullptr; }
 };
 
@@ -57,7 +63,16 @@ struct KvHostPools {
 /// halves of one unit move as two runs of different lengths. A q2k state is NOT kKvQ2 and NOT kKvQ4: a mover,
 /// a snapshot marker or a reader told "q2" would read V's q4_0 bytes as 2-bit slots, and one told "q4" would
 /// read K's 10-byte per-channel slots as 18-byte blocks. Both are silent, both are wrong.
-enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3, kKvQ2 = 4, kKvQ2K = 5 };
+///
+/// kKvQ2T is 6: `--kv q2t`, K on the q2 per-channel path with the LOUD CHANNELS AT 16 LEVELS (kv_q2.hpp: the
+/// loudest head_dim/4 channels of each head get 4-bit codes in an 18-byte slot, the rest keep the 4-level
+/// 2-bit 10-byte slot) + V in rotated q4_0, exactly q2k's V. 96 B per cell and KV head for K, 240 with V, 480
+/// per cell for 2 KV heads. It is a q2-family format for the movers - the loud plane's scale spans the same
+/// 32-cell group, so the residency unit is the group - and its K run is ONE contiguous run per unit, because
+/// the two planes live inside the same (group, head) block, quiet slots first. A q2t state is NOT kKvQ2: a
+/// mover told "q2" would move 80 B per cell and head of a 96 B layout, and the last 16 B of every block of 32
+/// cells would be left behind.
+enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3, kKvQ2 = 4, kKvQ2K = 5, kKvQ2T = 6 };
 
 /// K8V4's halves as the single-format append kernels see them, so a hybrid layer's host copy (and the prompt path's
 /// staging pool) is written by the same calls that write its VRAM pools: K is "int8 whose V is K", V is "q4_0 whose
@@ -89,6 +104,16 @@ inline KvHostPools kv_q2k_v_half(const KvHostPools& h) {
     return r;
 }
 
+/// `--kv q2t`'s K half, in the same shape: the q2t group kernels' K plane, the V plane folded onto the same
+/// pool, and the frozen level map carried along (the append kernels need it to place a channel's slot, and the
+/// fold means the map is read once for both lanes). V is q2k's V half unchanged - kv_q2t's V IS the q4_0 pool.
+inline KvHostPools kv_q2t_k_half(const KvHostPools& h) {
+    KvHostPools r;
+    r.k_q2 = h.k_q2; r.v_q2 = h.k_q2;
+    r.k_levels = h.k_levels; r.k_level_off = h.k_level_off;
+    return r;
+}
+
 /// The residency map of a streamed layer, all device memory at fixed addresses (the graphs bake them in).
 struct KvStreamMap {
     int32_t* page_table = nullptr;  ///< (n_blocks,) block -> slot, or -1
@@ -117,8 +142,12 @@ inline uint64_t kv_stream_map_bytes(int64_t n_slots) { return (uint64_t) n_slots
 /// its most granular half - the V side's q4_0 blocks are self-contained and would want 1, and it gets 8, which
 /// is harmless: a V run is just 8 blocks of 144 B per head, contiguous, and the residency it buys is coarser
 /// than V needs, never less than K needs.
+///
+/// q2t (kKvQ2T) takes it too, from the same half and for the same reason: the loud plane's scale spans the same
+/// 32-cell group as the quiet one, and both planes live inside the group's block, so a group's K bytes are one
+/// contiguous run of (32/page_size) * n_head_kv * 3,072 bytes and they move as one memcpy.
 inline int kv_stream_unit_blocks(const QsaShapes& s, int fmt) {
-    return (fmt == kKvQ2 || fmt == kKvQ2K) ? (int) (32 / s.page_size) : 1;
+    return (fmt == kKvQ2 || fmt == kKvQ2K || fmt == kKvQ2T) ? (int) (32 / s.page_size) : 1;
 }
 
 /// Every block evicted: page table all -1, slots free, counters zero.

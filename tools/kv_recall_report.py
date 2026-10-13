@@ -51,6 +51,7 @@ ARMS = [] if os.environ.get("KV_SPEED_ONLY") else [
     ("dev q4_0", DEV, "q4_0", {}),
     ("dev q2", DEV, "q2", {}),
     ("dev q2k", DEV, "q2k", {}),   # K 2-bit per-channel + V 4-bit: 448 B/cell, between q2's 320 and q4_0's 576
+    ("dev q2t", DEV, "q2t", {}),   # K top-q mixed-level (loudest 1/4 at 16-level LM) + V 4-bit: 480 B/cell
     ("dev q2+window", DEV, "q2", {"STRATA_KV_WINDOW": "128", "STRATA_KV_SINK": "8"}),
 ]
 SPEED_ONLY = [("dev q4_0", DEV, "q4_0", {}), ("dev q2", DEV, "q2", {}), ("dev q2k", DEV, "q2k", {})]
