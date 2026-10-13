@@ -460,6 +460,41 @@ void quant_kivi_mixed(const float* x, int n_cells, int n_heads, int D, float* ou
         }
 }
 
+/// TOP-FRACTION bit allocation for K - the lever the real-cache dump points at: K's channel RMS spans
+/// 5.8x (L3) to 74.9x (L47), so the LOUD channels are where resolution is worth anything. The loudest
+/// top_frac of channels get `loud_levels` (up to 16), the rest stay at 4. Unlike the 2.5-bit mixed arm
+/// (6/4 levels, 3-bit codes), loud channels can take 4-bit codes - 16 levels for the outliers that were
+/// eating the whole per-group scale. Average bits = 2 + top_frac * (bits(loud) - 2); bytes per cell and
+/// head = 32 * avg_bits + 16 (D=256). Host-only, measurement before kernels.
+void quant_kivi_topq(const float* x, int n_cells, int n_heads, int D, float top_frac, int loud_levels,
+                     float* out) {
+    const int stride = n_heads * D;
+    std::vector<float> rms((size_t) n_heads * D, 0.f);
+    for (int h = 0; h < n_heads; ++h)
+        for (int d = 0; d < D; ++d) {
+            double ss = 0.0;
+            for (int c = 0; c < n_cells; ++c) {
+                const float v = x[(size_t) c * stride + h * D + d];
+                ss += (double) v * v;
+            }
+            rms[(size_t) h * D + d] = (float) std::sqrt(ss / (double) n_cells);
+        }
+    std::vector<float> sorted(rms);
+    std::sort(sorted.begin(), sorted.end());
+    const int nloud = (int) std::lround(top_frac * (double) D);
+    const float thr = nloud > 0 ? sorted[(size_t) D - nloud] : 1e30f;   // smallest RMS still in the loud set
+    std::vector<float> tmp(32), tmpo(32);
+    for (int h = 0; h < n_heads; ++h)
+        for (int d = 0; d < D; ++d) {
+            const int L = rms[(size_t) h * D + d] >= thr ? loud_levels : 4;
+            for (int g = 0; g < n_cells; g += 32) {
+                for (int i = 0; i < 32; ++i) tmp[i] = x[(size_t) (g + i) * stride + h * D + d];
+                lloyd_max_group(tmp.data(), 32, L, tmpo.data());
+                for (int i = 0; i < 32; ++i) out[(size_t) (g + i) * stride + h * D + d] = tmpo[i];
+            }
+        }
+}
+
 /// ASYMMETRIC min/max with a zero-point, arbitrary level count - quant_asym's grid with L levels instead of
 /// 4. This is the user's second ask measured on its own: zero-point on the K side at 2.5 bits (6 uniform
 /// levels over [min, max]) against symmetric 6-level Lloyd-Max at the same codebook size.
@@ -1065,6 +1100,44 @@ int main() {
     std::printf("  verdict vs q4_0: best fractional arm %.3f%% against q4_0's %.3f%% and q2k's %.3f%%\n",
                 100 * std::min(std::min(e_k6c_v3tr, e_kmix_v3tr), std::min(e_k6ac_v3tr, e_kac_v4)),
                 100 * e_q4, 100 * e_k2v4_dev);
+
+    // ---- TOP-FRACTION K bit allocation: the loudest channels get the bits, everyone else stays at 2 bits.
+    // V stays at the shipping q2 per-channel, so every row is directly comparable to q2c (K2c + V2c, 160 B)
+    // and to its own q2k-shaped twin (V q4_0). Bytes: 32 * (2 + top_frac * (bits_loud - 2)) + 16 per cell/head.
+    std::vector<float> h_k_t8_16(Kref.size()), h_k_t4_16(Kref.size()), h_k_t8_6(Kref.size()), h_k_t4_6(Kref.size());
+    quant_kivi_topq(Kref.data(), N, H, D, 1.f / 8.f, 16, h_k_t8_16.data());
+    quant_kivi_topq(Kref.data(), N, H, D, 1.f / 4.f, 16, h_k_t4_16.data());
+    quant_kivi_topq(Kref.data(), N, H, D, 1.f / 8.f, 6, h_k_t8_6.data());
+    quant_kivi_topq(Kref.data(), N, H, D, 1.f / 4.f, 6, h_k_t4_6.data());
+    const double r_k_t8_16 = rel_rms(h_k_t8_16, Kref), r_k_t4_16 = rel_rms(h_k_t4_16, Kref);
+    const double r_k_t8_6 = rel_rms(h_k_t8_6, Kref), r_k_t4_6 = rel_rms(h_k_t4_6, Kref);
+    std::vector<float> out_t8_16, out_t4_16, out_t8_6, out_t4_6, out_t4_16_k;
+    attention(q, h_k_t8_16, h_v_kivi, D, cells, out_t8_16);
+    attention(q, h_k_t4_16, h_v_kivi, D, cells, out_t4_16);
+    attention(q, h_k_t8_6, h_v_kivi, D, cells, out_t8_6);
+    attention(q, h_k_t4_6, h_v_kivi, D, cells, out_t4_6);
+    attention(q, h_k_t4_16, h_vq4, D, cells, out_t4_16_k);   // the winner's q2k-shaped twin, if it wins
+    const double e_t8_16 = out_err(out_t8_16, out_ref, Vref), e_t4_16 = out_err(out_t4_16, out_ref, Vref);
+    const double e_t8_6 = out_err(out_t8_6, out_ref, Vref), e_t4_6 = out_err(out_t4_6, out_ref, Vref);
+    const double e_t4_16_k = out_err(out_t4_16_k, out_ref, Vref);
+    check(r_k_t8_16 < r_k_kivi && r_k_t4_16 < r_k_kivi,
+          "spending the extra bits on the loud channels beats spreading them evenly (per element)");
+    std::printf("\n  TOP-FRACTION K bit allocation (attention output; V at the shipping q2 per-channel):\n");
+    std::printf("  %-34s %7.3f%%  %4d B   K: loudest 1/8 at 16 levels, rest 4 (2.25 b avg)\n",
+                "K-top1/8@16b", 100 * e_t8_16, 88);
+    std::printf("  %-34s %7.3f%%  %4d B   K: loudest 1/4 at 16 levels, rest 4 (2.5 b avg)\n",
+                "K-top1/4@16b", 100 * e_t4_16, 96);
+    std::printf("  %-34s %7.3f%%  %4d B   K: loudest 1/8 at 6 levels, rest 4 (2.125 b avg)\n",
+                "K-top1/8@6b", 100 * e_t8_6, 84);
+    std::printf("  %-34s %7.3f%%  %4d B   K: loudest 1/4 at 6 levels, rest 4 (2.25 b avg)\n",
+                "K-top1/4@6b", 100 * e_t4_6, 88);
+    std::printf("  %-34s %7.3f%%  %4d B   K-top1/4@16b's q2k-shaped twin (V q4_0)\n",
+                "K-top1/4@16b + V4", 100 * e_t4_16_k, 96 + B4);
+    std::printf("  per element: top1/8@16 %.3f%%, top1/4@16 %.3f%%, top1/8@6 %.3f%%, top1/4@6 %.3f%% "
+                "(uniform 4-level %.3f%%, uniform 6-level %.3f%%)\n",
+                100 * r_k_t8_16, 100 * r_k_t4_16, 100 * r_k_t8_6, 100 * r_k_t4_6, 100 * r_k_kivi, 100 * r_k_6c);
+    std::printf("  reference rows: q2c %.3f%% (160 B), q2k %.3f%% (%d B)\n",
+                100 * e_lm4, 100 * e_k2v4_dev, B2 + B4);
     check(e_ac > 0.0 && e_jj > 0.0, "the published quantizers are live in this probe");
     // Measured, and it is the largest single lever found in this work: the ZERO-POINT, not the bit count.
     // Same 2 bits, same per-channel group; a min/max scale with an offset instead of a symmetric RMS scale
