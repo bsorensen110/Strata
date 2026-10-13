@@ -334,6 +334,172 @@ void quant_asym(const float* x, int n_cells, int n_heads, int D, bool per_channe
     }
 }
 
+/// CHANNEL REORDERING, SKVQ's first mechanism (arXiv 2405.06219): sort a tensor's channels by RMS so that a
+/// per-token group of 32 CONSECUTIVE channels is homogeneous - one scale per group then fits all 32 channels
+/// instead of being set by the group's outlier. The permutation is per KV head (channel d of head h reads the
+/// old channel perm[h*D+d]), computed from the cache being tested - at runtime it would be fixed offline from
+/// calibration data and folded into the query (K) and the output projection's columns (V), which is why it
+/// costs nothing at attention time.
+void channel_order(const std::vector<float>& X, int n_cells, int n_heads, int D, std::vector<int>& perm) {
+    const int stride = n_heads * D;
+    perm.assign((size_t) n_heads * D, 0);
+    std::vector<float> rms(D);
+    for (int h = 0; h < n_heads; ++h) {
+        for (int d = 0; d < D; ++d) {
+            double ss = 0.0;
+            for (int c = 0; c < n_cells; ++c) {
+                const float v = X[(size_t) c * stride + h * D + d];
+                ss += (double) v * v;
+            }
+            rms[d] = (float) std::sqrt(ss / (double) n_cells);
+        }
+        std::vector<int> idx(D);
+        for (int d = 0; d < D; ++d) idx[d] = d;
+        std::stable_sort(idx.begin(), idx.end(),
+                         [&](int a, int b) { return rms[a] < rms[b]; });
+        for (int d = 0; d < D; ++d) perm[(size_t) h * D + d] = idx[d];
+    }
+}
+
+/// Apply (or undo, with the inverse permutation) a channel reorder: new channel d of head h is old channel
+/// perm[h*D+d], every cell.
+void apply_channel_order(const std::vector<float>& X, const std::vector<int>& perm, int n_cells,
+                         int n_heads, int D, std::vector<float>& out) {
+    const int stride = n_heads * D;
+    out.assign(X.size(), 0.f);
+    for (int h = 0; h < n_heads; ++h)
+        for (int d = 0; d < D; ++d) {
+            const int src = perm[(size_t) h * D + d];
+            for (int c = 0; c < n_cells; ++c)
+                out[(size_t) c * stride + h * D + d] = X[(size_t) c * stride + h * D + src];
+        }
+}
+
+/// GENERIC Lloyd-Max on one 32-value group, any level count - the fractional-bit arms (2.5-bit K = 6 levels
+/// at ~2.58 bits of codebook, 1.5-bit V = 3 levels) need codebooks the device kernels do not have yet, and
+/// the gate exists to measure BEFORE the kernels are written. Uniform init on +-1 RMS, 12 iterations, which
+/// converges for L <= 8 on 32 Gaussian samples. The write-back rounds to fp16 like every stored value here.
+void lloyd_max_group(const float* x, int n, int L, float* out) {
+    double ss = 0.0;
+    for (int i = 0; i < n; ++i) ss += (double) x[i] * x[i];
+    const float s = (float) std::sqrt(ss / (double) n);
+    std::vector<float> cb(L);
+    for (int j = 0; j < L; ++j)
+        cb[j] = (L == 1) ? 0.f : -s + (2.f * s * (float) j) / (float) (L - 1);
+    for (int it = 0; it < 12; ++it) {
+        std::vector<float> sum(L, 0.f);
+        std::vector<int> cnt(L, 0);
+        for (int i = 0; i < n; ++i) {
+            int best = 0;
+            float bd = 1e30f;
+            for (int j = 0; j < L; ++j) {
+                const float d = std::fabs(x[i] - cb[j]);
+                if (d < bd) { bd = d; best = j; }
+            }
+            sum[best] += x[i];
+            cnt[best]++;
+        }
+        for (int j = 0; j < L; ++j)
+            if (cnt[j]) cb[j] = sum[j] / (float) cnt[j];
+    }
+    for (int i = 0; i < n; ++i) {
+        int best = 0;
+        float bd = 1e30f;
+        for (int j = 0; j < L; ++j) {
+            const float d = std::fabs(x[i] - cb[j]);
+            if (d < bd) { bd = d; best = j; }
+        }
+        out[i] = k::f32_from_f16(k::f16_from_f32(cb[best]));
+    }
+}
+
+/// Per-channel L-level Lloyd-Max (the quant_kivi shape, arbitrary codebook size): one scale per
+/// (dimension, 32-cell group). Host-only - this is the measurement that decides whether a 2.5-bit K
+/// format exists, before any kernel is written for it.
+void quant_kivi_l(const float* x, int n_cells, int n_heads, int D, int levels, float* out) {
+    const int stride = n_heads * D;
+    std::vector<float> tmp(32), tmpo(32);
+    for (int h = 0; h < n_heads; ++h)
+        for (int d = 0; d < D; ++d)
+            for (int g = 0; g < n_cells; g += 32) {
+                for (int i = 0; i < 32; ++i) tmp[i] = x[(size_t) (g + i) * stride + h * D + d];
+                lloyd_max_group(tmp.data(), 32, levels, tmpo.data());
+                for (int i = 0; i < 32; ++i) out[(size_t) (g + i) * stride + h * D + d] = tmpo[i];
+            }
+}
+
+/// MIXED-LEVEL per channel, the 2.5-bit average: channels sorted by RMS (the SKVQ permutation's own order),
+/// the loud half at 6 levels (~2.58 bits of codebook), the quiet half at 4 (2 bits). Codes store at 3 bits
+/// for the loud half and 2 for the quiet half, so the AVERAGE is 2.5 bits of code - 80 B of code bytes per
+/// cell and head at D=256, the same 16 B of scales, plus a per-channel level bitmap (D/8 = 32 B per cache,
+/// negligible per cell). SKVQ's mixed precision along channels, applied to K.
+void quant_kivi_mixed(const float* x, int n_cells, int n_heads, int D, float* out) {
+    const int stride = n_heads * D;
+    std::vector<float> rms((size_t) n_heads * D, 0.f);
+    for (int h = 0; h < n_heads; ++h)
+        for (int d = 0; d < D; ++d) {
+            double ss = 0.0;
+            for (int c = 0; c < n_cells; ++c) {
+                const float v = x[(size_t) c * stride + h * D + d];
+                ss += (double) v * v;
+            }
+            rms[(size_t) h * D + d] = (float) std::sqrt(ss / (double) n_cells);
+        }
+    std::vector<float> sorted(rms);
+    std::sort(sorted.begin(), sorted.end());
+    const float med = sorted[sorted.size() / 2];
+    std::vector<float> tmp(32), tmpo(32);
+    for (int h = 0; h < n_heads; ++h)
+        for (int d = 0; d < D; ++d) {
+            const int L = rms[(size_t) h * D + d] >= med ? 6 : 4;
+            for (int g = 0; g < n_cells; g += 32) {
+                for (int i = 0; i < 32; ++i) tmp[i] = x[(size_t) (g + i) * stride + h * D + d];
+                lloyd_max_group(tmp.data(), 32, L, tmpo.data());
+                for (int i = 0; i < 32; ++i) out[(size_t) (g + i) * stride + h * D + d] = tmpo[i];
+            }
+        }
+}
+
+/// ASYMMETRIC min/max with a zero-point, arbitrary level count - quant_asym's grid with L levels instead of
+/// 4. This is the user's second ask measured on its own: zero-point on the K side at 2.5 bits (6 uniform
+/// levels over [min, max]) against symmetric 6-level Lloyd-Max at the same codebook size.
+void quant_asym_l(const float* x, int n_cells, int n_heads, int D, int levels, bool per_channel, float* out) {
+    const int stride = n_heads * D;
+    const float hi_code = (float) (levels - 1);
+    auto qz = [&](const float* v, int n, float* o) {
+        float lo = v[0], hi = v[0];
+        for (int i = 0; i < n; ++i) {
+            if (v[i] < lo) lo = v[i];
+            if (v[i] > hi) hi = v[i];
+        }
+        float s = (hi - lo) / hi_code;
+        if (!(s > 0.0f)) s = 1e-8f;
+        const float ds = k::f32_from_f16(k::f16_from_f32(s));
+        const float dz = k::f32_from_f16(k::f16_from_f32(lo));
+        for (int i = 0; i < n; ++i) {
+            float q = std::nearbyintf((v[i] - dz) / ds);
+            q = q < 0.f ? 0.f : (q > hi_code ? hi_code : q);
+            o[i] = dz + q * ds;
+        }
+    };
+    std::vector<float> tmp(32), tmpo(32);
+    if (per_channel) {
+        for (int h = 0; h < n_heads; ++h)
+            for (int d = 0; d < D; ++d)
+                for (int g = 0; g < n_cells; g += 32) {
+                    for (int i = 0; i < 32; ++i) tmp[i] = x[(size_t) (g + i) * stride + h * D + d];
+                    qz(tmp.data(), 32, tmpo.data());
+                    for (int i = 0; i < 32; ++i) out[(size_t) (g + i) * stride + h * D + d] = tmpo[i];
+                }
+    } else {
+        for (int c = 0; c < n_cells; ++c)
+            for (int h = 0; h < n_heads; ++h) {
+                const size_t base = (size_t) c * stride + h * D;
+                qz(x + base, D, out + base);
+            }
+    }
+}
+
 /// JOINT per-channel x per-token scaling (the Coupled-Quantization / SKVQ direction): a value's scale is the
 /// PRODUCT of a channel scale and a token scale, so one 2-bit code carries both structures at once instead of
 /// choosing one axis. Costs the per-channel fp16 (16 B per cell and head) plus one fp16 per cell and head
@@ -776,6 +942,129 @@ int main() {
     std::printf("  %-34s %7.3f%%  %4d B   joint K, per-token asymmetric V\n", "joint K + asym-t V", 100 * e_jat, 82 + 68);
     std::printf("  per-element: asym-c K %.3f%% (symmetric %.3f%%), asym-t V %.3f%%, joint K %.3f%%, joint V %.3f%%\n",
                 100 * r_k_ac, 100 * r_k_kivi, 100 * r_v_at, 100 * r_k_j, 100 * r_v_j);
+
+    // ---- SKVQ's CHANNEL REORDERING (arXiv 2405.06219) and the fractional-bit widths it was published with
+    // (K 2.5-bit, V 1.5-bit). The reorder sorts channels by RMS so a per-token group of 32 CONSECUTIVE
+    // channels is homogeneous. For K's per-channel scale the order is a relabeling - proven below, not
+    // assumed - so the reorder can only act through V's per-token groups and the mixed-precision placement.
+    // Every reordered arm is unpermuted before its attention run, so the rows sit on the same scale as the
+    // tables above.
+    std::vector<int> perm_k, perm_v, iperm_k((size_t) H * D), iperm_v((size_t) H * D);
+    channel_order(Kref, N, H, D, perm_k);
+    channel_order(Vref, N, H, D, perm_v);
+    for (int h = 0; h < H; ++h)
+        for (int d = 0; d < D; ++d) {
+            iperm_k[(size_t) h * D + perm_k[(size_t) h * D + d]] = d;
+            iperm_v[(size_t) h * D + perm_v[(size_t) h * D + d]] = d;
+        }
+    std::vector<float> Kr, Vr;
+    apply_channel_order(Kref, perm_k, N, H, D, Kr);
+    apply_channel_order(Vref, perm_v, N, H, D, Vr);
+    // PROOF of the K claim: per-channel quantization of the reordered cache, unpermuted back, must be
+    // bit-for-bit the quantization of the original - a channel permutation changes which LABEL a scale
+    // carries, never the 32 cells the scale spans.
+    std::vector<float> h_k_kivi_r(Kref.size()), h_k_kivi_ru(Kref.size());
+    quant_kivi(Kr.data(), N, H, D, false, h_k_kivi_r.data());
+    apply_channel_order(h_k_kivi_r, iperm_k, N, H, D, h_k_kivi_ru);
+    bool k_reorder_bitexact = true;
+    for (size_t i = 0; i < Kref.size(); ++i)
+        if (h_k_kivi_ru[i] != h_k_kivi[i]) { k_reorder_bitexact = false; break; }
+    check(k_reorder_bitexact,
+          "channel reordering does not move per-channel K quantization at all (relabeling, not re-estimation)");
+
+    // Fractional-bit K arms, per-channel: 6-level Lloyd-Max (~2.58 bits), 6-level asymmetric min/max
+    // (zero-point at the same codebook size - the user's zero-point-on-K ask), and the 2.5-bit average
+    // (loud half 6 levels, quiet half 4).
+    std::vector<float> h_k_6c(Kref.size()), h_k_6ac(Kref.size()), h_k_mix(Kref.size());
+    quant_kivi_l(Kref.data(), N, H, D, 6, h_k_6c.data());
+    quant_asym_l(Kref.data(), N, H, D, 6, true, h_k_6ac.data());
+    quant_kivi_mixed(Kref.data(), N, H, D, h_k_mix.data());
+    const double r_k_6c = rel_rms(h_k_6c, Kref), r_k_6ac = rel_rms(h_k_6ac, Kref), r_k_mix = rel_rms(h_k_mix, Kref);
+
+    // Fractional-bit V arms, per-token, natural order AND reordered: 3-level LM (~1.58 bits) and 4-level
+    // asymmetric min/max. The reorder's whole effect is here.
+    std::vector<float> h_v_3t(Vref.size()), h_v_3t_ru(Vref.size()), h_v_3t_ru_u(Vref.size()),
+                       h_v_4t_ru(Vref.size()), h_v_4t_ru_u(Vref.size());
+    for (size_t row = 0; row < rows; ++row)
+        for (int b = 0; b < D / k::Q2_0; ++b) {
+            const size_t base = row * D + (size_t) b * k::Q2_0;
+            quant_lm(Vref.data() + base, k::Q2_0, true, h_v_3t.data() + base);
+            quant_lm(Vr.data() + base, k::Q2_0, true, h_v_3t_ru.data() + base);
+        }
+    quant_asym(Vr.data(), N, H, D, false, 0.0f, h_v_4t_ru.data());
+    apply_channel_order(h_v_3t_ru, iperm_v, N, H, D, h_v_3t_ru_u); // 3-level LM, reordered, back in natural order
+    apply_channel_order(h_v_4t_ru, iperm_v, N, H, D, h_v_4t_ru_u); // 4-level asym, reordered, back in natural order
+    const double r_v_3t = rel_rms(h_v_3t, Vref), r_v_3t_r = rel_rms(h_v_3t_ru_u, Vref),
+                 r_v_4t_r = rel_rms(h_v_4t_ru_u, Vref);
+
+    std::vector<float> out_v3t, out_v3t_r, out_v4t_r, out_k6c, out_k6ac, out_kmix,
+                       out_k6c_v3tr, out_kmix_v3tr, out_k6ac_v3tr, out_kac_v4, out_k2c_v3tr;
+    attention(q, Kref, h_v_3t, D, cells, out_v3t);
+    attention(q, Kref, h_v_3t_ru_u, D, cells, out_v3t_r);
+    attention(q, Kref, h_v_4t_ru_u, D, cells, out_v4t_r);
+    attention(q, h_k_6c, h_v_kivi, D, cells, out_k6c);
+    attention(q, h_k_6ac, h_v_kivi, D, cells, out_k6ac);
+    attention(q, h_k_mix, h_v_kivi, D, cells, out_kmix);
+    attention(q, h_k_6c, h_v_3t_ru_u, D, cells, out_k6c_v3tr);
+    attention(q, h_k_mix, h_v_3t_ru_u, D, cells, out_kmix_v3tr);
+    attention(q, h_k_6ac, h_v_3t_ru_u, D, cells, out_k6ac_v3tr);
+    attention(q, h_k_ac, h_vq4, D, cells, out_kac_v4);   // zero-point K at 2 bits on q2k's V side
+    attention(q, h_k_kivi, h_v_3t_ru_u, D, cells, out_k2c_v3tr);  // SKVQ's own budget: K 2b per-channel + V 1.5b reordered, byte-tied with q2c
+    const double e_v3t = out_err(out_v3t, out_ref, Vref), e_v3t_r = out_err(out_v3t_r, out_ref, Vref);
+    const double e_v4t_r = out_err(out_v4t_r, out_ref, Vref);
+    const double e_k6c = out_err(out_k6c, out_ref, Vref), e_k6ac = out_err(out_k6ac, out_ref, Vref);
+    const double e_kmix = out_err(out_kmix, out_ref, Vref);
+    const double e_k6c_v3tr = out_err(out_k6c_v3tr, out_ref, Vref);
+    const double e_kmix_v3tr = out_err(out_kmix_v3tr, out_ref, Vref);
+    const double e_k6ac_v3tr = out_err(out_k6ac_v3tr, out_ref, Vref);
+    const double e_kac_v4 = out_err(out_kac_v4, out_ref, Vref);
+    const double e_k2c_v3tr = out_err(out_k2c_v3tr, out_ref, Vref);
+
+    check(r_k_6c < r_k_kivi && r_k_6ac < r_k_kivi,
+          "a 6-level K codebook beats the 4-level one per element, symmetric or zero-point (2.5-bit K has a floor to stand on)");
+    std::printf("\n  SKVQ reorder + fractional bits (attention output; bytes per cell and KV head):\n");
+    std::printf("  %-30s %7.3f%%  %4d B   V 3-level per-token, natural order (1.5-bit V, no reorder)\n",
+                "V3t only", 100 * e_v3t, B2);
+    std::printf("  %-30s %7.3f%%  %4d B   the same V arm with SKVQ's channel reordering\n",
+                "V3t + reorder", 100 * e_v3t_r, B2);
+    std::printf("  %-30s %7.3f%%  %4d B   V 4-level asym per-token, reordered\n",
+                "V4t-asym + reorder", 100 * e_v4t_r, B2);
+    std::printf("  %-30s %7.3f%%  %4d B   K 6-level per-channel (~2.58-bit K), V q2\n",
+                "K6c only", 100 * e_k6c, 112 + B2);
+    std::printf("  %-30s %7.3f%%  %4d B   K 6-level asymmetric (zero-point), V q2\n",
+                "K6ac only", 100 * e_k6ac, 128 + B2);
+    std::printf("  %-30s %7.3f%%  %4d B   K 2.5-bit mixed (loud half 6-level), V q2\n",
+                "K2.5-mixed only", 100 * e_kmix, 96 + B2);
+    std::printf("  %-30s %7.3f%%  %4d B   SKVQ's own budget: K 2b per-channel, V 1.5b reordered\n",
+                "K2c + V3t-reord", 100 * e_k2c_v3tr, B2 + B2);
+    std::printf("  %-30s %7.3f%%  %4d B   SKVQ's own split, reordered V\n",
+                "K6c + V3t-reord", 100 * e_k6c_v3tr, 112 + B2);
+    std::printf("  %-30s %7.3f%%  %4d B   the 2.5-bit K / 1.5-bit V average\n",
+                "K2.5-mix + V3t-reord", 100 * e_kmix_v3tr, 96 + B2);
+    std::printf("  %-30s %7.3f%%  %4d B   zero-point 2.58-bit K + reordered 1.5-bit V\n",
+                "K6ac + V3t-reord", 100 * e_k6ac_v3tr, 128 + B2);
+    std::printf("  %-30s %7.3f%%  %4d B   zero-point 2-bit K on q2k's V side\n",
+                "K2ac + V4 (= q2k, K zero-point)", 100 * e_kac_v4, 96 + B4);
+    std::printf("  per element: K6c %.3f%% (4-level %.3f%%), K6ac %.3f%%, K2.5-mix %.3f%%; "
+                "V3t %.3f%% -> reordered %.3f%% (4-level asym reordered %.3f%%)\n",
+                100 * r_k_6c, 100 * r_k_kivi, 100 * r_k_6ac, 100 * r_k_mix,
+                100 * r_v_3t, 100 * r_v_3t_r, 100 * r_v_4t_r);
+    std::printf("  reference rows: q2c %.3f%% (160 B), q2k %.3f%% (%d B), q4_0 %.3f%% (%d B)\n",
+                100 * e_lm4, 100 * e_k2v4_dev, B2 + B4, 100 * e_q4, 2 * B4);
+    // The reorder's verdict is data-scoped by construction: on i.i.d. noise every channel's SAMPLED RMS is a
+    // draw from the same distribution, so the permutation is an arbitrary relabeling and the error can only
+    // move by quantizer noise - pinned at 10%, measured and printed everywhere.
+    if (!real_cache)
+        check(e_v3t_r <= e_v3t * 1.10,
+              "SYNTHETIC: reordering changes nothing beyond noise (i.i.d. channels have no RMS order to sort)");
+    std::printf("  reorder on V 3-level per-token (layer %d): %.3f%% -> %.3f%% (%.2fx) - %s\n", probe_layer,
+                100 * e_v3t, 100 * e_v3t_r, e_v3t / e_v3t_r,
+                e_v3t_r < e_v3t ? "the reorder helps" : "the reorder does not help");
+    std::printf("  SKVQ's byte-tied split (K2c + V3t-reord) vs our q2c at the same 160 B: %.3f%% vs %.3f%%\n",
+                100 * e_k2c_v3tr, 100 * e_lm4);
+    std::printf("  verdict vs q4_0: best fractional arm %.3f%% against q4_0's %.3f%% and q2k's %.3f%%\n",
+                100 * std::min(std::min(e_k6c_v3tr, e_kmix_v3tr), std::min(e_k6ac_v3tr, e_kac_v4)),
+                100 * e_q4, 100 * e_k2v4_dev);
     check(e_ac > 0.0 && e_jj > 0.0, "the published quantizers are live in this probe");
     // Measured, and it is the largest single lever found in this work: the ZERO-POINT, not the bit count.
     // Same 2 bits, same per-channel group; a min/max scale with an offset instead of a symmetric RMS scale

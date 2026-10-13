@@ -346,7 +346,66 @@ Best measured point: **K 2-bit per-channel + V 4-bit = 1.911% at 224 B per cell 
 for 2 KV heads, 22% under q4_0) at 2.2x q4_0's attention error.** That is the shape of the next format
 candidate: asymmetric bits, not a symmetric 2-bit block.
 
-## The FP16 window's scope, measured
+## SKVQ's channel reordering, and the 2.5-bit K / 1.5-bit V widths it was published with
+
+SKVQ (arXiv 2405.06219) is the paper whose mechanism the published "near lossless at 2 bits" rests on:
+sort each tensor's channels by RMS so a per-token group of 32 consecutive channels is homogeneous, then
+quantize K per-channel at 2 bits and V per-token at 1.5. The gate now implements the reorder
+(`channel_order` + `apply_channel_order`, host-side, computed from the cache under test) and the
+fractional-bit codebooks (generic Lloyd-Max at any level count; 6 levels ~ 2.58 bits, 3 levels ~ 1.58
+bits; a 2.5-bit average arm spends 6 levels on the loud half of the channels and 4 on the quiet half).
+
+**The mechanism is real on our cache - and it does not make the scheme competitive.**
+
+Reordering V's 3-level per-token quantization (attention output, fp16 K):
+
+| cache | natural | reordered | gain |
+|---|---:|---:|---:|
+| synthetic | 4.031% | 4.143% | 0.97x (noise; i.i.d. channels have no RMS order to sort) |
+| real L3 | 4.939% | 3.471% | **1.42x** |
+| real L11 | 6.550% | 3.540% | **1.85x** |
+| real L23 | 8.254% | 5.609% | **1.47x** |
+| real L47 | 13.232% | 12.926% | 1.02x |
+
+The reorder exploits exactly the structure the real-cache dump showed (V channel RMS max/median up to
+13.6x surviving the rotation), and it is a provable no-op for per-channel K - the gate pins it
+bit-for-bit: quantizing a reordered cache per-channel and unpermuting gives the identical array, because
+a channel permutation relabels scales, it never re-estimates them.
+
+But the schemes built on it lose to what we already ship, at equal or MORE bytes:
+
+| arm | B/cell/head | L3 | L11 | L23 | L47 |
+|---|---:|---:|---:|---:|---:|
+| q4_0 | 288 | 0.888 | 0.740 | 0.941 | 1.040 |
+| **q2c (shipping 2-bit)** | **160** | **3.508** | **3.471** | **3.655** | **2.948** |
+| **q2k (shipping mixed)** | **224** | **1.910** | **2.002** | **2.211** | **1.648** |
+| K2c + V3t-reordered (SKVQ's own budget, 160 B) | 160 | 3.887 | 4.109 | 6.273 | 13.920 |
+| K6c + V3t-reordered (2.58-bit K) | 192 | 3.993 | - | 6.228 | 12.560 |
+| K2.5-mixed + V3t-reordered (2.5-bit avg) | 176 | 4.261 | - | 6.770 | 13.250 |
+| K6ac + V3t-reordered (zero-point 2.58-bit K) | 208 | 3.676 | 3.597 | 6.097 | 12.775 |
+| K2ac + V4 (zero-point K on q2k) | 240 | 2.165 | 2.161 | 2.938 | **1.305** |
+
+Three findings:
+
+1. **SKVQ's byte-tied split loses to q2c on every real layer** (3.887 vs 3.508, 4.109 vs 3.471, 6.273 vs
+   3.655, 13.920 vs 2.948). The reason is the K side: at 2 bits per-channel K is the binding constraint
+   (the layers where K's channel RMS spans 5.8-74.9x), and no V-side trick recovers it. On the synthetic
+   cache the split actually beats q2c (6.365% vs 7.150%) - the synthetic cache has no K channel structure
+   either, so nothing binds, and V3t's per-token washing wins. The synthetic gate flattered SKVQ; the
+   real cache is where the ranking was decided.
+2. **The fractional-bit widths do not buy back their bytes.** 6-level K is 1.7x better per element than
+   4-level (19.2% vs 32.0% on L3) but the attention output barely moves (3.429% vs 3.508% at 192 B):
+   K's quantization error under the softmax is largely common-mode, so finer codebooks buy less than the
+   per-element RMS says. Every K6c/K2.5-mix/K6ac combo lands behind q2c at fewer bytes.
+3. **Zero-point on K is LAYER-dependent**: the min/max grid loses to Lloyd-Max on the well-behaved layers
+   (2.165 vs 1.910 on L3, 2.161 vs 2.002 on L11, 2.938 vs 2.211 on L23) and wins on the extreme-outlier
+   layer L47 (1.305 vs 1.648, 1.26x), where min/max's range-fitting pays for itself. Not a format change;
+   a per-layer choice if we ever want it.
+
+So the honest answer to "SKVQ was the mechanism for near lossless": the mechanism transfers (the reorder
+genuinely reorganizes our rotated cache's V structure), the published widths do not - our per-channel
+placements dominate every SKVQ-family arm at equal or fewer bytes on every real layer measured, and the
+shipping q2k remains the best point under q4_0.
 
 The window overlay is *written* by the prefill (`prefill.cpp:1504`, `2785`) and *read* by the decode
 attention. It therefore cannot change teacher-forced prompt-position logits, and the logit harness
