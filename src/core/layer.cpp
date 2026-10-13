@@ -868,9 +868,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         pool->per_slot = per;
         pool->n_slots = p.slots;
         pool->page_size = s.page_size;
-        if (st.kv_q2 || st.kv_q2k)
-            pool->unit = strata::kernels::kv_stream_unit_blocks(s, st.kv_q2k ? strata::kernels::kKvQ2K
-                                                                             : strata::kernels::kKvQ2);
+        if (st.kv_q2 || st.kv_q2k || st.kv_q2t)   // q2t: quiet + loud planes share the group-major block
+            pool->unit = strata::kernels::kv_stream_unit_blocks(
+                s, st.kv_q2t ? strata::kernels::kKvQ2T : st.kv_q2k ? strata::kernels::kKvQ2K : strata::kernels::kKvQ2);
         if (!pool->range.reserve(at) || !pool_grow(*pool, g_kv_elastic_init, [] { return (strata::core::VmmChunk) 0; })) {
             std::fprintf(stderr, "strata: the elastic K/V could not reserve or map its pools\n");
             return 0;
