@@ -526,3 +526,33 @@ ranks the formats.
 (plain q2 gets 2/3), 0 loops, prompt 2362 t/s, decode **137.4 t/s** (q2: 135.4, q4_0: 157.6). So q2k
 buys back the behavioral loss the 2-bit cache had, at 448 B per cell against q4_0's 576 and at 87% of
 q4_0's decode speed.
+
+## `--kv q2t`: the top-q lever shipped, and what it bought
+
+q2t gives the loudest quarter of K's channels a 16-level Lloyd-Max codebook (4-bit codes, 18 B per
+32-cell group and channel) and keeps the rest at q2's 4-level slot - 96 B per cell and head for K,
+240 with q4_0's V, **480 B per cell**. The level bitmap freezes on the first prefill batch and travels
+in the snapshot; the loud channels live in their own plane, addressed by the bitmap's prefix sum.
+
+The gate verified every piece (69 checks synthetic, 65 per real layer, all green): the freeze's loud
+set is the host reference's top-1/4 bit for bit, append placement is exact to 0.0090%, the gather's
+slot math is the append's placement bit-exact, the atomic single-cell path survives both planes
+(0.014-0.018% fp16 threshold flips), and the lm16 codebook is the converged Gaussian Lloyd-Max fit
+(0.049%). Two tables failed that fit before the third was right - one invented, one misremembered as
+"the literature values" that was a different quantizer's grid; the converged fit is the authority.
+
+**The honest gate verdict, layer-scoped**: q2t beats q2k on the typical real layers (1.02x L3, 1.23x
+L11, 1.09x L23) and loses on the extreme-outlier layer 47 (0.60x, where K's channel RMS spans 74.9x
+and no fixed grid tracks it); synthetic favors q2t (1.21x). The per-group-fit rows that motivated the
+format (1.228% L3, 0.805% L47) are an ENCODER CEILING - 16 centroids fitted to a group's 32 samples is
+degenerate - not a format; the fixed grid is what ships and what the device measures (the gate now
+separates the two rows and pins the device to the fixed grid, 1.872 = 1.872%).
+
+**End to end** (5K buried-fact probe): q2t matches release q4_0 exactly - mid 4/4, tail 4/4, short
+answers 3/3 with no window, 0 loops - at 480 B/cell, decode **139.4 t/s** (q2k 137.9, q2 135.6, q4_0
+157.3). The behavioral A/B is a tie with q2k; the gate's softmax probe is where the difference lives.
+
+**Shipping call**: `--kv q2k` remains the default mixed format (same behavior, 7% fewer bytes, no
+outlier-layer regression). `--kv q2t` ships as the measured alternative for typical-layer deployments
+and as the base the outlier layers would need to beat - per-group codebooks reach 1.037% on layer 47,
+but at a byte cost no layout here pays.
