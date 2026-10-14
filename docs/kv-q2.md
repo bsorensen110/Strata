@@ -613,5 +613,24 @@ its own QSA selections (`STRATA_QSA_DUMP`) and the fp16 cache (`--dump-kv`), the
 engine's attention output to ~1e-7 before any arm is scored. The random-query gate probe is NOT a
 calibration source for this: on real queries the best alpha is above 1 (widen the grid), the opposite of
 what the random query suggested on layer 47. Pinned in kv_q2_parity: "--kv-k-clip 0.8: the stored K
-scale is alpha x the rule ...", bit for bit (mutation-tested). The per-layer table follows the
-calibration runs.
+scale is alpha x the rule ...", bit for bit (mutation-tested).
+
+**Calibration** (`tools/kv_realq_probe.py`; real queries over the engine's own selections; three texts:
+an 890-token document, 6144 tokens of C++ (`kv_q2.cu`), 6144 tokens of markdown (`docs/kv-q2.md`); 256
+query positions x 24 heads each; e = attention-output error / rms(V)). The optimum is interior - error
+falls to alpha 1.20-1.25 and rises again from 1.30 (L7, window on: 1.00 6.00%, 1.25 4.34%, 1.50 5.39%).
+Picked per layer by **leave-one-text-out** (choose on two texts, score the third) in the decode view
+(8 sinks + 128-cell FP16 window); a layer gets an alpha only if the held-out gain holds on all three:
+
+| layer | alpha | held-out gain (document / code / prose) |
+|---|---:|---|
+| L3 | 1.20 | -14.5% / -15.6% / -10.2% |
+| L7 | 1.25 | -27.7% / -20.9% / -18.1% |
+| L11 | 1.10 | -8.3% / -4.7% / -4.3% |
+| L23 | 1.20 | -6.3% / -7.1% / -1.5% |
+| L47 | 1.20 | -7.5% / -7.3% / -8.9% |
+| L15, L19, L27, L31, L35, L39, L43 | 1.00 | not robust: a held-out pick can hurt (L31: +19.5%) |
+
+`--kv-k-clip 3:1.20,7:1.25,11:1.10,23:1.20,47:1.20`. Without the FP16 window the gains are smaller and
+only L47 (1.25: -16..-21%) and L3 (1.10: -5..-7%) hold out. These are attention-output numbers; the
+logit-level (KL) and recall validation in the engine is the next gate before any default changes.

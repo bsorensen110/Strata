@@ -175,6 +175,9 @@ def main():
     ap.add_argument("--alphas", default="0.70,0.75,0.80,0.85,0.90,0.95,1.00,1.05,1.10,1.20")
     ap.add_argument("--salient", default="64,256,1024")
     ap.add_argument("--json", default="")
+    ap.add_argument("--sections", default="alpha,salient,windows",
+                    help="which arm groups to run besides the baselines: alpha, salient, windows")
+    ap.add_argument("--windows", default="256,384,512,1152", help="FP16 window sizes for the windows section")
     a = ap.parse_args()
 
     ids, n_cells, layers = read_sdkv(Path(a.kv))
@@ -232,11 +235,11 @@ def main():
         r["q4_0"] = L.err(L.attend(K4, V4), Oref)
         r["q2k"] = L.err(L.attend(Kc1, V4), Oref)
         # decode view: sinks + window FP16
-        def win_err(K, V, extra=None, rows=None):
+        def win_err(K, V, extra=None, rows=None, window=WINDOW):
             rows = range(len(P)) if rows is None else rows
             O = []
             for rr in rows:
-                keep = window_keep(n_cells, int(P[rr]))
+                keep = window_keep(n_cells, int(P[rr]), window=window)
                 if extra is not None:
                     keep |= extra
                 O.append(L.attend(K, V, rows=[rr], keep=keep)[0])
@@ -245,7 +248,7 @@ def main():
         r["q2k+win"] = win_err(Kc1, V4)
         # clip sweep (K only)
         r["alpha"], r["alpha_win"] = {}, {}
-        for al in alphas:
+        for al in (alphas if "alpha" in a.sections else []):
             Ka = rot(q2c(kr, al))
             r["alpha"]["%.2f" % al] = L.err(L.attend(Ka, V4), Oref)
             r["alpha_win"]["%.2f" % al] = win_err(Ka, V4)
@@ -263,10 +266,14 @@ def main():
         second = range(half, len(P))
         r["q2k+win(2nd half)"] = win_err(Kc1, V4, rows=second)
         tot = mass[~excl].sum()
-        for M in salient:
+        r["windows"] = {}
+        for W in ([int(x) for x in a.windows.split(",")] if "windows" in a.sections else []):
+            r["windows"][str(W)] = {"all": win_err(Kc1, V4, window=W), "2nd": win_err(Kc1, V4, rows=second, window=W)}
+        for M in (salient if "salient" in a.sections else []):
             def top(score):
-                sc = score.copy(); sc[excl] = -1
-                keep = np.zeros(n_cells, bool); keep[np.argsort(-sc)[:M]] = True
+                sc = score.copy(); sc[excl] = -np.inf
+                order = np.argsort(-sc)[:min(M, int((~excl).sum()))]
+                keep = np.zeros(n_cells, bool); keep[order] = True
                 return keep
             ko = top(mass)
             r["salient"][str(M)] = {
@@ -276,6 +283,8 @@ def main():
                 "mass_share": float(mass[ko].sum() / tot) if tot > 0 else 0.0,
             }
         results[lid] = r
+        if not r["alpha"]:
+            r["alpha"] = {"1.00": r["q2k"]}; r["alpha_win"] = {"1.00": r["q2k+win"]}
         best_a = min(r["alpha"], key=lambda x: r["alpha"][x])
         best_w = min(r["alpha_win"], key=lambda x: r["alpha_win"][x])
         print("L%-2d pos %d-%d width %d | vs engine %.2e (scale %s, %s, bad rows %d) | elem K %.1f%% V %.1f%%"
@@ -290,6 +299,9 @@ def main():
             "M=%s oracle %.3f%% (mass %.0f%%) causal-mass %.3f%% causal-count %.3f%%"
             % (m, 100 * x["oracle"], 100 * x["mass_share"], 100 * x["causal_mass"], 100 * x["causal_count"])
             for m, x in r["salient"].items()), flush=True)
+        if r["windows"]:
+            print("     windows (q2k, sinks 8): " + "  ".join("W=%s %.3f%% (2nd %.3f%%)" % (w, 100 * x["all"], 100 * x["2nd"])
+                                                       for w, x in r["windows"].items()), flush=True)
     if a.json:
         Path(a.json).write_text(json.dumps(results, indent=1))
 
