@@ -100,6 +100,24 @@ ARMS = [
     # controls for the ranking: the two layers the probe ranks LEAST sensitive, and the top four
     dict(name="q2k+L15L47", kv="q2k", env=dict(), args=["--kv-layer", "15:q4_0,47:q4_0"]),
     dict(name="q2k+top4", kv="q2k", env=dict(), args=["--kv-layer", "7:q4_0,39:q4_0,23:q4_0,35:q4_0"]),
+    # K reconstruction gain (STRATA_KV_K_GAIN, measurement): codes chosen against the rule's scale, reconstruction
+    # beta times it - undoes the 4-level Lloyd-Max score shrink that makes the exact FP16 window over-weighted.
+    # Per-layer beta zeroes the window-mass bias on the real-query probe (scratch shrink-probe.py).
+    dict(name="q2k+win+gainL", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8",
+                                                   STRATA_KV_K_GAIN="3:1.044,7:1.050,11:1.034,15:1.023,19:1.021,23:1.037,27:1.013,31:1.000,35:1.012,39:1.020,43:1.030,47:1.020")),
+    dict(name="q2k+win+gain1.03", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8",
+                                                      STRATA_KV_K_GAIN="1.03")),
+    dict(name="q2k+gain1.03", kv="q2k", env=dict(STRATA_KV_K_GAIN="1.03")),
+    dict(name="q2k+win+gain1.05", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8", STRATA_KV_K_GAIN="1.05")),
+    dict(name="q2k+top4+win+gain1.03", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8", STRATA_KV_K_GAIN="1.03"),
+         args=["--kv-layer", "7:q4_0,39:q4_0,23:q4_0,35:q4_0"]),
+    dict(name="q2k+win+gain1.08", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8", STRATA_KV_K_GAIN="1.08")),
+    dict(name="q2k+win+gain1.10", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8", STRATA_KV_K_GAIN="1.10")),
+    dict(name="q2k+win+gain1.13", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8", STRATA_KV_K_GAIN="1.13")),
+    dict(name="q2k+gain1.05", kv="q2k", env=dict(STRATA_KV_K_GAIN="1.05")),
+    dict(name="q2k+gain1.08", kv="q2k", env=dict(STRATA_KV_K_GAIN="1.08")),
+    dict(name="q2k+gain1.10", kv="q2k", env=dict(STRATA_KV_K_GAIN="1.10")),
+    dict(name="q2k+gainL", kv="q2k", env=dict(STRATA_KV_K_GAIN="3:1.044,7:1.050,11:1.034,15:1.023,19:1.021,23:1.037,27:1.013,31:1.000,35:1.012,39:1.020,43:1.030,47:1.020")),
     # the clip spec was calibrated WITH the window on (8 sinks + 128): its decode-path arm
     dict(name="q2k+win+clip", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8"),
          args=["--kv-k-clip", "3:1.20,7:1.25,11:1.10,23:1.20,47:1.20"]),
@@ -428,6 +446,11 @@ def run_engine(cfg: dict, exe: str, arm: dict, tokens: list[int], out: Path, log
     elif mode != "greedy-decode":
         raise ValueError("unknown mode %s" % mode)
     env = dict(os.environ)
+    # Prompts under 1024 tokens otherwise share MoE experts with the CPU, and that split is not reproducible run to
+    # run (measured: a 730-token prompt's fp16 decode rows differ by up to 6.8 logits between two identical runs;
+    # bit-identical with the share off). It is a compute-placement choice, not a KV-format property, so every arm
+    # runs without it unless the caller's environment says otherwise.
+    env.setdefault("STRATA_PREFILL_CPU_SHARE", "0")
     env.update(arm["env"])
     if mode in ("greedy-decode", "forced"):
         env["STRATA_DECODE_LOGITS"] = str(out)

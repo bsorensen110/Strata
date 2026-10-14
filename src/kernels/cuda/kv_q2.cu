@@ -144,7 +144,13 @@ __global__ void kv_append_q2_group_kernel(uint8_t* __restrict__ k_q2, uint8_t* _
     // that stored scale; plane 1 (V) is never clipped. The rule itself works on the RAW scale: every stored
     // previous scale it reads is divided by `a` first, and the scale it writes is multiplied by `a`. With
     // a == 1.0f every multiply by a or 1/a is exact, so the scale is bit-identical to the rule without the clip.
-    const float a = is_v ? 1.0f : k_clip;
+    // A NEGATIVE k_clip is the reconstruction-gain mode (measurement, STRATA_KV_K_GAIN): the stored scale is
+    // |k_clip| times the rule's exactly as with the clip, but the codes are chosen against the rule's (raw) scale,
+    // so the code assignment is unchanged and only the reconstruction grows - it undoes the 4-level Lloyd-Max
+    // shrink of the attention scores (slope ~0.93 on real queries) without moving any value to another level.
+    const float kparam = is_v ? 1.0f : k_clip;
+    const bool k_gain = kparam < 0.0f;
+    const float a = k_gain ? -kparam : kparam;
     const float inv_a = 1.0f / a;
     const long long g0 = pos0 >= 0 ? pos0 / Q2_0 : (long long) __ldg(step + kStepPos) / Q2_0;
     const long long g = g0 + blockIdx.y;
@@ -236,6 +242,7 @@ __global__ void kv_append_q2_group_kernel(uint8_t* __restrict__ k_q2, uint8_t* _
         s = __fmul_rn(a, s);                         // complete group: store the clipped scale
     }
     const uint16_t sbits = f16_from_f32(s);
+    const float sc = k_gain ? __fmul_rn(s, inv_a) : s;   // the scale the codes are chosen against
     const bool whole = (n == Q2_0);
     const bool lm3 = is_v && v3level;
 
@@ -249,7 +256,7 @@ __global__ void kv_append_q2_group_kernel(uint8_t* __restrict__ k_q2, uint8_t* _
         const long long p = pos0 >= 0 ? pos0 + i : (long long) __ldg(step + (long long) i * step_stride + kStepPos);
         if (p / Q2_0 != g) continue;
         const float v = src[(long long) i * row_stride + h * head_dim + d];
-        const unsigned long long code = (unsigned long long) (lm3 ? q2_code_lm3(v, s) : q2_code_lm4(v, s));
+        const unsigned long long code = (unsigned long long) (lm3 ? q2_code_lm3(v, sc) : q2_code_lm4(v, sc));
         const int li = (int) (p % Q2_0);
         pack |= code << (8 * (li >> 2) + 2 * (li & 3));
         const long long page = (long long) __ldg(table + p / page_size);
@@ -278,7 +285,7 @@ __global__ void kv_append_q2_group_kernel(uint8_t* __restrict__ k_q2, uint8_t* _
                 if (page < 0) continue;
                 const long long pc = page * page_size + (p % page_size);
                 const float v = src[(long long) i * row_stride + h * head_dim + d];
-                const int code = lm3 ? q2_code_lm3(v, s) : q2_code_lm4(v, s);
+                const int code = lm3 ? q2_code_lm3(v, sc) : q2_code_lm4(v, sc);
                 q2c_put_cell(pool, pc / Q2_0, (int) (pc % Q2_0), h, d, kv_heads, head_dim, code, fresh, sbits);
             }
     }
@@ -293,7 +300,7 @@ __global__ void kv_append_q2_group_kernel(uint8_t* __restrict__ k_q2, uint8_t* _
             if (p / Q2_0 != g) continue;
             const int li = (int) (p % Q2_0);
             const float v = src[(long long) i * row_stride + h * head_dim + d];
-            const int code = lm3 ? q2_code_lm3(v, s) : q2_code_lm4(v, s);
+            const int code = lm3 ? q2_code_lm3(v, sc) : q2_code_lm4(v, sc);
             if (host.k_q2 != nullptr)
                 q2c_put_cell(is_v ? host.v_q2 : host.k_q2, g, li, h, d, kv_heads, head_dim, code, fresh, sbits);
             if (stage.k_q2 != nullptr)

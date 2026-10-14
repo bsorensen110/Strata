@@ -263,6 +263,19 @@ void qsa_set_kv_k_clip(int64_t model_layer, float alpha) {
     g_kv_k_clip[(size_t) model_layer] = alpha;
 }
 float qsa_kv_k_clip(int64_t model_layer) {
+    // STRATA_KV_K_GAIN (measurement): "B" for every layer or "L:B,L:B" per model layer - the reconstruction-gain
+    // mode, handed to the q2 append kernels as a NEGATIVE k_clip (kv_q2.cu). Overrides --kv-k-clip on its layers.
+    if (const char* g = std::getenv("STRATA_KV_K_GAIN"); g != nullptr && *g) {
+        const std::string spec(g);
+        if (spec.find(':') == std::string::npos) return -std::strtof(spec.c_str(), nullptr);
+        for (size_t at = 0; at < spec.size();) {
+            const size_t comma = spec.find(',', at), colon = spec.find(':', at);
+            if (colon == std::string::npos || colon > comma) break;
+            if (std::strtoll(spec.c_str() + at, nullptr, 10) == model_layer)
+                return -std::strtof(spec.c_str() + colon + 1, nullptr);
+            at = comma == std::string::npos ? spec.size() : comma + 1;
+        }
+    }
     return model_layer >= 0 && (size_t) model_layer < g_kv_k_clip.size() ? g_kv_k_clip[(size_t) model_layer] : 1.0f;
 }
 void qsa_set_kv_layer_format(int64_t model_layer, int fmt) {
