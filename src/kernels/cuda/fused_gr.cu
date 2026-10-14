@@ -2194,14 +2194,59 @@ struct PArgs {
     float* part;        // [T][NR][NB]
     float* ssp;         // [T][NB]
     unsigned* bar;      // [0] count, [32] generation, [48] abort (a barrier that timed out)
-    unsigned long long timeout_ticks;   // s_memrealtime ticks (100 MHz) a barrier waits before it aborts the read
+    unsigned long long timeout_ticks;   // logical 100 MHz timeout units (native clock or calibrated spin proxy)
+    unsigned long long spin_budget;     // cards without s_memrealtime (gfx1200/1201): the host-calibrated spin count
+                                        // that stands in for timeout_ticks; 0 on cards with the clock (dead code there)
     double* partd;      // STRATA_HC_PERSIST=3 (a reference only): the partial dots and sums of squares in double
     double* sspd;
 };
+// gfx12 (RDNA4: gfx1200/1201) has no s_memrealtime (clang: "needs target feature s-memrealtime"; ld.lld: "instruction
+// not supported on this GPU"), so the barrier clock is gated on its invocability. Cards without the clock use a
+// host-calibrated spin budget measured with the same 80-block loop, plus forced-timeout checks at both 50 ms and 2 s.
+// Any failed probe/calibration disables this opt-in path; counts are a conservative time proxy, not a hardware clock.
+// Measured on the R9700 (gfx1201): bench/results/2026-10-13-hc-persist-gfx1201.
+__global__ void clock_probe_kernel(int* out) {
+    if (threadIdx.x == 0) *out = __builtin_amdgcn_is_invocable(__builtin_amdgcn_s_memrealtime) ? 1 : 0;
+}
+__global__ void spin_cal_kernel(unsigned iters, unsigned* bar) {
+    if (threadIdx.x != 0) return;
+    const unsigned gen = __hip_atomic_load(&bar[32], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    unsigned long long spins = 0;
+    while (__hip_atomic_load(&bar[32], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == gen) {
+        if (__hip_atomic_load(&bar[48], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0u) break;
+        if (++spins > iters) break;
+        __builtin_amdgcn_s_sleep(1);
+    }
+}
+// Conservative ns per iteration of the same 80-block spin body as grid_sync. The first launch warms the module;
+// 80 independent blocks (no barrier) reproduce the atomic-load contention without risking a residency deadlock.
+inline double calibrate_spin_ns() {
+    unsigned* bar = nullptr;
+    if (cudaMalloc((void**) &bar, 64 * sizeof(unsigned)) != cudaSuccess) { cudaGetLastError(); return 0.0; }
+    if (cudaMemset(bar, 0, 64 * sizeof(unsigned)) != cudaSuccess) { cudaGetLastError(); cudaFree(bar); return 0.0; }
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    if (cudaEventCreate(&e0) != cudaSuccess || cudaEventCreate(&e1) != cudaSuccess) {
+        cudaGetLastError(); if (e0) cudaEventDestroy(e0); if (e1) cudaEventDestroy(e1); cudaFree(bar); return 0.0;
+    }
+    const unsigned iters = 2000;
+    spin_cal_kernel<<<NB, THREADS>>>(iters, bar);
+    const bool warmed = cudaGetLastError() == cudaSuccess && cudaDeviceSynchronize() == cudaSuccess;
+    bool ok = warmed && cudaEventRecord(e0) == cudaSuccess;
+    if (ok) {
+        spin_cal_kernel<<<NB, THREADS>>>(iters, bar);
+        ok = cudaGetLastError() == cudaSuccess && cudaEventRecord(e1) == cudaSuccess && cudaEventSynchronize(e1) == cudaSuccess;
+    }
+    float ms = 0.0f;
+    if (ok) ok = cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
+    cudaEventDestroy(e0); cudaEventDestroy(e1); cudaFree(bar); cudaGetLastError();
+    const double measured_ns = ok ? (double) ms * 1e6 / (double) iters : 0.0;
+    const double conservative_ns = measured_ns * 1.25;   // margin for clock / scheduling variation
+    return conservative_ns > 100.0 && conservative_ns < 1e6 ? conservative_ns : 0.0;
+}
 // Returns false when the read was aborted: a block waited longer than `ticks` (the 80 blocks were not all resident - the
 // start-up check finds that out by running every T with a short timeout) or another block aborted.  Then every block
 // leaves the kernel; the outputs are not written completely and bar[48] stays set until the host clears the words.
-__device__ __forceinline__ bool grid_sync(unsigned* bar, unsigned long long ticks) {
+__device__ __forceinline__ bool grid_sync(unsigned* bar, unsigned long long ticks, unsigned long long spin_budget) {
     __shared__ int s_abort;
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -2212,11 +2257,22 @@ __device__ __forceinline__ bool grid_sync(unsigned* bar, unsigned long long tick
         if (arrived == NB - 1) {
             __hip_atomic_store(&bar[0], 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
             __hip_atomic_fetch_add(&bar[32], 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
-        } else {
+        } else if (__builtin_amdgcn_is_invocable(__builtin_amdgcn_s_memrealtime)) {
             const unsigned long long t0 = __builtin_amdgcn_s_memrealtime();
             while (__hip_atomic_load(&bar[32], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == gen) {
                 if (__hip_atomic_load(&bar[48], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0u) { ab = 1; break; }
                 if (__builtin_amdgcn_s_memrealtime() - t0 > ticks) {
+                    __hip_atomic_store(&bar[48], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+                    ab = 1;
+                    break;
+                }
+                __builtin_amdgcn_s_sleep(1);
+            }
+        } else {
+            unsigned long long spins = 0;
+            while (__hip_atomic_load(&bar[32], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) == gen) {
+                if (__hip_atomic_load(&bar[48], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) != 0u) { ab = 1; break; }
+                if (++spins > spin_budget) {
                     __hip_atomic_store(&bar[48], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
                     ab = 1;
                     break;
@@ -2230,6 +2286,33 @@ __device__ __forceinline__ bool grid_sync(unsigned* bar, unsigned long long tick
     __syncthreads();
     __threadfence();
     return s_abort == 0;
+}
+__global__ void timeout_probe_kernel(unsigned* bar, unsigned long long ticks, unsigned long long spin_budget) {
+    if (grid_sync(bar, ticks, spin_budget))
+        __hip_atomic_store(&bar[48], 2u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);   // 79 blocks must time out
+}
+inline bool test_timeout_budget(unsigned long long ticks, double spin_ns, double& elapsed_ms) {
+    unsigned* bar = nullptr;
+    cudaEvent_t e0 = nullptr, e1 = nullptr;
+    if (cudaMalloc((void**) &bar, 64 * sizeof(unsigned)) != cudaSuccess) { cudaGetLastError(); return false; }
+    bool ok = cudaMemset(bar, 0, 64 * sizeof(unsigned)) == cudaSuccess &&
+              cudaEventCreate(&e0) == cudaSuccess && cudaEventCreate(&e1) == cudaSuccess;
+    const unsigned long long budget = (unsigned long long) ((double) ticks * 10.0 / spin_ns);
+    if (ok) ok = cudaEventRecord(e0) == cudaSuccess;
+    if (ok) {
+        timeout_probe_kernel<<<NB - 1, THREADS>>>(bar, ticks, budget);
+        ok = cudaGetLastError() == cudaSuccess && cudaEventRecord(e1) == cudaSuccess && cudaEventSynchronize(e1) == cudaSuccess;
+    }
+    float ms = 0.0f;
+    if (ok) ok = cudaEventElapsedTime(&ms, e0, e1) == cudaSuccess;
+    unsigned abort_word = 0;
+    if (ok) ok = cudaMemcpy(&abort_word, bar + 48, sizeof(abort_word), cudaMemcpyDeviceToHost) == cudaSuccess;
+    elapsed_ms = ms;
+    if (e0) cudaEventDestroy(e0);
+    if (e1) cudaEventDestroy(e1);
+    cudaFree(bar); cudaGetLastError();
+    const double target_ms = (double) ticks / 100000.0;   // logical 100 MHz ticks
+    return ok && abort_word == 1u && elapsed_ms >= target_ms * 0.3 && elapsed_ms <= target_ms * 1.5;
 }
 // STRATA_HC_PERSIST=3 (a reference only, slow): every dot and sum accumulated in double
 __device__ __forceinline__ double dot8d(const uint4 w, const float* x) {
@@ -2300,7 +2383,7 @@ __global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
                 else f.part[((size_t) k * NR + r) * NB + b] = (float) acc[k];
             }
     }
-    if (!grid_sync(f.bar, f.timeout_ticks)) return;
+    if (!grid_sync(f.bar, f.timeout_ticks, f.spin_budget)) return;
     // (B) rs per stream (every block), then rows (k, r) = b + 80 j reduced to lo / inject by the blocks in turn
     if (tid < T * HC) {
         const int k = tid / HC, c = tid - k * HC;
@@ -2348,7 +2431,7 @@ __global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
             f.a[k].inject_out[r - LR] = (float) sum;
         }
     }
-    if (!grid_sync(f.bar, f.timeout_ticks)) return;
+    if (!grid_sync(f.bar, f.timeout_ticks, f.spin_budget)) return;
     for (int idx = tid; idx < T * LR; idx += THREADS) {
         const int k = idx / LR, r = idx - k * LR;
         lo[k][r] = f.a[k].lo[r];
@@ -2410,6 +2493,7 @@ struct DevState {
     unsigned* bar = nullptr;
     int max_t = 0;      // 0: off on this card
     bool tried = false;
+    double spin_ns = 0.0;   // ns per spin iteration on cards without s_memrealtime; 0: the clock path
 };
 DevState g_dev[64];
 using KFn = void (*)(PArgs);
@@ -2439,6 +2523,8 @@ void launch(const FusedGrArgs* a, int n_tok, const DevState& st, cudaStream_t s,
     PArgs f;
     for (int t = 0; t < n_tok; ++t) f.a[t] = a[t];
     f.part = st.part; f.ssp = st.ssp; f.bar = st.bar; f.partd = st.partd; f.sspd = st.sspd; f.timeout_ticks = ticks;
+    // timeout_ticks are 10 ns units; spin_ns includes the conservative calibration margin
+    f.spin_budget = st.spin_ns > 0.0 ? (unsigned long long) ((double) ticks * 10.0 / st.spin_ns) : 0ULL;
     kernel_for(n_tok)<<<NB, THREADS, 0, s>>>(f);
 }
 bool env_on() {
@@ -2461,6 +2547,51 @@ void fused_gr_persist_init() {
         std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: the kernel is written for 32-lane waves "
                              "(this card runs %d)\n", dev, prop.warpSize);
         return;
+    }
+    // Probe the device, not the host compiler: s_memrealtime is a device-only builtin.
+    int* flag = nullptr;
+    int has_clock = 0;
+    bool clock_probe_ok = cudaMalloc((void**) &flag, sizeof(int)) == cudaSuccess;
+    if (clock_probe_ok) {
+        hcp::clock_probe_kernel<<<1, 1>>>(flag);
+        clock_probe_ok = cudaGetLastError() == cudaSuccess && cudaMemcpy(&has_clock, flag, sizeof(int), cudaMemcpyDeviceToHost) == cudaSuccess;
+        cudaFree(flag);
+    }
+    cudaGetLastError();
+    if (!clock_probe_ok) {
+        std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: cannot probe the barrier clock\n", dev);
+        return;
+    }
+    if (!has_clock) {
+        st.spin_ns = hcp::calibrate_spin_ns();
+        if (st.spin_ns <= 0.0) {
+            std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: barrier timeout calibration failed\n", dev);
+            return;
+        }
+        std::fprintf(stderr, "strata hc: CUDA%d: calibrated gfx12 barrier spin at %.2f us/iteration (80 blocks)\n",
+                     dev, st.spin_ns / 1000.0);
+        double check_ms = 0.0, run_ms = 0.0;
+        if (!hcp::test_timeout_budget(hcp::kTicksCheck, st.spin_ns, check_ms) ||
+            !hcp::test_timeout_budget(hcp::kTicksRun, st.spin_ns, run_ms)) {
+            std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: calibrated barrier timeout self-test failed "
+                                 "(check %.1f ms, run %.1f ms)\n", dev, check_ms, run_ms);
+            return;
+        }
+        // Correct the event-based per-spin estimate against measured end-to-end timeout durations, then validate both
+        // budgets again. Scale to the slower observed timeout so neither nominal deadline is exceeded.
+        const double check_ratio = check_ms / ((double) hcp::kTicksCheck / 100000.0);
+        const double run_ratio = run_ms / ((double) hcp::kTicksRun / 100000.0);
+        const double correction = check_ratio > run_ratio ? check_ratio : run_ratio;
+        st.spin_ns *= correction;
+        if (!hcp::test_timeout_budget(hcp::kTicksCheck, st.spin_ns, check_ms) ||
+            !hcp::test_timeout_budget(hcp::kTicksRun, st.spin_ns, run_ms) ||
+            check_ms < 25.0 || check_ms > 62.5 || run_ms < 1000.0 || run_ms > 2500.0) {
+            std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: corrected timeout self-test failed "
+                                 "(check %.1f ms, run %.1f ms)\n", dev, check_ms, run_ms);
+            return;
+        }
+        std::fprintf(stderr, "strata hc: CUDA%d: gfx12 timeout self-test passed (calibration correction %.3f; "
+                             "50 ms budget -> %.1f ms; 2000 ms budget -> %.1f ms)\n", dev, correction, check_ms, run_ms);
     }
     const int mp = prop.multiProcessorCount;   // only for the confirmation line (WGPs on RDNA)
     bool ok = cudaMalloc((void**) &st.part, (size_t) kFusedGrMaxT * hcp::NR * hcp::NB * sizeof(float)) == cudaSuccess &&
@@ -2578,8 +2709,9 @@ void fused_gr_persist_init() {
     st.max_t = max_t;
     std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1: the verifier's hyper-connection read runs as one "
                          "persistent kernel (80 blocks on %d multiprocessors, up to %d tokens; %d token counts timed out in "
-                         "the check; checked against the default read, max relative difference %.2g)\n", dev, mp, max_t,
-                 timeouts, worst);
+                         "the check; checked against the default read, max relative difference %.2g%s)\n", dev, mp, max_t,
+                 timeouts, worst,
+                 st.spin_ns > 0.0 ? "; no s_memrealtime: barrier timeouts use a calibrated spin budget" : "");
 }
 
 bool fused_gr_read_persist(const FusedGrArgs* a, int n_tok, void* stream) {
