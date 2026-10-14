@@ -668,3 +668,46 @@ The measured motivation: the real-query probe (`tools/kv_realq_probe.py`) finds 
 error over q4_0 differs ~2.2x between layers (L7/L39 worst, L47 best), so promoting the 1-3 worst layers
 to q4_0 buys the most accuracy per byte: promoting 2 of the 12 QSA layers raises the average from 448
 to 469 B per cell (+4.7% of the cache). The engine's logit-level and decode-path numbers follow below.
+
+### Engine-level results for the three levers (logit KL and decode attention)
+
+Logit KL vs the fp16 arm, teacher-forced over the prompt (`tools/kv_precision_compare.py`, `--dump-prompt-logits`,
+served args, build of this branch). Texts: the three built-in prompts (731 / 890 / 761 tokens) and two files the
+clip calibration never saw, `src/kernels/cuda/kv_stream.cu` and `README.md` (6144 tokens each). Noise floor: three
+separate runs of the q2k arm give identical KL on the two 6144-token texts and vary by up to 5% on the short ones.
+
+| Text | q4_0 | q2k | +clip | +clip (no-window spec) | L7+L39 at q4_0 | L15+L47 at q4_0 | top 4 at q4_0 |
+|---|---|---|---|---|---|---|---|
+| code agent   | 0.0418 | 0.2079 | 0.2226 | 0.2090 | 0.1950 (-6.2%)  | 0.2033 (-2.2%)  | 0.1772 (-14.8%) |
+| document     | 0.0294 | 0.1814 | 0.1824 | 0.1819 | 0.1711 (-5.7%)  | 0.1588 (-12.5%) | 0.1425 (-21.4%) |
+| chat         | 0.0277 | 0.1603 | 0.1516 | 0.1604 | 0.1350 (-15.8%) | 0.1440 (-10.2%) | 0.1148 (-28.4%) |
+| kv_stream.cu | 0.0231 | 0.1753 | 0.1694 | 0.1757 | 0.1511 (-13.8%) | 0.1587 (-9.5%)  | 0.1346 (-23.2%) |
+| README.md    | 0.0238 | 0.1516 | 0.1548 | 0.1540 | 0.1386 (-8.6%)  | 0.1413 (-6.8%)  | 0.1182 (-22.0%) |
+| mean change  |        |        | -0.2%  | +0.2%  | **-10.0%**      | -8.2%           | **-22.0%**      |
+
+(The q2k column and the per-layer arms are one run; the clip columns another, whose q2k row matches to the noise
+floor. q2k's KL here is 5-7.6x q4_0's.)
+
+- **The clip factor buys nothing at the logit level.** Its calibrated -5% to -28% attention-error gains (the table
+  above) do not reach the logits in this view. The caveat: this view runs the PREFILL attention, which never reads
+  the FP16 window, so it cannot score the window-on spec at its best; the decode-path check below is where that
+  shows up, and it needs the teacher-forced decode below to be conclusive.
+- **Layer-wise precision is a linear dial, not a free lunch.** Promoting the two layers the real-query probe ranks
+  MOST sensitive (7, 39) cuts KL 10.0%; the two it ranks LEAST sensitive (15, 47) cut 8.2% - within the noise of
+  each other. Four layers (7, 39, 23, 35) cut 22.0%. Each promoted layer buys ~5% KL for +2.4% of the cache
+  (q4_0 everywhere: ~-80% for +28.6%), so the per-layer ranking does not concentrate the benefit at the logit
+  level. `--kv-layer` is still the cheapest bytes-for-quality knob there is; it is not a way around the trade.
+
+Decode attention (`STRATA_QSA_DDUMP`, the first post-prompt query, its input token identical across arms; relative
+error of the attention output vs the fp16 arm):
+
+- **The FP16 overlay is exact for q2k.** With a window covering the whole prompt, the first QSA layer (L3) - the
+  only layer whose inputs do not depend on the KV format - falls from 0.185 to 0.004 (731-token prompt) and from
+  0.196 to 0.014 (761 tokens). A 128-cell window cuts L3's q2k error 12% / 13% / 17% on three prompts.
+- **Deeper layers are not a per-layer measurement in this view**: each inherits the format's prefill differences
+  through the residual stream, and past 2051 cells the indexer's top-k selects different cells per arm (single-
+  query errors of 0.4-0.75 at L23+ on a 16K prompt, swinging either way). Averaged over layers and nine prompts:
+  q4_0 0.087 -> 0.065 with the window; q2k 0.251 -> 0.257; q2k+L7L39 0.211 (-16%); window+clip+L7L39 0.201 (-20%).
+- What is missing is a teacher-forced DECODE (every arm fed the same continuation through the decode path), which
+  would give decode-path KL for the window, the clip spec and an FP16 overlay of salient cells; the engine does not
+  have one yet.
