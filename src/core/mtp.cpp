@@ -776,7 +776,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
             const KvHostPools hk = kv_q2k_k_half(st_.host), hv = kv_q2k_v_half(st_.host);
             const bool mirror = st_.host.present();
             strata::kernels::kv_append_q2_steps(st_.k_q2, st_.k_q2, st_.page_table, step, 4, T, kcur_, kcur_, s, cs,
-                                                mirror ? &hk : nullptr, /*v3level*/ false);
+                                                mirror ? &hk : nullptr, /*v3level*/ false, st_.kv_k_clip);
             kv_append_q4_steps(st_.v_q4, st_.v_q4, st_.page_table, step, 4, T, vcur_, vcur_, s, cs,
                                mirror ? &hv : nullptr);
         }
@@ -784,7 +784,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
             kv_append_q4_steps(st_.k_q4, st_.v_q4, st_.page_table, step, 4, T, kcur_, vcur_, s, cs, &st_.host);
         else if (!no_batch_kv && st_.kv_q2)   // 2-bit, 4-level Lloyd-Max (kv_q2.hpp), the drafter's ring in --kv q2
             strata::kernels::kv_append_q2_steps(st_.k_q2, st_.v_q2, st_.page_table, step, 4, T, kcur_, vcur_, s, cs,
-                                                &st_.host, /*v3level*/ false);
+                                                &st_.host, /*v3level*/ false, st_.kv_k_clip);
         else if (!no_batch_kv && st_.kv_int8)
             kv_append_q8_steps(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step, 4, kcur_, vcur_,
                                (int) (NKV * HD), T, s, cs, &st_.host);
@@ -807,7 +807,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
                     const bool mirror = st_.host.present();
                     strata::kernels::kv_append_q2_step(st_.k_q2, st_.k_q2, st_.page_table, step + t * 4,
                                                        kcur_ + t * NKV * HD, kcur_ + t * NKV * HD, s, cs,
-                                                       mirror ? &hk : nullptr, /*v3level*/ false);
+                                                       mirror ? &hk : nullptr, /*v3level*/ false, st_.kv_k_clip);
                     kv_append_q4_step(st_.v_q4, st_.v_q4, st_.page_table, step + t * 4, vcur_ + t * NKV * HD,
                                       vcur_ + t * NKV * HD, s, cs, mirror ? &hv : nullptr);
                 }
@@ -817,7 +817,7 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
                 else if (st_.kv_q2)
                     strata::kernels::kv_append_q2_step(st_.k_q2, st_.v_q2, st_.page_table, step + t * 4,
                                                        kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host,
-                                                       /*v3level*/ false);
+                                                       /*v3level*/ false, st_.kv_k_clip);
                 else if (st_.kv_int8)
                     kv_append_q8_step(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step + t * 4,
                                       kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st_.host);

@@ -342,6 +342,11 @@ void kv_gather_q2t_step(const uint8_t* k_q2t, const uint8_t* v_q2t, const int32_
 // is what decides the scale and whether a code byte needs an atomic. The rule, and which call sites take the tail
 // path, is spelled out in the header comment of src/kernels/cuda/kv_q2.cu.
 //
+// `k_clip` (the last parameter of all three, default 1.0) is the per-layer K clip factor of `--kv-k-clip`: the
+// K plane's stored scale becomes k_clip times the scale the rule computes, and the codes are chosen against the
+// stored (clipped) scale. The V plane always uses 1.0, so a plain-q2 call with two planes clips K only. 1.0 is
+// bit-identical to the rule without the factor (every multiply by 1.0f is exact).
+//
 /// Append the (already rotated) cell at step[kStepPos]. With a host copy (KV streaming) it is written there too,
 /// and to VRAM only if its block is resident. `v3level` selects V's codebook; K is always the 4-level one. The
 /// engine appends BOTH pools in one call with v3level = false, the shipping setting (4-level Lloyd-Max for K and
@@ -353,7 +358,7 @@ void kv_gather_q2t_step(const uint8_t* k_q2t, const uint8_t* v_q2t, const int32_
 /// launch on one stream, so these appends are sequential and the scale read is deterministic.
 void kv_append_q2_step(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table, const int32_t* step,
                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
-                       const KvHostPools* host = nullptr, bool v3level = true);
+                       const KvHostPools* host = nullptr, bool v3level = true, float k_clip = 1.0f);
 
 /// Many cells at once (a verification batch, the drafter's ring): GROUP-GRANULAR. The kernel walks the steps'
 /// positions and, for every group they touch, quantizes all the cells of that group the call has, so each
@@ -361,7 +366,7 @@ void kv_append_q2_step(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table, 
 /// the atomic path, exactly as a single-cell append does.
 void kv_append_q2_steps(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table, const int32_t* step,
                         int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
-                        void* stream, const KvHostPools* host = nullptr, bool v3level = true);
+                        void* stream, const KvHostPools* host = nullptr, bool v3level = true, float k_clip = 1.0f);
 
 /// The prompt path: T consecutive (rotated) cells from pos0, K/V [T, n_head_kv, 256]; also into `stage` (identity
 /// layout, the one-layer staging pool of a streamed session) when given. Group-granular: the grid is over the
@@ -370,7 +375,7 @@ void kv_append_q2_steps(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table,
 /// path.
 void kv_append_q2(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
                   const float* V, const QsaShapes& s, void* stream, const KvHostPools* host = nullptr,
-                  const KvHostPools* stage = nullptr, bool v3level = true);
+                  const KvHostPools* stage = nullptr, bool v3level = true, float k_clip = 1.0f);
 
 /// Gather step[kStepWidth] cells named by `ids` into FP16 scratch [id][kv_head][head_dim] (still rotated).
 void kv_gather_q2_step(const uint8_t* k_q2, const uint8_t* v_q2, const int32_t* page_table, const int32_t* ids,

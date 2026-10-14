@@ -46,6 +46,14 @@
 // butterfly. The host reference in src/kernels/kv_q2_parity.cpp (quant_kivi) sums the same way in the same order,
 // which is what makes the gate's bitwise check possible: an ulp in the scale flips a code at a threshold. The
 // scale is stored as fp16 and read back with f32_from_f16 before multiplying, exactly as the reader does.
+//
+// THE SCALE'S CLIP (`--kv-k-clip`, the kernel's `k_clip`). On the K plane the stored scale is `a` times the
+// scale the rule computes, and the codes are chosen against that stored (clipped) scale; V is never clipped.
+// The rule itself stays in the RAW domain: a stored previous scale is divided by `a` before it enters the
+// formula, the in-thread recompute of a complete g-1 produces exactly what that block stores (a * the rule,
+// fp16-rounded), and a partial group that already carries a scale keeps it as stored. With a == 1.0f every
+// multiply by a or 1/a is exact, so the default path is bit-identical to the rule without the clip - the
+// parity gate's bitwise checks run at a == 1.0f and pin that.
 
 #include "strata/kernels/kv_q2.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -129,9 +137,15 @@ __global__ void kv_append_q2_group_kernel(uint8_t* __restrict__ k_q2, uint8_t* _
                                           int step_stride, int n_steps, int64_t pos0, const float* __restrict__ kcur,
                                           const float* __restrict__ vcur, int kv_heads, int head_dim, int page_size,
                                           int planes, KvHostPools host, KvHostPools stage, bool v3level,
-                                          int use_prev) {
+                                          int use_prev, float k_clip) {
     const bool is_v = (blockIdx.z % (unsigned) planes) == 1u;
     const int h = blockIdx.x, d = threadIdx.x;
+    // THE CLIP (`--kv-k-clip`): plane 0 (K) stores `a` times the scale the rule computes and quantizes against
+    // that stored scale; plane 1 (V) is never clipped. The rule itself works on the RAW scale: every stored
+    // previous scale it reads is divided by `a` first, and the scale it writes is multiplied by `a`. With
+    // a == 1.0f every multiply by a or 1/a is exact, so the scale is bit-identical to the rule without the clip.
+    const float a = is_v ? 1.0f : k_clip;
+    const float inv_a = 1.0f / a;
     const long long g0 = pos0 >= 0 ? pos0 / Q2_0 : (long long) __ldg(step + kStepPos) / Q2_0;
     const long long g = g0 + blockIdx.y;
     const int row_stride = kv_heads * head_dim;
@@ -180,11 +194,14 @@ __global__ void kv_append_q2_group_kernel(uint8_t* __restrict__ k_q2, uint8_t* _
     //     reachable for in-order appends (its earlier cells would already carry a scale); if it were, the
     //     read sees 0 (the fallback) or that fresh scale, either a valid estimate, never a torn value.
     //   Single-cell appends use the same formula with n = 1 (s is then ~97% prev): one rule for both paths.
+    // With the clip (a != 1) the rule runs in the RAW domain: every stored previous scale is divided by `a`
+    // before it enters the formula, and the scale this block writes is `a` times the rule's result. A partial
+    // group that already carries a scale keeps it as stored (it was written clipped; no second alpha).
     float s = sqrtf(ss * (1.0f / (float) n));
     bool fresh = false;                              // does this call write the group's scale?
     if (n < Q2_0) {
         const float stored = q2c_scale(sp, g, h, d, kv_heads, head_dim);
-        if (stored > 0.0f) s = stored;
+        if (stored > 0.0f) s = stored;               // already the clipped scale: keep it, no alpha again
         else {
             fresh = true;
             float prev = 0.0f;
@@ -202,15 +219,21 @@ __global__ void kv_append_q2_group_kernel(uint8_t* __restrict__ k_q2, uint8_t* _
                         ss_prev = __fadd_rn(ss_prev, __fmul_rn(v, v));
                         ++n_prev;
                     }
+                    // exactly what this launch stores for a complete g-1: the clipped scale, a * the rule
                     prev = n_prev == Q2_0
-                               ? f32_from_f16(f16_from_f32(sqrtf(ss_prev * (1.0f / (float) Q2_0))))
+                               ? f32_from_f16(f16_from_f32(__fmul_rn(a, sqrtf(ss_prev * (1.0f / (float) Q2_0)))))
                                : q2c_scale(sp, g - 1, h, d, kv_heads, head_dim);
                 }
             }
-            if (prev > 0.0f)
-                s = sqrtf(__fmul_rn(__fadd_rn(ss, __fmul_rn((float) (Q2_0 - n), __fmul_rn(prev, prev))),
+            if (prev > 0.0f) {
+                const float prev_raw = __fmul_rn(prev, inv_a);   // stored -> raw domain
+                s = sqrtf(__fmul_rn(__fadd_rn(ss, __fmul_rn((float) (Q2_0 - n), __fmul_rn(prev_raw, prev_raw))),
                                     1.0f / (float) Q2_0));
+            }
+            s = __fmul_rn(a, s);                     // store the clipped scale
         }
+    } else {
+        s = __fmul_rn(a, s);                         // complete group: store the clipped scale
     }
     const uint16_t sbits = f16_from_f32(s);
     const bool whole = (n == Q2_0);
@@ -316,7 +339,7 @@ __global__ void kv_gather_q2_kernel(const uint8_t* __restrict__ k_q2, const uint
 // the launch size never depends on the positions - which are device state, and the graphs bake launch sizes in.
 void kv_append_q2_steps(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table, const int32_t* step,
                         int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
-                        void* stream, const KvHostPools* host, bool v3level) {
+                        void* stream, const KvHostPools* host, bool v3level, float k_clip) {
     if (n_steps <= 0) return;
     need_256(s, "kv_append_q2");
     need_page(s, "kv_append_q2");
@@ -324,22 +347,23 @@ void kv_append_q2_steps(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table,
     const dim3 grid((unsigned) s.n_head_kv, (unsigned) (n_steps + 1), (unsigned) planes);
     kv_append_q2_group_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(
         k_q2, v_q2, page_table, step, step_stride, n_steps, -1, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim,
-        (int) s.page_size, planes, host ? *host : KvHostPools{}, KvHostPools{}, v3level, n_steps == 1 ? 1 : 0);
+        (int) s.page_size, planes, host ? *host : KvHostPools{}, KvHostPools{}, v3level, n_steps == 1 ? 1 : 0,
+        k_clip);
     check("kv_append_q2 launch");
 }
 
 // The decode append: one cell, which is a partial group - the atomic path, and the group keeps its scale.
 void kv_append_q2_step(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table, const int32_t* step,
                        const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
-                       const KvHostPools* host, bool v3level) {
-    kv_append_q2_steps(k_q2, v_q2, page_table, step, 0, 1, kcur, vcur, s, stream, host, v3level);
+                       const KvHostPools* host, bool v3level, float k_clip) {
+    kv_append_q2_steps(k_q2, v_q2, page_table, step, 0, 1, kcur, vcur, s, stream, host, v3level, k_clip);
 }
 
 // The prompt path: T consecutive cells from pos0, group-granular. The range's first and last group are partial
 // when the chunk is not a multiple of 32 cells (it usually is not) and take the atomic path.
 void kv_append_q2(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table, int64_t pos0, int64_t T, const float* K,
                   const float* V, const QsaShapes& s, void* stream, const KvHostPools* host, const KvHostPools* stage,
-                  bool v3level) {
+                  bool v3level, float k_clip) {
     if (T <= 0) return;
     need_256(s, "kv_append_q2");
     need_page(s, "kv_append_q2");
@@ -348,7 +372,7 @@ void kv_append_q2(uint8_t* k_q2, uint8_t* v_q2, const int32_t* page_table, int64
     const dim3 grid((unsigned) s.n_head_kv, (unsigned) ((T + Q2_0 - 1) / Q2_0 + 1), (unsigned) planes);
     kv_append_q2_group_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(
         k_q2, v_q2, page_table, nullptr, 0, (int) T, pos0, K, V, (int) s.n_head_kv, (int) s.head_dim,
-        (int) s.page_size, planes, h, st, v3level, 0);
+        (int) s.page_size, planes, h, st, v3level, 0, k_clip);
     check("kv_append_q2 batch launch");
 }
 

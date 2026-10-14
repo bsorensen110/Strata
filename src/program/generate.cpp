@@ -409,6 +409,10 @@ struct Options {
     /// quantized --kv formats gain from it.
     int64_t kv_window = 0;
     int64_t kv_sink = 8;
+    /// Per-layer K clip factor for the q2-family per-channel scale (`--kv-k-clip`, kv_q2.hpp): a comma list of
+    /// items, each a bare float (the default for every QSA layer) or `L:A` (model layer L, e.g. `3:0.85`).
+    /// The K scale is stored as A times the scale the rule computes; 1.0 (the default) is bit-identical.
+    std::string kv_k_clip;
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
@@ -765,6 +769,13 @@ void usage() {
                  "                       7% more bytes, and better than q4_0 on the layer with the widest channel\n"
                  "                       spread (kv_q2_parity, K-top1/4@16b + V4). Streams and rings like q2;\n"
                  "                       --kv-window applies\n"
+                 "  --kv-k-clip SPEC     per-layer CLIP FACTOR on the K side of the q2-family per-channel scale\n"
+                 "                       (--kv q2 / q2k): the stored K scale becomes A times the scale the rule\n"
+                 "                       computes, and the codes are quantized against that stored scale. SPEC is a\n"
+                 "                       comma list: a bare float is the default for every QSA layer, `L:A` sets\n"
+                 "                       model layer L (3, 7, ... 47 - the numbering --dump-kv uses). Examples:\n"
+                 "                       `0.9`, `3:0.85,47:0.7`, `0.95,47:0.8`. 0.25 <= A <= 4.0; A = 1.0 (the\n"
+                 "                       default) is bit-identical to the rule without the flag. V is never clipped\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -2069,6 +2080,7 @@ int main(int argc, char** argv) {
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--kv-window") o.kv_window = std::atoll(next("--kv-window"));
         else if (a == "--kv-sink") o.kv_sink = std::atoll(next("--kv-sink"));
+        else if (a == "--kv-k-clip") o.kv_k_clip = next("--kv-k-clip");
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
@@ -3002,6 +3014,79 @@ int main(int argc, char** argv) {
                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
+    // **`--kv-k-clip`: the per-layer K clip factor on the q2-family per-channel scale (kv_q2.hpp).**  SPEC is a
+    // comma list; an item is a bare float (the default for every QSA layer) or `L:A` (model layer L - the
+    // numbering --dump-kv and STRATA_KV_PROBE_LAYER use).  The K scale is STORED as A times the scale the rule
+    // computes, and the codes are quantized against that stored scale; A = 1.0 (the default) is bit-identical.
+    // Validated here, where the geometry is known (L must be a QSA layer of THIS model), and handed to
+    // layer.cpp's table before session init, which copies it into each main layer's QsaState.
+    if (!o.kv_k_clip.empty()) {
+        float clip_default = 1.0f;
+        std::vector<std::pair<int64_t, float>> clip_layers;
+        for (size_t at = 0; at <= o.kv_k_clip.size();) {
+            const size_t comma = o.kv_k_clip.find(',', at);
+            const std::string item = o.kv_k_clip.substr(at, comma == std::string::npos ? std::string::npos
+                                                                                       : comma - at);
+            at = comma == std::string::npos ? o.kv_k_clip.size() + 1 : comma + 1;
+            if (item.empty()) continue;
+            const size_t colon = item.find(':');
+            const std::string a_str = colon == std::string::npos ? item : item.substr(colon + 1);
+            float a = 0.0f;
+            size_t used = 0;
+            try { a = (float) std::stod(a_str, &used); } catch (...) {}
+            if (used != a_str.size() || !(a >= 0.25f && a <= 4.0f)) {
+                std::fprintf(stderr, "strata generate: --kv-k-clip: '%s' is not A or L:A with 0.25 <= A <= 4.0\n",
+                             item.c_str());
+                return 2;
+            }
+            if (colon == std::string::npos) {
+                clip_default = a;
+                continue;
+            }
+            const std::string l_str = item.substr(0, colon);
+            int64_t layer = -1;
+            size_t lused = 0;
+            try { layer = (int64_t) std::stoll(l_str, &lused); } catch (...) {}
+            if (lused != l_str.size() || layer < 0 || !strata::core::is_qsa_layer(g, layer) ||
+                layer >= g.n_layers) {
+                std::fprintf(stderr, "strata generate: --kv-k-clip: '%s' names layer %lld, not a QSA layer of this "
+                                     "model (QSA layers: %lld, %lld, ... %lld)\n", item.c_str(), (long long) layer,
+                             (long long) (g.qsa_interval - 1), (long long) (2 * g.qsa_interval - 1),
+                             (long long) (g.n_layers - 1));
+                return 2;
+            }
+            clip_layers.push_back({layer, a});
+        }
+        // the effective per-layer alphas: the default on every QSA layer, then the named layers on top
+        std::vector<std::pair<int64_t, float>> eff;
+        if (clip_default != 1.0f)
+            for (int64_t l = g.qsa_interval - 1; l < g.n_layers; l += g.qsa_interval) eff.push_back({l, clip_default});
+        for (const auto& e : clip_layers) eff.push_back(e);
+        bool any_clip = false;
+        for (const auto& e : eff) any_clip = any_clip || e.second != 1.0f;
+        if (any_clip) {
+            if (o.kv != "q2" && o.kv != "q2k") {
+                std::fprintf(stderr, "strata generate: --kv-k-clip with a non-1.0 alpha needs --kv q2 or q2k "
+                                     "(the q2-family per-channel K scale); --kv is %s\n", o.kv.c_str());
+                return 2;
+            }
+            for (const auto& e : eff)
+                if (e.second != 1.0f) strata::core::qsa_set_kv_k_clip(e.first, e.second);
+            std::string listed;
+            char buf[96];
+            if (clip_default != 1.0f) {
+                std::snprintf(buf, sizeof buf, "default %.3f", clip_default);
+                listed = buf;
+            }
+            for (const auto& [layer, a] : clip_layers) {
+                if (a == 1.0f) continue;
+                std::snprintf(buf, sizeof buf, "%s%lld:%.3f", listed.empty() ? "" : ", ", (long long) layer, a);
+                listed += buf;
+            }
+            std::fprintf(stderr, "strata generate: --kv-k-clip: K scale clip alpha (%s) - the stored K scale is "
+                                 "alpha times the rule's, V unclipped\n", listed.c_str());
+        }
+    }
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,
     // and `session_init` below builds the rope table from it and captures the kernels reading its constants
     // (rope_scaling.hpp); the only hard constraint is "set before that", and dying on a bad rope key beats

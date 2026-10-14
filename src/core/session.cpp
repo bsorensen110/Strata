@@ -112,10 +112,16 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
-    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+    for (int64_t j = 0; j < s.qsa_alloc; ++j) {
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
                            s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
             return 0;
+        // the per-layer K clip factor (--kv-k-clip): ordinal qsa_ord0 + j is the model layer
+        // (qsa_ord0 + j) * qsa_interval + qsa_interval - 1 - the numbering --dump-kv uses (is_qsa_layer's
+        // derivation, inverted). The drafter's ring state is built in mtp.cpp and keeps 1.0.
+        s.qsa_states[s.qsa_ord0 + j].kv_k_clip =
+            qsa_kv_k_clip((s.qsa_ord0 + j) * I + (I - 1));
+    }
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 
     s.moe_arena = take(moe_buffers_bytes(g, k));

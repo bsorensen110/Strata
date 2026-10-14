@@ -587,3 +587,31 @@ answers 3/3 with no window, 0 loops - at 480 B/cell, decode **139.4 t/s** (q2k 1
 outlier-layer regression). `--kv q2t` ships as the measured alternative for typical-layer deployments
 and as the base the outlier layers would need to beat - per-group codebooks reach 1.037% on layer 47,
 but at a byte cost no layout here pays.
+
+### Per-layer K clip factor (`--kv-k-clip`)
+
+`--kv-k-clip SPEC` puts a per-layer CLIP FACTOR alpha on the K side of the q2-family per-channel scale
+(`--kv q2` and `--kv q2k`): the stored K scale becomes `alpha * (the scale the rule computes)`, and the
+codes are then chosen against that clipped scale (the unrounded float, as for every q2 code; the reader
+dequantizes with the stored fp16 bits). alpha < 1 clips harder, alpha > 1 widens the grid. SPEC is a comma list; an item is a bare float
+(the default for every QSA layer) or `L:A` (model layer L - 3, 7, ... 47, the numbering `--dump-kv` and
+STRATA_KV_PROBE_LAYER use). Examples: `0.9`, `3:0.85,47:0.7`, `0.95,47:0.8`. 0.25 <= A <= 4.0; a
+non-1.0 alpha is refused unless `--kv` is q2 or q2k. V is never clipped, and the MTP drafter's ring
+state keeps 1.0.
+
+The exact rule, in `kv_append_q2_group_kernel`: the rule itself runs in the RAW domain. Every stored
+previous scale it reads (the pool's scale of group g-1, or the in-thread recompute of a complete g-1 in
+the same launch - which produces exactly what that block stores, `f16(alpha * sqrt(ss_prev/32))`) is
+converted first: `prev_raw = prev_stored * (1.0f / alpha)`. The rule computes s from ss, n and prev_raw
+exactly as above - complete group, fresh partial with prev, fresh partial without prev - and the scale
+that gets stored is `f16(alpha * s)`. A partial group that already carries a scale keeps it as stored
+(no second alpha). With alpha = 1.0 every multiply by 1.0f is exact, so the stored bytes are
+**bit-identical** to the rule without the flag; the parity gate's bitwise checks run at 1.0.
+
+alpha is calibrated per layer with `tools/kv_realq_probe.py`: the model's own queries (`STRATA_QSA_QDUMP`),
+its own QSA selections (`STRATA_QSA_DUMP`) and the fp16 cache (`--dump-kv`), the probe reproducing the
+engine's attention output to ~1e-7 before any arm is scored. The random-query gate probe is NOT a
+calibration source for this: on real queries the best alpha is above 1 (widen the grid), the opposite of
+what the random query suggested on layer 47. Pinned in kv_q2_parity: "--kv-k-clip 0.8: the stored K
+scale is alpha x the rule ...", bit for bit (mutation-tested). The per-layer table follows the
+calibration runs.

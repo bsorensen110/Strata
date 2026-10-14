@@ -255,6 +255,10 @@ struct QsaState {
     /// A reader told "q2" would read the loud channels' 18-byte slots as 10-byte ones, and a mover told "q2"
     /// would move 80 of every block's 96 bytes per cell and head. Both are silent, both are wrong.
     bool kv_q2t = false;
+    /// Per-layer K clip factor (`--kv-k-clip`, kv_q2.hpp): the q2-family per-channel K scale is STORED as this
+    /// times the scale the rule computes - the codes are then chosen against the stored (clipped) scale, and V
+    /// and the drafter ring never see it. 1.0 (the default) is bit-identical to the rule without it.
+    float kv_k_clip = 1.0f;
     uint32_t* kv_levels = nullptr;      ///< (n_head_kv * head_dim / 32) words: bit set = loud (16 levels, 4-bit)
     int32_t* kv_level_off = nullptr;    ///< (n_head_kv * head_dim) byte offsets of each channel's slot in its block
     int32_t* kv_level_frozen = nullptr; ///< 0: the bitmap has not been computed (every channel quiet = the q2 layout)
@@ -384,6 +388,13 @@ bool qsa_kv_q2k();
 /// the session.
 void qsa_set_kv_q2t(bool enabled);
 bool qsa_kv_q2t();
+/// Per-layer K clip factor (`--kv-k-clip`): the q2/q2k K scale is stored as `alpha` times the scale the rule
+/// computes (kv_q2.hpp). Indexed by MODEL layer (3, 7, ... 47 - the numbering `--dump-kv` and
+/// STRATA_KV_PROBE_LAYER use); every layer defaults to 1.0, which is bit-identical to the rule without the
+/// factor. Set per layer before session init; `session_init` copies the table into each main layer's
+/// `QsaState::kv_k_clip` (the drafter ring keeps 1.0).
+void qsa_set_kv_k_clip(int64_t model_layer, float alpha);
+float qsa_kv_k_clip(int64_t model_layer);
 /// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid /
 /// kKvQ2 / kKvQ2K / kKvQ2T). THE MIXED FORMATS ARE NAMED AS MIXED: kKvHybrid is "int8 K + q4_0 V", kKvQ2K is
 /// "q2-per-channel K + q4_0 V" and kKvQ2T is "q2t mixed-level K + q4_0 V", each with its own runs in

@@ -2142,6 +2142,62 @@ int main() {
                          "batch append into a fresh group stores the full-group RMS with the previous group's "
                          "mean square for the 20 cells not yet written, bit for bit, and the same bits whether "
                          "the previous group was in this launch or the last");
+        // --kv-k-clip: the same two appends with alpha = 0.8 on K. The stored scale is alpha x the rule, the rule
+        // runs in the raw domain (the stored previous scale divided by alpha first), and the codes are chosen
+        // against the stored (clipped) scale. Host mirror: separate float ops in the kernel's order.
+        {
+            const float a = 0.8f, inv_a = 1.0f / a;
+            uint8_t* kq2_c = dalloc<uint8_t>(pool48);
+            uint8_t* kq2_d = dalloc<uint8_t>(pool48);
+            k::kv_append_q2(kq2_c, kq2_c, d_tab48, 0, 32, dK, dK, s, nullptr, nullptr, nullptr, false, a);
+            k::kv_append_q2(kq2_c, kq2_c, d_tab48, 32, 12, dK + (size_t) 32 * H * D, dK + (size_t) 32 * H * D, s,
+                            nullptr, nullptr, nullptr, false, a);
+            k::kv_append_q2(kq2_d, kq2_d, d_tab48, 0, n44, dK, dK, s, nullptr, nullptr, nullptr, false, a);
+            ck(cudaDeviceSynchronize(), "clipped 44-cell appends");
+            std::vector<uint8_t> hc(pool48), hd(pool48);
+            ck(cudaMemcpy(hc.data(), kq2_c, pool48, cudaMemcpyDeviceToHost), "clipped pool c");
+            ck(cudaMemcpy(hd.data(), kq2_d, pool48, cudaMemcpyDeviceToHost), "clipped pool d");
+            bool clip_ok = true, codes_ok = true, differs = false;
+            for (int h = 0; h < H && clip_ok; ++h)
+                for (int d = 0; d < D && clip_ok; ++d) {
+                    float ss0 = 0.0f, ss1 = 0.0f;
+                    for (int i = 0; i < 32; ++i) {
+                        const float v = Kref[(size_t) i * H * D + (size_t) h * D + d];
+                        ss0 += v * v;
+                    }
+                    for (int i = 32; i < n44; ++i) {
+                        const float v = Kref[(size_t) i * H * D + (size_t) h * D + d];
+                        ss1 += v * v;
+                    }
+                    const float s0 = sqrtf(ss0 * (1.0f / 32.0f));
+                    const uint16_t want0 = k::f16_from_f32(a * s0);
+                    const float prev_raw = k::f32_from_f16(want0) * inv_a;
+                    const float pp = prev_raw * prev_raw;
+                    const float t = 20.0f * pp;
+                    const float u = ss1 + t;
+                    const float w = u * (1.0f / 32.0f);
+                    const uint16_t want1 = k::f16_from_f32(a * sqrtf(w));
+                    const k::block_q2c_0* c0 = k::q2c_slot(hc.data(), 0, h, d, H, D);
+                    const k::block_q2c_0* c1 = k::q2c_slot(hc.data(), 1, h, d, H, D);
+                    if (c0->d != want0 || c1->d != want1 || k::q2c_slot(hd.data(), 0, h, d, H, D)->d != want0 ||
+                        k::q2c_slot(hd.data(), 1, h, d, H, D)->d != want1)
+                        clip_ok = false;
+                    if (want0 != k::f16_from_f32(s0)) differs = true;   // the clip actually moved the scale
+                    for (int i = 0; i < 32; ++i) {                     // group 0's codes vs the CLIPPED scale
+                        // the kernel picks codes against the unrounded float scale (a x the rule); the reader
+                        // dequantizes with the stored fp16 bits - as for every q2 code
+                        const int want_code = k::q2_code_lm4(Kref[(size_t) i * H * D + (size_t) h * D + d],
+                                                             a * s0);
+                        if (((c0->qs[i / 4] >> (2 * (i % 4))) & 3) != want_code) codes_ok = false;
+                    }
+                }
+            check(clip_ok && codes_ok && differs,
+                  "--kv-k-clip 0.8: the stored K scale is alpha x the rule (complete group) and alpha x the raw-domain "
+                  "shrink (fresh partial group), bit for bit, the same bits in one call or two, and the codes are "
+                  "chosen against the clipped scale");
+            cudaFree(kq2_c);
+            cudaFree(kq2_d);
+        }
     } else {
         std::printf("  fresh partial group after a complete one: NOT RUN - the probe cache has %d cells, fewer\n"
                     "  than the 44 the check appends\n", N);
