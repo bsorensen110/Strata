@@ -210,13 +210,34 @@ void kv_window_env() {
     }
     if (g_kv_window > 0 && g_kv_sinks > g_kv_window) g_kv_sinks = g_kv_window;
 }
+/// `--kv-layer`: per-layer KV format overrides, by MODEL layer index (3, 7, ... 47).  Sparse: -1 = the global
+/// format.  Only the rotated family (q4_0 / q2 / q2k) can be named - all three are Hadamard-rotated
+/// (QsaState::kv_rot), so the rotation, the FP16 window overlay and the query rotation stay uniform across a
+/// mixed session.  Mirrors `qsa_set_kv_k_clip`: `session_init` passes each main layer's model layer to the
+/// sizing and init of its state; the drafter ring passes -1 and keeps the global format.
+std::vector<int> g_kv_layer_fmt;
+/// The KV format flags one state gets: the globals, with the layer's `--kv-layer` override replacing the
+/// format when it names one.  The override is only ever q4_0 / q2 / q2k (validated at the CLI), so int8, q2t
+/// and hybrid stay global - they cannot be combined with an override.
+struct KvFmt { bool int8, q4, q2, q2k, q2t, hybrid; };
+KvFmt kv_fmt(int64_t model_layer) {
+    KvFmt f{g_kv_int8, g_kv_q4, g_kv_q2, g_kv_q2k, g_kv_q2t, g_kv_hybrid};
+    if (model_layer >= 0 && (size_t) model_layer < g_kv_layer_fmt.size()) {
+        const int o = g_kv_layer_fmt[(size_t) model_layer];
+        if (o >= 0)
+            f = {false, o == strata::kernels::kKvQ4, o == strata::kernels::kKvQ2, o == strata::kernels::kKvQ2K,
+                 false, false};
+    }
+    return f;
+}
 /// Is the overlay in play for the state about to be sized/created?  Only the quantized formats gain from it (an
 /// FP16 state is already exact) and the MTP drafter's ring keeps its plain format, the hybrid setting's reason:
 /// the block movers never see an arena the rest of the engine does not know about.
-bool kv_window_wanted(int64_t ring_cells) {
+bool kv_window_wanted(int64_t ring_cells, int64_t model_layer) {
     kv_window_env();
+    const KvFmt f = kv_fmt(model_layer);
     return g_kv_window > 0 && ring_cells <= 0 &&
-           (g_kv_q4 || g_kv_q2 || g_kv_q2k || g_kv_q2t || (g_kv_int8 && !g_kv_q4 && !g_kv_q2));
+           (f.q4 || f.q2 || f.q2k || f.q2t || (f.int8 && !f.q4 && !f.q2));
 }
 strata::kernels::KvWindowShape kv_window_shape() {
     return strata::kernels::KvWindowShape{(int32_t) g_kv_window, (int32_t) g_kv_sinks};
@@ -243,6 +264,14 @@ void qsa_set_kv_k_clip(int64_t model_layer, float alpha) {
 }
 float qsa_kv_k_clip(int64_t model_layer) {
     return model_layer >= 0 && (size_t) model_layer < g_kv_k_clip.size() ? g_kv_k_clip[(size_t) model_layer] : 1.0f;
+}
+void qsa_set_kv_layer_format(int64_t model_layer, int fmt) {
+    if (g_kv_layer_fmt.size() <= (size_t) model_layer) g_kv_layer_fmt.resize((size_t) model_layer + 1, -1);
+    g_kv_layer_fmt[(size_t) model_layer] = fmt;
+}
+int qsa_kv_layer_format(int64_t model_layer) {
+    return model_layer >= 0 && (size_t) model_layer < g_kv_layer_fmt.size()
+               ? g_kv_layer_fmt[(size_t) model_layer] : -1;
 }
 void qsa_set_kv_window(int64_t window, int64_t sinks) {
     g_kv_window_asked = true;
@@ -708,18 +737,20 @@ struct KvPlan {
     int mode = 0;
     int64_t pages = 0, slots = 0, pooled_rows = 0;
 };
-KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
+KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells, int64_t model_layer) {
     KvPlan p;
     // q2's residency unit is a GROUP of 32/page_size = 8 pages (its per-channel scale is shared by the whole
     // group, kv_stream.hpp), so the slot count is rounded up to whole groups and to at least one sweep step of
     // them (the resolve block's 1,024 threads each look at one group). q2k takes the same unit for the same
     // reason - its K side IS the q2 per-channel path, so its scale is shared by the group and the group is
     // resident together or not at all - and so does q2t, whose loud plane's scale spans the same group. Every
-    // other format has unit 1 and is untouched by this.
-    const int64_t unit = (g_kv_q2 || g_kv_q2k || g_kv_q2t)
+    // other format has unit 1 and is untouched by this.  The format is the LAYER's (`--kv-layer`): a q4_0
+    // layer promoted out of a q2k session has unit 1 and its own page rounding.
+    const KvFmt f = kv_fmt(model_layer);
+    const int64_t unit = (f.q2 || f.q2k || f.q2t)
                              ? (int64_t) strata::kernels::kv_stream_unit_blocks(
-                                   s, g_kv_q2t ? strata::kernels::kKvQ2T
-                                               : (g_kv_q2k ? strata::kernels::kKvQ2K : strata::kernels::kKvQ2))
+                                   s, f.q2t ? strata::kernels::kKvQ2T
+                                            : (f.q2k ? strata::kernels::kKvQ2K : strata::kernels::kKvQ2))
                              : 1;
     p.pages = (max_cells + s.page_size - 1) / s.page_size;
     // A q2/q2k pool holds WHOLE GROUPS: its 10-byte slots are group-major, so a page count that is not a
@@ -749,7 +780,8 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     }
     return p;
 }
-uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8, bool q2k, bool q2t) {
+uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8, bool q2k, bool q2t, bool q4,
+                       bool q2) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
         const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2 +
@@ -772,8 +804,8 @@ uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8
         return rows * (strata::kernels::kv_q2t_bytes_per_head((int) s.head_dim) +
                        strata::kernels::kv_q4_bytes_per_head((int) s.head_dim)) + 64;
     }
-    if (g_kv_q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
-    if (g_kv_q2) return (uint64_t) pages * s.page_size * strata::kernels::kv_q2_bytes_per_cell(s) + 64;
+    if (q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
+    if (q2) return (uint64_t) pages * s.page_size * strata::kernels::kv_q2_bytes_per_cell(s) + 64;
     return int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
                 : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
 }
@@ -784,19 +816,21 @@ int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
+                         int64_t model_layer) {
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    const KvPlan p = kv_plan(s, max_cells, ring_cells, model_layer);
+    const KvFmt f = kv_fmt(model_layer);
     uint64_t n = 0;
     if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
         // q2k needs no `ring_cells <= 0` guard, unlike hybrid: the drafter's ring state keeps the q2k format
         // (mtp.cpp toggles only k8v4 to plain INT8), so its ring pools are sized by the same two widths.
-        n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
-                           g_kv_int8 || g_kv_hybrid, g_kv_q2k, g_kv_q2t) + 4 * 16;   // K/V pools (the VRAM slots)
+        n += kv_pool_bytes(s, p.slots, f.hybrid && ring_cells <= 0,
+                           f.int8 || f.hybrid, f.q2k, f.q2t, f.q4, f.q2) + 4 * 16;   // K/V pools (the VRAM slots)
     // q2t's level map (the bitmap, its prefix sum, the freeze flag) is arena memory in every mode, elastic
     // included: the pools move to the VMM range and these do not, so they are counted here, not in
     // kv_pool_bytes, where the elastic branch skips them.
-    if (g_kv_q2t)
+    if (f.q2t)
         n += (uint64_t) s.n_head_kv * ((s.head_dim + 31) / 32) * 4 + (uint64_t) s.n_head_kv * s.head_dim * 4 +
              4 * 16;
     n += (uint64_t) p.pages * 4;                                               // page_table
@@ -809,22 +843,23 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     // the FP16 sliding window + attention sinks (kv_window.hpp); fixed, not proportional to max_cells
-    if (kv_window_wanted(ring_cells)) n += strata::kernels::kv_window_bytes(s, kv_window_shape()) + 16;
+    if (kv_window_wanted(ring_cells, model_layer)) n += strata::kernels::kv_window_bytes(s, kv_window_shape()) + 16;
     return align_up16(n) + 256;
 }
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope, int64_t ring_cells) {
+                        const QsaState* share_rope, int64_t ring_cells, int64_t model_layer) {
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    const KvPlan p = kv_plan(s, max_cells, ring_cells, model_layer);
+    const KvFmt f = kv_fmt(model_layer);
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
-    st.kv_int8 = g_kv_int8 && !g_kv_q4 && !g_kv_q2;
-    st.kv_q4 = g_kv_q4 && !g_kv_q2;   // q2 wins a request that sets both: it is the smaller format
-    st.kv_q2 = g_kv_q2;
+    st.kv_int8 = f.int8 && !f.q4 && !f.q2;
+    st.kv_q4 = f.q4 && !f.q2;   // q2 wins a request that sets both: it is the smaller format
+    st.kv_q2 = f.q2;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
     // mtp.cpp). A streamed one keeps its host copy in the same three runs (kv_stream.cu, kKvHybrid).
-    if (g_kv_hybrid && ring_cells <= 0) {
+    if (f.hybrid && ring_cells <= 0) {
         st.kv_hybrid = true;
         st.kv_int8 = false;
         st.kv_q4 = false;
@@ -833,7 +868,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // which the drafter's appends already know, so nothing is toggled off for it (mtp.cpp). It clears the two
     // single-format flags rather than setting them: a state with kv_q2 AND kv_q4 set is a q2 state by the rule
     // above, and this format is neither of those two pools.
-    if (g_kv_q2k) {
+    if (f.q2k) {
         st.kv_q2k = true;
         st.kv_q2 = false;
         st.kv_q4 = false;
@@ -843,7 +878,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // path and its V side is the q4 path, both of which the drafter's appends already know. It clears the
     // single-format flags rather than setting them, and it is checked after q2k so a request that asks for
     // both takes q2k (the smaller of the two, and the one that ships).
-    if (g_kv_q2t && !st.kv_q2k) {
+    if (f.q2t && !st.kv_q2k) {
         st.kv_q2t = true;
         st.kv_q2 = false;
         st.kv_q4 = false;
@@ -935,7 +970,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.k_win = nullptr;
     st.v_win = nullptr;
     st.win_bulk_rows = 0;
-    if (kv_window_wanted(ring_cells)) {
+    if (kv_window_wanted(ring_cells, model_layer)) {
         const strata::kernels::KvWindowShape ws = kv_window_shape();
         const uint64_t win_rows = (uint64_t) strata::kernels::kv_window_slots(ws) * s.n_head_kv * s.head_dim;
         st.k_win = c.take<uint16_t>(win_rows);

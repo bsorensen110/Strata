@@ -325,7 +325,11 @@ struct QsaState {
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+/// `model_layer` is the MODEL layer index (3, 7, ... 47 - the numbering `--dump-kv` and `--kv-k-clip` use) whose
+/// `--kv-layer` override, if any, replaces the global format for this state; -1 (the default) is the global
+/// format - what the MTP drafter's ring and every caller without a per-layer spec pass.
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
+                         int64_t model_layer = -1);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
@@ -395,6 +399,14 @@ bool qsa_kv_q2t();
 /// `QsaState::kv_k_clip` (the drafter ring keeps 1.0).
 void qsa_set_kv_k_clip(int64_t model_layer, float alpha);
 float qsa_kv_k_clip(int64_t model_layer);
+/// Layer-wise mixed KV precision (`--kv-layer`): the per-layer KV format override, by MODEL layer index
+/// (3, 7, ... 47).  Sparse: `qsa_kv_layer_format` answers -1 (the global format) for every layer a caller has
+/// not set.  `fmt` is one of the ROTATED FAMILY's `kKvQ4` / `kKvQ2` / `kKvQ2K` (validated at the CLI): all
+/// three share the Hadamard rotation, so the rotation, the FP16 window overlay and the query rotation stay
+/// uniform across a mixed session.  Set per layer before session init; `session_init` passes the model layer
+/// to each main layer's sizing and init (the drafter ring passes -1 and keeps the global format).
+void qsa_set_kv_layer_format(int64_t model_layer, int fmt);
+int qsa_kv_layer_format(int64_t model_layer);
 /// The state's KV format for the block-moving functions of kv_stream.hpp (kKvF16 / kKvInt8 / kKvQ4 / kKvHybrid /
 /// kKvQ2 / kKvQ2K / kKvQ2T). THE MIXED FORMATS ARE NAMED AS MIXED: kKvHybrid is "int8 K + q4_0 V", kKvQ2K is
 /// "q2-per-channel K + q4_0 V" and kKvQ2T is "q2t mixed-level K + q4_0 V", each with its own runs in
@@ -408,8 +420,9 @@ inline int qsa_kv_format(const QsaState& st) {
     if (st.kv_q2) return strata::kernels::kKvQ2;
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
+/// `model_layer`: as in `qsa_state_bytes` - the layer's `--kv-layer` format, -1 for the global format.
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0, int64_t model_layer = -1);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,

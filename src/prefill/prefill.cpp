@@ -868,40 +868,84 @@ void take_stage(Alloc& o_borrowed, const core::SessionState& ss, const strata::k
     own.owned = o_borrowed.owned;
     Alloc& o = stage_own() ? own : o_borrowed;
     const size_t rows = (size_t) q0.n_pages * s.n_head_kv * s.page_size;
-    if (q0.kv_hybrid) {   // K8V4: the three runs of kKvHybrid; pools_of() then reads as the hybrid pools (mode 3)
-        st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
-        st.k_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
-        st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
-    } else if (q0.kv_q2k) {   // q2k: the staging pool is the identity layout, so the same two runs the state
-                              // carves - K at the q2 width, V at the q4_0 one. pools_of() then reads (K mode 4,
-                              // V mode 2), the pair the fused attention uses for this format.
-        st.k_q2 = o.take<uint8_t>(rows * strata::kernels::kv_q2_bytes_per_head((int) s.head_dim), ok);
-        st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
-    } else if (q0.kv_q2t) {   // q2t: the staging pool is the identity layout, so the same two runs the state
-                              // carves - K at the q2t width (96 B per cell and head), V at the q4_0 one - and
-                              // the state's own level map, which is what places a channel's slot in this copy
-                              // too. pools_of() then reads (K mode 6, V mode 2), the pair the fused attention
-                              // uses for this format.
-        st.k_q2 = o.take<uint8_t>(rows * strata::kernels::kv_q2t_bytes_per_head((int) s.head_dim), ok);
-        st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
+    // The pool is ONE buffer reused layer by layer, so it is sized by the WIDEST streamed layer: under
+    // `--kv-layer` a q4_0 layer's K (144 B per cell and head) does not fit in a q2k pool's 80-byte K plane,
+    // and the per-layer fold (the prompt path, below) writes each layer's own format into it.  The planes
+    // alias - one layer at a time reads them - and a zero-width plane is skipped, so a single-format session
+    // carves exactly the runs it carved before.
+    const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    const uint64_t q2_row = strata::kernels::kv_q2_bytes_per_head((int) s.head_dim);
+    const uint64_t q2t_row = strata::kernels::kv_q2t_bytes_per_head((int) s.head_dim);
+    uint64_t wK = 0, wK8 = 0, wKsc = 0, wV = 0, wV8 = 0, wVsc = 0;
+    const int64_t j1 = ss.qsa_ord0 + std::max<int64_t>(ss.qsa_alloc, 1);
+    for (int64_t j = ss.qsa_ord0; j < j1; ++j) {
+        const core::QsaState& q = ss.qsa_states[j];
+        if (q.kv_mode != 1) continue;
+        if (q.kv_hybrid) {
+            wK8 = std::max(wK8, rows * s.head_dim);
+            wKsc = std::max(wKsc, rows * (s.head_dim / 64) * 2);
+            wV = std::max(wV, rows * q4_row);
+        } else if (q.kv_q2k) {
+            wK = std::max(wK, rows * q2_row);
+            wV = std::max(wV, rows * q4_row);
+        } else if (q.kv_q2t) {
+            wK = std::max(wK, rows * q2t_row);
+            wV = std::max(wV, rows * q4_row);
+        } else if (q.kv_q4) {
+            wK = std::max(wK, rows * q4_row);
+            wV = std::max(wV, rows * q4_row);
+        } else if (q.kv_q2) {
+            wK = std::max(wK, rows * q2_row);
+            wV = std::max(wV, rows * q2_row);
+        } else if (q.kv_int8) {
+            wK8 = std::max(wK8, rows * s.head_dim);
+            wV8 = std::max(wV8, rows * s.head_dim);
+            wKsc = std::max(wKsc, rows * (s.head_dim / 64) * 2);
+            wVsc = std::max(wVsc, rows * (s.head_dim / 64) * 2);
+        } else {
+            wK = std::max(wK, rows * s.head_dim * 2);
+            wV = std::max(wV, rows * s.head_dim * 2);
+        }
+    }
+    uint8_t* kp = wK ? o.take<uint8_t>(wK, ok) : nullptr;
+    int8_t* k8 = wK8 ? (int8_t*) o.take<uint8_t>(wK8, ok) : nullptr;
+    uint16_t* ksc = wKsc ? (uint16_t*) o.take<uint8_t>(wKsc, ok) : nullptr;
+    uint8_t* vp = wV ? o.take<uint8_t>(wV, ok) : nullptr;
+    int8_t* v8 = wV8 ? (int8_t*) o.take<uint8_t>(wV8, ok) : nullptr;
+    uint16_t* vsc = wVsc ? (uint16_t*) o.take<uint8_t>(wVsc, ok) : nullptr;
+    st.k_q2 = kp; st.k_q4 = kp; st.k_pool = (uint16_t*) kp;
+    st.k_q = k8; st.k_scale = ksc;
+    st.v_q4 = vp; st.v_q2 = vp; st.v_pool = (uint16_t*) vp;
+    st.v_q = v8; st.v_scale = vsc;
+    if (q0.kv_q2t) {   // the level map is the state's own device array (the host copy carries the same pointers)
         st.k_levels = q0.kv_levels;
         st.k_level_off = q0.kv_level_off;
-    } else if (q0.kv_q4) {
-        st.k_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
-        st.v_q4 = o.take<uint8_t>(rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim), ok);
-    } else if (q0.kv_q2) {
-        st.k_q2 = o.take<uint8_t>(rows * strata::kernels::kv_q2_bytes_per_head((int) s.head_dim), ok);
-        st.v_q2 = o.take<uint8_t>(rows * strata::kernels::kv_q2_bytes_per_head((int) s.head_dim), ok);
-    } else if (q0.kv_int8) {
-        st.k_q = o.take<int8_t>(rows * s.head_dim, ok);
-        st.v_q = o.take<int8_t>(rows * s.head_dim, ok);
-        st.k_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
-        st.v_scale = o.take<uint16_t>(rows * (s.head_dim / 64), ok);
-    } else {
-        st.k_pool = o.take<uint16_t>(rows * s.head_dim, ok);
-        st.v_pool = o.take<uint16_t>(rows * s.head_dim, ok);
     }
 }
+// The staging pool's view for ONE layer. take_stage() sizes the pool by the widest streamed layer and aliases every
+// format's pointers to the same two buffers (one layer at a time uses them), but the readers - the fused attention
+// and the block movers - infer the format from WHICH pointers are set (k_q2t -> 6, k_q2 -> 4, k_q4 -> 2, k_q -> 1,
+// else fp16). So every reader gets a view that carries only the planes of that layer's own format, exactly the
+// set the single-format take_stage carved before `--kv-layer`.
+strata::kernels::KvHostPools stage_view(const strata::kernels::KvHostPools& raw, const core::QsaState& st) {
+    strata::kernels::KvHostPools h;
+    if (st.kv_hybrid) {
+        h.k_q = raw.k_q; h.k_scale = raw.k_scale; h.v_q4 = raw.v_q4;
+    } else if (st.kv_q2k || st.kv_q2t) {
+        h.k_q2 = raw.k_q2; h.v_q4 = raw.v_q4;
+        if (st.kv_q2t) { h.k_levels = raw.k_levels; h.k_level_off = raw.k_level_off; }
+    } else if (st.kv_q4) {
+        h.k_q4 = raw.k_q4; h.v_q4 = raw.v_q4;
+    } else if (st.kv_q2) {
+        h.k_q2 = raw.k_q2; h.v_q2 = raw.v_q2;
+    } else if (st.kv_int8) {
+        h.k_q = raw.k_q; h.v_q = raw.v_q; h.k_scale = raw.k_scale; h.v_scale = raw.v_scale;
+    } else {
+        h.k_pool = raw.k_pool; h.v_pool = raw.v_pool;
+    }
+    return h;
+}
+
 strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, const int32_t* table) {
     strata::kernels::QsaAttnPools p;
     p.k_pool = h.k_pool; p.v_pool = h.v_pool; p.k_q = h.k_q; p.v_q = h.v_q; p.k_scale = h.k_scale; p.v_scale = h.v_scale;
@@ -2376,7 +2420,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     err = "prefill: releasing KV staging pool";
                     return false;
                 }
-                strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), state.host,
+                strata::kernels::kv_stage_from_host(pools_of(stage_view(m.stage, state), m.ident_table), state.host,
                     core::qsa_kv_format(state), (p0 + s.page_size - 1) / s.page_size, s, m.kv_copy);
                 if (cudaPeekAtLastError() != cudaSuccess ||
                     cudaEventRecord(m.kv_ready, m.kv_copy) != cudaSuccess) {
@@ -2776,7 +2820,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 return false;
                             }
                             kv_pending = -1;
-                        } else strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), st.host,
+                        } else strata::kernels::kv_stage_from_host(pools_of(stage_view(m.stage, st), m.ident_table), st.host,
                                                             core::qsa_kv_format(st),
                                                             (p0 + s.page_size - 1) / s.page_size, s, m.cs);
                         pt.mark(kPfQsa, cs);
@@ -2868,7 +2912,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 strata::kernels::KvWindowShape{(int32_t) st.kv_window, (int32_t) st.kv_sinks}, p0, T,
                                 m.Kc, m.Vc, s, m.cs);
                         if (host_by_dma)
-                            strata::kernels::kv_unstage_to_host(pools_of(m.stage, m.ident_table), st.host,
+                            strata::kernels::kv_unstage_to_host(pools_of(stage_view(m.stage, st), m.ident_table), st.host,
                                                                 core::qsa_kv_format(st), p0 / s.page_size,
                                                                 (p0 + T + s.page_size - 1) / s.page_size, s, m.cs);
                     }
@@ -3002,7 +3046,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     }
-                    const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
+                    const strata::kernels::QsaAttnPools pools = staged ? pools_of(stage_view(m.stage, st), m.ident_table)
                                                                        : core::qsa_attn_pools(st);
                     pt.mark(kPfQsaAttn, cs);
                     // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level

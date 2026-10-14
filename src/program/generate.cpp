@@ -413,6 +413,10 @@ struct Options {
     /// items, each a bare float (the default for every QSA layer) or `L:A` (model layer L, e.g. `3:0.85`).
     /// The K scale is stored as A times the scale the rule computes; 1.0 (the default) is bit-identical.
     std::string kv_k_clip;
+    /// Layer-wise mixed KV precision (`--kv-layer`): a comma list of `L:FMT` (model layer L, FMT in q4_0 / q2 /
+    /// q2k) overriding the `--kv` format for named QSA layers.  The base `--kv` must also be one of the three:
+    /// all are Hadamard-rotated, so the rotation, the FP16 window overlay and the query rotation stay uniform.
+    std::string kv_layer;
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
@@ -776,6 +780,13 @@ void usage() {
                  "                       model layer L (3, 7, ... 47 - the numbering --dump-kv uses). Examples:\n"
                  "                       `0.9`, `3:0.85,47:0.7`, `0.95,47:0.8`. 0.25 <= A <= 4.0; A = 1.0 (the\n"
                  "                       default) is bit-identical to the rule without the flag. V is never clipped\n"
+                 "  --kv-layer SPEC      per-layer KV FORMAT override: a comma list of `L:FMT` - model layer L\n"
+                 "                       (3, 7, ... 47, the numbering --dump-kv uses) stores FMT (q4_0, q2, q2k)\n"
+                 "                       and every other QSA layer keeps --kv. The base --kv must ALSO be one of\n"
+                 "                       q4_0 / q2 / q2k: all three are Hadamard-rotated, so the rotation, the\n"
+                 "                       FP16 window overlay and the query rotation stay uniform. A layer listed\n"
+                 "                       twice: last wins. The MTP drafter's ring keeps the global --kv. Example:\n"
+                 "                       `--kv q2k --kv-layer 7:q4_0,39:q4_0` - 448 B/cell everywhere, 576 on 7/39\n"
                  "  --kv-resident N      KV streaming: keep N cells of each QSA layer in VRAM (min 20480) and the\n"
                  "                       whole K/V in pinned RAM; the freed VRAM goes to expert slots. 0 (default):\n"
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
@@ -2081,6 +2092,7 @@ int main(int argc, char** argv) {
         else if (a == "--kv-window") o.kv_window = std::atoll(next("--kv-window"));
         else if (a == "--kv-sink") o.kv_sink = std::atoll(next("--kv-sink"));
         else if (a == "--kv-k-clip") o.kv_k_clip = next("--kv-k-clip");
+        else if (a == "--kv-layer") o.kv_layer = next("--kv-layer");
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
@@ -3014,6 +3026,87 @@ int main(int argc, char** argv) {
                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu vec_dot (STRATA_NO_IQ256 set)");
     strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
     int64_t K = 10;
+    // **`--kv-layer`: layer-wise mixed KV precision.**  SPEC is a comma list of `L:FMT`: model layer L (the
+    // numbering --dump-kv and --kv-k-clip use) stores FMT (q4_0 / q2 / q2k) and every other QSA layer keeps
+    // --kv.  The base --kv must also be one of the three: all three are Hadamard-rotated (QsaState::kv_rot),
+    // so the rotation, the FP16 window overlay and the query rotation stay uniform across a mixed session -
+    // int8 / k8v4 / q2t / fp16 are refused by name.  A layer listed twice: last wins.  Validated here, where
+    // the geometry is known, and handed to layer.cpp's table before session init, which passes each main
+    // layer's model layer to its sizing and init.  The MTP drafter's ring keeps the global --kv (mtp.cpp).
+    if (!o.kv_layer.empty()) {
+        if (o.kv != "q4_0" && o.kv != "q2" && o.kv != "q2k") {
+            std::fprintf(stderr, "strata generate: --kv-layer needs --kv q4_0, q2 or q2k (the Hadamard-rotated\n"
+                                 "family: the rotation, the FP16 window overlay and the query rotation stay\n"
+                                 "uniform across a mixed session); --kv is %s\n", o.kv.c_str());
+            return 2;
+        }
+        std::vector<std::pair<int64_t, int>> kv_layers;   // model layer -> kKvQ4/kKvQ2/kKvQ2K; last wins
+        for (size_t at = 0; at <= o.kv_layer.size();) {
+            const size_t comma = o.kv_layer.find(',', at);
+            const std::string item = o.kv_layer.substr(at, comma == std::string::npos ? std::string::npos
+                                                                                      : comma - at);
+            at = comma == std::string::npos ? o.kv_layer.size() + 1 : comma + 1;
+            if (item.empty()) continue;
+            const size_t colon = item.find(':');
+            const std::string l_str = colon == std::string::npos ? item : item.substr(0, colon);
+            const std::string f_str = colon == std::string::npos ? "" : item.substr(colon + 1);
+            const int fmt = f_str == "q4_0" ? strata::kernels::kKvQ4
+                        : f_str == "q2" ? strata::kernels::kKvQ2
+                        : f_str == "q2k" ? strata::kernels::kKvQ2K : -1;
+            int64_t layer = -1;
+            size_t lused = 0;
+            try { layer = (int64_t) std::stoll(l_str, &lused); } catch (...) {}
+            if (colon == std::string::npos || fmt < 0 || lused != l_str.size() || layer < 0 ||
+                !strata::core::is_qsa_layer(g, layer) || layer >= g.n_layers) {
+                std::fprintf(stderr, "strata generate: --kv-layer: '%s' is not L:FMT with FMT q4_0, q2 or q2k "
+                                     "and L a QSA layer of this model (QSA layers: %lld, %lld, ... %lld)\n",
+                             item.c_str(), (long long) (g.qsa_interval - 1), (long long) (2 * g.qsa_interval - 1),
+                             (long long) (g.n_layers - 1));
+                return 2;
+            }
+            bool replaced = false;
+            for (auto& e : kv_layers)
+                if (e.first == layer) { e.second = fmt; replaced = true; break; }
+            if (!replaced) kv_layers.push_back({layer, fmt});
+        }
+        for (const auto& e : kv_layers) strata::core::qsa_set_kv_layer_format(e.first, e.second);
+        // one startup line: the per-layer formats and the resulting average KV bytes per cell over the QSA layers
+        strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
+        s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim;
+        s.idx_n_head = g.idx_q_heads; s.idx_dim = g.idx_key_dim;
+        const uint64_t q2h = strata::kernels::kv_q2_bytes_per_head((int) g.head_dim);
+        const uint64_t q4h = strata::kernels::kv_q4_bytes_per_head((int) g.head_dim);
+        const int base_fmt = o.kv == "q4_0" ? strata::kernels::kKvQ4
+                           : o.kv == "q2" ? strata::kernels::kKvQ2 : strata::kernels::kKvQ2K;
+        auto fmt_bytes = [&](int fmt) {
+            return fmt == strata::kernels::kKvQ4 ? strata::kernels::kv_q4_bytes_per_cell(s)
+                 : fmt == strata::kernels::kKvQ2 ? strata::kernels::kv_q2_bytes_per_cell(s)
+                 : (q2h + q4h) * (uint64_t) g.n_head_kv;
+        };
+        auto fmt_name = [](int fmt) {
+            return fmt == strata::kernels::kKvQ4 ? "q4_0" : fmt == strata::kernels::kKvQ2 ? "q2" : "q2k";
+        };
+        uint64_t sum = 0;
+        int64_t n_qsa = 0, n_promoted = 0;
+        std::string listed;
+        char buf[96];
+        for (int64_t l = g.qsa_interval - 1; l < g.n_layers; l += g.qsa_interval) {
+            int fmt = base_fmt;
+            for (const auto& e : kv_layers) if (e.first == l) fmt = e.second;
+            sum += fmt_bytes(fmt);
+            ++n_qsa;
+            if (fmt != base_fmt) {
+                ++n_promoted;
+                std::snprintf(buf, sizeof buf, "%sL%lld:%s", listed.empty() ? "" : ", ", (long long) l,
+                              fmt_name(fmt));
+                listed += buf;
+            }
+        }
+        std::fprintf(stderr, "strata generate: --kv-layer: %s - %lld of %lld QSA layers promoted, average %llu B "
+                             "per cell (base --kv %s: %llu B)\n", listed.c_str(), (long long) n_promoted,
+                     (long long) n_qsa, (unsigned long long) (n_qsa ? sum / (uint64_t) n_qsa : 0), o.kv.c_str(),
+                     (unsigned long long) fmt_bytes(base_fmt));
+    }
     // **`--kv-k-clip`: the per-layer K clip factor on the q2-family per-channel scale (kv_q2.hpp).**  SPEC is a
     // comma list; an item is a bare float (the default for every QSA layer) or `L:A` (model layer L - the
     // numbering --dump-kv and STRATA_KV_PROBE_LAYER use).  The K scale is STORED as A times the scale the rule
@@ -3065,9 +3158,21 @@ int main(int argc, char** argv) {
         bool any_clip = false;
         for (const auto& e : eff) any_clip = any_clip || e.second != 1.0f;
         if (any_clip) {
-            if (o.kv != "q2" && o.kv != "q2k") {
-                std::fprintf(stderr, "strata generate: --kv-k-clip with a non-1.0 alpha needs --kv q2 or q2k "
-                                     "(the q2-family per-channel K scale); --kv is %s\n", o.kv.c_str());
+            // PER LAYER (the --kv-k-clip rule is about the format, not the flag): a non-1.0 alpha acts on the
+            // q2-family per-channel K scale, so it is allowed only on layers whose EFFECTIVE format - the
+            // --kv-layer override if one names the layer, the global --kv otherwise - is q2 or q2k.
+            for (const auto& e : eff) {
+                if (e.second == 1.0f) continue;
+                const int ov = strata::core::qsa_kv_layer_format(e.first);
+                const bool q2fam = ov >= 0 ? (ov == strata::kernels::kKvQ2 || ov == strata::kernels::kKvQ2K)
+                                           : (o.kv == "q2" || o.kv == "q2k");
+                if (q2fam) continue;
+                std::fprintf(stderr, "strata generate: --kv-k-clip: layer %lld stores %s - a non-1.0 alpha needs "
+                                     "that layer's format to be q2 or q2k (the q2-family per-channel K scale)%s\n",
+                             (long long) e.first,
+                             ov == strata::kernels::kKvQ4 ? "q4_0"
+                             : ov >= 0 ? "q2k" : o.kv.c_str(),
+                             ov >= 0 ? " (its --kv-layer override)" : "");
                 return 2;
             }
             for (const auto& e : eff)
@@ -4100,6 +4205,7 @@ int main(int argc, char** argv) {
             const bool hyb = strata::core::qsa_kv_hybrid();
             const bool q2k = strata::core::qsa_kv_q2k();
             const bool i8 = strata::core::qsa_kv_int8() && !q4;
+            const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
             std::vector<strata::core::QsaState> qs((size_t) g.n_qsa_layers());
             for (int64_t j = 0; j < g.n_qsa_layers(); ++j) {
                 qs[(size_t) j].max_cells = o.max_context;
@@ -4111,12 +4217,25 @@ int main(int argc, char** argv) {
                 // q2k is its own flag: the staging pool take_stage() carves for a streamed prompt path is
                 // K-at-the-q2-width + V-at-the-q4-width, which no combination of the other three describes.
                 qs[(size_t) j].kv_q2k = q2k;
+                // --kv-layer: ordinal j is model layer j*I + (I-1); an override replaces the format for that
+                // state, so take_stage()'s widest-layer sizing sees the promoted layer's width.
+                const int ov = strata::core::qsa_kv_layer_format(j * I + (I - 1));
+                if (ov >= 0) {
+                    qs[(size_t) j].kv_int8 = false;
+                    qs[(size_t) j].kv_hybrid = false;
+                    qs[(size_t) j].kv_q4 = ov == strata::kernels::kKvQ4;
+                    qs[(size_t) j].kv_q2k = ov == strata::kernels::kKvQ2K;
+                    qs[(size_t) j].kv_q2 = ov == strata::kernels::kKvQ2;
+                }
             }
             strata::core::SessionState ss{};
             ss.max_cells = o.max_context;
             ss.qsa_states = qs.data();
-            const int64_t I = std::max<int64_t>(g.qsa_interval, 1);
             ss.qsa_ord0 = (int) (lb / I);
+            // the widest-layer sizing (take_stage) ranges over the allocated states; the fake array covers
+            // every ordinal from qsa_ord0 on, a superset of any stage range starting at lb (over-counting is
+            // the safe direction here, as the comment above this lambda notes).
+            ss.qsa_alloc = g.n_qsa_layers() - ss.qsa_ord0;
             // no_ring: serve sizes the streamed ring to what the rig affords (scan's ring_room), so the gate's
             // discriminator is the MOE set against each cache's slots - the ring is a separate budget, not a
             // reason a stage cannot lend.  bytes_needed's default ring (384 slots) would inflate a 2-layer

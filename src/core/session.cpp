@@ -64,8 +64,11 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     n += gdn_buffers_bytes(g);
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
+    // Summed PER LAYER: `--kv-layer` gives a layer a different KV format, and the formats differ in bytes
+    // per cell (q2k 448, q4_0 576 for 2 KV heads), so one global size times the layer count is wrong.
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true) + (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false);
+        for (int64_t j = 0; j < q_n; ++j)
+            n += qsa_state_bytes(g, max_cells, j == 0, 0, (q_lo + j) * I + (I - 1));
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
     n += block_buffers_bytes(g);
@@ -104,23 +107,31 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true), rest = qsa_state_bytes(g, max_cells, false);
-    s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
+    // The states are sized PER LAYER (the model layer of ordinal qsa_ord0 + j is (qsa_ord0 + j) * I + I - 1):
+    // `--kv-layer` gives a layer a different KV format, and the formats differ in bytes per cell, so the arena
+    // is a running sum of per-layer sizes, not one size times the count.  With no override every size equals
+    // the global one, and the offsets are exactly what `first + (j-1) * rest` used to give.
+    uint64_t qbytes = 0;
+    for (int64_t j = 0; j < s.qsa_alloc; ++j)
+        qbytes += qsa_state_bytes(g, max_cells, j == 0, 0, (s.qsa_ord0 + j) * I + (I - 1));
+    s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? qbytes : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
     s.qsa_buf_arena = take(qsa_buffers_bytes(g, max_cells));
 
     uint8_t* qp = (uint8_t*) s.qsa_state_arena;
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here
+    uint64_t qoff = 0;
     for (int64_t j = 0; j < s.qsa_alloc; ++j) {
-        if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0]) == 0)
+        const int64_t ml = (s.qsa_ord0 + j) * I + (I - 1);
+        if (qsa_state_init(g, max_cells, qp + qoff, s.qsa_states[s.qsa_ord0 + j],
+                           j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0], 0, ml) == 0)
             return 0;
+        qoff += qsa_state_bytes(g, max_cells, j == 0, 0, ml);
         // the per-layer K clip factor (--kv-k-clip): ordinal qsa_ord0 + j is the model layer
         // (qsa_ord0 + j) * qsa_interval + qsa_interval - 1 - the numbering --dump-kv uses (is_qsa_layer's
         // derivation, inverted). The drafter's ring state is built in mtp.cpp and keeps 1.0.
-        s.qsa_states[s.qsa_ord0 + j].kv_k_clip =
-            qsa_kv_k_clip((s.qsa_ord0 + j) * I + (I - 1));
+        s.qsa_states[s.qsa_ord0 + j].kv_k_clip = qsa_kv_k_clip(ml);
     }
     qsa_buffers_init(g, max_cells, s.qsa_buf_arena, s.qsa_bufs);
 

@@ -634,3 +634,37 @@ Picked per layer by **leave-one-text-out** (choose on two texts, score the third
 `--kv-k-clip 3:1.20,7:1.25,11:1.10,23:1.20,47:1.20`. Without the FP16 window the gains are smaller and
 only L47 (1.25: -16..-21%) and L3 (1.10: -5..-7%) hold out. These are attention-output numbers; the
 logit-level (KL) and recall validation in the engine is the next gate before any default changes.
+
+### Layer-wise mixed precision (`--kv-layer`)
+
+`--kv-layer SPEC` overrides the `--kv` format for named QSA layers: `--kv q2k --kv-layer 7:q4_0,39:q4_0`
+keeps q2k everywhere except model layers 7 and 39, which store q4_0. SPEC is a comma list of `L:FMT` -
+model layer L (3, 7, ... 47, the numbering `--dump-kv` and `--kv-k-clip` use) and FMT in {q4_0, q2, q2k};
+a layer listed twice takes the last. The base `--kv` must ALSO be one of q4_0 / q2 / q2k: all three are
+Hadamard-rotated (`QsaState::kv_rot`), so the rotation, the FP16 window overlay and the query rotation
+stay uniform across a mixed session - `int8`, `k8v4`, `q2t` and `fp16` are refused by name, on both sides
+of the flag. The MTP drafter's ring state keeps the GLOBAL `--kv` format (it is not a main layer;
+`mtp.cpp` passes -1). `--kv-k-clip` follows the layer: a non-1.0 alpha is allowed only on layers whose
+EFFECTIVE format is q2 or q2k, and the error names the layer and its format.
+
+The plumbing: `qsa_set_kv_layer_format(model_layer, fmt)` fills a sparse table in `layer.cpp` (mirroring
+`qsa_set_kv_k_clip`), and `qsa_state_bytes` / `qsa_state_init` take the model layer, resolving the
+effective format once per state. Every per-state size - the VRAM pools, the host copy, the residency
+unit, the FP16 window - follows the state's format, and the session arena is a running sum of per-layer
+sizes (with no override every size equals the global one, so the default path is byte-identical). The
+streaming staging pool is sized by the WIDEST streamed layer, since one buffer is reused layer by layer -
+and every reader gets a per-layer VIEW of it (`stage_view` in `prefill.cpp`) carrying only that layer's
+format planes. The readers infer the format from WHICH pointers are set (the tensor-core prompt attention
+takes q4_0 mode whenever `k_q4` is set; the decode attention checks k_q2t, k_q2, k_q4, k_q in that order),
+so a pool with every format's pointer aliased to one buffer reads a q2k layer as q4_0. Measured: with the
+raw aliased pool, `--kv q2k` on a 40K-token prompt (streamed, every chunk staged) generates token 0 sixteen
+times; with the view it generates exactly what the pre-`--kv-layer` binary generates, for q4_0 and q2k.
+Conversation snapshots already carry a PER-LAYER format marker (`qsa_kv_format(st)` + rotated +
+q2_layout, `conversation_snapshot.cpp`), and `conversation_kv_validate` compares it layer by layer: a
+snapshot taken with one `--kv-layer` spec refuses to restore into a session with a different spec
+("incompatible K/V geometry" on the layer whose marker moved).
+
+The measured motivation: the real-query probe (`tools/kv_realq_probe.py`) finds q2k's excess attention
+error over q4_0 differs ~2.2x between layers (L7/L39 worst, L47 best), so promoting the 1-3 worst layers
+to q4_0 buys the most accuracy per byte: promoting 2 of the 12 QSA layers raises the average from 448
+to 469 B per cell (+4.7% of the cache). The engine's logit-level and decode-path numbers follow below.
