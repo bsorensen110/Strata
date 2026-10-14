@@ -78,6 +78,17 @@ ARMS = [
     dict(name="q2+win512", kv="q2", env=dict(STRATA_KV_WINDOW="512", STRATA_KV_SINK="8")),
     dict(name="q2+win1024", kv="q2", env=dict(STRATA_KV_WINDOW="1024", STRATA_KV_SINK="8")),
     dict(name="q4_0+win512", kv="q4_0", env=dict(STRATA_KV_WINDOW="512", STRATA_KV_SINK="8")),
+    # Per-layer K clip factor (--kv-k-clip), calibrated leave-one-text-out on real queries
+    # (tools/kv_realq_probe.py, docs/kv-q2.md): the decode-view spec and the no-window spec.
+    dict(name="q2k+clip", kv="q2k", env=dict(), args=["--kv-k-clip", "3:1.20,7:1.25,11:1.10,23:1.20,47:1.20"]),
+    dict(name="q2k+clip-nw", kv="q2k", env=dict(), args=["--kv-k-clip", "3:1.10,47:1.25"]),
+    # Layer-wise mixed precision (--kv-layer): the two layers the real-query probe ranks most sensitive at q4_0.
+    dict(name="q2k+L7L39", kv="q2k", env=dict(), args=["--kv-layer", "7:q4_0,39:q4_0"]),
+    dict(name="q2k+clip+L7L39", kv="q2k", env=dict(),
+         args=["--kv-layer", "7:q4_0,39:q4_0", "--kv-k-clip", "3:1.20,11:1.10,23:1.20,47:1.20"]),
+    # controls for the ranking: the two layers the probe ranks LEAST sensitive, and the top four
+    dict(name="q2k+L15L47", kv="q2k", env=dict(), args=["--kv-layer", "15:q4_0,47:q4_0"]),
+    dict(name="q2k+top4", kv="q2k", env=dict(), args=["--kv-layer", "7:q4_0,39:q4_0,23:q4_0,35:q4_0"]),
 ]
 REFERENCE = "fp16"
 CODE_AGENT = """Task: add a KV cache parity check to the engine and make the suite run in CI.
@@ -387,7 +398,7 @@ def run_engine(cfg: dict, exe: str, arm: dict, tokens: list[int], out: Path, log
     # mode="decode": one row per GENERATED token, from the speculative acceptance loop - the decode path,
     # which is where the FP16 window overlay and the quantized bulk actually act.
     dump_flag = "--dump-prompt-logits" if mode == "prompt" else "--dump-logits"
-    cmd = [exe] + engine_args(cfg, arm["kv"]) + [
+    cmd = [exe] + engine_args(cfg, arm["kv"]) + list(arm.get("args", [])) + [
         "--tokens-file", str(tok_file),
         "--max-new", str(max_new),
         "--greedy",
@@ -473,6 +484,8 @@ def main() -> int:
     ap.add_argument("--config", default=str(CONFIG))
     ap.add_argument("--arms", default=",".join(d["name"] for d in ARMS))
     ap.add_argument("--texts", default="all", help="all, or a substring of a text name")
+    ap.add_argument("--text-file", action="append", default=[],
+                    help="NAME=PATH: an extra text read from a file (repeatable), e.g. a long source file")
     ap.add_argument("--tmp", default=str(ROOT / "tmp" / "kv-precision"))
     ap.add_argument("--json", default=str(ROOT / "tmp" / "kv-precision" / "kv_precision_compare.json"))
     ap.add_argument("--keep-logits", action="store_true", help="leave the per-arm logits files in place")
@@ -517,7 +530,11 @@ def main() -> int:
 
     tok = load_tokenizer(cfg)
     prompts: dict[str, list[int]] = dict()
-    for name, body in TEXTS:
+    extra = []
+    for spec in a.text_file:
+        nm, _, path = spec.partition("=")
+        extra.append((nm, Path(path).read_text(encoding="utf-8", errors="replace")))
+    for name, body in TEXTS + extra:
         if a.texts != "all" and a.texts.lower() not in name.lower():
             continue
         limit = a.token_limit if a.token_limit > 0 else a.max_tokens

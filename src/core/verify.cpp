@@ -429,6 +429,7 @@ Verifier::~Verifier() {
     if (h_commitb_) cudaFreeHost(h_commitb_);
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
+    for (float* b : dd_attn_) if (b) cudaFree(b);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
@@ -531,6 +532,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
     const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
+    if (const char* dd = std::getenv("STRATA_QSA_DDUMP"); dd != nullptr && dd_attn_.empty()) {   // measurement only
+        dd_path_ = dd;
+        dd_attn_.assign((size_t) nQ, nullptr);
+        const size_t bytes = (size_t) strata::kernels::kVerifyMaxT * g.n_head * g.head_dim * sizeof(float);
+        for (auto& b : dd_attn_)
+            if (cudaMalloc(&b, bytes) != cudaSuccess || cudaMemset(b, 0, bytes) != cudaSuccess) {
+                err = "verify: STRATA_QSA_DDUMP buffers";
+                return false;
+            }
+    }
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
     const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
@@ -1377,6 +1388,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 13, grp);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
+                if (!dd_attn_.empty())   // STRATA_QSA_DDUMP: a D2D copy is a graph node, so it replays with the window
+                    cudaMemcpyAsync(dd_attn_[(size_t) qi] + (size_t) tb * NH * HD, attn_ + tb * NH * HD,
+                                    (size_t) n * NH * HD * sizeof(float), cudaMemcpyDeviceToDevice, cs);
                 if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
                                               (int) (n * NH), (int) HD, cs);
                 else
@@ -2183,6 +2197,19 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (!dd_attn_.empty()) {   // STRATA_QSA_DDUMP: the window's decode attention output, every QSA layer
+        const int32_t zv = (int32_t) (g_->n_head * g_->head_dim);
+        std::vector<float> h((size_t) T * zv);
+        if (std::FILE* f = std::fopen(dd_path_.c_str(), "ab")) {
+            for (size_t q = 0; q < dd_attn_.size(); ++q) {
+                cudaMemcpy(h.data(), dd_attn_[q], h.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                const int32_t hdr[4] = {(int32_t) q, (int32_t) pos0, (int32_t) T, zv};
+                std::fwrite(hdr, 4, 4, f);
+                std::fwrite(h.data(), sizeof(float), h.size(), f);
+            }
+            std::fclose(f);
+        }
+    }
     if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {   // #871: refresh_ar saw the table whole
         *(volatile uint32_t*) h_plan_err_ = 0;
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";

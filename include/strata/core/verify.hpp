@@ -342,6 +342,11 @@ private:
     const int32_t* spec_q_ = nullptr;   ///< set_spec_q: the drafter's q rows for the next window (host)
     int spec_nq_ = 0;
     int32_t* d_spec_ = nullptr;          ///< device: kVerifyMaxT draft ids, then kVerifyMaxT q rows
+    /// STRATA_QSA_DDUMP=<file> (measurement): each QSA layer's DECODE attention output (pre-gate, un-rotated) for
+    /// the window rows, copied device-to-device inside the captured window into dd_attn_[qsa layer] and written
+    /// to the file after every window's sync (record: int32 {qsa layer, pos0, T, NH*HD} + T*NH*HD f32).
+    std::vector<float*> dd_attn_;
+    std::string dd_path_;
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
     std::vector<float> logit_bias_host_;
