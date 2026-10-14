@@ -3018,6 +3018,32 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                    s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
                         }
                     if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
+                    // STRATA_QSA_QDUMP=<file>: append every QSA layer's attention QUERIES and the attention OUTPUT
+                    // for the prompt's last STRATA_QSA_QDUMP_LAST (256) positions - records of int32 {qsa layer,
+                    // first position, rows, ZV} + rows*ZV f32 queries + rows*ZV f32 outputs (pre-gate). With
+                    // `--kv fp16` the queries are in the same unrotated space as `--dump-kv`'s K, and the output
+                    // is what the gate's real-query attention probe must reproduce (scale, GQA head mapping,
+                    // causal mask). MEASUREMENT PATH: one sync per layer per chunk, only when the variable is set.
+                    if (static const char* qdump = std::getenv("STRATA_QSA_QDUMP"); qdump != nullptr) {
+                        static const long long qlast = std::getenv("STRATA_QSA_QDUMP_LAST")
+                                                           ? std::atoll(std::getenv("STRATA_QSA_QDUMP_LAST")) : 256;
+                        const long long first = pos0 + n - qlast;   // first position to record
+                        if (p0 + T > first) {
+                            const int64_t r0 = first > p0 ? first - p0 : 0, rows = T - r0;
+                            std::vector<float> hq((size_t) (rows * ZV)), ha((size_t) (rows * ZV));
+                            cudaMemcpyAsync(hq.data(), m.q + r0 * ZV, hq.size() * 4, cudaMemcpyDeviceToHost, m.cs);
+                            cudaMemcpyAsync(ha.data(), m.attn + r0 * ZV, ha.size() * 4, cudaMemcpyDeviceToHost, m.cs);
+                            cudaStreamSynchronize(m.cs);
+                            if (std::FILE* f = std::fopen(qdump, "ab")) {
+                                const int32_t hdr[4] = {(int32_t) qsa_index, (int32_t) (p0 + r0), (int32_t) rows,
+                                                        (int32_t) ZV};
+                                std::fwrite(hdr, 4, 4, f);
+                                std::fwrite(hq.data(), 4, hq.size(), f);
+                                std::fwrite(ha.data(), 4, ha.size(), f);
+                                std::fclose(f);
+                            }
+                        }
+                    }
                     pt.mark(kPfQsa, cs);
                     const int64_t ld_a = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs, ld_a);
