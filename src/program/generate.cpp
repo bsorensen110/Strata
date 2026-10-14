@@ -325,6 +325,13 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
 struct Options {
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
+    /// **`--force-tokens FILE`: teacher-forced DECODE.**  After the prompt, decode step i feeds exactly
+    /// forced[i] (step 0's input is forced[0], not the prefill's argmax), whatever the model's own pick, and
+    /// the run stops after the list.  Every window is one token (no MTP / suffix / lookup drafts), so the
+    /// rows STRATA_DECODE_LOGITS writes are the distributions after feeding each forced token - comparable
+    /// across arms, which greedy decode's rows are not once an arm diverges.  Same file format as
+    /// --tokens-file.  Measurement path: single-sequence non-serve generate only.
+    std::vector<int64_t> force_tokens;
     int64_t max_new = 16;
     int64_t max_context = 4096;
     bool greedy = true;
@@ -733,6 +740,12 @@ void usage() {
                  "  --pack DIR           the pack directory (default pack/full)\n"
                  "  --tokens LIST        the prompt as comma-separated token IDS (required)\n"
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
+                 "  --force-tokens PATH  teacher-forced decode: after the prompt, feed exactly these token ids\n"
+                 "                       (same file format as --tokens-file), one per decode step, and stop after\n"
+                 "                       the list.  Windows are one token (drafting off), so the rows\n"
+                 "                       STRATA_DECODE_LOGITS writes are the distributions after each fed token.\n"
+                 "                       Non-serve single-sequence generate only; refuses --serve, --batch,\n"
+                 "                       --pipeline-windows, --prefill-until, --spec-oracle, --spec-follow.\n"
                  "  --gpu LIST           run on these GPUs, comma-separated nvidia-smi/PCI indices (default: every\n"
                  "                       visible one); sets CUDA_VISIBLE_DEVICES/CUDA_DEVICE_ORDER inside the engine,\n"
                  "                       so a caller never has to export environment variables\n"
@@ -2049,6 +2062,18 @@ int main(int argc, char** argv) {
             }
             have_tokens = true;
         }
+        else if (a == "--force-tokens") {
+            if (!o.force_tokens.empty()) { std::fprintf(stderr, "supply --force-tokens once\n"); return 2; }
+            std::ifstream input(next("--force-tokens"));
+            if (!input) { std::fprintf(stderr, "cannot open force-token file\n"); return 2; }
+            std::string text((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+            if (input.bad()) { std::fprintf(stderr, "cannot read force-token file\n"); return 2; }
+            std::string error;
+            if (text.find('\0') != std::string::npos || !parse_i64_list(text.c_str(), o.force_tokens, error)) {
+                std::fprintf(stderr, "malformed force-token file: %s\n", error.c_str()); return 2;
+            }
+            if (o.force_tokens.empty()) { std::fprintf(stderr, "--force-tokens: the file holds no ids\n"); return 2; }
+        }
         else if (a == "--max-new") o.max_new = std::atoll(next("--max-new"));
         else if (a == "--max-context") o.max_context = std::atoll(next("--max-context"));
         else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
@@ -2785,6 +2810,29 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --dump-prompt-logits is written by the non-serve prompt path; "
                              "--serve has no sink for it. Run one prompt per process without --serve.\n");
         return 2;
+    }
+    // --force-tokens: the decode loop feeds the list, one token per verify window.  Paths with their own
+    // decode loop, their own continuation, or a prompt the window path finishes cannot carry it - refuse.
+    if (!o.force_tokens.empty()) {
+        const char* off = o.serve ? "it needs the non-serve generate path (--serve runs its own decode loop)"
+                        : o.batch != 0 ? "not with --batch slots"
+                        : o.pipeline_windows > 0 ? "not with --pipeline-windows"
+                        : o.prefill_until > 0 ? "not with --prefill-until (the window path feeds the prompt tail)"
+                        : !o.spec_oracle.empty() ? "not with --spec-oracle (the fed tokens ARE the list)"
+                        : !o.spec_follow.empty() ? "not with --spec-follow (the fed tokens ARE the list)"
+                        : o.max_new > (int64_t) o.force_tokens.size()
+                            ? "--max-new is larger than the forced list (generation stops after the list)"
+                        : o.tokens.size() + o.force_tokens.size() > (size_t) o.max_context
+                            ? "the prompt plus the forced list exceeds --max-context"
+                        : nullptr;
+        if (off != nullptr) {
+            std::fprintf(stderr, "strata generate: --force-tokens is refused: %s\n", off);
+            return 2;
+        }
+        std::fprintf(stderr, "strata generate: --force-tokens: decode runs one-token verify windows; drafting "
+                             "is off (--mtp, --suffix-draft and --lookup-chain draft nothing on this path)\n");
+        o.suffix_draft = 0;
+        o.lookup_chain = 0;
     }
     if (o.no_ple && !o.ple_gguf.empty()) {
         std::fprintf(stderr, "strata generate: --no-ple and --ple-gguf are mutually exclusive\n");
@@ -13026,9 +13074,11 @@ int main(int argc, char** argv) {
         // position and recording only from `n_prompt - 1` onward is what keeps the two cases from needing
         // separate handling - and the version that "obviously" only samples after the prompt loses exactly one
         // token's worth of conditioning.
-        if (pos >= n_prompt - 1) produced.push_back(next);
-        if ((int64_t) produced.size() >= o.max_new) break;
-        if (o.stop_eos && pos >= n_prompt - 1 &&
+        // **--force-tokens: the model's pick at the last prompt position is not the output** - the forced
+        // list is.  Hand the decode to the window loop without recording this pick.
+        if (pos >= n_prompt - 1 && o.force_tokens.empty()) produced.push_back(next);
+        if (o.force_tokens.empty() && (int64_t) produced.size() >= o.max_new) break;
+        if (o.stop_eos && o.force_tokens.empty() && pos >= n_prompt - 1 &&
             std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) next) != o.eos_ids.end()) break;
         // TEACHER FORCING while the prompt lasts: the next input is the prompt's own next token, not the
         // model's guess.  Feeding the guess would make the run depend on the model's own errors from position
@@ -13038,7 +13088,8 @@ int main(int argc, char** argv) {
         ss.ple_prev[1] = (int32_t) tok;
         tok = (pos + 1 < n_prompt) ? o.tokens[(size_t) (pos + 1)] : next;
         // Plan v0.3 P6: from the first generated token on, the speculative loop below takes over.
-        if (o.spec > 0 && pos >= n_prompt - 1) { spec_pos = pos + 1; break; }
+        // --force-tokens enters it at the last prompt position even with --spec 0: its windows feed the list.
+        if ((o.spec > 0 || !o.force_tokens.empty()) && pos >= n_prompt - 1) { spec_pos = pos + 1; break; }
     }
 
     // ================================ plan v0.3 P6: SPECULATIVE DECODING ================================
@@ -13085,7 +13136,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
-        const bool use_mtp = !o.mtp.empty();
+        // --force-tokens: one-token windows, no drafts - the MTP drafter stays unbuilt.
+        const bool use_mtp = !o.mtp.empty() && o.force_tokens.empty();
         if (use_mtp && !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
@@ -13267,6 +13319,17 @@ int main(int argc, char** argv) {
         }
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
         std::vector<uint8_t> fdiff((size_t) o.spec, 0);
+        // **STRATA_DECODE_LOGITS=<file>: one record per window - the head row of the LAST ACCEPTED position**
+        // (row `a`, written after the acceptance decision, from the device buffer the captured graph fills right
+        // after the head is final).  Record: int32 {pos, n_vocab, row, 0} then n_vocab f32.  With --force-tokens
+        // every window is one token, so the rows are the distributions after feeding forced[i] - the decode-path
+        // teacher-forced rows, on a native (IQ) pack with graph replay, where --dump-logits' rows diverge
+        // between arms after a few tokens and --dump-prompt-logits never reads the window overlay.
+        const char* dl_env = std::getenv("STRATA_DECODE_LOGITS");
+        std::FILE* dec_logits = dl_env != nullptr ? std::fopen(dl_env, "ab") : nullptr;
+        if (dl_env != nullptr && dec_logits == nullptr)
+            std::fprintf(stderr, "strata generate: STRATA_DECODE_LOGITS: cannot write %s\n", dl_env);
+        std::vector<float> dec_row((size_t) ver.vocab());
         std::FILE* hashes = o.window_hashes.empty() ? nullptr : std::fopen(o.window_hashes.c_str(), "w");
         if (!o.window_hashes.empty() && hashes == nullptr) {
             std::fprintf(stderr, "strata generate: cannot write %s\n", o.window_hashes.c_str());
@@ -13296,10 +13359,16 @@ int main(int argc, char** argv) {
         }
         const double pool_ms0 = drive.cpu_ms;
         const int64_t misses0 = drive.d.multi_misses, entries0 = drive.d.multi_entries;
+        // **--force-tokens: every window is ONE token, the list's next id** (the first window, on a native
+        // pack, still runs the prompt's last token: it appends that token's K/V and its pick is discarded).
+        // Nothing drafts, so the window's rows are the distributions after feeding forced[i] - what
+        // STRATA_DECODE_LOGITS writes, comparable across arms.
+        const bool forcing = !o.force_tokens.empty();
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
             int T = S_mtp;
-            if (use_mtp && o.spec_min_p > 0.0) {
+            if (forcing) T = 1;
+            else if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
                 while (T < S_mtp && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
             }
@@ -13342,6 +13411,15 @@ int main(int argc, char** argv) {
                 return 2;
             }
             window[0] = x;
+            if (forcing && !first_window) {
+                if ((int64_t) produced.size() >= (int64_t) o.force_tokens.size()) break;   // the list is spent
+                window[0] = (int32_t) o.force_tokens[(size_t) produced.size()];
+                if (window[0] < 0 || (int64_t) window[0] >= n_vocab) {
+                    std::fprintf(stderr, "strata generate: --force-tokens id %d at step %lld is outside 0..%lld\n",
+                                 (int) window[0], (long long) produced.size(), (long long) (n_vocab - 1));
+                    return 2;
+                }
+            }
             for (int i = 1; i < T; ++i) {
                 const size_t at = produced.size() - 1 + (size_t) i;
                 int32_t d = from_sfx ? sbuf[(size_t) i - 1] : use_mtp ? drafts[(size_t) i - 1]
@@ -13389,6 +13467,7 @@ int main(int argc, char** argv) {
             }
             int a = 0;
             while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+            const bool was_first = first_window;
             if (first_window) {
                 first_window = false;
                 ttft_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_start).count();
@@ -13422,7 +13501,11 @@ int main(int argc, char** argv) {
             if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
             bool eos = false;
             for (int i = 0; i <= a && (int64_t) produced.size() < max_new && !eos; ++i) {
-                produced.push_back(outv[(size_t) i]);
+                // --force-tokens: the FED token is the output (the model's pick is discarded); the first
+                // window ran the prompt's last token, conditions the state, and emits nothing.
+                if (forcing && was_first) break;
+                const int32_t emit = forcing ? window[0] : outv[(size_t) i];
+                produced.push_back(emit);
                 // ---- **--dump-logits, THE SPECULATIVE PATH.**  This site exists because a native (IQ) pack
                 // NEVER RUNS THE PER-TOKEN LOOP ABOVE: its loop head breaks on the FIRST iteration
                 // (`if (native_pack) { spec_pos = pos; break; }`), and a non-native pack hands the decode over
@@ -13475,10 +13558,18 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                if (sfx_on) sfx.append(outv[(size_t) i]);
-                if (o.lookup_chain > 0) extra_sources_append(&outv[(size_t) i], 1);
-                eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end();
+                if (sfx_on) sfx.append(emit);
+                if (o.lookup_chain > 0) extra_sources_append(&emit, 1);
+                eos = o.stop_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) emit) != o.eos_ids.end();
                 if (!follow.empty()) { follow_differ += fdiff[(size_t) i]; ++follow_emitted; }
+            }
+            // STRATA_DECODE_LOGITS: the row of the LAST ACCEPTED position (row a) of this window.  The
+            // captured graph copied the head to the persistent buffer right after it was final; the commit
+            // graph touches neither, so the rows are valid until the next ver.run.
+            if (dec_logits != nullptr && ver.copy_dl(a, dec_row.data())) {
+                const int32_t dl_hdr[4] = {(int32_t) (p + a), (int32_t) ver.vocab(), a, 0};
+                std::fwrite(dl_hdr, 4, 4, dec_logits);
+                std::fwrite(dec_row.data(), sizeof(float), dec_row.size(), dec_logits);
             }
             if (eos) {
                 if (adapt_thr.joinable()) adapt_thr.join();
@@ -13493,12 +13584,12 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
-            x = outv[(size_t) a];
+            x = forcing ? window[0] : outv[(size_t) a];
             p += a + 1;
             const double round_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             total_ms += round_ms;
-            if (timed_round && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
-            else if (timed_round) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
+            if (timed_round && !forcing && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
+            else if (timed_round && !forcing) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "strata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);
@@ -13509,6 +13600,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (hashes != nullptr) std::fclose(hashes);
+        if (dec_logits != nullptr) std::fclose(dec_logits);
         std::printf("%-24s %lld rounds of %d, drafts accepted %lld of %lld (%.3f), %.2f tokens per round\n",
                     "speculation", (long long) rounds, o.spec, (long long) drafts_ok, (long long) drafts_total,
                     drafts_total > 0 ? (double) drafts_ok / (double) drafts_total : 0.0,

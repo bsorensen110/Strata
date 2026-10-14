@@ -430,6 +430,7 @@ Verifier::~Verifier() {
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
     for (float* b : dd_attn_) if (b) cudaFree(b);
+    if (dl_logits_) cudaFree(dl_logits_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
@@ -541,6 +542,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                 err = "verify: STRATA_QSA_DDUMP buffers";
                 return false;
             }
+    }
+    if (const char* dl = std::getenv("STRATA_DECODE_LOGITS"); dl != nullptr && dl_logits_ == nullptr) {   // measurement only
+        dl_path_ = dl;
+        const size_t bytes = (size_t) strata::kernels::kVerifyMaxT * n_vocab_ * sizeof(float);
+        if (cudaMalloc((void**) &dl_logits_, bytes) != cudaSuccess || cudaMemset(dl_logits_, 0, bytes) != cudaSuccess) {
+            dl_logits_ = nullptr;
+            err = "verify: STRATA_DECODE_LOGITS buffer";
+            return false;
+        }
     }
     const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
     const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
@@ -1758,6 +1768,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return false;
             }
         }
+        if (dl_logits_ != nullptr)   // STRATA_DECODE_LOGITS: a D2D copy is a graph node, so it replays with the
+            cudaMemcpyAsync(dl_logits_, head_logits_, (size_t) T * n_vocab_ * sizeof(float), cudaMemcpyDeviceToDevice,
+                            cs);   // window, right after the head rows are final (the head section runs only on the
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
@@ -3027,6 +3040,14 @@ bool Verifier::copy_logits(int t, float* host) const {
     if (next_ != nullptr) return next_->copy_logits(t, host);   // a layer split: the head is on the last stage
     if (head_logits_ == nullptr || host == nullptr || t < 0 || n_vocab_ <= 0) return false;
     return cudaMemcpy(host, head_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
+                      cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+
+bool Verifier::copy_dl(int t, float* host) const {
+    if (next_ != nullptr) return next_->copy_dl(t, host);   // a layer split: the head is on the last stage
+    if (dl_logits_ == nullptr || host == nullptr || t < 0 || t >= strata::kernels::kVerifyMaxT || n_vocab_ <= 0)
+        return false;
+    return cudaMemcpy(host, dl_logits_ + (size_t) t * (size_t) n_vocab_, (size_t) n_vocab_ * sizeof(float),
                       cudaMemcpyDeviceToHost) == cudaSuccess;
 }
 

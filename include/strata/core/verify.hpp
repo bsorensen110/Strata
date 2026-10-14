@@ -84,6 +84,9 @@ public:
     bool run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out, std::string& err);
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
+    /// STRATA_DECODE_LOGITS: row `t` of the captured device-to-device copy of the last window's head logits
+    /// (the buffer the graph fills right after the head is final). False when the variable is unset.
+    bool copy_dl(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
@@ -347,6 +350,12 @@ private:
     /// to the file after every window's sync (record: int32 {qsa layer, pos0, T, NH*HD} + T*NH*HD f32).
     std::vector<float*> dd_attn_;
     std::string dd_path_;
+    /// STRATA_DECODE_LOGITS=<file> (measurement): the window's head logits, copied device-to-device inside the
+    /// captured window right after the head is final; the decode loop (generate.cpp), which knows the accepted
+    /// count, reads row `a` with copy_dl() and writes the file: int32 {pos, n_vocab, row, 0} then n_vocab f32.  With
+    /// --force-tokens every window is one token, so the row is the distribution after feeding forced[i].
+    float* dl_logits_ = nullptr;
+    std::string dl_path_;
     int hist_len_ = 0;
     bool head_sampling_ = true;          ///< set_head_sampling
     std::vector<float> logit_bias_host_;

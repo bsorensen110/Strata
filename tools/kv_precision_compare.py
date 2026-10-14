@@ -29,6 +29,17 @@ THE ARMS
   fp16 (the reference), int8, q4_0, q2, q2k (K 2-bit per-channel + V 4-bit, 448 B/cell for 2 KV heads), q2 and
   q2k with STRATA_KV_WINDOW=128 STRATA_KV_SINK=8, and q4_0 with the same window environment.
 
+FORCED DECODE (--forced-decode N)
+  The prompt rows come from the PREFILL attention path, which never reads the FP16 sliding window overlay -
+  a decode-time KV feature cannot move them. --forced-decode measures the DECODE rows: the fp16 reference
+  greedy-generates N tokens with STRATA_DECODE_LOGITS (the verify window's head, the last accepted position
+  of each window - the rows --dump-logits cannot give on a native IQ pack), and every arm is then fed
+  exactly that continuation with --force-tokens, one token per verify window. Every arm scores the same
+  continuation at the same positions, so the table (top-1, mean KL, perplexity ratio, nats/token +- CI) is
+  comparable past the first divergent token. The reference rows are a FORCED fp16 run (greedy decode drafts,
+  so its rows are fewer and come from 2-4-token windows); a second forced fp16 run against it is the run-to-run
+  noise floor.
+
 COST, STATED PLAINLY
   strata generate (non-serve) takes ONE prompt per process and the engine takes about 40 s to load, so the
   harness pays the load once per (arm, text): 6 arms x 3 texts = 18 loads, roughly 12 to 20 minutes on an
@@ -89,6 +100,9 @@ ARMS = [
     # controls for the ranking: the two layers the probe ranks LEAST sensitive, and the top four
     dict(name="q2k+L15L47", kv="q2k", env=dict(), args=["--kv-layer", "15:q4_0,47:q4_0"]),
     dict(name="q2k+top4", kv="q2k", env=dict(), args=["--kv-layer", "7:q4_0,39:q4_0,23:q4_0,35:q4_0"]),
+    # the clip spec was calibrated WITH the window on (8 sinks + 128): its decode-path arm
+    dict(name="q2k+win+clip", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8"),
+         args=["--kv-k-clip", "3:1.20,7:1.25,11:1.10,23:1.20,47:1.20"]),
 ]
 REFERENCE = "fp16"
 CODE_AGENT = """Task: add a KV cache parity check to the engine and make the suite run in CI.
@@ -391,21 +405,33 @@ def lib_dirs(cfg: dict, exe: str) -> list[str]:
 
 
 def run_engine(cfg: dict, exe: str, arm: dict, tokens: list[int], out: Path, log: Path,
-               max_new: int = 1, mode: str = "prompt") -> int:
+               max_new: int = 1, mode: str = "prompt", force_file: Path | None = None) -> int:
     tok_file = out.with_suffix(".tokens.txt")
     tok_file.write_text(",".join(str(t) for t in tokens), encoding="utf-8")
     # mode="prompt": teacher-forced rows, one per prompt position (the prefill path).
     # mode="decode": one row per GENERATED token, from the speculative acceptance loop - the decode path,
     # which is where the FP16 window overlay and the quantized bulk actually act.
-    dump_flag = "--dump-prompt-logits" if mode == "prompt" else "--dump-logits"
+    # mode="greedy-decode": greedy for max_new tokens, rows via STRATA_DECODE_LOGITS (the verify window's
+    # head, every window's LAST accepted position) - works on a native IQ pack where --dump-logits is 0 bytes.
+    # mode="forced": --force-tokens force_file, one-token windows, rows via STRATA_DECODE_LOGITS.
     cmd = [exe] + engine_args(cfg, arm["kv"]) + list(arm.get("args", [])) + [
         "--tokens-file", str(tok_file),
         "--max-new", str(max_new),
         "--greedy",
-        dump_flag, str(out),
     ]
+    if mode == "prompt":
+        cmd += ["--dump-prompt-logits", str(out)]
+    elif mode == "decode":
+        cmd += ["--dump-logits", str(out)]
+    elif mode == "forced":
+        cmd += ["--force-tokens", str(force_file)]
+    elif mode != "greedy-decode":
+        raise ValueError("unknown mode %s" % mode)
     env = dict(os.environ)
     env.update(arm["env"])
+    if mode in ("greedy-decode", "forced"):
+        env["STRATA_DECODE_LOGITS"] = str(out)
+        out.unlink(missing_ok=True)   # the engine APPENDS records: a stale file would mix two runs
     libs = lib_dirs(cfg, exe)
     if libs:
         if os.name == "nt":
@@ -478,6 +504,75 @@ def compare_decode(ref_path: Path, ref_tokens: list[int], arm_path: Path, arm_to
                 arm_token=arm_tokens[agree] if agree < len(arm_tokens) else None)
 
 
+# ------------------------------------------------------------------ forced decode
+def read_decode_rows(path: Path) -> dict[int, np.ndarray]:
+    """STRATA_DECODE_LOGITS records, appended per verify window: int32 {pos, n_vocab, row, 0} then n_vocab
+    f32 - the head row of the window's LAST position. Keyed by pos: the forced run writes one row per fed
+    token (plus the first window's, at the last prompt position), and the rows of two runs are comparable
+    exactly where their positions agree."""
+    rows: dict[int, np.ndarray] = {}
+    with open(path, "rb") as f:
+        while True:
+            hdr = f.read(16)
+            if not hdr:
+                break
+            if len(hdr) < 16:
+                raise ValueError("%s: %d trailing header bytes" % (str(path), len(hdr)))
+            pos, n_vocab, row, zero = [int(v) for v in np.frombuffer(hdr, dtype="<i4")]
+            if zero != 0 or row < 0 or n_vocab <= 0:
+                raise ValueError("%s: bad record header %s" % (str(path), (pos, n_vocab, row, zero)))
+            buf = f.read(n_vocab * 4)
+            if len(buf) != n_vocab * 4:
+                raise ValueError("%s: short row at position %d" % (str(path), pos))
+            rows[pos] = np.frombuffer(buf, dtype="<f4")
+    if not rows:
+        raise ValueError("%s: no records (the engine wrote nothing)" % str(path))
+    return rows
+
+
+def compare_forced(ref_rows: dict[int, np.ndarray], arm_rows: dict[int, np.ndarray],
+                   targets: dict[int, int]) -> dict:
+    """The prompt-mode metrics over the DECODE rows: the rows both runs wrote, aligned by position.
+    The row at position p predicts the token at p+1; `targets` gives it for the scored positions
+    (the forced continuation itself, known for every arm because every arm is fed the same list)."""
+    pos = sorted(set(ref_rows) & set(arm_rows))
+    scored = [p for p in pos if p in targets]
+    top1_same, kl, d_i = 0, [], []
+    nats_a, nats_r = [], []
+    for r0 in range(0, len(pos), 16):
+        chunk = pos[r0:r0 + 16]
+        xr = np.stack([ref_rows[p] for p in chunk]).astype(np.float64)
+        xa = np.stack([arm_rows[p] for p in chunk]).astype(np.float64)
+        if not (np.isfinite(xr).all() and np.isfinite(xa).all()):
+            raise ValueError("non-finite logits in %d rows" % len(chunk))
+        lr, la = log_softmax(xr), log_softmax(xa)
+        top1_same += int(np.count_nonzero(np.argmax(xr, axis=1) == np.argmax(xa, axis=1)))
+        kl += np.sum(np.exp(lr) * (lr - la), axis=1).tolist()
+        take = [i for i, p in enumerate(chunk) if p in targets]
+        if take:
+            idx = np.array(take, dtype=np.int64)
+            tgt = np.array([targets[chunk[i]] for i in take], dtype=np.int64)
+            nats_a += [-float(v) for v in la[idx, tgt]]
+            nats_r += [-float(v) for v in lr[idx, tgt]]
+            d_i += [a - b for a, b in zip(nats_a[-len(take):], nats_r[-len(take):])]
+    mean_d = float(np.mean(d_i)) if d_i else float("nan")
+    se = float(np.asarray(d_i, dtype=np.float64).std(ddof=1)) / math.sqrt(len(d_i)) if len(d_i) > 1 else float("nan")
+    ppl_a = math.exp(float(np.mean(nats_a))) if nats_a else float("nan")
+    ppl_r = math.exp(float(np.mean(nats_r))) if nats_r else float("nan")
+    return dict(
+        n_rows=len(pos),
+        n_scored=len(scored),
+        top1_same_pct=100.0 * top1_same / len(pos) if pos else float("nan"),
+        mean_kl=float(np.mean(kl)) if kl else float("nan"),
+        perplexity=ppl_a,
+        perplexity_ref=ppl_r,
+        perplexity_ratio=ppl_a / ppl_r if nats_a else float("nan"),
+        nats_delta_vs_fp16=mean_d,
+        nats_delta_se=se,
+        indistinguishable=bool(len(d_i) > 1 and abs(mean_d) < 2.0 * se),
+    )
+
+
 # ------------------------------------------------------------------ main
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -505,6 +600,15 @@ def main() -> int:
     ap.add_argument("--repeat", type=int, default=3,
                     help="with --decode: runs per arm. Greedy decode is not reproducible run to run on this "
                          "engine, so decode-path numbers are means over repeats with their spread.")
+    ap.add_argument("--forced-decode", type=int, default=0,
+                    help="forced-decode mode: the fp16 reference greedy-generates N tokens under "
+                         "STRATA_DECODE_LOGITS; every arm (fp16 included) is then run with --force-tokens "
+                         "<that continuation> and STRATA_DECODE_LOGITS, and the prompt-mode table (top-1, "
+                         "mean KL, perplexity ratio, nats/token +- CI) is reported over the DECODE rows, "
+                         "aligned by position. Every arm is teacher-forced on the same continuation, so the "
+                         "rows stay comparable past the first divergent token - the measurement the FP16 "
+                         "window overlay and a salient-cell overlay can move. The forced fp16 run against "
+                         "the unforced fp16 rows is the run-to-run noise floor.")
     a = ap.parse_args()
 
     cfg = json.loads(Path(a.config).read_text(encoding="utf-8"))
@@ -608,6 +712,97 @@ def main() -> int:
                        arms=[dict(name=an, kv=arm_of[an]["kv"], env=arm_of[an]["env"]) for an in arms],
                        texts=dict((n, dict(n_tokens=len(ids))) for n, ids in prompts.items()),
                        metrics=dict((an, dict((n, dec[n][an]) for n in prompts)) for an in arms))
+        Path(a.json).write_text(json.dumps(payload, indent=1), encoding="utf-8")
+        print()
+        print("wrote %s" % a.json)
+        return 0
+
+    if a.forced_decode > 0:
+        # Teacher-forced DECODE: the fp16 reference greedy-generates the continuation, every arm is then fed
+        # exactly that list one token per verify window, and the head row after each fed token is compared at
+        # the same position. The forced fp16 run is the noise floor: same arm, same list, run to run.
+        N = a.forced_decode
+        fdec: dict[str, dict[str, dict]] = dict()
+        conts: dict[str, list[int]] = dict()
+        for name, ids in prompts.items():
+            tag = re.sub("[^a-z0-9]+", "-", name.lower())
+            n_prompt = len(ids)
+            ref_out = tmp / (tag + "-fp16.greedydec.bin")
+            ref_log = tmp / (tag + "-fp16.greedydec.log")
+            if run_engine(cfg, exe, arm_of[REFERENCE], ids, ref_out, ref_log, max_new=N,
+                          mode="greedy-decode") != 0:
+                return 1
+            C = generated_tokens(ref_log)
+            if not C:
+                print("DEFECT: %s: the fp16 reference generated no tokens (see %s)" % (name, ref_log))
+                return 1
+            conts[name] = C
+            force_file = tmp / (tag + "-forced.tokens.txt")
+            force_file.write_text(",".join(str(t) for t in C), encoding="utf-8")
+            # the reference ROWS come from a FORCED fp16 run, not the greedy one: greedy decode drafts (2-4-token
+            # verify windows, one row per window at its last accepted position), so its rows are fewer and come
+            # from a different window shape. Forced, every arm - the reference included - runs the same one-token
+            # windows and writes a row at every position; the arms loop's own fp16 run is then a SECOND forced
+            # fp16 run, which makes its row the true run-to-run noise floor.
+            ref_fout = tmp / (tag + "-fp16.forcedref.bin")
+            if run_engine(cfg, exe, arm_of[REFERENCE], ids, ref_fout, tmp / (tag + "-fp16.forcedref.log"),
+                          max_new=len(C), mode="forced", force_file=force_file) != 0:
+                return 1
+            ref_rows = read_decode_rows(ref_fout)
+            # the row at position n_prompt + j - 1 predicts the token at n_prompt + j, which is C[j]
+            targets = {n_prompt + j - 1: C[j] for j in range(1, len(C))}
+            fdec[name] = dict()
+            files: dict[str, Path] = {REFERENCE: ref_out, "forcedref": ref_fout}
+            for an in arms:
+                out = tmp / ("%s-%s.forceddec.bin" % (tag, an))
+                log = tmp / ("%s-%s.forceddec.log" % (tag, an))
+                if run_engine(cfg, exe, arm_of[an], ids, out, log, max_new=len(C), mode="forced",
+                              force_file=force_file) != 0:
+                    return 1
+                files[an] = out
+                got = generated_tokens(log)
+                if got != C:
+                    print("DEFECT: %s %s: the forced output is not the continuation (%d of %d tokens match)"
+                          % (name, an, sum(1 for x, y in zip(got, C) if x == y), len(C)), flush=True)
+                fdec[name][an] = compare_forced(ref_rows, read_decode_rows(out), targets)
+            if not a.keep_logits:
+                for p in files.values():
+                    p.unlink(missing_ok=True)
+        print()
+        print("Forced-decode precision from STRATA_DECODE_LOGITS + --force-tokens, reference --kv %s." % REFERENCE)
+        print("The reference greedy-generates %d tokens; every arm is then fed exactly that continuation, one" % N)
+        print("token per verify window, and its head row after each fed token is compared at the same position.")
+        print("Reference rows: a forced %s run (every arm runs one-token windows, a row per position). The %s row"
+              % (REFERENCE, REFERENCE))
+        print("is the NOISE FLOOR: a second forced %s run against the first - same arm, same list, run to run."
+              % REFERENCE)
+        print("perplexity ratio is the arm's over the reference's on the scored rows.")
+        print()
+        print("| %-22s | %-12s | %18s | %9s | %11s | %34s |"
+              % ("Text", "KV", "Same top-1 as fp16", "Mean KL", "PPL ratio", "vs fp16 (nats/token)"))
+        print("|" + "---|" * 6)
+        for name in prompts:
+            for an in arms:
+                r = fdec[name][an]
+                label = an + (" (noise floor)" if an == REFERENCE else "")
+                delta = "%+.3f +- %.3f" % (r["nats_delta_vs_fp16"], r["nats_delta_se"])
+                if an != REFERENCE and r["indistinguishable"]:
+                    delta += " (indistinguishable)"
+                print("| %-22s | %-12s | %17.1f%% | %9.4f | %11.3f | %34s |"
+                      % (name if an == arms[0] else "", label, r["top1_same_pct"], r["mean_kl"],
+                         r["perplexity_ratio"], delta))
+        print()
+        print("rows per arm (n_rows = positions both runs wrote; n_scored = rows with a target in the list):")
+        for name in prompts:
+            for an in arms:
+                r = fdec[name][an]
+                print("  %-14s %-22s n_rows=%d n_scored=%d" % (name, an, r["n_rows"], r["n_scored"]))
+        payload = dict(engine=exe, config=str(a.config), reference=REFERENCE, mode="forced-decode",
+                       n_tokens=N,
+                       arms=[dict(name=an, kv=arm_of[an]["kv"], env=arm_of[an]["env"]) for an in arms],
+                       texts=dict((n, dict(n_tokens=len(ids), continuation=conts[n]))
+                                  for n, ids in prompts.items()),
+                       metrics=fdec)
         Path(a.json).write_text(json.dumps(payload, indent=1), encoding="utf-8")
         print()
         print("wrote %s" % a.json)
