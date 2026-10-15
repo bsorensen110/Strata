@@ -3350,9 +3350,10 @@ int main(int argc, char** argv) {
                 return 2;
             }
             // only q2-family layers get a gain (a named non-q2 layer was refused above; the bare default's
-            // non-q2 layers are the ones the startup line reports as skipped - they keep 1.0)
+            // non-q2 layers are the ones the startup line reports as skipped - they keep 1.0). Every effective
+            // entry, 1.0 included: a named `L:1.0` after a bare default must turn layer L back off.
             for (const auto& e : eff)
-                if (e.second != 1.0f && q2fam_layer(e.first)) strata::core::qsa_set_kv_k_gain(e.first, e.second);
+                if (q2fam_layer(e.first)) strata::core::qsa_set_kv_k_gain(e.first, e.second);
             std::string listed;
             char buf[96];
             if (gain_default != 1.0f) {
