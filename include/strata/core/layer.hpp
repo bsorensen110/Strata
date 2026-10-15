@@ -399,6 +399,17 @@ bool qsa_kv_q2t();
 /// `QsaState::kv_k_clip` (the drafter ring keeps 1.0).
 void qsa_set_kv_k_clip(int64_t model_layer, float alpha);
 float qsa_kv_k_clip(int64_t model_layer);
+/// Per-layer K reconstruction gain (`--kv-k-gain`): the q2/q2k K scale is stored as `beta` times the scale
+/// the rule computes - exactly as the clip stores `alpha` times it - but the CODES are chosen against the
+/// rule's (un-gained) scale (kv_q2.cu's NEGATIVE k_clip): the code assignment is unchanged, only the
+/// reconstruction grows. Indexed by MODEL layer like the clip; every layer defaults to 1.0 (off). Set per
+/// layer before session init; `qsa_kv_k_clip` answers the NEGATIVE of a set gain, which is what the q2
+/// append kernels read (the drafter ring keeps 1.0).
+void qsa_set_kv_k_gain(int64_t model_layer, float beta);
+float qsa_kv_k_gain(int64_t model_layer);
+/// The `--kv-k-clip` table as the CLI set it, WITHOUT the STRATA_KV_K_GAIN override - what `--kv-k-gain`
+/// checks a layer against, so a harness run with the env var set is not read as a clip.
+float qsa_kv_k_clip_cli(int64_t model_layer);
 /// Layer-wise mixed KV precision (`--kv-layer`): the per-layer KV format override, by MODEL layer index
 /// (3, 7, ... 47).  Sparse: `qsa_kv_layer_format` answers -1 (the global format) for every layer a caller has
 /// not set.  `fmt` is one of the ROTATED FAMILY's `kKvQ4` / `kKvQ2` / `kKvQ2K` (validated at the CLI): all

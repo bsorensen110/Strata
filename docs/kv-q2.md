@@ -669,6 +669,45 @@ error over q4_0 differs ~2.2x between layers (L7/L39 worst, L47 best), so promot
 to q4_0 buys the most accuracy per byte: promoting 2 of the 12 QSA layers raises the average from 448
 to 469 B per cell (+4.7% of the cache). The engine's logit-level and decode-path numbers follow below.
 
+### K reconstruction gain (`--kv-k-gain`)
+
+The 4-level Lloyd-Max K codebook is MSE-optimal, and that is the problem: an MSE-optimal quantizer's
+reconstruction is shrunk toward zero. On real queries the slope of q2k's attention scores on the exact
+scores is 0.92-0.97 (q4_0: 0.997-0.998). With the FP16 window on, the exact window cells out-score the
+shrunk bulk, and the softmax over-weights the window by +1.7..+5.9% of its mass on 11 of the 12 QSA
+layers (L31: -0.5%); q4_0 + window: +0.1..+0.4%.
+
+`--kv-k-gain SPEC` undoes the shrink without moving any code: the stored K scale becomes `beta` times the
+scale the rule computes - exactly as `--kv-k-clip` stores `alpha` times it - but the codes are chosen
+against the rule's (un-gained) scale, so the code assignment is unchanged and only the reconstruction
+grows. SPEC is a comma list: a bare float is the default for every QSA layer whose effective format is
+q2 / q2k (a bare B silently skips the others, and the startup line says so) or `L:B` (model layer L - 3,
+7, ... 47, the numbering `--dump-kv` uses). 1.0 <= B <= 1.5; B = 1.0 (the default) is off. A layer cannot
+carry both a non-1.0 `--kv-k-clip` and a non-1.0 gain: pick one - the clip moves the codes, the gain
+keeps them. V is never gained, and the MTP drafter's ring keeps 1.0. The kernel side is `kv_q2.cu`'s
+NEGATIVE `k_clip` (the gain mode); `qsa_kv_k_clip` answers the negative of a set gain, and
+STRATA_KV_K_GAIN stays as the measurement override for the precision harness, applied only on layers the
+CLI did not give a gain. Pinned in kv_q2_parity: "K reconstruction gain 1.1".
+
+Forced-decode KL vs fp16 (`tools/kv_precision_compare.py`, nine texts, 128 tokens; geometric-mean change
+vs plain q2k, texts better):
+
+| arm | mean KL change | texts better |
+|---|---|---|
+| window alone | +8.2% | 5/9 |
+| gain 1.10 alone | -1.1% | 4/9 |
+| window + gain 1.03 | -8.9% | 5/9 |
+| window + gain 1.05 | -15.1% | 7/9 |
+| window + gain 1.08 | -25.9% | 7/9 |
+| window + gain 1.10 | -30.1% | 8/9 |
+| window + gain 1.13 | -29.1% | 6/9 |
+
+Window + gain 1.10 vs window alone: -35.4% (9/9). For scale: `--kv-layer` top-4 at q4_0 is -40.2% (9/9)
+for +9.5% of the cache; q4_0 everywhere is -89.4%.
+
+The logit optimum (~1.10) sits ABOVE the offline bias-zeroing value (per-layer 1.00-1.05, mean 1.025):
+the offline criterion under-shoots. Recommended with q2k: `--kv-window 128 --kv-sink 8 --kv-k-gain 1.10`.
+
 ### Engine-level results for the three levers (logit KL and decode attention)
 
 Logit KL vs the fp16 arm, teacher-forced over the prompt (`tools/kv_precision_compare.py`, `--dump-prompt-logits`,

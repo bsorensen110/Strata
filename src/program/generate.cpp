@@ -420,6 +420,13 @@ struct Options {
     /// items, each a bare float (the default for every QSA layer) or `L:A` (model layer L, e.g. `3:0.85`).
     /// The K scale is stored as A times the scale the rule computes; 1.0 (the default) is bit-identical.
     std::string kv_k_clip;
+    /// Per-layer K reconstruction gain for the q2 family (`--kv-k-gain`): a comma list of items, each a bare
+    /// float (the default for every QSA layer whose EFFECTIVE format is q2 / q2k - a bare B silently skips
+    /// the others) or `L:B` (model layer L, e.g. `3:1.10`). The K scale is stored as B times the rule's and
+    /// the codes are chosen against the rule's (un-gained) scale - the code assignment is unchanged, only
+    /// the reconstruction grows; 1.0 (the default) is off. A layer cannot carry both a non-1.0 --kv-k-clip
+    /// and a non-1.0 gain.
+    std::string kv_k_gain;
     /// Layer-wise mixed KV precision (`--kv-layer`): a comma list of `L:FMT` (model layer L, FMT in q4_0 / q2 /
     /// q2k) overriding the `--kv` format for named QSA layers.  The base `--kv` must also be one of the three:
     /// all are Hadamard-rotated, so the rotation, the FP16 window overlay and the query rotation stay uniform.
@@ -793,6 +800,16 @@ void usage() {
                  "                       model layer L (3, 7, ... 47 - the numbering --dump-kv uses). Examples:\n"
                  "                       `0.9`, `3:0.85,47:0.7`, `0.95,47:0.8`. 0.25 <= A <= 4.0; A = 1.0 (the\n"
                  "                       default) is bit-identical to the rule without the flag. V is never clipped\n"
+                 "  --kv-k-gain SPEC     per-layer K RECONSTRUCTION GAIN for the q2 family (--kv q2 / q2k): the\n"
+                 "                       stored K scale becomes B times the scale the rule computes, but the codes\n"
+                 "                       are chosen against the rule's scale - the code assignment is unchanged,\n"
+                 "                       only the reconstruction grows (it undoes the 4-level Lloyd-Max shrink of\n"
+                 "                       the attention scores). SPEC is a comma list: a bare float is the default\n"
+                 "                       for every QSA layer whose format is q2 / q2k (others are skipped), `L:B`\n"
+                 "                       sets model layer L (3, 7, ... 47 - the numbering --dump-kv uses).\n"
+                 "                       Examples: `1.10`, `3:1.10,7:1.10`. 1.0 <= B <= 1.5; B = 1.0 (the default)\n"
+                 "                       is off. A layer cannot carry both a non-1.0 --kv-k-clip and a non-1.0\n"
+                 "                       gain: the clip moves the codes, the gain keeps them. V is never gained\n"
                  "  --kv-layer SPEC      per-layer KV FORMAT override: a comma list of `L:FMT` - model layer L\n"
                  "                       (3, 7, ... 47, the numbering --dump-kv uses) stores FMT (q4_0, q2, q2k)\n"
                  "                       and every other QSA layer keeps --kv. The base --kv must ALSO be one of\n"
@@ -2117,6 +2134,7 @@ int main(int argc, char** argv) {
         else if (a == "--kv-window") o.kv_window = std::atoll(next("--kv-window"));
         else if (a == "--kv-sink") o.kv_sink = std::atoll(next("--kv-sink"));
         else if (a == "--kv-k-clip") o.kv_k_clip = next("--kv-k-clip");
+        else if (a == "--kv-k-gain") o.kv_k_gain = next("--kv-k-gain");
         else if (a == "--kv-layer") o.kv_layer = next("--kv-layer");
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
@@ -3238,6 +3256,120 @@ int main(int argc, char** argv) {
             }
             std::fprintf(stderr, "strata generate: --kv-k-clip: K scale clip alpha (%s) - the stored K scale is "
                                  "alpha times the rule's, V unclipped\n", listed.c_str());
+        }
+    }
+    // **`--kv-k-gain`: the per-layer K reconstruction gain for the q2 family (kv_q2.cu's NEGATIVE-k_clip
+    // mode).**  SPEC is a comma list; an item is a bare float (the default for every QSA layer whose
+    // EFFECTIVE format is q2 / q2k - a bare B silently skips the others, and the startup line says so) or
+    // `L:B` (model layer L - the numbering --dump-kv and STRATA_KV_PROBE_LAYER use).  The K scale is STORED
+    // as B times the scale the rule computes - exactly as --kv-k-clip stores A times it - but the codes are
+    // quantized against the rule's (un-gained) scale: the code assignment is unchanged and only the
+    // reconstruction grows.  B = 1.0 (the default) is off.  A layer cannot carry BOTH a non-1.0 --kv-k-clip
+    // and a non-1.0 gain - pick one: the clip moves the codes, the gain keeps them.  Validated here, where
+    // the geometry is known (L must be a QSA layer of THIS model), and handed to layer.cpp's gain table
+    // before session init; `qsa_kv_k_clip` answers the negative of a set gain, which is what the q2 append
+    // kernels read through each main layer's QsaState.
+    if (!o.kv_k_gain.empty()) {
+        float gain_default = 1.0f;
+        std::vector<std::pair<int64_t, float>> gain_layers;
+        for (size_t at = 0; at <= o.kv_k_gain.size();) {
+            const size_t comma = o.kv_k_gain.find(',', at);
+            const std::string item = o.kv_k_gain.substr(at, comma == std::string::npos ? std::string::npos
+                                                                                       : comma - at);
+            at = comma == std::string::npos ? o.kv_k_gain.size() + 1 : comma + 1;
+            if (item.empty()) continue;
+            const size_t colon = item.find(':');
+            const std::string b_str = colon == std::string::npos ? item : item.substr(colon + 1);
+            float b = 0.0f;
+            size_t used = 0;
+            try { b = (float) std::stod(b_str, &used); } catch (...) {}
+            if (used != b_str.size() || !(b >= 1.0f && b <= 1.5f)) {
+                std::fprintf(stderr, "strata generate: --kv-k-gain: '%s' is not B or L:B with 1.0 <= B <= 1.5\n",
+                             item.c_str());
+                return 2;
+            }
+            if (colon == std::string::npos) {
+                gain_default = b;
+                continue;
+            }
+            const std::string l_str = item.substr(0, colon);
+            int64_t layer = -1;
+            size_t lused = 0;
+            try { layer = (int64_t) std::stoll(l_str, &lused); } catch (...) {}
+            if (lused != l_str.size() || layer < 0 || !strata::core::is_qsa_layer(g, layer) ||
+                layer >= g.n_layers) {
+                std::fprintf(stderr, "strata generate: --kv-k-gain: '%s' names layer %lld, not a QSA layer of this "
+                                     "model (QSA layers: %lld, %lld, ... %lld)\n", item.c_str(), (long long) layer,
+                             (long long) (g.qsa_interval - 1), (long long) (2 * g.qsa_interval - 1),
+                             (long long) (g.n_layers - 1));
+                return 2;
+            }
+            gain_layers.push_back({layer, b});
+        }
+        // the effective per-layer gains: the default on every QSA layer, then the named layers on top
+        std::vector<std::pair<int64_t, float>> eff;
+        if (gain_default != 1.0f)
+            for (int64_t l = g.qsa_interval - 1; l < g.n_layers; l += g.qsa_interval) eff.push_back({l, gain_default});
+        for (const auto& e : gain_layers) eff.push_back(e);
+        bool any_gain = false;
+        for (const auto& e : eff) any_gain = any_gain || e.second != 1.0f;
+        if (any_gain) {
+            // PER LAYER, like --kv-k-clip: a non-1.0 gain acts on the q2-family K, so a NAMED layer is
+            // allowed only when its EFFECTIVE format - the --kv-layer override if one names the layer, the
+            // global --kv otherwise - is q2 or q2k; the error names the layer and its format.  A BARE
+            // default SKIPS the non-q2 layers (they keep the rule) and says how many in the startup line.
+            auto q2fam_layer = [&](int64_t l) {
+                const int ov = strata::core::qsa_kv_layer_format(l);
+                return ov >= 0 ? (ov == strata::kernels::kKvQ2 || ov == strata::kernels::kKvQ2K)
+                               : (o.kv == "q2" || o.kv == "q2k");
+            };
+            for (const auto& e : gain_layers) {
+                if (e.second == 1.0f || q2fam_layer(e.first)) continue;
+                const int ov = strata::core::qsa_kv_layer_format(e.first);
+                std::fprintf(stderr, "strata generate: --kv-k-gain: layer %lld stores %s - a non-1.0 gain needs "
+                                     "that layer's format to be q2 or q2k (the q2-family K)%s\n",
+                             (long long) e.first,
+                             ov == strata::kernels::kKvQ4 ? "q4_0"
+                             : ov >= 0 ? "q2k" : o.kv.c_str(),
+                             ov >= 0 ? " (its --kv-layer override)" : "");
+                return 2;
+            }
+            int64_t n_skipped = 0;
+            if (gain_default != 1.0f)
+                for (int64_t l = g.qsa_interval - 1; l < g.n_layers; l += g.qsa_interval)
+                    if (!q2fam_layer(l)) ++n_skipped;
+            // pick one: a layer cannot carry both a non-1.0 clip and a non-1.0 gain (the CLI clip table -
+            // the STRATA_KV_K_GAIN env override is not a clip, and the harness sets it without the flag)
+            for (const auto& e : eff) {
+                if (e.second == 1.0f) continue;
+                const float alpha = strata::core::qsa_kv_k_clip_cli(e.first);
+                if (alpha == 1.0f) continue;
+                std::fprintf(stderr, "strata generate: --kv-k-gain: layer %lld carries --kv-k-clip %.3f - pick "
+                                     "one: --kv-k-clip moves the codes, --kv-k-gain keeps them\n",
+                             (long long) e.first, alpha);
+                return 2;
+            }
+            // only q2-family layers get a gain (a named non-q2 layer was refused above; the bare default's
+            // non-q2 layers are the ones the startup line reports as skipped - they keep 1.0)
+            for (const auto& e : eff)
+                if (e.second != 1.0f && q2fam_layer(e.first)) strata::core::qsa_set_kv_k_gain(e.first, e.second);
+            std::string listed;
+            char buf[96];
+            if (gain_default != 1.0f) {
+                std::snprintf(buf, sizeof buf, "default %.3f", gain_default);
+                listed = buf;
+            }
+            for (const auto& [layer, b] : gain_layers) {
+                if (b == 1.0f) continue;
+                std::snprintf(buf, sizeof buf, "%s%lld:%.3f", listed.empty() ? "" : ", ", (long long) layer, b);
+                listed += buf;
+            }
+            if (n_skipped > 0) {
+                std::snprintf(buf, sizeof buf, ", %lld non-q2 layers skipped", (long long) n_skipped);
+                listed += buf;
+            }
+            std::fprintf(stderr, "strata generate: --kv-k-gain: K reconstruction gain (%s) - the stored K scale "
+                                 "is beta times the rule's, codes unchanged, V untouched\n", listed.c_str());
         }
     }
     // THE ROPE CONFIG RESOLVES HERE, BEFORE ANY WEIGHT MOVES - the CLI and the model file have both spoken,

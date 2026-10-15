@@ -262,9 +262,31 @@ void qsa_set_kv_k_clip(int64_t model_layer, float alpha) {
     if (g_kv_k_clip.size() <= (size_t) model_layer) g_kv_k_clip.resize((size_t) model_layer + 1, 1.0f);
     g_kv_k_clip[(size_t) model_layer] = alpha;
 }
+/// `--kv-k-gain`: the per-layer K reconstruction gains, by MODEL layer index, the same sparse table as the
+/// clip. The q2/q2k K scale is STORED as beta times the rule's - exactly as the clip stores alpha times it -
+/// but the codes are chosen against the rule's (un-gained) scale, so the code assignment is unchanged and
+/// only the reconstruction grows (kv_q2.cu's NEGATIVE k_clip). `qsa_kv_k_clip` answers the negative of a set
+/// gain; `session_init` copies that into each main layer's `QsaState::kv_k_clip`; the drafter ring never
+/// reads it and keeps 1.0.
+std::vector<float> g_kv_k_gain;
+void qsa_set_kv_k_gain(int64_t model_layer, float beta) {
+    if (g_kv_k_gain.size() <= (size_t) model_layer) g_kv_k_gain.resize((size_t) model_layer + 1, 1.0f);
+    g_kv_k_gain[(size_t) model_layer] = beta;
+}
+float qsa_kv_k_gain(int64_t model_layer) {
+    return model_layer >= 0 && (size_t) model_layer < g_kv_k_gain.size() ? g_kv_k_gain[(size_t) model_layer] : 1.0f;
+}
+float qsa_kv_k_clip_cli(int64_t model_layer) {
+    return model_layer >= 0 && (size_t) model_layer < g_kv_k_clip.size() ? g_kv_k_clip[(size_t) model_layer] : 1.0f;
+}
 float qsa_kv_k_clip(int64_t model_layer) {
-    // STRATA_KV_K_GAIN (measurement): "B" for every layer or "L:B,L:B" per model layer - the reconstruction-gain
-    // mode, handed to the q2 append kernels as a NEGATIVE k_clip (kv_q2.cu). Overrides --kv-k-clip on its layers.
+    // Order: the `--kv-k-gain` table FIRST (the CLI, validated at the parse), then STRATA_KV_K_GAIN
+    // (measurement: "B" for every layer or "L:B,L:B" per model layer - the precision harness's override,
+    // applied only on layers the CLI did not give a gain), then the `--kv-k-clip` alpha. A gain is handed
+    // to the q2 append kernels as a NEGATIVE k_clip (kv_q2.cu): the stored scale is beta x the rule
+    // exactly as the clip stores alpha x it, but the codes are chosen against the un-gained scale.
+    const float gain = qsa_kv_k_gain(model_layer);
+    if (gain != 1.0f) return -gain;
     if (const char* g = std::getenv("STRATA_KV_K_GAIN"); g != nullptr && *g) {
         const std::string spec(g);
         if (spec.find(':') == std::string::npos) return -std::strtof(spec.c_str(), nullptr);
@@ -276,7 +298,7 @@ float qsa_kv_k_clip(int64_t model_layer) {
             at = comma == std::string::npos ? spec.size() : comma + 1;
         }
     }
-    return model_layer >= 0 && (size_t) model_layer < g_kv_k_clip.size() ? g_kv_k_clip[(size_t) model_layer] : 1.0f;
+    return qsa_kv_k_clip_cli(model_layer);
 }
 void qsa_set_kv_layer_format(int64_t model_layer, int fmt) {
     if (g_kv_layer_fmt.size() <= (size_t) model_layer) g_kv_layer_fmt.resize((size_t) model_layer + 1, -1);
