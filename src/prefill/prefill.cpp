@@ -3072,7 +3072,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (static const char* qdump = std::getenv("STRATA_QSA_QDUMP"); qdump != nullptr) {
                         static const long long qlast = std::getenv("STRATA_QSA_QDUMP_LAST")
                                                            ? std::atoll(std::getenv("STRATA_QSA_QDUMP_LAST")) : 256;
-                        const long long first = pos0 + n - qlast;   // first position to record
+                        // STRATA_QSA_QDUMP_PER_CHUNK=N: the last N rows of EVERY chunk instead (what a chunk-local
+                        // selection - e.g. picking salient cells from the chunk's own last queries while its FP16
+                        // staging still exists - would see); the prompt's last chunk then covers its last N rows.
+                        static const long long qchunk = std::getenv("STRATA_QSA_QDUMP_PER_CHUNK")
+                                                            ? std::atoll(std::getenv("STRATA_QSA_QDUMP_PER_CHUNK")) : 0;
+                        const long long first = qchunk > 0 ? p0 + T - qchunk : pos0 + n - qlast;   // first position
                         if (p0 + T > first) {
                             const int64_t r0 = first > p0 ? first - p0 : 0, rows = T - r0;
                             std::vector<float> hq((size_t) (rows * ZV)), ha((size_t) (rows * ZV));

@@ -117,6 +117,17 @@ ARMS = [
     dict(name="q2k+gain1.05", kv="q2k", env=dict(STRATA_KV_K_GAIN="1.05")),
     dict(name="q2k+gain1.08", kv="q2k", env=dict(STRATA_KV_K_GAIN="1.08")),
     dict(name="q2k+gain1.10", kv="q2k", env=dict(STRATA_KV_K_GAIN="1.10")),
+    # stacking: per-layer promotion + window + the logit-optimal gain; window sizes with the gain
+    dict(name="q2k+top4+win+gain1.10", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8",
+                                                         STRATA_KV_K_GAIN="1.10"),
+         args=["--kv-layer", "7:q4_0,39:q4_0,23:q4_0,35:q4_0"]),
+    dict(name="q2k+L7L39+win+gain1.10", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8",
+                                                          STRATA_KV_K_GAIN="1.10"),
+         args=["--kv-layer", "7:q4_0,39:q4_0"]),
+    dict(name="q2k+win256+gain1.10", kv="q2k", env=dict(STRATA_KV_WINDOW="256", STRATA_KV_SINK="8",
+                                                       STRATA_KV_K_GAIN="1.10")),
+    dict(name="q2k+win512+gain1.10", kv="q2k", env=dict(STRATA_KV_WINDOW="512", STRATA_KV_SINK="8",
+                                                       STRATA_KV_K_GAIN="1.10")),
     dict(name="q2k+gainL", kv="q2k", env=dict(STRATA_KV_K_GAIN="3:1.044,7:1.050,11:1.034,15:1.023,19:1.021,23:1.037,27:1.013,31:1.000,35:1.012,39:1.020,43:1.030,47:1.020")),
     # the clip spec was calibrated WITH the window on (8 sinks + 128): its decode-path arm
     dict(name="q2k+win+clip", kv="q2k", env=dict(STRATA_KV_WINDOW="128", STRATA_KV_SINK="8"),

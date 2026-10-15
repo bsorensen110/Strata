@@ -708,6 +708,46 @@ for +9.5% of the cache; q4_0 everywhere is -89.4%.
 The logit optimum (~1.10) sits ABOVE the offline bias-zeroing value (per-layer 1.00-1.05, mean 1.025):
 the offline criterion under-shoots. Recommended with q2k: `--kv-window 128 --kv-sink 8 --kv-k-gain 1.10`.
 
+**Stacking and window size** (same nine texts, gain 1.10; geometric-mean change in forced-decode KL vs plain q2k,
+texts better; every arm reproducible - re-runs match to four decimals):
+
+| arm | mean KL | vs q2k | texts better | extra bytes at 262144 |
+|---|---|---|---|---|
+| q2k | 0.1849 | | | |
+| window 128 + gain | 0.1338 | -30.1% | 8/9 | ~3.6 MiB overlay |
+| window 256 + gain | 0.1185 | -38.3% | 8/9 | ~7 MiB |
+| window 512 + gain | 0.1261 | -36.7% | 8/9 | ~13 MiB |
+| L7+L39 at q4_0 | 0.1452 | -21.0% | 8/9 | +64 MiB |
+| L7+L39 + window 128 + gain | 0.1131 | -39.7% | 9/9 | +68 MiB |
+| top-4 (7, 39, 23, 35) at q4_0 | 0.1137 | -40.2% | 9/9 | +128 MiB |
+| top-4 + window 128 + gain | **0.0916** | **-53.2%** | **9/9** | +132 MiB |
+| q4_0 | 0.0209 | -89.4% | 9/9 | +384 MiB |
+
+- Window 256 beats 128 by a further -11.7% (8/9 texts); 512 is no better than 256 (it beats 128 on only 4/9).
+- With the gain the levers STACK: top-4 + window + gain is -21.8% beyond top-4 alone (8/9); at gain 1.03 the window
+  had added nothing on top of top-4 (+8.8%) - the shrink bias was eating it.
+- Recommended q2k serving set, by budget: `--kv-window 256 --kv-sink 8 --kv-k-gain 1.10` (+7 MiB, -38%); add
+  `--kv-layer 7:q4_0,39:q4_0,23:q4_0,35:q4_0` for -53% at +132 MiB. q4_0 remains ~4x lower KL than the best q2k set.
+
+### Salient FP16 cells: measured viability (not implemented)
+
+The design (an FP16 overlay of the highest-attention-mass cells, on top of the window) depends on WHEN a cell can be
+picked: once quantized, its FP16 values are gone. Measured offline (real-query probe, `STRATA_QSA_QDUMP_PER_CHUNK`:
+the last 256 queries of every prefill chunk; scored on the prompt's final 128 queries; bulk = q2k with gain 1.10;
+attention-output error change vs window 128 + gain alone, median over the 12 QSA layers):
+
+| text (chunks) | budget | chunk-local pick (FP16 from the chunk's staging) | pick over every cell (needs an FP16 host shadow) |
+|---|---|---|---|
+| 6144-token C++ (1 chunk) | 256 / 1024 | -13% / -30% | identical (one chunk) |
+| 16384-token C++ (2 chunks of 8192) | 256 | -1% (one layer +2%) | -3% |
+| | 1024 | -6% | -9% |
+
+The benefit shrinks fast with context length (attention mass spreads over more cells) and a prefill-time pick keeps
+about half of it. With the window's precedent (the probe predicted -50%, the engine's L3 decode attention showed
+-12..-17% before the gain), the expected logit gain at long context is a few percent for a 13-file engine change (sizing,
+arena carve, readers in both decode-attention kernels, mass atomics, promotion at prefill and window eviction,
+snapshot restore). Not built; the measurement hook and the probe stay for a later attempt with a host shadow.
+
 ### Engine-level results for the three levers (logit KL and decode attention)
 
 Logit KL vs the fp16 arm, teacher-forced over the prompt (`tools/kv_precision_compare.py`, `--dump-prompt-logits`,
