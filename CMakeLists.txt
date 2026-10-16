@@ -367,6 +367,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/kv_stream.cu
                           src/kernels/cuda/kv_q4.cu
                           src/kernels/cuda/kv_q2.cu
+                          src/kernels/cuda/tcq_v.cu
                           src/kernels/cuda/kv_window.cu
                           src/kernels/cuda/fused_gr.cu
                           src/kernels/cuda/cvec.cu
@@ -439,6 +440,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # FMA changes tie results. The embedding gather also relies on separately rounded operations.
     set_source_files_properties(src/kernels/cuda/elementwise.cu src/kernels/cuda/quantize_act.cu
       PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+  endif()
+
+  # The trellis-coded 2-bit V writer/reader (tcq_v.cu): no FMA contraction, so the Viterbi cost and the block scale
+  # round exactly like the host reference in tcq_v.hpp (tcq_v_parity compares them bit for bit).
+  if(STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+    set_source_files_properties(src/kernels/cuda/tcq_v.cu PROPERTIES COMPILE_OPTIONS "--fmad=false")
   endif()
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
@@ -997,6 +1004,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(kv_q2_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(kv_q2_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME kv_q2_parity COMMAND kv_q2_parity)
+
+  # The trellis-coded 2-bit V (include/strata/kernels/tcq_v.hpp, tcq_v_cuda.hpp) device writer/reader vs the host
+  # reference in the same header, bit for bit, for 4/8/16 states (GPU, synthetic, no model).
+  add_executable(tcq_v_parity src/kernels/tcq_v_parity.cpp)
+  target_include_directories(tcq_v_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(tcq_v_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME tcq_v_parity COMMAND tcq_v_parity)
 
   # KV streaming (docs/kv-streaming-design.md): streamed vs resident attention, bitwise (GPU, synthetic, no model).
   add_executable(kv_stream_parity src/kernels/kv_stream_parity.cpp)
