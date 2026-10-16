@@ -257,6 +257,10 @@ and the repository rules are in [AGENTS.md](AGENTS.md).
 
 ### Connect your other apps
 
+For a shared single engine, the experimental, opt-in [priority scheduler](docs/SOLO_PRIORITY.md)
+lets short text requests interrupt and resume a long answer using the conversation RAM cache.
+Cold reads can still delay a short request.
+
 | App type | Base URL |
 | --- | --- |
 | OpenAI-compatible (most apps and agents) | `http://127.0.0.1:8080/v1` (any API key, any model name) |
