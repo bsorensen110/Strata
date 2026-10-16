@@ -533,6 +533,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
     const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
     const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
+    if (const char* dq = std::getenv("STRATA_QSA_DQDUMP"); dq != nullptr && dq_attn_.empty()) {   // measurement only
+        dq_path_ = dq;
+        dq_attn_.assign((size_t) nQ, nullptr);
+        const size_t bytes = (size_t) strata::kernels::kVerifyMaxT * g.n_head * g.head_dim * sizeof(float);
+        for (auto& b : dq_attn_)
+            if (cudaMalloc(&b, bytes) != cudaSuccess || cudaMemset(b, 0, bytes) != cudaSuccess) {
+                err = "verify: STRATA_QSA_DQDUMP buffers";
+                return false;
+            }
+    }
     if (const char* dd = std::getenv("STRATA_QSA_DDUMP"); dd != nullptr && dd_attn_.empty()) {   // measurement only
         dd_path_ = dd;
         dd_attn_.assign((size_t) nQ, nullptr);
@@ -1397,6 +1407,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
                 stamp(l, 13, grp);
+                if (!dq_attn_.empty())   // STRATA_QSA_DQDUMP: the decode queries this window attends with (post RoPE/FWHT)
+                    cudaMemcpyAsync(dq_attn_[(size_t) qi] + (size_t) tb * NH * HD, qcur_ + tb * NH * HD,
+                                    (size_t) n * NH * HD * sizeof(float), cudaMemcpyDeviceToDevice, cs);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
                 if (!dd_attn_.empty())   // STRATA_QSA_DDUMP: a D2D copy is a graph node, so it replays with the window
                     cudaMemcpyAsync(dd_attn_[(size_t) qi] + (size_t) tb * NH * HD, attn_ + tb * NH * HD,
@@ -2210,6 +2223,19 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
+    if (!dq_attn_.empty()) {   // STRATA_QSA_DQDUMP: the window's decode queries, every QSA layer (rotated space)
+        const int32_t zv = (int32_t) (g_->n_head * g_->head_dim);
+        std::vector<float> h((size_t) T * zv);
+        if (std::FILE* f = std::fopen(dq_path_.c_str(), "ab")) {
+            for (size_t q = 0; q < dq_attn_.size(); ++q) {
+                cudaMemcpy(h.data(), dq_attn_[q], h.size() * sizeof(float), cudaMemcpyDeviceToHost);
+                const int32_t hdr[4] = {(int32_t) q, (int32_t) pos0, (int32_t) T, zv};
+                std::fwrite(hdr, 4, 4, f);
+                std::fwrite(h.data(), sizeof(float), h.size(), f);
+            }
+            std::fclose(f);
+        }
+    }
     if (!dd_attn_.empty()) {   // STRATA_QSA_DDUMP: the window's decode attention output, every QSA layer
         const int32_t zv = (int32_t) (g_->n_head * g_->head_dim);
         std::vector<float> h((size_t) T * zv);

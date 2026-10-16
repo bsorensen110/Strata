@@ -350,6 +350,10 @@ private:
     /// to the file after every window's sync (record: int32 {qsa layer, pos0, T, NH*HD} + T*NH*HD f32).
     std::vector<float*> dd_attn_;
     std::string dd_path_;
+    // STRATA_QSA_DQDUMP: the window's decode attention QUERIES (post RoPE and FWHT, the space the decode kernel reads),
+    // same copy/write pattern as dd_attn_. Measurement only; empty unless the variable is set.
+    std::vector<float*> dq_attn_;
+    std::string dq_path_;
     /// STRATA_DECODE_LOGITS=<file> (measurement): the window's head logits, copied device-to-device inside the
     /// captured window right after the head is final; the decode loop (generate.cpp), which knows the accepted
     /// count, reads row `a` with copy_dl() and writes the file: int32 {pos, n_vocab, row, 0} then n_vocab f32.  With
