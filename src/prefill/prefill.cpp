@@ -4006,18 +4006,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                       *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                 if (!wn || !wd || !wu || !wi) return false;
                 pt.mark(kPfHc, cs);
-                // STRATA_HC_Q8 without a bf16 copy: this path's GEMMs read bf16, so the matrices are dequantized per half
-                core::WeightRef wd_q8, wu_q8;
-                if (!wd->data && wd->hc_q8 && !wu->data && wu->hc_q8) {
-                    wd_q8 = *wd; wu_q8 = *wu;
-                    const uint16_t *vd = nullptr, *vu = nullptr;
-                    if (!core::NativeDense::hc_bf16_view_pair(*wd, *wu, m.cs, vd, vu, 0)) {
-                        err = "prefill: the Q8_0 hyper-connection projections could not be dequantized";
-                        return false;
-                    }
-                    wd_q8.data = vd; wu_q8.data = vu;
-                    wd = &wd_q8; wu = &wu_q8;
-                }
+                const bool can_upmix = wu->q8_scale == nullptr && hc_upmix() &&
+                                       T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() &&
+                                       !m.lo16_lo && !m.mixed_bf_lo && wu->kind == core::WeightKind::Bf16InF32 &&
+                                       (wu->data != nullptr || wu->hc_q8 != nullptr) && wu->ne0 == LR && wu->ne1 == D;
+                static int upmix_checks = [] { const char* e = std::getenv("STRATA_HC_UPMIX_CHECK"); return e ? std::atoi(e) : 0; }();
+                const uint8_t* wu_q8_raw = (can_upmix && !wu->data && wu->hc_q8) ? (const uint8_t*) wu->hc_q8 : nullptr;
                 // the xn16 token stride of this chunk (the writers of both halves and of the fused write-backs use it)
                 const int64_t ldx = hc_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) && !gr_unfused() &&
                                             !m.xn16_lo ? D + XN_PAD : D;
@@ -4025,7 +4019,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, m.cs, m.xn16_lo, xf16);
                 else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, m.cs, m.xn16_lo, ldx, xf16);
                 normed = false;
-                pt.mark(kPfHcDown, cs);   // STRATA_PREFILL_TIMING: the hyper-connection read's parts on their own lines (norm stays on "hc read")
+                // STRATA_HC_Q8 without a bf16 copy: dequantize wd (6.55 MB) right before its GEMM so gr_norm_rs and wu
+                // do not evict it from the L2 / Infinity Cache before bf16_proj(wd) reads it.
+                core::WeightRef wd_q8, wu_q8;
+                if (!wd->data && wd->hc_q8) {
+                    wd_q8 = *wd;
+                    wd_q8.data = core::NativeDense::hc_bf16_view(*wd, m.cs, 0, 0);
+                    if (!wd_q8.data) {
+                        err = "prefill: the Q8_0 hyper-connection projections could not be dequantized";
+                        return false;
+                    }
+                    wd = &wd_q8;
+                }
+                pt.mark(kPfHcDown, cs);   // STRATA_PREFILL_TIMING: the hyper-connection read's parts on their own lines (norm stays on "hc read")>>>>>>> bf1ff2e4e (perf(rdna4): port gr_upmix to gfx12 and fuse Q8_0 w_up dequantization (P1b))
                 bool hcd = false;
                 bool hdown = false;
                 if (wd->q8_scale == nullptr && ldx != D && !pf_hcdown()) {   // not with STRATA_HC_REQ8's int8 rows   // STRATA_HCD_EXACT: the exact-order down kernel when hipBLASLt would take 1176 / 1177
@@ -4045,17 +4051,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 pt.mark(kPfHcUp, cs);
                 bool upmixed = false;
-                if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
-                    wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D) {
-                    static int checks = [] { const char* e = std::getenv("STRATA_HC_UPMIX_CHECK"); return e ? std::atoi(e) : 0; }();
-                    if (checks > 0) {   // the default pair first, kept for the comparison
-                        --checks;
+                if (can_upmix) {
+                    if (upmix_checks > 0) {   // the default pair first, kept for the comparison
+                        --upmix_checks;
+                        if (!wu->data && wu->hc_q8) {
+                            wu_q8 = *wu;
+                            wu_q8.data = core::NativeDense::hc_bf16_view(*wu, m.cs, 1, 0);
+                            if (!wu_q8.data) {
+                                err = "prefill: the Q8_0 hyper-connection projections could not be dequantized";
+                                return false;
+                            }
+                            wu = &wu_q8;
+                        }
                         if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err)) return false;
                         gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
                         std::vector<float> ref((size_t) T * N), got((size_t) T * N);
                         cudaMemcpyAsync(ref.data(), m.mixed, ref.size() * 4, cudaMemcpyDeviceToHost, m.cs);
-                        upmixed = gr_upmix(m.lo16, (const uint16_t*) wu->data, m.R, m.grs, (const float*) wn->data,
-                                           m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
+                        upmixed = gr_upmix(m.lo16, wu_q8_raw ? nullptr : (const uint16_t*) wu->data, m.R, m.grs,
+                                           (const float*) wn->data, m.mixed, m.mixed_bf, m.mixed_h, T, m.cs, wu_q8_raw);
                         cudaMemcpyAsync(got.data(), m.mixed, got.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                         cudaStreamSynchronize(m.cs);
                         double e2 = 0, r2 = 0, emax = 0;
@@ -4067,12 +4080,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                      "max |diff| %.3e (%s)\n", (long long) l, half, (long long) T,
                                      std::sqrt(e2 / std::max(r2, 1e-30)), emax, upmixed ? "upmix" : "upmix refused");
                     } else {
-                        upmixed = gr_upmix(m.lo16, (const uint16_t*) wu->data, m.R, m.grs, (const float*) wn->data,
-                                           m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
+                        upmixed = gr_upmix(m.lo16, wu_q8_raw ? nullptr : (const uint16_t*) wu->data, m.R, m.grs,
+                                           (const float*) wn->data, m.mixed, m.mixed_bf, m.mixed_h, T, m.cs, wu_q8_raw);
                     }
                 }
+                if (!upmixed) {
+                    if (!wu->data && wu->hc_q8) {
+                        wu_q8 = *wu;
+                        wu_q8.data = core::NativeDense::hc_bf16_view(*wu, m.cs, 1, 0);
+                        if (!wu_q8.data) {
+                            err = "prefill: the Q8_0 hyper-connection projections could not be dequantized";
+                            return false;
+                        }
+                        wu = &wu_q8;
+                    }
+                    if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
+                }
                 if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
-                pt.mark(kPfHcInj, cs);
+                pt.mark(kPfHcInj, cs);>>>>>>> bf1ff2e4e (perf(rdna4): port gr_upmix to gfx12 and fuse Q8_0 w_up dequantization (P1b))
                 if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 pt.mark(kPfHcMix, cs);
                 if (upmixed) {
@@ -4083,9 +4108,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              m.mixed_bf_lo);
                 }
 
-                if (wd_q8.data) { // the HC GEMMs that read the scratch are enqueued: the next user waits for them
-                    core::NativeDense::hc_bf16_release_pair(m.cs, 0);
-                }
+                if (wd_q8.data) core::NativeDense::hc_bf16_release(m.cs, 0, 0);
+                if (wu_q8.data) core::NativeDense::hc_bf16_release(m.cs, 1, 0);
                 if (half == 0 && !core::is_qsa_layer(g, l)) {
                     // ======================= GDN =======================
                     const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
