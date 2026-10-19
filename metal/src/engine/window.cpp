@@ -106,6 +106,8 @@ struct PromptBufs {
         kcur, vcur, iqr, ikr, qcur, qcurh, qidx, scores, qids, part, XQ, xqh, logits, ids, wts, bcnt, boff, eoff, tiles, meta,
         stok, sw, pos, XS, HS, YE, yr, gsh, ush, hh, ys, sgv, WD, WU, Wqkv, Wz, Wal, Wbe, Wout, Wq, Wk, Wv, Wiq, Wik, Wr,
         Wsg, Wshg, Wshu, Wshd, pemb, pembh, pkey, pval, keyn, qn, gated, normW, Wpk, Wpv;
+    mtl::Buffer xrot;   // Gyro: the FFN input rotated for the folded experts
+    bool ev3 = true;    // the experts on the v3 (matrix-unit register operand) kernels; false: v2 (trellis types have only those)
 };
 
 // The vision path (--vision, GENI requests), from the shared host code: the image rows of the prompt being read
@@ -484,7 +486,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     }
     n_vocab_ = (int64_t) T("output.weight").shape[1];
     lib_ = cx_->compile({"quant.metal", "units.metal", "moe.metal", "gemv.metal", "router.metal", "gr.metal", "gr2.metal",
-                         "glue.metal"});
+                         "glue.metal", "hadamard.metal"});
     rcounter_ = cx_->alloc(16);
     lgdn_ = cx_->compile({"gdn.metal"}, "#define NO_GGML_COMMON 1\n");
     lqsa_ = cx_->compile({"qsa.metal", "qsa2.metal"}, "#define NO_GGML_COMMON 1\n");
@@ -2106,11 +2108,12 @@ struct PgMm { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t
 int pg_unit(int t) { return t == ref::Q2_0 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 ? 16 : 32; }
 // the v2 (M4) expert tiles: the K-quants need TK 128, Q8_0 / IQ4_XS TK 32 (their 32-value units), the rest TK 16
 std::string gu2_tile(int t) {
+    if (t >= ref::TQ2_T && t <= ref::TQK7) return "_16_64_32_2";   // Gyro: 32-value units
     if (t == ref::Q4_K || t == ref::Q5_K || t == ref::Q6_K) return "_16_16_128_2";   // the M4's best (513fc615)
     if (t == ref::Q8_0 || t == ref::IQ4_XS) return "_16_64_32_2";
     return "_16_64_16_2";
 }
-std::string dn2_tile(int t) { return t == ref::IQ4_NL || t == ref::Q5_1 || t == ref::Q8_0 ? "_16_64_32_2" : "_16_64_16_2"; }
+std::string dn2_tile(int t) { return t == ref::IQ4_NL || t == ref::Q5_1 || t == ref::Q8_0 || (t >= ref::TQ2_T && t <= ref::TQK7) ? "_16_64_32_2" : "_16_64_16_2"; }
 }  // namespace
 
 struct Window::PromptGemm {
@@ -2121,6 +2124,7 @@ struct Window::PromptGemm {
         iqr, ikr, qcur, qcurh, qidx, scores, qids, part, XQ, xqh, logits, ids, wts, bcnt, boff, eoff, tiles, meta, stok, sw, pos,
         XS, HS, YE, yr, gsh, ush, hh, ys, sgv, emb, embh, pkey, pval, keyn, qn, gated, normW;
     mtl::Buffer WD, WU, Wqkv, Wz, Wal, Wbe, Wout, Wq, Wk, Wv, Wiq, Wik, Wr, Wsg, Wshg, Wshu, Wshd, Wpk, Wpv;
+    mtl::Buffer xrot;
 };
 
 int Window::prompt_chunk_rows() const { return pg_ ? pg_->MT : 0; }
@@ -2155,12 +2159,13 @@ bool Window::prompt_gemm_init(std::string& err) {
     p.MT = C;
     p.QS = std::min(C, 256);
     p.lib = cx_->compile({"quant.metal", "units.metal", "mma.metal", "dense_mm.metal", "moe_mm.metal", "gr.metal", "gemv.metal",
-                          "prompt.metal"});
+                          "prompt.metal", "hadamard.metal"});
     p.lgdn = cx_->compile({"gdn.metal", "gdn_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
     p.lqsa = cx_->compile({"qsa.metal", "qsa_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
     p.k4 = ::coop_k4(*cx_);
     const char* eg = std::getenv("STRATA_METAL_PROMPT_EXPERTS");   // v2 | v3 (default: v3 with the M5's layout)
     p.gu_v3 = p.dn_v3 = eg ? std::string(eg) == "v3" : p.k4;
+    if (trellis_experts()) p.gu_v3 = p.dn_v3 = false;   // Gyro: the trellis types have the v2 kernels only
     const char* eq = std::getenv("STRATA_METAL_PROMPT_QSA");       // v1 | flash (default: flash with the M5's layout)
     p.flash = eq ? std::string(eq) == "flash" : p.k4;
     const size_t MT = (size_t) C;
@@ -2205,6 +2210,7 @@ bool Window::prompt_gemm_init(std::string& err) {
         p.Wq = F16((size_t) 12288 * N); p.Wk = F16((size_t) 512 * N); p.Wv = F16((size_t) 512 * N); p.Wiq = F16((size_t) 512 * N);
         p.Wik = F16((size_t) 128 * N); p.Wr = F16((size_t) NEXP * N); p.Wsg = F16((size_t) N); p.Wshg = F16((size_t) NFF * N);
         p.Wshu = F16((size_t) NFF * N); p.Wshd = F16((size_t) N * NFF);
+        if (strata::kernels::cpu::hadamard_spec().any()) p.xrot = F32(MT * N);   // Gyro: the rotated FFN input
         if (ple_on_) {
             p.emb = F32(MT * N); p.embh = F16(MT * N); p.pkey = F32(MT * 10240); p.pval = F32(MT * N); p.keyn = F32(MT * 10240);
             p.qn = F32(MT * 10240); p.gated = F32(MT * 10240); p.normW = F32(MT * 10240);
@@ -2437,10 +2443,18 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         if (stream_) { ma.gate_off = 0; ma.up_off = st_->up_in_slot(l); ma.down_off = st_->down_in_slot(l); }
         const size_t ebase = moe_rebase(ma.gate_off, ma.up_off, ma.down_off);
         const uint32_t ne_ = N;
+        const auto& hs = strata::kernels::cpu::hadamard_spec();
+        const bool had_gu = hs.gu(l), had_dn = hs.down(l);
+        if (had_gu || had_dn) had_init();
+        if (had_gu) {   // Gyro: the folded gate / up weights read H (s * x); rotated once per token, before the gather
+            HadArgs ha{N, hs_set_[0] ? 1u : 0u, 1.0f / std::sqrt((float) hs.block), 0};
+            D(PP(p.lib, "hadamard_rows"), {mtl::Arg::B(p.mixed), mtl::Arg::B(p.xrot), mtl::Arg::B(hsg_[0]), mtl::Arg::V(ha)},
+              N / hs.block, T, hs.block);
+        }
         {
             mtl::Dispatch g;
             g.p = PP(p.lib, "mm_gather");
-            g.args = {mtl::Arg::B(p.mixed), mtl::Arg::B(p.stok), mtl::Arg::B(p.XS), mtl::Arg::V(ne_)};
+            g.args = {mtl::Arg::B(had_gu ? p.xrot : p.mixed), mtl::Arg::B(p.stok), mtl::Arg::B(p.XS), mtl::Arg::V(ne_)};
             g.tg[0] = 256;
             g.indirect = &p.meta;
             g.ind_off = 8 * 4;
@@ -2473,6 +2487,16 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         gu.ind_off = 2 * 4;
         if (stream_) cuts.push_back((int) ds.size());   // the host's turn: this layer's experts put in place
         push(ds, gu);
+        if (had_dn) {   // the folded down weights read the rotated h: in place on the rows the plan placed
+            HadArgs ha{NFF, hs_set_[1] ? 1u : 0u, 1.0f / std::sqrt((float) hs.block), 0};
+            mtl::Dispatch hd;
+            hd.p = PP(p.lib, "hadamard_rows_h");
+            hd.args = {mtl::Arg::B(p.HS), mtl::Arg::B(hsg_[1]), mtl::Arg::V(ha)};
+            hd.tg[0] = hs.block;
+            hd.indirect = &p.meta;
+            hd.ind_off = 8 * 4;
+            push(ds, hd);
+        }
         mtl::Dispatch dn;
         if (p.dn_v3) {
             const std::string fn = "mm_down3_" + std::to_string(ed.type) + "_16_64_32_2";
@@ -2693,9 +2717,7 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
                      const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
-    // trellis experts: the prompt runs through the decode window (MAXT rows at a time) until the matrix-unit kernels take them
-    static const bool windows = (std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window") ||
-                                g_window->trellis_experts();
+    static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";
     static const int64_t min_rows = std::getenv("STRATA_METAL_PROMPT_MIN") ? std::atoll(std::getenv("STRATA_METAL_PROMPT_MIN")) : 32;
     if (!windows && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
     if (!windows && g_window->streaming()) {

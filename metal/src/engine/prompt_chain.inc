@@ -52,7 +52,7 @@ bool Window::pc_setup(int C) {
     const double t0 = now_ms();
     if (b.C == 0) {
         b.lib = cx_->compile({"quant.metal", "units.metal", "mma.metal", "dense_mm.metal", "moe_mm.metal", "gr.metal",
-                              "gemv.metal", "prompt.metal"});
+                              "gemv.metal", "prompt.metal", "hadamard.metal"});
         b.lgdn = cx_->compile({"gdn.metal", "gdn_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
         b.lqsa = cx_->compile({"qsa.metal", "qsa_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
         b.k4 = coop_k4();
@@ -93,8 +93,13 @@ bool Window::pc_setup(int C) {
     // else v2
     b.gu3[0] = 16; b.gu3[1] = 32; b.gu3[2] = 32; b.gu3[3] = 4;
     b.dn3[0] = 16; b.dn3[1] = 64; b.dn3[2] = 32; b.dn3[3] = 2;
-    b.meta.as<uint32_t>()[2] = b.k4 ? NFF / (b.gu3[1] * b.gu3[3]) : NFF / 64;
-    b.meta.as<uint32_t>()[5] = b.k4 ? N / (b.dn3[1] * b.dn3[3]) : N / 64;
+    b.ev3 = b.k4 && !trellis_experts();
+    b.meta.as<uint32_t>()[2] = b.ev3 ? NFF / (b.gu3[1] * b.gu3[3]) : NFF / 64;
+    b.meta.as<uint32_t>()[5] = b.ev3 ? N / (b.dn3[1] * b.dn3[3]) : N / 64;
+    if (strata::kernels::cpu::hadamard_spec().any()) {
+        had_init();
+        b.xrot = F32(MT * N);
+    }
     std::fprintf(stderr, "strata metal: prompt kernels (mac-kern's prompt chain) for chunks of %d rows, %s, ready in %.0f ms\n",
                  C, b.k4 ? "matrix-unit register operands (COOP_K4)" : "the older expert / attention kernels (no M5 layout)",
                  now_ms() - t0);
@@ -290,16 +295,23 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         ma.d_stride = (uint64_t) ma.d_row * N;
         const size_t ebase = moe_rebase(ma.gate_off, ma.up_off, ma.down_off);
         const uint32_t ne = N;
+        const auto& hs = strata::kernels::cpu::hadamard_spec();
+        const bool had_gu = hs.gu(l), had_dn = hs.down(l);
+        if (had_gu) {   // Gyro: the folded gate / up weights read H (s * x); rotated once per token, before the gather
+            HadArgs ha{N, hs_set_[0] ? 1u : 0u, 1.0f / std::sqrt((float) hs.block), 0};
+            D(P_(b.lib, "hadamard_rows"), {mtl::Arg::B(b.mixed), mtl::Arg::B(b.xrot), mtl::Arg::B(hsg_[0]), mtl::Arg::V(ha)},
+              N / hs.block, nT, hs.block);
+        }
         mtl::Dispatch g;
         g.p = P_(b.lib, "mm_gather");
-        g.args = {mtl::Arg::B(b.mixed), mtl::Arg::B(b.stok), mtl::Arg::B(b.XS), mtl::Arg::V(ne)};
+        g.args = {mtl::Arg::B(had_gu ? b.xrot : b.mixed), mtl::Arg::B(b.stok), mtl::Arg::B(b.XS), mtl::Arg::V(ne)};
         g.tg[0] = 256;
         g.indirect = &b.meta;
         g.ind_off = 8 * 4;
         ds.push_back(g);
         auto tl3 = [](const int* t) { return std::to_string(t[0]) + "_" + std::to_string(t[1]) + "_" + std::to_string(t[2]) + "_" + std::to_string(t[3]); };
         mtl::Dispatch gu;
-        if (b.k4) {
+        if (b.ev3) {
             const std::string fn = "mm_gu3_" + std::to_string(eg.type) + "_" + tl3(b.gu3);
             gu.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
         } else {
@@ -307,19 +319,29 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             gu.p = P_(b.lib, fn, mtl::Constants().i(5, 0), fn + "#p0");
         }
         gu.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.XS), mtl::Arg::B(b.HS), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
-        gu.tg[0] = b.k4 ? 32 * b.gu3[3] : 64;
+        gu.tg[0] = b.ev3 ? 32 * b.gu3[3] : 64;
         gu.indirect = &b.meta;
         gu.ind_off = 2 * 4;
         ds.push_back(gu);
+        if (had_dn) {   // the folded down weights read the rotated h: in place on the rows the plan placed
+            HadArgs ha{NFF, hs_set_[1] ? 1u : 0u, 1.0f / std::sqrt((float) hs.block), 0};
+            mtl::Dispatch hd;
+            hd.p = P_(b.lib, "hadamard_rows_h");
+            hd.args = {mtl::Arg::B(b.HS), mtl::Arg::B(hsg_[1]), mtl::Arg::V(ha)};
+            hd.tg[0] = hs.block;
+            hd.indirect = &b.meta;
+            hd.ind_off = 8 * 4;
+            ds.push_back(hd);
+        }
         mtl::Dispatch dn;
-        if (b.k4) {
+        if (b.ev3) {
             const std::string fn = "mm_down3_" + std::to_string(ed.type) + "_" + tl3(b.dn3);
             dn.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
         } else {
             dn.p = P_(b.lib, "mm_down2_" + std::to_string(ed.type) + dn2_tile(ed.type));
         }
         dn.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.HS), mtl::Arg::B(b.YE), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
-        dn.tg[0] = b.k4 ? 32 * b.dn3[3] : 64;
+        dn.tg[0] = b.ev3 ? 32 * b.dn3[3] : 64;
         dn.indirect = &b.meta;
         dn.ind_off = 5 * 4;
         ds.push_back(dn);

@@ -61,34 +61,3 @@ kernel void slc_touch(device const uint4* src [[buffer(0)]], device uint* sink [
     }
     if (s == 0x9e3779b9u) sink[0] = s;
 }
-
-// Gyro (APR): y = H_block (signs * x) per block of `block` values of each row (src/kernels/cuda/iq_kernels.cu's
-// hadamard_rows_kernel; the butterflies of hadamard.cpp in the same order, so the floats are the CPU's).  Grid
-// (width / block, rows), block threads (a power of two <= 1024); y may be x (each threadgroup reads its block, then writes it).
-struct HadArgs {
-    uint width;
-    uint has_signs;
-    float scale;     // 1 / sqrt(block), as hadamard_rotate computes it
-    uint pad;
-};
-kernel void hadamard_rows(device const float* x [[buffer(0)]], device float* y [[buffer(1)]],
-                          device const float* signs [[buffer(2)]], constant HadArgs& a [[buffer(3)]],
-                          uint3 tg [[threadgroup_position_in_grid]], ushort i [[thread_index_in_threadgroup]],
-                          uint3 nt [[threads_per_threadgroup]]) {
-    threadgroup float hb[1024];
-    const ushort n = ushort(nt.x);
-    const uint col = tg.x * n + i, at = tg.y * a.width + col;
-    float v = x[at];
-    if (a.has_signs) v *= signs[col];
-    hb[i] = v;
-    for (ushort len = 1; len < n; len <<= 1) {
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if ((i & len) == 0) {
-            const float p = hb[i], q = hb[i + len];
-            hb[i] = p + q;
-            hb[i + len] = p - q;
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    y[at] = hb[i] * a.scale;
-}

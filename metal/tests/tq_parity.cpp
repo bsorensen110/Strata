@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     mtl::Context cx;
-    const int lib = cx.compile({"quant.metal", "units.metal", "moe.metal", "glue.metal"});
+    const int lib = cx.compile({"quant.metal", "units.metal", "moe.metal", "hadamard.metal"});
     std::printf("device %s\n", cx.device_name().c_str());
     bool all_ok = true;
     ref::Rng rng(seed);
