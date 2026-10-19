@@ -37,9 +37,11 @@ the original model as for every Qwen3.8-Flash-Next file) and the start script. N
 APR port, and the released 0.1.45 stops at v4. A ready-made engine that is older is replaced by one compiled from this source
 (setup), or the app says the model needs a newer engine and offers Update engine.
 
-**Supported:** NVIDIA (CUDA, Linux and Windows) and AMD (HIP, experimental: the authors validated gfx1151; we ran
-gfx1201 with identical output to rc2). **Not supported:** Intel Arc (SYCL) and Apple Metal: the engines there have no
-trellis kernels; the Metal engine refuses the file at load with the reason.
+**Supported:** NVIDIA (CUDA, Linux and Windows), AMD (HIP, experimental: the authors validated gfx1151; we ran
+gfx1201 with identical output to rc2) and Apple Metal (Gyro-M, TQ2_T, run on an M5 Max: the decode kernels are in
+`metal/kernels/quant.metal` and `moe.metal`, the Hadamard rotations in `hadamard.metal`, the prompt path is the v2
+expert GEMMs of `moe_mm.metal`; `metal/tests/tq_parity` checks them against the CPU reference). **Not supported:** Intel Arc
+(SYCL): that engine has no trellis kernels.
 
 **Pictures.** Gyro reads pictures with the original model's picture reader file (the same one every Qwen3.8-Flash-Next
 model uses; setup downloads it with the model). The reader opens only the vocabulary and the header of the Gyro file, so
