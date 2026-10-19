@@ -471,7 +471,10 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         // the chunks of a model bigger than one Metal buffer overlap by the largest range bound at one offset: a tensor,
         // or a layer's routed experts (gate, up and down, bound together at the first of them: moe_rebase)
         size_t span = 0;
-        for (const auto& kv : f_.tensors) span = std::max<size_t>(span, kv.second.bytes);
+        // (the PLE table is read from the file by the shared host code, never by a kernel: a Gyro file holds it in the same
+        // GGUF - 54 GB, more than a chunk can overlap by - so it does not set the span)
+        for (const auto& kv : f_.tensors)
+            if (kv.first != "per_layer_token_embd.weight") span = std::max<size_t>(span, kv.second.bytes);
         for (int l = 0; l < 48; ++l) {
             const std::string b = "blk." + std::to_string(l) + ".";
             const gguf::Tensor *g = f_.find(b + "ffn_gate_exps.weight"), *u = f_.find(b + "ffn_up_exps.weight"),
@@ -888,7 +891,8 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         a.topk = TOPK;
         a.n_expert = NEXP;
         const bool dq2 = td.type == ref::Q2_0;
-        const int gl = 32, gr = 1, gs = 4, ds_ = 4;
+        // Gyro's trellis rows: 80 units of 32 weights a row, so 16 lanes a row (5 each) beat 32 (2.5: half the lanes idle for a unit)
+        const int gl = tg_.type >= ref::TQ2_T && tg_.type <= ref::TQK7 ? 16 : 32, gr = 1, gs = 4, ds_ = 4;
         // the down tile: Q2_0 8,1; else 4,2 - but on the M4 (no M5 layout) Q5_1 4,1 and Q8_0 8,1 (4,2 spills there:
         // 24-36 GB/s, mac-kern 513fc615)
         const bool m4 = !m5_layout();
