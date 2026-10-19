@@ -922,6 +922,16 @@ __device__ __forceinline__ void iq_sync_lds() {
 #endif
 }
 
+__device__ __forceinline__ void iq_sync_lds() {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+#elif defined(__HIPCC__)
+    asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+#else
+    __syncthreads();
+#endif
+}
+
 template<> inline constexpr bool kSplit<16> = true;
 template<> struct Split<16> {   // IQ2_XXS
     struct W { int g[8]; int ls; float dw; };
@@ -1856,7 +1866,7 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
         // the trellis types' int8 codebook: 2048 u16 (4 KB), read by 8 random lookups per 16 weights
         const uint32_t* src = (const uint32_t*) tq_lut_i8;
         for (int i = tid; i < 1024; i += nthreads) s_buf[i] = src[i];
-        __syncthreads();
+        __syncthreads();>>>>>>> 6cb45386c (perf(hip): optimize EXPDEC routed-expert kernels and enable by default on gfx12)
         return s_buf;
     } else if constexpr (TY == 21) {
         // 512 codebook words, then two 256-word tables: the byte masks of a sign byte's bits 0-3 and of its bits
@@ -4075,17 +4085,47 @@ int env_int_or(const char* name, int dflt) {
     return v != nullptr && v[0] != '\0' ? std::atoi(v) : dflt;
 }
 // read at first use (not at load), so a per-architecture default set at start (nv_defaults.hpp) is seen; native_expert_set_expdec overrides
+bool expdec_default_gfx12() {
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    static int arch[64] = {};   // 0 unknown, 1 gfx12, 2 other
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (arch[dev] == 0) {
+        cudaDeviceProp p{};
+        const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+                        strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+        (void) cudaGetLastError();
+        arch[dev] = ok ? 1 : 2;
+    }
+    return arch[dev] == 1;
+#else
+    return false;
+#endif
+}
 int g_expdec = -1;
-int expdec_mode() { if (g_expdec < 0) g_expdec = env_on("STRATA_EXPDEC") ? 1 : 0; return g_expdec; }
+int expdec_mode() {
+    if (g_expdec >= 0) return g_expdec;
+    const char* v = std::getenv("STRATA_EXPDEC");
+    if (v != nullptr && v[0] != '\0') return v[0] != '0' ? 1 : 0;
+    return expdec_default_gfx12() ? 1 : 0;
+}
 int g_expdec_r = env_int_or("STRATA_EXPDEC_R", 1);          // gate/up rows per lane: 1, 2 (bench: R=1 wins on the 2080 Ti)
 int g_expdec_dr = env_int_or("STRATA_EXPDEC_DR", 4);        // down rows per lane: 1, 2, 4 (Q2_0: R=4 wins on both cards)
 int g_expdec_minb = env_int_or("STRATA_EXPDEC_MINB", STRATA_EXPDEC_MINB);   // gate/up __launch_bounds__ min blocks: 2 (<= 128 regs) or 4 (<= 64)
 int g_expdec_d20 = env_int_or("STRATA_EXPDEC_D20", 0);      // 1: EXPDEC also for the IQ4_NL down (bench: no gain, default kernel)
-// 1: EXPDEC for the down too (Q2_0; IQ4_NL with _D20).  Default 0: in the engine (nsys of a 131k decode on a 2080 Ti) the Q2_0 down
-// with EXPDEC was ~10% slower than the default kernel although the bench alone had it at 0.78.  Read at first use, so a per-architecture
-// default set at start (arch_defaults.cpp: gfx12) is seen; native_expert_set_expdec_params overrides.
+// 1: EXPDEC for the down too (Q2_0; IQ4_NL with _D20).  Default 0 on CUDA (on a 2080 Ti at 131k decode the Q2_0 down
+// with EXPDEC was ~10% slower than the default kernel); default 1 on gfx12 (RDNA4, R9700: Q2_0 down is 24-27% faster in
+// expdec_bench and faster end-to-end in decode).
 int g_expdec_down = -1;
-int expdec_down_on() { if (g_expdec_down < 0) g_expdec_down = env_int_or("STRATA_EXPDEC_DOWN", 0) != 0 ? 1 : 0; return g_expdec_down; }
+int expdec_down_on() {
+    if (g_expdec_down >= 0) return g_expdec_down;
+    const char* v = std::getenv("STRATA_EXPDEC_DOWN");
+    if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0 ? 1 : 0;
+    return expdec_default_gfx12() ? 1 : 0;
+}>>>>>>> 6cb45386c (perf(hip): optimize EXPDEC routed-expert kernels and enable by default on gfx12)
 int g_expdec_rb = env_int_or("STRATA_EXPDEC_RB", 0);        // gate/up rows per block (0 = auto)
 int g_expdec_drb = env_int_or("STRATA_EXPDEC_DRB", 0);      // down rows per block (0 = auto)
 int g_expdec_minblk = env_int_or("STRATA_EXPDEC_MINBLK", 800);   // auto: the most rows per block that keep this many blocks
@@ -4139,6 +4179,8 @@ void expdec_gu_t(int64_t gy, int64_t cap_groups, cudaStream_t s, const unsigned 
 // engine's log that the EXPDEC kernels are the ones launched (or captured into the window's graph), with the
 // choices in force.
 void expdec_note(const NativeExpertLayout& L, bool gu, bool taken, cudaStream_t s, int64_t gy, int64_t cap_groups) {
+    static const bool verbose = env_on("STRATA_EXPDEC");
+    if (!verbose) return;
     static bool seen[2][64][2] = {};
     const int ty = gu ? L.gu_type : L.d_type;
     if (ty < 0 || ty >= 64 || seen[gu ? 0 : 1][ty][taken ? 1 : 0]) return;
