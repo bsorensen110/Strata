@@ -5570,7 +5570,13 @@ int main(int argc, char** argv) {
         // second PinnedArena, so the whole block can be handed back with one MEM_RELEASE once the residency table
         // proves no pair of them can be read from RAM.  A large-page allocation cannot be freed in part - that is
         // why the block exists at all.  The release itself waits for host_res, below.
-        if (multi_gpu && !split_at.empty() && !o.mmap_experts) arena_src.set_split_layer(split_at.front());
+        // Gated on the same switch that releases it: without the release, two blocks are pure overhead (the tail is
+        // read into its own allocation and kept).  Default = one block, byte-identical to before.
+        {
+            const char* ar = std::getenv("STRATA_ARENA_RELEASE_BLOCK");
+            if (multi_gpu && !split_at.empty() && !o.mmap_experts && ar != nullptr && ar[0] != '\0' && ar[0] != '0')
+                arena_src.set_split_layer(split_at.front());
+        }
         if (!arena_src.open(o.pack, g.n_layers, g.n_expert, /*threads=*/6, err, pin_limit,
                             o.shared_expert_arena)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
