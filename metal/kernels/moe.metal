@@ -334,3 +334,8 @@ DN_SET(T_Q5_1) DN_SET(T_Q8_0)
 DN_SET(T_Q2_0)
 DN_SET(T_Q2_0R)
 DN_SET(T_IQ4_NL)
+// Gyro's trellis experts (T_TQ2T / T_TQK6 / T_TQK7): the tiles the window and the tq_parity bench use
+#define GU_TQ(F) GU(F, 32, 1, 4) GU(F, 32, 2, 4) GU(F, 16, 1, 4) GU(F, 16, 2, 4) GU(F, 8, 1, 4) GU(F, 32, 1, 8)
+#define DN_TQ(F) DN(F, 4, 2, 4) DN(F, 4, 1, 4) DN(F, 8, 1, 4) DN(F, 8, 2, 4) DN(F, 16, 1, 4) DN(F, 2, 2, 4)
+GU_TQ(T_TQ2T) GU_TQ(T_TQK6) GU_TQ(T_TQK7)
+DN_TQ(T_TQ2T) DN_TQ(T_TQK6) DN_TQ(T_TQK7)

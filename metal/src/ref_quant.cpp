@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "ggml-common-tq.h"
+
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
@@ -23,6 +25,7 @@ const char* type_name(int t) {
         case IQ2_XXS: return "IQ2_XXS"; case IQ2_XS: return "IQ2_XS"; case IQ2_S: return "IQ2_S";
         case IQ3_XXS: return "IQ3_XXS"; case IQ3_S: return "IQ3_S"; case IQ4_NL: return "IQ4_NL";
         case IQ4_XS: return "IQ4_XS"; case Q2_0: return "Q2_0";
+        case TQ2_T: return "TQ2_T"; case TQK6: return "TQK6"; case TQK7: return "TQK7";
     }
     return "?";
 }
@@ -32,6 +35,7 @@ int block_elems(int t) {
         case F32: case F16: case BF16: return 1;
         case Q4_0: case Q5_0: case Q5_1: case Q8_0: case IQ4_NL: return 32;
         case Q2_0: return 64;
+        case TQ2_T: case TQK6: case TQK7: return 128;
         default: return 256;
     }
 }
@@ -43,6 +47,7 @@ int block_bytes(int t) {
         case Q3_K: return 110; case Q4_K: return 144; case Q5_K: return 176; case Q6_K: return 210;
         case IQ2_XXS: return 66; case IQ2_XS: return 74; case IQ2_S: return 82; case IQ3_XXS: return 98;
         case IQ3_S: return 110; case IQ4_XS: return 136;
+        case TQ2_T: return 34; case TQK6: return 26; case TQK7: return 30;
     }
     std::fprintf(stderr, "ref: unknown type %d\n", t);
     std::exit(2);
@@ -102,8 +107,37 @@ static void get_scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
     }
 }
 
+// The trellis state of step t (ggml-common-tq.h): TQ2_T s = qs[(t + 31) % 32] << 8 | qs[t]; TQK6 / TQK7 the 16 stream bits from
+// bit (31 - t) * K, LSB first, circular modulo 32 * K bits; masked to 15 bits.  Bit by bit, so it shares no code with the
+// kernels' word reads.
+static uint32_t tq_state_ref(int t, int kb, const uint8_t* qs) {
+    if (kb == 8) return (((uint32_t)qs[(t + 31) % 32] << 8) | qs[t]) & TQ_STATE_MASK;
+    const int nbits = 32 * kb;
+    uint32_t v = 0;
+    for (int i = 0; i < 16; ++i) {
+        const int bit = ((31 - t) * kb + i) % nbits;
+        v |= (uint32_t)((qs[bit >> 3] >> (bit & 7)) & 1) << i;
+    }
+    return v & TQ_STATE_MASK;
+}
+
+// Step t gives weights 4t..4t+3: x = state * 0x9e3779b1, the points tq_lut[x >> 21] and tq_lut[(x >> 10) & 2047] (fp16
+// pairs), times d.  The exact fp16 values; the CPU kernels round them to int16 at 2^-13 (tq_cpu.hpp).
+static void deq_tq(int kb, const uint8_t* b, float* y) {
+    const float d = f16_to_f32(rd16(b));
+    for (int t = 0; t < 32; ++t) {
+        const uint32_t x = tq_state_ref(t, kb, b + 2) * 0x9e3779b1u;
+        const uint32_t pt[2] = {x >> 21, (x >> 10) & 2047u};
+        for (int h = 0; h < 2; ++h)
+            for (int j = 0; j < 2; ++j) y[4 * t + 2 * h + j] = f16_to_f32(tq_lut_f16[2 * pt[h] + j]) * d;
+    }
+}
+
 static void deq_block(int t, const uint8_t* b, float* y) {
     switch (t) {
+        case TQ2_T: deq_tq(8, b, y); return;
+        case TQK6: deq_tq(6, b, y); return;
+        case TQK7: deq_tq(7, b, y); return;
         case Q2_0: {
             const float d = f16_to_f32(rd16(b));
             for (int j = 0; j < 64; ++j) y[j] = (float)(((b[2 + j / 4] >> ((j % 4) * 2)) & 3) - 1) * d;
@@ -437,6 +471,7 @@ void random_blocks(int t, uint8_t* dst, int rows, int cols, uint64_t seed, float
             case IQ2_XXS: case IQ2_XS: case IQ2_S: put16(b, f32_to_f16(scale * u / 4)); break;
             case IQ3_XXS: put16(b, f32_to_f16(scale * u / 8)); break;
             case IQ3_S: put16(b, f32_to_f16(scale * u / 64)); break;
+            case TQ2_T: case TQK6: case TQK7: put16(b, f32_to_f16(scale * u)); break;   // codebook points are ~unit
             default: break;
         }
     }

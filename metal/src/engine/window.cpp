@@ -22,6 +22,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/conversation_cache.hpp"
 #include "strata/core/session.hpp"
+#include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/ngram.hpp"
 
 #include <algorithm>
@@ -62,6 +63,7 @@ struct MoeArgs {
 struct GdnArgs { uint32_t h_k, h_v, channels, commit; float eps; uint32_t plane; };
 struct QsaArgs { uint32_t pos0, pos_base, max_cells, n_tok; float eps; };
 struct GlueArgs { uint32_t n, n_tok, n_embd, topk; };
+struct HadArgs { uint32_t width, has_signs; float scale; uint32_t pad; };
 struct ArgArgs { uint32_t n_vocab, parts; };
 // the routed gate/up's i-quant grids from constant memory (QUANT_CTAB, function constant 23 of quant.metal): bitwise
 // the threadgroup copy's values, 3-7% faster on the M5 Max; STRATA_METAL_CTAB=0 turns it off
@@ -235,6 +237,14 @@ private:
         ysh_, sg_, qfull_, kcur_, vcur_, iqr_, ikr_, qcur_, qidx_, scores_, qids_, part_, cs_, lm_, apv_, api_, tokout_,
         emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_, pleHist_;
     Act XA_, XF_, XY_, XQ_, XH_, XE_;
+    // Gyro (hadamard.hpp): the experts' input activations are rotated before the routed GEMVs - the FFN input into xr_ (the
+    // router and the shared expert read it unrotated), the SwiGLU rows h_ in place
+    mtl::Buffer xr_, hsg_[2];      // hsg_: the sign vectors of widths N, NFF
+    bool hs_set_[2] = {false, false};
+    bool had_ready_ = false;
+    void had_init();
+    void had_rows(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, size_t x_off, const mtl::Buffer& y, size_t y_off,
+                  int width, int rows);
     int cur_inj_ = 0;
     // state
     std::vector<mtl::Buffer> gst_, ghist_[2], kq_, vq_, ksc_, vsc_, tail_, dead_, pooled_;
@@ -290,6 +300,14 @@ private:
     double pg_ms_ = 0;
     int64_t pg_tok_ = 0;
 public:
+    // Gyro: some layer's routed experts are trellis-coded (ggml 144-146), which the matrix-unit prompt kernels do not take
+    bool trellis_experts() const {
+        for (int l = 0; l < 48; ++l) {
+            const gguf::Tensor* t = f_.find("blk." + std::to_string(l) + ".ffn_gate_exps.weight");
+            if (t && t->type >= 144 && t->type <= 146) return true;
+        }
+        return false;
+    }
     bool prompt_gemm_on(int64_t n) const;
     bool prompt_gemm_init(std::string& err);
     bool prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err);
@@ -626,6 +644,40 @@ void Window::gemv(std::vector<mtl::Dispatch>& ds, const gguf::Tensor& t, const A
     push(ds, d);
 }
 
+void Window::had_init() {
+    if (had_ready_) return;
+    const auto& hs = strata::kernels::cpu::hadamard_spec();
+    const int widths[2] = {N, NFF};
+    for (int k = 0; k < 2; ++k) {
+        const float* sg = strata::kernels::cpu::hadamard_signs(widths[k]);
+        hs_set_[k] = sg != nullptr;
+        hsg_[k] = cx_->alloc(4 * (size_t) widths[k]);
+        if (sg) std::memcpy(hsg_[k].ptr, sg, 4 * (size_t) widths[k]);
+        if (widths[k] % hs.block != 0) {
+            std::fprintf(stderr, "strata metal: Hadamard block %d does not divide the expert width %d\n", hs.block, widths[k]);
+            std::exit(1);
+        }
+    }
+    xr_ = cx_->alloc(4 * (size_t) MAXT * N);
+    std::fprintf(stderr, "strata metal: Hadamard-folded experts (block %d, signs %s)\n", hs.block,
+                 hs_set_[0] || hs_set_[1] ? "from the pack" : "none");
+    had_ready_ = true;
+}
+
+// y = H_block (signs * x) per block of each of `rows` rows of `width` (hadamard_rows of glue.metal); y may be x
+void Window::had_rows(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, size_t x_off, const mtl::Buffer& y, size_t y_off,
+                      int width, int rows) {
+    const int blk = strata::kernels::cpu::hadamard_spec().block, k = width == N ? 0 : 1;
+    HadArgs ha{(uint32_t) width, hs_set_[k] ? 1u : 0u, 1.0f / std::sqrt((float) blk), 0};
+    mtl::Dispatch d;
+    d.p = P(lib_, "hadamard_rows", {}, "hadamard_rows");
+    d.args = {mtl::Arg::B(x, x_off), mtl::Arg::B(y, y_off), mtl::Arg::B(hsg_[k]), mtl::Arg::V(ha)};
+    d.grid[0] = width / blk;
+    d.grid[1] = rows;
+    d.tg[0] = blk;
+    push(ds, d);
+}
+
 void Window::xprep(std::vector<mtl::Dispatch>& ds, const mtl::Buffer& x, const Act& out, int n) {
     mtl::Dispatch d;
     d.p = P(lib_, "xprep", {}, "xprep");
@@ -874,6 +926,9 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
                                 "_" + std::to_string(gs);
         const std::string dnn = "moe_down_" + std::to_string(dq2 ? 142 : td.type) + "_" + std::to_string(dl) + "_" +
                                 std::to_string(dr) + "_" + std::to_string(ds_);
+        const auto& hs = strata::kernels::cpu::hadamard_spec();
+        const bool had_gu = hs.gu(l), had_dn = hs.down(l);
+        if (had_gu || had_dn) had_init();
         mtl::Dispatch g;
         const mtl::Buffer& EW = stream_ ? st_->chunk(0) : W_;
         // function constant 23 (QUANT_CTAB): the i-quant grids from constant memory, no threadgroup copy (same values)
@@ -884,6 +939,10 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         g.p = P(lib_, gun, ac, gun + ak);
         g.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(XF_.b, XF_.plane_bytes() * xkind(tg_.type)), mtl::Arg::B(h_), mtl::Arg::B(plan_),
                   mtl::Arg::V(a), mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4)};
+        if (had_gu) {   // the gate / up weights are Hadamard-folded: they read H (s * x), never x
+            had_rows(ds, XF_.b, 0, xr_, 0, N, ntok);
+            g.args[1] = mtl::Arg::B(xr_);
+        }
         if (stream_)
             for (int c = -1; c < 3; ++c)
                 g.args.push_back(c < 0 ? mtl::Arg::B(st_->smap(), (size_t) l * 512 * 4) : mtl::Arg::B(st_->chunk(c + 1)));
@@ -894,6 +953,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         push(ds, g);
         nb_ = true;
         gemv(ds, T(b + "ffn_down_shexp.weight"), XH_, ysh_, N, ntok);
+        if (had_dn) had_rows(ds, h_, 0, h_, 0, NFF, ntok * TOPK);   // the folded down weights read the rotated h
         mtl::Dispatch dd;
         dd.p = P(lib_, dnn, ac, dnn + ak);
         dd.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(h_), mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(h_)};
@@ -2633,7 +2693,9 @@ bool prompt_run(const int64_t* tokens, int64_t n, int64_t pos0, const float* con
 bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
                      const std::function<bool(const float*, int64_t, int64_t, std::string&)>& on_chunk, std::string& err) {
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
-    static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";
+    // trellis experts: the prompt runs through the decode window (MAXT rows at a time) until the matrix-unit kernels take them
+    static const bool windows = (std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window") ||
+                                g_window->trellis_experts();
     static const int64_t min_rows = std::getenv("STRATA_METAL_PROMPT_MIN") ? std::atoll(std::getenv("STRATA_METAL_PROMPT_MIN")) : 32;
     if (!windows && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
     if (!windows && g_window->streaming()) {

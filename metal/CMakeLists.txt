@@ -45,6 +45,9 @@ foreach(src ${STRATA_METAL_TESTS})
   add_executable(${t} ${src})
   target_link_libraries(${t} PRIVATE mtl_rt)
 endforeach()
+# Gyro's trellis experts: the Metal kernels against the CPU reference (scalar trellis rows, the Hadamard rotation)
+target_sources(tq_parity PRIVATE ${STRATA_ROOT}/src/kernels/cpu/tq_cpu.cpp ${STRATA_ROOT}/src/kernels/cpu/hadamard.cpp)
+target_include_directories(tq_parity PRIVATE ${STRATA_ROOT}/include)
 
 # ---- the device runtime and the engine (mac-design) ---------------------------------------------------------------
 set(METAL_CPP_DIR "" CACHE PATH "metal-cpp headers (https://developer.apple.com/metal/cpp/), e.g. metal-cpp_26")
