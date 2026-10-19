@@ -435,7 +435,14 @@ __device__ __forceinline__ uint32_t pack_bf16x2(uint32_t a, uint32_t b) {   // l
 // less LDS traffic on the B side.  The dropped products are each <= 2^-16 of the leading term:
 // rel err ~1.5e-5, enough to flip a near-tie block in/out of the top-k (gate: selections identical
 // 253-256/256 against the 6-product kernel; upstream's own WMMA-vs-warp baseline is 254/256).
-template <bool S2>
+// XQ (STRATA_SELECT_GRID=1|2): x = the query tiles, so the CTAs that share a key tile are scheduled
+// together and L2 holds it for all 16 of them.  Default keeps 0.1.45's CTA order (bitwise identical
+// output: only the scheduling order moves).  Measured on gfx1151 (qsa_select_bench, 256 queries,
+// capacity 524288): at 98K blocks the 6-product scorer 7.0 -> 5.1 ms; at 24K blocks the key set is
+// L2-marginal and the swap is slower, so STRATA_SELECT_GRID=2 swaps only launches deeper than
+// STRATA_SELECT_GRID_MIN blocks (default 8192 = a 32K context); =1 forces the swap at any size.
+template <bool S2, bool XQ = false>
+>>>>>>> 939d56e1c (hip: STRATA_SELECT_GRID=2 - the selection scorer's CTA order swaps for L2 (bitwise identical))
 __global__ void __launch_bounds__(128) block_scores_wmma_kernel(const float* __restrict__ pooled,
                                                                 const float* __restrict__ q_idx,
                                                                 const int32_t* __restrict__ steps, int64_t nq,
@@ -444,7 +451,7 @@ __global__ void __launch_bounds__(128) block_scores_wmma_kernel(const float* __r
     __shared__ __align__(16) uint16_t sq[S2 ? 2 : 3][IDX_HEADS][WQT][WQS];   // hi / mid / [lo], [head][query][dim]
     __shared__ int s_nbid[WQT];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5, l16 = lane & 15, g = lane >> 4;
-    const int64_t q0 = (int64_t) blockIdx.y * WQT;
+    const int64_t q0 = (int64_t) (XQ ? blockIdx.x : blockIdx.y) * WQT;   // XQ: x = the query tile
     for (int i = t; i < WQT * IDX_HEADS * IDX_DIM / 4; i += 128) {
         const int row = i / (IDX_DIM / 4), c = i % (IDX_DIM / 4);
         const int qr = row / IDX_HEADS, h = row % IDX_HEADS;
@@ -467,7 +474,7 @@ __global__ void __launch_bounds__(128) block_scores_wmma_kernel(const float* __r
     const int64_t qi = q0 + l16;
     const int nb_q = s_nbid[l16];
     for (int it = 0; it < WITER; ++it) {
-        const int64_t b0 = (((int64_t) blockIdx.x * WITER + it) * 4 + warp) * 16;
+        const int64_t b0 = (((int64_t) (XQ ? blockIdx.y : blockIdx.x) * WITER + it) * 4 + warp) * 16;
         if (b0 >= reach || b0 >= hi_nbid) break;          // warp-uniform; later tiles start higher
         const int64_t row = b0 + l16;
         const bool rv = row < hi_nbid && row < max_blocks;
@@ -2372,11 +2379,30 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
         // default keeps the 6-product kernel's bits.  Measured on gfx1151: the scorer 2x at all
         // depths, selections 253-256/256 identical (qsa_select_bench); +1.3% end-to-end at 98K
         // against the four-lanes thread scorer (#1943) on the same card.
-        static const bool split2 = [] { const char* v = std::getenv("STRATA_SELECT_SPLIT2"); return v != nullptr && v[0] == '1'; }();
-        if (split2)
-            block_scores_wmma_kernel<true><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
-        else
-            block_scores_wmma_kernel<false><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+                static const bool split2 = [] { const char* v = std::getenv("STRATA_SELECT_SPLIT2"); return v != nullptr && v[0] == '1'; }();
+        // STRATA_SELECT_GRID: 0 = 0.1.45's CTA order (default, byte-identical); 1 = x = the query
+        // tiles always; 2 = adaptive (x = the query tiles once the launch is deep enough for L2 to
+        // matter).  Measured on gfx1151 (qsa_select_bench, 256 queries, capacity 524288): the
+        // 6-product scorer 7.0 -> 5.1 ms at 98K blocks; at 24K blocks the whole key set is
+        // L2-marginal and the swap is slower - the adaptive bound sits between the 24K loss and
+        // the 98K win, and the engine A/B (interleaved x3 at 512K context) measured +1.8%.
+                static const int grid_env = [] { const char* v = std::getenv("STRATA_SELECT_GRID");
+        static const int64_t grid_min = [] { const char* v = std::getenv("STRATA_SELECT_GRID_MIN");
+                                             return v != nullptr ? std::atoll(v) : int64_t(8192); }();
+        const bool xq = grid_env == 1 || (grid_env == 2 && reach > grid_min);
+        const dim3 grid(xq ? (unsigned) ((nq + WQT - 1) / WQT) : (unsigned) ((reach + per - 1) / per),
+                        xq ? (unsigned) ((reach + per - 1) / per) : (unsigned) ((nq + WQT - 1) / WQT));
+        if (split2) {
+            if (xq)
+                block_scores_wmma_kernel<true, true><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+            else
+                block_scores_wmma_kernel<true, false><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+        } else {
+            if (xq)
+                block_scores_wmma_kernel<false, true><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+            else
+                block_scores_wmma_kernel<false, false><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+>>>>>>> 939d56e1c (hip: STRATA_SELECT_GRID=2 - the selection scorer's CTA order swaps for L2 (bitwise identical))
         block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); std::exit(1); }
