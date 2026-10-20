@@ -1,7 +1,7 @@
 #include "strata/kernels/dflash2.hpp"
+#include "strata/kernels/f16_bits.hpp"      // host-safe fp16 <-> bits: __half_as_ushort/__ushort_as_half are device-only in HIP
 #include "strata/spec/dflash_policy.hpp"
 #include <cuda_runtime.h>
-#include <cuda_fp16.h>
 #include <cstring>
 #include <algorithm>
 #include <cmath>
@@ -188,8 +188,8 @@ void target_features_and_attention() {
         std::vector<uint16_t> k(pages*page*kv*hd),v(k.size());
         std::vector<float> q(rows*heads*hd);
         for(size_t i=0;i<k.size();++i) {
-            k[i]=__half_as_ushort(__float2half(((int)(i%43)-21)*0.015f));
-            v[i]=__half_as_ushort(__float2half(((int)(i%37)-18)*0.03f));
+            k[i]=strata::kernels::f16_from_f32(((int)(i%43)-21)*0.015f);
+            v[i]=strata::kernels::f16_from_f32(((int)(i%37)-18)*0.03f);
         }
         for(size_t i=0;i<q.size();++i)q[i]=((int)(i%29)-14)*0.02f;
         for(int r=0;r<rows;++r)steps[r*4+1]=end;
@@ -216,7 +216,7 @@ void target_features_and_attention() {
                 if(window && std::abs(c-(end-rows+r))>=window)continue;
                 const size_t pr=((size_t)table[c/page]*kv+h/(heads/kv))*page+c%page;
                 double s=0;
-                for(int d=0;d<hd;++d)s+=q[(r*heads+h)*hd+d]*__half2float(__ushort_as_half(k[pr*hd+d]));
+                for(int d=0;d<hd;++d)s+=q[(r*heads+h)*hd+d]*strata::kernels::f32_from_f16(k[pr*hd+d]);
                 scores[c]=s/std::sqrt((double)hd);m=std::max(m,scores[c]);
             }
             double sum=0;for(double& s:scores){s=std::exp(s-m);sum+=s;}
@@ -224,7 +224,7 @@ void target_features_and_attention() {
                 double acc=0;
                 for(int c=0;c<end;++c) {
                     const size_t pr=((size_t)table[c/page]*kv+h/(heads/kv))*page+c%page;
-                    acc+=scores[c]*__half2float(__ushort_as_half(v[pr*hd+d]));
+                    acc+=scores[c]*strata::kernels::f32_from_f16(v[pr*hd+d]);
                 }
                 near(got[(r*heads+h)*hd+d],acc/sum);
             }
@@ -252,8 +252,8 @@ void attention_benchmark(const char* bits_path) {
         std::vector<uint16_t> k(pages * page * kv * hd), v(k.size());
         std::vector<float> q(rows * heads * hd);
         for (size_t i = 0; i < k.size(); ++i) {
-            k[i] = __half_as_ushort(__float2half(((int)(i % 43) - 21) * 0.015f));
-            v[i] = __half_as_ushort(__float2half(((int)(i % 37) - 18) * 0.03f));
+            k[i] = strata::kernels::f16_from_f32(((int)(i % 43) - 21) * 0.015f);
+            v[i] = strata::kernels::f16_from_f32(((int)(i % 37) - 18) * 0.03f);
         }
         for (size_t i = 0; i < q.size(); ++i) q[i] = ((int)(i % 29) - 14) * 0.02f;
         Device<float> dq(q), out(q.size()), scratch(rows * heads * ((active + 63) / 64) * 130);
@@ -373,7 +373,7 @@ void invalid_model_values() {
     const int rows=2,heads=1,kv=1,page=4;
     std::vector<float> q(rows*128,0.1f);q[0]=NAN;
     Device<float> dq(q),out(q.size()),scratch(rows*130);
-    Device<uint16_t> dk(std::vector<uint16_t>(page*128,__half_as_ushort(__float2half(0.5f)))),dv(std::vector<uint16_t>(page*128,0));
+    Device<uint16_t> dk(std::vector<uint16_t>(page*128,strata::kernels::f16_from_f32(0.5f))),dv(std::vector<uint16_t>(page*128,0));
     Device<int32_t> table(std::vector<int32_t>{0}),steps(std::vector<int32_t>{0,2,0,2,0,2,0,2});
     dflash2_attention(dq.p,dk.p,dv.p,table.p,steps.p,out.p,scratch.p,rows,heads,kv,page,2,0,nullptr);
     auto got=out.read(q.size());

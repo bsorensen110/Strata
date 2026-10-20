@@ -87,8 +87,16 @@ if(STRATA_HIP_GFX906)
   set(STRATA_ENABLE_CUDA ON CACHE BOOL "" FORCE)
 endif()
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1012/gfx1030 unvalidated)" OFF)
-if(STRATA_ENABLE_DFLASH2 AND (NOT STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP OR STRATA_HIP_GFX906))
-  message(FATAL_ERROR "DFlash2 currently requires the NVIDIA CUDA backend")
+if(STRATA_ENABLE_DFLASH2)
+  if(NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+    message(FATAL_ERROR "DFlash2 needs a GPU backend: enable STRATA_ENABLE_CUDA or STRATA_ENABLE_HIP")
+  elseif(STRATA_ENABLE_HIP)
+    # The DFlash2 kernels are written in portable CUDA/HIP (no tensor cores, no cublas): the HIP backend builds
+    # the same sources through include/strata/platform/hip_compat.  Upstream validated only on CUDA, so say so.
+    message(WARNING "DFlash2 on the HIP backend (STRATA_ENABLE_HIP) is unvalidated upstream: run dflash2_parity")
+  elseif(STRATA_HIP_GFX906)
+    message(WARNING "DFlash2 on gfx906 (STRATA_HIP_GFX906 wave64 layer) is unvalidated upstream: run dflash2_parity")
+  endif()
 endif()
 option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
 # MMQ prompt kernels for Q4_K / Q5_K / Q5_1 / Q6_K (Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF
