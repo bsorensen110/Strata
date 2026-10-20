@@ -170,6 +170,43 @@ SYCL build (`sycl/CMakeLists.txt`) takes every other source from the original lo
 is edited. `sycl/include/dpct/` is the vendored SYCLomatic helper library, so the port builds without the
 migration tool.
 
+**Expert-parallel prompt row reduction (opt-in).** With `--expert-parallel-device`, the peer card returns one
+FP32 row per routed expert of every prompt token, and the primary combines them. `STRATA_EP_PREFILL_REDUCE=1` sums
+the peer-owned routed experts of each token on the peer first and returns one FP32 row per token; the primary adds
+its own routed sum and the shared expert. Decode is unchanged. Unset keeps the per-expert rows and the original
+combine. The FP32 addition order changes, so generated text can change. `STRATA_EP_PREFILL_PUSH=1` (with the
+reduction) moves the sum region to the primary and has the peer write it through the IPC mapping, each producer
+work item fencing at system scope; the host peer wait stays, and the primary still copies the sum uncached before
+using it. PUSH changes the transport, not the arithmetic: its outputs are bitwise those of the reduction alone.
+
+Measured on 0.2.0-beta, two B70s, IQ3_XXS, `--expert-parallel-device 1 --prefill 8192 --max-context 65536 --kv int8
+--spec 4 --mtp`, one slot, fresh prompts, one engine per arm (prompt tok/s at 4K / 32K):
+
+| | 4K | 32K | decode tok/s, two prompts |
+|---|---:|---:|---|
+| unset | 635 | 720 | 80.0 / 81.3 |
+| `STRATA_EP_PREFILL_REDUCE=1` | 993 | 1,264 | 80.6 / 83.8 |
+| `+ STRATA_EP_PREFILL_PUSH=1` | 1,148 | 1,514 | 80.2 / 83.4 |
+
+A one-off posted write of 256,235,520 bytes takes 22.8 ms (11.2 GB/s) against 77.2 ms (3.3 GB/s) for an uncached
+peer read, measured on 0.1.x; it excludes the primary's later uncached copy. These are bounded screens at one slot,
+not a stability or 200K-context qualification.
+
+`sycl/probe/ep_prefill_reduce.cpp` checks two-card IPC updates against an independent FP32 FMA oracle in the
+original router order: all-primary, all-peer and mixed ownership, up to 4,096 tokens, repeated updates and a cached
+GPU consumer. Run it without arguments and with `--push`; both 26-case suites pass with a largest error of 9.54e-7
+(tolerance scaled by contribution magnitude). Build it in the oneAPI development image and run it with both cards;
+Docker needs `--cap-add SYS_PTRACE` for the Level Zero IPC import under its default seccomp profile:
+
+```sh
+icpx -O2 -fsycl -fsycl-targets=spir64_gen \
+  -Xsycl-target-backend=spir64_gen "-device bmg-g31 -options -cl-fp32-correctly-rounded-divide-sqrt" \
+  -I sycl/include -I include sycl/probe/ep_prefill_reduce.cpp \
+  sycl/src/kernels/cuda/ep_kernels.dp.cpp -lze_loader -o ep-prefill-reduce-probe
+ONEAPI_DEVICE_SELECTOR='level_zero:*' SYCL_CACHE_PERSISTENT=0 ./ep-prefill-reduce-probe
+ONEAPI_DEVICE_SELECTOR='level_zero:*' SYCL_CACHE_PERSISTENT=0 ./ep-prefill-reduce-probe --push
+```
+
 **How it was made, so it can be redone.**
 
 1. `sycl/tools/Dockerfile` - the dev image: the llama.cpp SYCL image plus SYCLomatic (`dpct` 2025.3),
