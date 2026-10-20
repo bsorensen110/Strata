@@ -400,13 +400,6 @@ public:
         return total;
     }
 
-    // What evict_oldest() could give back in all: everything parked that is not a pinned shared prefix.
-    size_t evictable_bytes() const {
-        size_t n = 0;
-        for (const auto& e : entries_) if (!e.pinned()) n += e.bytes();
-        return n;
-    }
-
     // The physical-RAM gate of the parking path: may a snapshot of `allocation` bytes be built while the host keeps
     // `floor` bytes free?  `available()` reads the host's free RAM and `release()` hands what the allocator still
     // holds of freed memory back to the kernel.  Where the first reading refuses, it releases once (make_room may
