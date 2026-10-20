@@ -39,7 +39,8 @@ target_compile_definitions(mtl_rt PRIVATE
 target_link_libraries(mtl_rt PUBLIC "-framework Metal" "-framework Foundation")
 
 file(GLOB STRATA_METAL_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
-list(REMOVE_ITEM STRATA_METAL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_hello.cpp)
+list(REMOVE_ITEM STRATA_METAL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_hello.cpp
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/session_limits_test.cpp)
 foreach(src ${STRATA_METAL_TESTS})
   get_filename_component(t ${src} NAME_WE)
   add_executable(${t} ${src})
@@ -129,3 +130,9 @@ target_link_libraries(strata PRIVATE strata_metal_kernels strata_metal_host stra
 add_executable(host_sampler_parity tests/engine/host_sampler_parity.cpp)
 target_link_libraries(host_sampler_parity PRIVATE strata_metal_kernels)
 add_test(NAME host_sampler_parity COMMAND host_sampler_parity)
+
+# The session file's read limits against the sizes the decode window saves (no GPU, no model)
+add_executable(session_limits_test tests/session_limits_test.cpp)
+target_link_libraries(session_limits_test PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
+add_test(NAME session_limits_test COMMAND session_limits_test)
+>
