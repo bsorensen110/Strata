@@ -1494,7 +1494,7 @@ A complete atomic replacement that is itself self-consistent and keeps the same 
 have no writer but this engine. A transfer failure after the device
 writes began ends the engine (`FATAL`) rather than decode from a partial
 state; the server reports `500` and starts it again. A restore does not park the outgoing session. Not supported with
-`--layer-split`, `--peer-device`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
+`--layer-split`, `--batch` (the config's `"parallel"`, #465; the server answers `501`) or
 `--prompt-cache 0` (the RAM conversation cache need not be on). On Linux the file
 moves with `O_DIRECT` in 16 MiB blocks when the filesystem takes it (buffered I/O otherwise, or with
 `STRATA_SESSION_BUFFERED=1`); on Windows with buffered I/O. The engine has been run on Linux/CUDA only. An earlier
