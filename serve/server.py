@@ -7387,6 +7387,15 @@ def make_handler(svc: Service):
                 if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
                     svc.request_trace.peer_ip = self.client_address[0]
                     self.record = svc.begin_request(path, req)
+                    # thinking_token_budget (vLLM), thinking_budget (Qwen) and thinking_budget_tokens (llama.cpp):
+                    # other providers' names for #123's thinking budget (pi's compat.thinkingTokenBudgetField
+                    # sends one of them).  The request's own reasoning_budget_tokens wins; if a client sends
+                    # several of the aliases, the first of the three above does.
+                    if req.get("reasoning_budget_tokens") is None:
+                        for alias in ("thinking_token_budget", "thinking_budget", "thinking_budget_tokens"):
+                            if req.get(alias) is not None:
+                                req["reasoning_budget_tokens"] = req.pop(alias)
+                                break
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path.startswith("/slots/"):
