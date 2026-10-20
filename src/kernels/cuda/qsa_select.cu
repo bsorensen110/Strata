@@ -436,13 +436,18 @@ __device__ __forceinline__ uint32_t pack_bf16x2(uint32_t a, uint32_t b) {   // l
 // capacity 524288): at 98K blocks the 6-product scorer 7.0 -> 5.1 ms; at 24K blocks the key set is
 // L2-marginal and the swap is slower, so STRATA_SELECT_GRID=2 swaps only launches deeper than
 // STRATA_SELECT_GRID_MIN blocks (default 8192 = a 32K context); =1 forces the swap at any size.
-template <bool XQ = false>
+// S2 (STRATA_SELECT_SPLIT2=1): keep only the hi/mid bf16 pieces - 3 wmma instead of 6, a fifth
+// less LDS traffic on the B side.  The dropped products are each <= 2^-16 of the leading term:
+// rel err ~1.5e-5, enough to flip a near-tie block in/out of the top-k (gate: selections identical
+// 253-256/256 against the 6-product kernel; upstream's own WMMA-vs-warp baseline is 254/256).
+// integ: the two opt-ins are one template's two parameters (#3499 XQ + #3498 S2).
+template <bool XQ = false, bool S2 = false>
 __global__ void __launch_bounds__(128) block_scores_wmma_kernel(const float* __restrict__ pooled,
                                                                 const float* __restrict__ q_idx,
                                                                 const int32_t* __restrict__ steps, int64_t nq,
                                                                 int64_t max_blocks, int64_t reach,
                                                                 float* __restrict__ out) {
-    __shared__ __align__(16) uint16_t sq[3][IDX_HEADS][WQT][WQS];   // hi / mid / lo, [head][query][dim]
+    __shared__ __align__(16) uint16_t sq[S2 ? 2 : 3][IDX_HEADS][WQT][WQS];   // hi / mid / [lo], [head][query][dim]
     __shared__ int s_nbid[WQT];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5, l16 = lane & 15, g = lane >> 4;
     const int64_t q0 = (int64_t) (XQ ? blockIdx.x : blockIdx.y) * WQT;   // XQ: x = the query tile
@@ -457,7 +462,8 @@ __global__ void __launch_bounds__(128) block_scores_wmma_kernel(const float* __r
         for (int j = 0; j < 4; ++j) split3(x[j], hb[j], mb[j], lb[j]);
         *reinterpret_cast<uint2*>(&sq[0][h][qr][c * 4]) = make_uint2(pack_bf16x2(hb[0], hb[1]), pack_bf16x2(hb[2], hb[3]));
         *reinterpret_cast<uint2*>(&sq[1][h][qr][c * 4]) = make_uint2(pack_bf16x2(mb[0], mb[1]), pack_bf16x2(mb[2], mb[3]));
-        *reinterpret_cast<uint2*>(&sq[2][h][qr][c * 4]) = make_uint2(pack_bf16x2(lb[0], lb[1]), pack_bf16x2(lb[2], lb[3]));
+        if (!S2)
+            *reinterpret_cast<uint2*>(&sq[2][h][qr][c * 4]) = make_uint2(pack_bf16x2(lb[0], lb[1]), pack_bf16x2(lb[2], lb[3]));
     }
     if (t < WQT) s_nbid[t] = q0 + t < nq ? steps[(q0 + t) * kStepCount + kStepNBid] : 0;
     __syncthreads();
@@ -490,26 +496,33 @@ __global__ void __launch_bounds__(128) block_scores_wmma_kernel(const float* __r
             uint32_t hb[SEL_KL], mb[SEL_KL], lb[SEL_KL];
 #pragma unroll
             for (int j = 0; j < SEL_KL; ++j) split3(x[j], hb[j], mb[j], lb[j]);
-            sel_u4 ah, am, al;
+            sel_u4 ah, am = {}, al = {};
 #pragma unroll
             for (int j = 0; j < SEL_KL / 2; ++j) {
                 ah[j] = pack_bf16x2(hb[2 * j], hb[2 * j + 1]);
                 am[j] = pack_bf16x2(mb[2 * j], mb[2 * j + 1]);
-                al[j] = pack_bf16x2(lb[2 * j], lb[2 * j + 1]);
+                if (!S2) al[j] = pack_bf16x2(lb[2 * j], lb[2 * j + 1]);
             }
-            const sel_s8 Ah = __builtin_bit_cast(sel_s8, ah), Am = __builtin_bit_cast(sel_s8, am),
-                         Al = __builtin_bit_cast(sel_s8, al);
+            const sel_s8 Ah = __builtin_bit_cast(sel_s8, ah);
+            const sel_s8 Am __attribute__((unused)) = __builtin_bit_cast(sel_s8, am);
+            const sel_s8 Al __attribute__((unused)) = __builtin_bit_cast(sel_s8, al);
 #pragma unroll
             for (int h = 0; h < IDX_HEADS; ++h) {
                 const sel_s8 Bh = *reinterpret_cast<const sel_s8*>(&sq[0][h][l16][kk * 16 + SEL_KOFF(g)]);
                 const sel_s8 Bm = *reinterpret_cast<const sel_s8*>(&sq[1][h][l16][kk * 16 + SEL_KOFF(g)]);
-                const sel_s8 Bl = *reinterpret_cast<const sel_s8*>(&sq[2][h][l16][kk * 16 + SEL_KOFF(g)]);
-                cor[h] = wmma_bf16(Al, Bh, cor[h]);
-                cor[h] = wmma_bf16(Ah, Bl, cor[h]);
-                cor[h] = wmma_bf16(Am, Bm, cor[h]);
-                cor[h] = wmma_bf16(Ah, Bm, cor[h]);
-                cor[h] = wmma_bf16(Am, Bh, cor[h]);
-                acc[h] = wmma_bf16(Ah, Bh, acc[h]);
+                if (S2) {   // dropped: Al*Bh, Ah*Bl, Am*Bm (each <= 2^-16 of Ah*Bh)
+                    cor[h] = wmma_bf16(Ah, Bm, cor[h]);
+                    cor[h] = wmma_bf16(Am, Bh, cor[h]);
+                    acc[h] = wmma_bf16(Ah, Bh, acc[h]);
+                } else {
+                    const sel_s8 Bl = *reinterpret_cast<const sel_s8*>(&sq[2][h][l16][kk * 16 + SEL_KOFF(g)]);
+                    cor[h] = wmma_bf16(Al, Bh, cor[h]);
+                    cor[h] = wmma_bf16(Ah, Bl, cor[h]);
+                    cor[h] = wmma_bf16(Am, Bm, cor[h]);
+                    cor[h] = wmma_bf16(Ah, Bm, cor[h]);
+                    cor[h] = wmma_bf16(Am, Bh, cor[h]);
+                    acc[h] = wmma_bf16(Ah, Bh, acc[h]);
+                }
             }
         }
         // relu per head, heads added in order (as the warp kernel); this lane: query qi, blocks b0 + SEL_ROW(i, g)
@@ -1977,10 +1990,21 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
         const bool xq = grid_env == 1 || (grid_env == 2 && reach > grid_min);
         const dim3 grid(xq ? (unsigned) ((nq + WQT - 1) / WQT) : (unsigned) ((reach + per - 1) / per),
                         xq ? (unsigned) ((reach + per - 1) / per) : (unsigned) ((nq + WQT - 1) / WQT));
-        if (xq)
-            block_scores_wmma_kernel<true><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+        // STRATA_SELECT_SPLIT2=1: the hi/mid bf16 pieces only (3 wmma instead of 6), opt-in; the
+        // default keeps the 6-product kernel's bits.  Measured on gfx1151: the scorer 2x at all
+        // depths, selections 253-256/256 identical (qsa_select_bench); +1.3% end-to-end at 98K
+        // against the four-lanes thread scorer (#1943) on the same card.
+        static const bool split2 = [] { const char* v = std::getenv("STRATA_SELECT_SPLIT2"); return v != nullptr && v[0] == '1'; }();
+        // integ: #3499's grid swap (XQ) and #3498's hi/mid pieces (S2) are two parameters of the
+        // same kernel - dispatch the four combinations.
+        if (xq && split2)
+            block_scores_wmma_kernel<true, true><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+        else if (xq)
+            block_scores_wmma_kernel<true, false><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+        else if (split2)
+            block_scores_wmma_kernel<false, true><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
         else
-            block_scores_wmma_kernel<><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+            block_scores_wmma_kernel<false, false><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
         block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); std::exit(1); }
