@@ -30,6 +30,25 @@ Work through the steps in order. Tell the user what you are doing in plain words
 
 ## 1. Check the PC
 
+The quickest way is setup's own check, which prints the GPU(s), driver, RAM, CPU, free disk and whether this PC can run
+Strata, and installs nothing except Python and the `.venv` it needs to run (step 2 gets the repository first):
+
+```
+Windows:  START-HERE.bat --check
+Linux:    ./setup.sh --check
+```
+
+To check by hand:
+
+| What | Windows (PowerShell) | Linux |
+| --- | --- | --- |
+| OS | `[Environment]::OSVersion` | `cat /etc/os-release` |
+| NVIDIA GPU, VRAM, driver | `nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv` | the same |
+| AMD GPU | `Get-CimInstance Win32_VideoController \| Select-Object Name, AdapterRAM` (AdapterRAM is capped at 4 GB; trust the model name) | `lspci \| grep -i -E 'vga\|display'`; VRAM: `cat /sys/class/drm/card*/device/mem_info_vram_total` (bytes); `rocm-smi` only if ROCm is installed |
+| RAM | `(Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB` | `free -g` |
+| Free disk | `Get-PSDrive -PSProvider FileSystem` | `df -h .` |
+| GPU's NUMA node (Linux) | does not apply | `cat /sys/bus/pci/devices/<BDF>/numa_node` (`<BDF>` is the one `nvidia-smi -q` or `lspci` prints); on a two-socket PC, give that number to `--numa-hot-node` together with `--resident-budget-gib` (without a budget the flag is off and nothing is placed) ([DETAILS.md](DETAILS.md#numa-placement---numa-hot-node-linux-dual-socket-off-by-default)) |
+
 Requirements (details: [INSTALL.md](INSTALL.md#what-you-need)):
 
 - **GPU:** NVIDIA RTX 20, 30, 40 or 50 series, or AMD Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT,
