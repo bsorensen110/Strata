@@ -14831,7 +14831,7 @@ int main(int argc, char** argv) {
                 std::printf("CACHE_SOURCE %d %lld\n", observed_slot_source, (long long) resume);
                 std::fflush(stdout);
             }
-            if (want_cvec != cvec_cached) {            if (want_cvec != cvec_cached || want_lora != lora_cached) {
+            if (want_cvec != cvec_cached || want_lora != lora_cached) {
                 live_ok = false;
                 checks.clear();
                 cvec_cached = want_cvec;
