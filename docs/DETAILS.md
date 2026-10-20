@@ -2364,7 +2364,6 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
   against the FP16 prompt path (IQ3_XXS, `--prefill auto`): 8K prompt KL 0.042 (0.1.39: 0.054), top-1 agreement
   93.5% (92.2%); 32K prompt KL 0.020 (0.019), top-1 95.3% (95.0%) - the same band as before. `STRATA_RING_BYTES=0`
   restores 0.1.39's ring, loan and chunk choice.
-<<<<<<< HEAD
 - **`STRATA_PREFILL_KEEP=N` (128 by default): the expert-cache slots a loan must leave resident while a prompt
   chunk borrows the cache's tail**, so on a small cache it is this number, not the auto lend's 90% cap, that picks
   the chunk: on the Q8_0 four-way's 691- and 937-slot stages it leaves 563 and 809 slots where the cap would leave
@@ -2380,7 +2379,6 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
   experts resident for the prompt's own tokens and buys a smaller chunk. `STRATA_GLM_PREFILL_KEEP` is accepted as
   the same knob, the numbers are the same ones the scan, the per-stage lend regions, the serve loan, the smallest
   cache a start accepts and the vram-elastic reserve used before, and unset every one of them is 128 as before.
-=======
 - **`STRATA_PREFILL_MAX="8192,4096,8192,8192"` (opt-in): a ceiling on the prompt chunk of each prompt-path
   participant, in the split's order** - entry 0 is the first card's path (it reads the chunk's embeddings and hands
   its rows on), entry *i* the *i*-th stage; `0` or an absent entry is no ceiling, and values are multiples of 256.
@@ -2394,7 +2392,17 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
   against 94,840 ms for the capped 16k/16k/8k/7k shape, on its byte-identical 100,535-token read - which is why a
   ceiling only lowers a stage and never raises one, and why it is opt-in. The start prints one line a participant
   (`prompt chunk: CUDA%d reads N tokens a step`), and unset every number above is what it was.
->>>>>>> intg/3306
+- **`STRATA_WARM_PROMPT=N` (`--serve`, off by default): one synthetic prompt of N tokens (32 if you ask for less)
+  is read through the whole part chain before the engine says READY**, so a session's first request does not pay
+  what only a session's first prompt pays - the first chunk carries every kernel's first launch, the prompt path's
+  own allocations and the tiers' first reads, and no later prompt pays any of it. It is from the Maya checkout
+  (`project-maya`), local commit `cc58309` (2026-10-14), whose `STRATA_GLM_WARM_PROMPT` is accepted as the same knob;
+  Maya's issue #8 reported 95-133 ms/token on a first prompt against 23-44 warm. On this engine the knob is how you
+  measure it: the first request's time to first token, or its `PP` line, with the variable set and unset is the A/B. It takes the same loan a request takes (the slots the prompt path is laid out in go
+  non-resident and are refilled from the arena afterwards) and every participant's state is zeroed before and
+  after it, so no conversation can see it; a prompt path that cannot run prints why and the first prompt pays it,
+  and the start never fails because of it. The ids are spread over the vocabulary, so the routes are not one
+  expert's.
 
 The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**.
 
