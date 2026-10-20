@@ -684,13 +684,14 @@ void qsa_set_kv_elastic(bool enabled, int64_t init_cells) {
 bool qsa_kv_elastic() { return g_kv_elastic; }
 int64_t qsa_kv_elastic_cells() {
     int64_t cells = std::numeric_limits<int64_t>::max();
-    for (const auto& p : g_pools) cells = std::min<int64_t>(cells, pool_slots_mapped(*p) * p->page_size);
+    for (const auto& p : g_pools) if (p) cells = std::min<int64_t>(cells, pool_slots_mapped(*p) * p->page_size);
     return cells;
 }
 int64_t qsa_kv_elastic_need(int64_t cells) {
     const uint64_t G = strata::core::vmm_granularity();
     int64_t n = 0;
     for (const auto& p : g_pools) {
+        if (!p) continue;
         const int64_t slots = pool_slots(*p, cells);
         for (size_t a = 0; a < p->off.size(); ++a) {
             const int64_t c0 = (int64_t) (p->off[a] / G), c1 = c0 + pool_chunks(*p, a, slots);
@@ -701,13 +702,14 @@ int64_t qsa_kv_elastic_need(int64_t cells) {
 }
 bool qsa_kv_elastic_grow(int64_t cells, const std::function<strata::core::VmmChunk()>& take) {
     for (auto& p : g_pools)
-        if (!pool_grow(*p, cells, take)) return false;
+        if (p && !pool_grow(*p, cells, take)) return false;
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::core::VmmChunk)>& give) {
     const uint64_t G = strata::core::vmm_granularity();
     int64_t n = 0;
     for (auto& p : g_pools) {
+        if (!p) continue;
         const int64_t slots = pool_slots(*p, cells);
         for (size_t a = 0; a < p->off.size(); ++a) {
             const int64_t c0 = (int64_t) (p->off[a] / G), c1 = c0 + pool_chunks(*p, a, slots);
@@ -720,13 +722,23 @@ int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::co
 }
 uint64_t qsa_kv_elastic_mapped_bytes() {
     uint64_t n = 0;
-    for (const auto& p : g_pools) n += (uint64_t) p->range.mapped_count() * strata::core::vmm_granularity();
+    for (const auto& p : g_pools) if (p) n += (uint64_t) p->range.mapped_count() * strata::core::vmm_granularity();
     return n;
 }
 uint64_t qsa_kv_elastic_full_bytes() {
     uint64_t n = 0;
-    for (const auto& p : g_pools) n += (uint64_t) p->range.chunks() * strata::core::vmm_granularity();
+    for (const auto& p : g_pools) if (p) n += (uint64_t) p->range.chunks() * strata::core::vmm_granularity();
     return n;
+}
+void qsa_state_release_elastic(QsaState& st) {
+    if (st.kv_elastic >= 0 && (size_t) st.kv_elastic < g_pools.size()) {
+        g_pools[(size_t) st.kv_elastic].reset();
+        st.kv_elastic = -1;
+    }
+}
+uint64_t qsa_state_elastic_bytes(const QsaState& st) {
+    if (st.kv_elastic < 0 || (size_t) st.kv_elastic >= g_pools.size() || !g_pools[(size_t) st.kv_elastic]) return 0;
+    return (uint64_t) g_pools[(size_t) st.kv_elastic]->range.mapped_count() * strata::core::vmm_granularity();
 }
 namespace {
 
@@ -754,13 +766,13 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     }
     return p;
 }
-uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
+uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8, bool q4) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
         const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2 +
                rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim) + 64;
     }
-    if (g_kv_q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
+    if (q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
     return int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
                 : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
 }
@@ -772,12 +784,23 @@ int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+    return qsa_state_bytes(g, max_cells, with_rope, ring_cells, QsaStateInitOptions{});
+}
+
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
+                         const QsaStateInitOptions& opts) {
+    if (opts.disable_streaming) ring_cells = 0;   // bytes and init force this identically
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    KvPlan p = kv_plan(s, max_cells, ring_cells);
+    if (opts.no_indexer) p.pooled_rows = 0;
+    const bool elastic = !opts.disable_elastic && strata::core::vmm_available() &&
+                         (opts.elastic_init_cells > 0 || (g_kv_elastic && !opts.force_owned_kv));
+    const bool hybrid = g_kv_hybrid && !opts.force_owned_kv && !opts.force_f16_kv;
+    const bool int8 = (g_kv_int8 || g_kv_hybrid) && !opts.force_owned_kv && !opts.force_f16_kv;
     uint64_t n = 0;
-    if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
-        n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
-                           g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
+    if (!(elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
+        n += kv_pool_bytes(s, p.slots, hybrid && ring_cells <= 0, int8,
+                           g_kv_q4 && !opts.force_owned_kv && !opts.force_f16_kv) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
     if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
@@ -792,15 +815,26 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope, int64_t ring_cells) {
+    return qsa_state_init(g, max_cells, base, st, share_rope, ring_cells, QsaStateInitOptions{});
+}
+
+uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+                        const QsaState* share_rope, int64_t ring_cells, const QsaStateInitOptions& opts) {
+    if (opts.disable_streaming) ring_cells = 0;   // bytes and init force this identically
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    KvPlan p = kv_plan(s, max_cells, ring_cells);
+    if (opts.no_indexer) p.pooled_rows = 0;
+    const bool elastic = !opts.disable_elastic && strata::core::vmm_available() &&
+                         (opts.elastic_init_cells > 0 || (g_kv_elastic && !opts.force_owned_kv));
+    const bool hybrid = g_kv_hybrid && !opts.force_owned_kv && !opts.force_f16_kv;
+    const bool int8 = (g_kv_int8 || g_kv_hybrid) && !opts.force_owned_kv && !opts.force_f16_kv;
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
-    st.kv_int8 = g_kv_int8 && !g_kv_q4;
-    st.kv_q4 = g_kv_q4;
+    st.kv_int8 = int8 && !g_kv_q4;
+    st.kv_q4 = g_kv_q4 && !opts.force_owned_kv && !opts.force_f16_kv;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
     // mtp.cpp). A streamed one keeps its host copy in the same three runs (kv_stream.cu, kKvHybrid).
-    if (g_kv_hybrid && ring_cells <= 0) {
+    if (hybrid && ring_cells <= 0) {
         st.kv_hybrid = true;
         st.kv_int8 = false;
         st.kv_q4 = false;
@@ -811,7 +845,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
-    if (g_kv_elastic && p.mode == 0) {
+    if (elastic && p.mode == 0) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
         const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
         const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
@@ -830,7 +864,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         pool->per_slot = per;
         pool->n_slots = p.slots;
         pool->page_size = s.page_size;
-        if (!pool->range.reserve(at) || !pool_grow(*pool, g_kv_elastic_init, [] { return (strata::core::VmmChunk) 0; })) {
+        if (!pool->range.reserve(at) || !pool_grow(*pool, opts.elastic_init_cells > 0 ? opts.elastic_init_cells : g_kv_elastic_init, [] { return (strata::core::VmmChunk) 0; })) {
             std::fprintf(stderr, "strata: the elastic K/V could not reserve or map its pools\n");
             return 0;
         }
@@ -1533,15 +1567,17 @@ float* R = bb.R;
     // and 0 is what every caller before this used.
     if (run0) {
 st_begin(layer, 0, stream);
+    const uint16_t *vd0 = nullptr, *vu0 = nullptr;
+    NativeDense::hc_bf16_view_pair(*w_down[0], *w_up[0], stream, vd0, vu0, 1);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = pending_ffn; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject2;
-        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = NativeDense::hc_bf16_view(*w_down[0], stream, 0, 1);
-        fa.w_up = NativeDense::hc_bf16_view(*w_up[0], stream, 1, 1); fa.s_down = w_down[0]->q8_scale; fa.s_up = w_up[0]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[0]->data;
+        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = vd0;
+        fa.w_up = vu0; fa.s_down = w_down[0]->q8_scale; fa.s_up = w_up[0]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[0]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    if (w_down[0]->q8_scale || w_up[0]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[0]->data, NativeDense::hc_bf16_view(*w_down[0], stream, 0, 1),            NativeDense::hc_bf16_view(*w_up[0], stream, 1, 1), (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    if (w_down[0]->q8_scale || w_up[0]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[0]->data, vd0, vu0, (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
     st_end(layer, 0, stream);    dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);        }
     if (run1) {
@@ -1556,15 +1592,17 @@ st_begin(layer, 0, stream);
     // the same contract `block_layer_post` has, and the reason the two are only meaningful in order.
     if (run3) {
 st_begin(layer, 3, stream);
+    const uint16_t *vd1 = nullptr, *vu1 = nullptr;
+    NativeDense::hc_bf16_view_pair(*w_down[1], *w_up[1], stream, vd1, vu1, 1);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = true; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject;
-        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = NativeDense::hc_bf16_view(*w_down[1], stream, 0, 1);
-        fa.w_up = NativeDense::hc_bf16_view(*w_up[1], stream, 1, 1); fa.s_down = w_down[1]->q8_scale; fa.s_up = w_up[1]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[1]->data;
+        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = vd1;
+        fa.w_up = vu1; fa.s_down = w_down[1]->q8_scale; fa.s_up = w_up[1]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[1]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    if (w_down[1]->q8_scale || w_up[1]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[1]->data, NativeDense::hc_bf16_view(*w_down[1], stream, 0, 1),            NativeDense::hc_bf16_view(*w_up[1], stream, 1, 1), (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    if (w_down[1]->q8_scale || w_up[1]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[1]->data, vd1, vu1, (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
     st_end(layer, 3, stream);        }
     if (run4) {
