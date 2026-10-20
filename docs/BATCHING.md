@@ -416,9 +416,7 @@ policy:
   the engine did not use is released.
 
 The policy's interface is `place`, `park_destination`, `cache_state`, `superseded_slots`, `reliable_flags`,
-`configure` / `settings` (their docstrings say what they
-answer). This part ships them as an interface without a policy: with `STRATA_SLOT_CACHE_AFFINITY=1` (or
-`STRATA_CACHE_TRACE=1`) and no policy they raise `NotImplementedError`; with both off nothing changes.
+`configure` / `settings` (their docstrings say what they answer). The policy is described below.
 
 `/metrics` shows what happened: `live.cache_events` (the last 96: allocation, admission with the tokens reused and
 read, resume and cache source, park claims and `parked`, expiries), each request's key, client
@@ -428,6 +426,75 @@ where its cache came from), and for slots the client of the conversation each on
 `STRATA_CACHE_TRACE=1` each request's snapshot of how long a start every slot shared with its prompt (lengths only,
 `serve/cache_trace.py`). The client address is the socket's (behind a reverse proxy, the proxy's); `X-Forwarded-For`
 and request fields are not used. No prompt text or token ids are recorded.
+
+### The placement policy (`serve/slot_policy.py`)
+
+Rules alone cannot tell which history to give up when a new conversation needs a slot and none is free of value: the
+one used longest ago may be a 90K-token conversation whose user is reading the answer, the newest a side request's 300
+tokens. The policy weighs length and age, and every threshold is a parameter:
+
+- **Protection grows with length**: 0.1 s at 500 tokens, 2 s at 2K, 10 s at 8K, 45 s at 32K, 65 s at 50K, 90 s at
+  100K, 120 s at 262144 (piecewise linear; `STRATA_SLOT_TTL_MAX_S`, default 120, scales the whole curve). A side
+  request's history is free again almost at once; a long conversation outlasts the time its user reads and types.
+- **Retention score** = (n / 50000)^0.7 x (n / (n + 2000))^2 x (0.25 + 0.75 x freshness), freshness = 1 - age / TTL,
+  and 0 once expired; overwrite score = 1 / (1 + retention). A fresh 50K history is worth about 1, a 500-token one
+  0.002; a fresh 50K history outweighs a 150K one about to expire.
+- **Blank slots** - empty, known invalid, or a superseded copy (its history is the start of another idle slot's: the
+  conversation went on there) - count as expired and worth nothing.
+- **A continued conversation** (an idle slot's whole history is the start of the prompt; matches within 2% of the
+  longest, one second of the prompt rate and 4096 tokens count too) runs in its slot or in a blank slot of a less
+  loaded group - the engine copies it there, so moving costs nothing - and **never in a slot that holds another
+  conversation**, expired or not. On the machine above an earlier version that put group balance first moved two Claude
+  Code conversations, idle for minutes between turns, into each other's slot on every turn, and each turn read 60-100K
+  tokens from token 0.
+- **An expired history is not deleted**: it still matches until it is overwritten. A new conversation takes a blank
+  expired or blank slot: first one not worth keeping (blank, or its score at freshness 0 below
+  `STRATA_SLOT_EXPIRED_KEEP_SCORE`, default 0.01 - about 2.5K tokens), then by group load, a blank slot before a
+  history, and the lowest score.
+- **An older version of the same conversation** - an idle history that shares at least
+  `STRATA_SLOT_SIBLING_SHARE` (default 98%; 0: off) of its own length with the prompt but is not its start (the client
+  rewrote its end) - is replaced in place, protected or not, when no slot's history continues the prompt. Claude
+  Code's safety classifier inserts each query's new tool calls before the closing text of its transcript, so no
+  query continues the previous one; kept side by side, the versions took 4-5 of the 6 slots on the machine above and
+  pushed the other conversations out.
+- **No wait**: when every idle history is still protected, the request overwrites the one that loses least at once
+  (losses within 10% go by group load). An earlier version waited up to 5 s first, once per request; with more
+  requests than slots each wait ran its full 5 s, the slot idle meanwhile, and ended in the same overwrite (7 of 7 in
+  a 15-minute test on the machine above), so it was removed.
+- **Expired value decays**: after its protection an expired history is worth its score at freshness 0 times
+  `1 - x^2`, where x runs from 0 at the end of its protection to 1 at a total idle age of
+  `STRATA_SLOT_IDLE_VALUE_ZERO_S` (default 1800 s; 0 disables decay). Reclaiming and parking use this value; it never
+  changes whether a history can match.
+- **Park** (with `slot_padding_safe=1`): not when the main session's conversation's value at its idle age is below
+  `STRATA_SLOT_PARK_MIN_VALUE` (default 0.01, about 2.6K tokens at expiry; no separate length cut-off), or when a slot
+  holds `STRATA_SLOT_PARK_KEPT_SHARE` (default 98%) of it already. Then its own older copy, else an older version of
+  it (`STRATA_SLOT_SIBLING_SHARE` above, protected or not; the most shared first), else an idle expired slot
+  in the reclaim order above (not worth keeping first, then group load, then the lowest value); a history worth
+  keeping is taken only when the main session's conversation is worth at least `STRATA_SLOT_PARK_VALUE_RATIO` (default
+  2) times more. Never another conversation's protected slot. The parked copy keeps the main session's last-use time.
+- A busy slot is never matched or overwritten. On an engine without `slot_padding_safe=1`, a slot that would pad
+  over a protected idle history below it costs that history's retention too.
+
+Measured on the machine above (0.1.44.1, `--batch 6` in 3 groups, `STRATA_PIPELINE_ACTIVE_ROWS=1`):
+
+- Park: a 37,359-token conversation, a short side request, then its next turn. Without `park=`: 0 tokens reused, the
+  turn took 14 s; with it: 37,352 reused, about 1 s, and the same greedy output (temperature 0) as before the side
+  request.
+- Retention under load: conversation A (37K tokens) parked, two clients generating 1,500-token answers in a loop (so
+  batch mode stays on), conversations B (9K) and C (7.9K) taking turns about every 30 s - past their protection of
+  about 11 and 10 s. Tokens reused on turns 1-3:
+
+| Ordering of expired histories | B | C |
+| --- | --- | --- |
+| by group load first (an earlier version) | 0 every turn | 0 every turn |
+| + one still worth keeping goes last (this policy) | all but the ~20 new | 0 every turn |
+| + wait for a cheaper slot about to leave its protection (removed) | all but the ~20 new | all but the ~20 new |
+
+In the first row a new turn took the other conversation's expired slot for group balance, so B and C overwrote each
+other; in the second, C went to a side request that arrived a second after another one finished, while that one's
+1.5K-token history was about to leave its protection. The third row waited for that protection to end, under the
+same one-per-request wait as above; it went with that wait. The policy accepts this case: a protected history is
+not overwritten while an expired one can be.
 
 ## The VRAM expert tier keeps adapting in batch windows
 
