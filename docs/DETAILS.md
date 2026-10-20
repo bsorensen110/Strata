@@ -2421,6 +2421,15 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
   to completion as before. Unset, the scratch stays on free VRAM (the size classes stay - they are what bounds the
   pool), and a layout that uses its whole loan, or that spilled into owned buffers, publishes no tail - the pool
   then allocates as it always did.
+- **Where a prompt chunk's time went (opt-in, `STRATA_PREFILL_STAGES=1`; off when unset):** the engine prints one
+  line a stage a chunk (the Maya checkout's spelling `STRATA_GLM_PREFILL_STAGES` is accepted as the same knob) - the
+  chunk's wall, the copy lane's own span split into what ran before it (lead), the lane itself and what ran
+  behind it (tail), the bytes it moved and the bytes the chunk's consumers waited on (the difference is the ring's
+  read-ahead), the hand-off a later stage of a layer split paid, the GPU's own phases over the chunk, and the experts
+  and host time it spent. Without it a prefill change can only be judged by the prompt's ms/token, which mixes the
+  chunk size, the copy lane, the host and the phases. The syncs it adds wait only on copies the compute stream has
+  already waited for (the issuer is joined when the chunk ends); setting and unsetting the variable beside a
+  `--bench` A/B is how to check it costs nothing.
 
 The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**.
 
