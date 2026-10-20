@@ -4426,7 +4426,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // STRATA_PATTN_SM60=1 (qsa_pattn.hpp, sm_6x, int8 K/V): the decode kernels' output bit for bit from a
                     // score kernel and a value kernel that merges as it folds (no partials, no merge kernel), ~100
                     // queries a batch in the same scratch; any refusal or launch failure runs the loop below
-                    if (!gated && (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
+// STRATA_PROMPT_ATTN_RDNA2=1 (HIP gfx103x, INT8 K/V): one block per query and KV head, no split and merge
+#if defined(STRATA_USE_HIP)
+                    const bool rdna2_attn = !old_attn && strata::kernels::qsa_prompt_attn_rdna2(m.q, pools, m.sel_ids, m.steps_dev,
+                                                                                               m.cap, s, m.attn, T, m.cs);
+#else
+                    const bool rdna2_attn = false;   // HIP only (the CUDA, SYCL and Metal builds never reference it)
+#endif
+                    if (!gated && !rdna2_attn && (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                                         m.attn, T, m.cs)))
 #if !defined(STRATA_GPU_METAL)   // qsa_pattn.cu is in the CUDA / HIP kernel library only
                         if (!(strata::kernels::pattn_mode() != 0 &&
@@ -4434,7 +4441,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                (uint64_t) m.attn_batch *
                                                                    strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s),
                                                                m.attn, T, m.cs)))
-#endif
+#endif>>>>>>> 99f255ac4 (qsa: STRATA_PROMPT_ATTN_RDNA2=1 (opt-in, HIP gfx103x, INT8 K/V) reads a prompt's attention one block per (query, KV head))
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
                             strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
