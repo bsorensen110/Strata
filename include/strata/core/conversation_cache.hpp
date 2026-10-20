@@ -176,6 +176,7 @@ struct SavedConversation {
     // In-memory DFlash context, separate from the target/MTP disk-session schema.
     std::vector<ConversationKv> dflash_kv;
     bool cvec = true;
+    bool lora = true;   // the LoRA adapter's setting (--lora; true when none is loaded)
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
 
@@ -277,13 +278,14 @@ public:
     }
 
     template<class Token>
-    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec) const {
+    Match best(const std::vector<Token>& prompt, const std::vector<ConversationImageKey>& images, bool cvec,
+               bool lora = true) const {
         Match best;
         // Ties prefer the most recently parked branch. The caller prefers its
         // already-active state when that offers the same prefix length.
         for (size_t i = entries_.size(); i-- > 0;) {
             const auto& e = entries_[i];
-            if (e.cvec != cvec) continue;
+            if (e.cvec != cvec || e.lora != lora) continue;
             auto consider = [&](const ConversationCheckpoint& c, bool live) {
                 const int64_t n = conversation_prefix(c, prompt, images);
                 if (n > best.tokens) best = {i, n, live, serials_[i]};
@@ -418,11 +420,12 @@ public:
     // back, when the chain's spread checkpoints no longer hold one near its end).  An entry without checkpoints, or
     // another conversation that only shares the system prompt's root with it, is kept.  Returns how many were dropped.
     size_t drop_superseded(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
-                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) {
+                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
+                           bool lora = true) {
         size_t dropped = 0;
         for (size_t i = 0; i < entries_.size();) {
             const auto& e = entries_[i];
-            if (superseded_at(e, ids, images, checkpoints, cvec) > 0 &&
+            if (e.lora == lora && superseded_at(e, ids, images, checkpoints, cvec) > 0 &&
                 !(guarded_ != 0 && serials_[i] == guarded_)) {
                 bytes_ -= e.bytes();
                 erase(i);
@@ -449,7 +452,7 @@ public:
     bool put(SavedConversation&& image, size_t held = 0) {
         const size_t n = image.bytes();
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
-        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
+        drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec, image.lora);
         if (!make_room(n, held)) return false;
         entries_.push_back(std::move(image));
         serials_.push_back(next_serial_++);

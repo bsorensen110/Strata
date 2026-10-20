@@ -691,7 +691,8 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
 // supplies this stage's K/V as streamed sources; when null the K/V is taken from s.kv (the captured image).
 void put_stage(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
     for (int64_t g : s.geometry) o.i64(g);
-    o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64((s.cvec ? 1 : 0) | (s.rope_migration[0] ? 2 : 0));
+    o.i64(s.layer_lo); o.i64(s.layer_hi);
+    o.u64((s.cvec ? 1 : 0) | (s.lora ? 0 : 2) | (s.rope_migration[0] ? 4 : 0));   // bit1: LoRA off, bit2: RoPE migration
     if (s.rope_migration[0]) for (auto value : s.rope_migration) o.u64(value);
     put_checkpoint(o, s.live);
     o.u64(s.checkpoints.size());
@@ -798,9 +799,10 @@ bool get_stage(In& in, SavedConversation& s, const std::pair<int64_t, int64_t>* 
     if (!in.i64(s.layer_lo) || !in.i64(s.layer_hi) || !in.u64(cvec)) return false;
     if (want_range && (want_range->first != s.layer_lo || want_range->second != s.layer_hi))
         return in.fail("saved with another layer range than this runtime's");
-    if (cvec > 3) return in.fail("invalid cvec/migration flag");
+    if (cvec > 7) return in.fail("invalid cvec/LoRA/migration flag");
     s.cvec = (cvec & 1) != 0;
-    if (cvec & 2) {
+    s.lora = (cvec & 2) == 0;
+    if (cvec & 4) {
         for (auto& value : s.rope_migration) if (!in.u64(value)) return false;
         if (s.rope_migration[0] != 1 || !s.rope_migration[1] || !s.rope_migration[2] || !s.rope_migration[3])
             return in.fail("invalid approximate RoPE migration provenance");
@@ -995,6 +997,7 @@ uint64_t session_config_fingerprint(const SessionConfig& c) {
     b.f64("rope.beta_fast", c.rope.beta_fast);
     b.f64("rope.beta_slow", c.rope.beta_slow);
     b.u64("cvec", c.cvec);
+    if (c.lora != 0) b.u64("lora", c.lora);   // absent without an adapter: older files keep their fingerprint
     b.u64("switches", c.switches.size());
     for (const auto& [name, value] : c.switches) b.i64("switch." + name, value);
     return b.digest();
