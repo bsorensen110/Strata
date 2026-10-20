@@ -166,7 +166,13 @@ __global__ void __launch_bounds__(UP_THREADS) lora_up_pdl_kernel(const float* __
 #if !defined(__HIPCC__) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     cudaGridDependencySynchronize();   // h written and visible; before sm_90 the launch is an ordinary one
 #endif
+#if defined(__HIPCC__)
+    // HIP has no __ldcg (the L2-coherent load): the LoRA h block is written once by the
+    // producer kernel and read after a grid sync, so the cached global load is the same value.
+    for (int i = threadIdx.x; i < NT * rank; i += UP_THREADS) hs[i] = __ldg(h + i);
+#else
     for (int i = threadIdx.x; i < NT * rank; i += UP_THREADS) hs[i] = __ldcg(h + i);
+#endif
     __syncthreads();
     if (o >= n_out) return;
     float acc[NT];
