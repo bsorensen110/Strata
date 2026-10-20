@@ -110,7 +110,8 @@ async function loadHealth() {
                  :               {max: 4, readmax: 1, plimchars: 3000};
       ws = {...ws, ...tier};
     }
-    $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
+    $("attach-btn").title = health.videos ? "Attach a text file, a picture or a video (or drop it here)"
+                          : health.images ? "Attach a text file or a picture (or drop it here)"
                                           : "Attach a text file (or drop it here)";
     $("chat-empty-sub").innerHTML = `${esc(health.model)} runs on this PC. Nothing leaves it.<br>` +
       `Web search is off by default &ndash; when on, only the search query goes out.`;
@@ -678,6 +679,7 @@ async function optimizeQuery(text, signal) {
 
 function saveChat() {
   store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
+                                           videos: (m.videos || []).map((v) => ({name: v.name})),
                                            files: (m.files || []).map((f) => ({name: f.name})),
                                            // a tool's picture is base64 in the page, not something to keep on disk
                                            tools: (m.tools || []).map((t) => ({...t, images: undefined}))})));
@@ -707,6 +709,15 @@ function msgEl(m, i) {
       for (const im of m.images) {
         if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || "image"; wrap.appendChild(img); }
         else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || "image"); wrap.appendChild(c); }
+      }
+      el.appendChild(wrap);
+    }
+    if (m.videos && m.videos.length) {
+      const wrap = document.createElement("div");
+      wrap.className = "msg-images";
+      for (const v of m.videos) {
+        if (v.url) { const vid = document.createElement("video"); vid.src = v.url; vid.controls = true; vid.preload = "metadata"; vid.title = v.name || "video"; wrap.appendChild(vid); }
+        else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("video", "st-icon st-icon--sm"); c.append(v.name || "video"); wrap.appendChild(c); }
       }
       el.appendChild(wrap);
     }
@@ -873,9 +884,11 @@ function apiMessages() {
   for (const m of messages) {
     if (m.role === "user") {
       const imgs = (m.images || []).filter((i) => i.url);
+      const vids = (m.videos || []).filter((v) => v.url);
       const text = userText(m);
-      out.push({role: "user", content: imgs.length ? [{type: "text", text},
-        ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}}))] : text});
+      out.push({role: "user", content: imgs.length || vids.length ? [{type: "text", text},
+        ...imgs.map((i) => ({type: "image_url", image_url: {url: i.url}})),
+        ...vids.map((v) => ({type: "video_url", video_url: {url: v.url}}))] : text});
     } else if (!(busy && busy.msg === m)) {            // the answer being asked for now is not history yet
       out.push(...assistantMessages(m));
     }
@@ -921,7 +934,8 @@ function setBusy(on) {
 async function send() {
   const text = $("input").value.trim();
   if ((!text && !attachments.length) || busy) return;
-  messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
+  messages.push({role: "user", text, images: attachments.filter((a) => a.kind === "image"),
+                 videos: attachments.filter((a) => a.kind === "video"),
                  files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
   attachments = [];
   renderAttachments();
@@ -1104,6 +1118,9 @@ $("export-btn").onclick = () => {
 // pictures and text files: the attach button, dropping them on the chat, or pasting a picture (issue #30)
 const TEXT_EXT = /\.(txt|md|markdown|rst|tex|py|pyi|ipynb|js|mjs|cjs|ts|tsx|jsx|vue|svelte|json|jsonl|csv|tsv|log|ya?ml|toml|ini|cfg|conf|env|xml|html?|css|scss|less|c|cc|cpp|cxx|h|hh|hpp|cu|cuh|rs|go|java|kt|kts|swift|rb|php|pl|lua|r|jl|scala|sql|sh|bash|zsh|fish|ps1|psm1|bat|cmd|diff|patch|gradle|cmake|mk|dockerfile|gitignore|proto|graphql)$/i;
 const MAX_TEXT_FILE = 512 * 1024;
+// videos go to the server as a data: URL in a video_url part; ffmpeg reads them (strata-video)
+const VIDEO_EXT = /\.(mp4|m4v|webm|mov|mkv|avi|wmv|flv|mpe?g|3gp|ogv|ts)$/i;
+const MAX_VIDEO = 200e6;
 function isTextFile(f) {
   return f.type.startsWith("text/") || /json|xml|javascript|yaml|toml|x-sh|x-python/.test(f.type) ||
          TEXT_EXT.test(f.name) || /(^|[\\/])(makefile|dockerfile|readme|license)$/i.test(f.name);
@@ -1118,7 +1135,15 @@ function addFiles(files) {
       r.readAsDataURL(f);
       continue;
     }
-    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${health.images ? " or pictures" : ""}.`); continue; }
+    if (f.type.startsWith("video/") || VIDEO_EXT.test(f.name)) {
+      if (!health.videos) { toast("warn", "Videos are off", health.images ? "This server's image encoder cannot read videos." : "This model was set up for text only."); continue; }
+      if (f.size > MAX_VIDEO) { toast("warn", "Video too large", `${f.name} is over 200 MB.`); continue; }
+      const r = new FileReader();
+      r.onload = () => { attachments.push({kind: "video", name: f.name || "video", url: r.result}); renderAttachments(); };
+      r.readAsDataURL(f);
+      continue;
+    }
+    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${health.videos ? ", pictures or videos" : health.images ? " or pictures" : ""}.`); continue; }
     if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
     const r = new FileReader();
     r.onload = () => {
@@ -1147,7 +1172,7 @@ function renderAttachments() {
   attachments.forEach((a, i) => {
     const c = document.createElement("span");
     c.className = "chip";
-    c.innerHTML = icon(a.kind === "file" ? "attach" : "image", "st-icon st-icon--sm");
+    c.innerHTML = icon(a.kind === "file" ? "attach" : a.kind === "video" ? "video" : "image", "st-icon st-icon--sm");
     c.append(a.name);
     const x = document.createElement("button");
     x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", "Remove");
