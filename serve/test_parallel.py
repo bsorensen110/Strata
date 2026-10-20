@@ -1130,7 +1130,10 @@ class ParallelService(FakeEngineCase):
         prompt = self.svc.history[[h["output_tokens"] for h in self.svc.history].index(
             max(h["output_tokens"] for h in self.svc.history))]["prompt_total"]
         self.assertGreaterEqual(u["input_tokens"], 1, u)
-        self.assertEqual(u["input_tokens"] + u["cache_read_input_tokens"], prompt, u)
+        # integ reconciliation (#2511 on our #1869 semantics): a continued leg reports the FIRST read's reuse as
+        # cache_read, so the prompt splits input + cache_creation (the continuation's new tokens) + cache_read.
+        self.assertEqual(u["input_tokens"] + u.get("cache_creation_input_tokens", 0) + u["cache_read_input_tokens"],
+                         prompt, u)
         self.assertEqual(u["cache_read_input_tokens"], 3, u)    # the first read's reuse, not the continuation's
 
     def test_slot_drafts_reach_http_and_metrics(self):
