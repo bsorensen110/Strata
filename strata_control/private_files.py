@@ -95,14 +95,27 @@ def current_user_sid() -> str:
     return _sid_cache
 
 
+def _as_sid(name: str) -> str:
+    """An SDDL alias (``LA``, ``SY``, ``BA``, ...) as its string SID, or ``name`` unchanged.
+
+    The DACL that :func:`restrict_to_current_user` writes names the user by SID, but Windows renders
+    the built-in Administrator (RID 500) back as the alias ``LA``. Comparing that text to
+    :func:`current_user_sid` never matches, so every entry is normalised first (#3406).
+    """
+    if not WINDOWS:
+        return name
+    resolved = _string_sid(name)                       # the text itself when Windows does not know it
+    return resolved if resolved.startswith("S-1-") else name
+
+
 def _same_sid(sddl_trustee: str, sid: str) -> bool:
     """True when an SDDL trustee names ``sid``. SDDL prints well-known accounts as two-letter aliases (the built-in
-    Administrator, RID 500, is ``LA``), so an alias is turned into its string SID before the compare (#3302)."""
+    Administrator, RID 500, is ``LA``), so an alias is turned into its string SID before the compare (#3302, #3406)."""
     if sddl_trustee == sid:
         return True
     if not WINDOWS:
         return False
-    return _string_sid(sddl_trustee) == sid.upper()
+    return _as_sid(sddl_trustee).upper() == sid.upper()
 
 
 def restrict_to_current_user(path: str | os.PathLike, *, directory: bool | None = None) -> None:
