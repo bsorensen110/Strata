@@ -231,11 +231,13 @@ public:
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
-    void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n);
+    void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
+                                NativeArithmetic arithmetic = NativeArithmetic::Default);
     /// The same, with `aside` run by the host thread right after the first phase's tasks are published - the workers
     /// compute while the host does it (a peer GPU's launch, ~30 us a layer, used to run before this call and hold the
     /// whole pool back by that much).  The host joins the first phase's drain when `aside` returns.
-    void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, const std::function<void()>& aside);
+    void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, const std::function<void()>& aside,
+                                NativeArithmetic arithmetic = NativeArithmetic::Default);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -351,6 +353,7 @@ private:
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
     };
     const NativeFmt* nfmt_ = nullptr;
+    NativeArithmetic narithmetic_ = NativeArithmetic::Default;
     std::vector<SplitBufMulti> split_multi_;
     // STRATA_NUMA_POOL (on by default, Linux, exactly 2 nodes; 0 turns it off): in the native row phases (modes 5/6)
     // every expert's rows are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up

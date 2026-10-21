@@ -5338,7 +5338,7 @@ int tail_skip_rank() {
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
-                                float* out) {
+                                float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
     if (n_tok < 1 || n_tok > MAXT) {
@@ -5767,7 +5767,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     {
         const auto b0 = std::chrono::steady_clock::now();
         if (njobs > 0) {
-            if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs);
+            if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs, arithmetic);
             else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
             ++d.cold_batches;
         }
@@ -5853,8 +5853,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // #2720 (STRATA_ADAPT_OVERLAP): the peer's copies launch from the pool's first phase, so they land while the
         // next window runs; the callback runs once (peer_go is idempotent).
         if (native && with_peer && d.peer != nullptr && !peer_launched)
-            d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], jobs, nj, [&] { (void) peer_go(); });
-        else if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], jobs, nj);
+            d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], jobs, nj, [&] { (void) peer_go(); }, arithmetic);
+        else if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], jobs, nj, arithmetic);
         else d.pool->run_split_multi(jobs, nj);
     };
     run_jobs(d.jobs_multi.data(), nfirst, true);

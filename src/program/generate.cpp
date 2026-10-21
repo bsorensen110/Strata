@@ -70,6 +70,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/dflash.hpp"
+#include "strata/core/gated_proposal.hpp"
 #include "strata/prefill/prefill.hpp"
 #if defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
@@ -1221,12 +1222,12 @@ void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* w
 }
 
 /// Plan v0.3 P6: the pool for a verify window.
-void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+void drive_pool_multi_impl(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                      int64_t layer, strata::kernels::cpu::NativeArithmetic arithmetic) {
     Drive* t = (Drive*) user;
     t->d.layers = layer;
     const Clock::time_point a = Clock::now();
-    strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out);
+    strata::core::expert_pool_dispatch_multi(t->d, x_f, ids, n_tok, k, out, arithmetic);
 
     t->cpu_ms += std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     ++t->calls;
@@ -1245,6 +1246,13 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
     }
 }
 
+void drive_pool_multi(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
+    drive_pool_multi_impl(u,x,ids,n,k,out,l,strata::kernels::cpu::NativeArithmetic::Default);
+}
+void drive_pool_multi_invariant(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
+    drive_pool_multi_impl(u,x,ids,n,k,out,l,strata::kernels::cpu::NativeArithmetic::WindowInvariant);
+}
+
 /// Layer split: every verify stage shares one Drive (its counters, usage and failure flags); the GPU plan, the expert
 /// cache and the PCIe share the pool uses for a layer are those of the stage that runs it.
 struct SplitDrive {
@@ -1257,8 +1265,8 @@ struct SplitDrive {
     const uint64_t* cache_slot_off[kMax] = {};
     int pcie_num[kMax] = {};
 };
-void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                      int64_t layer) {
+void drive_pool_split_impl(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
+                      int64_t layer, strata::kernels::cpu::NativeArithmetic arithmetic) {
     SplitDrive* s = (SplitDrive*) user;
     int st = 0;
     while (st + 1 < s->n && layer >= s->end[st]) ++st;
@@ -1267,7 +1275,14 @@ void drive_pool_split(void* user, const float* x_f, const int32_t* ids, int64_t 
     d.d.cache_base = s->cache_base[st];
     d.d.cache_slot_off = s->cache_slot_off[st];
     d.d.pcie_num = s->pcie_num[st];
-    drive_pool_multi(s->base, x_f, ids, n_tok, k, out, layer);
+    drive_pool_multi_impl(s->base, x_f, ids, n_tok, k, out, layer, arithmetic);
+}
+
+void drive_pool_split(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
+    drive_pool_split_impl(u,x,ids,n,k,out,l,strata::kernels::cpu::NativeArithmetic::Default);
+}
+void drive_pool_split_invariant(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
+    drive_pool_split_impl(u,x,ids,n,k,out,l,strata::kernels::cpu::NativeArithmetic::WindowInvariant);
 }
 
 /// Layer split across GPUs: a later stage on its own device, with its own copy of the dense weights, a session, an
@@ -2896,6 +2911,63 @@ static int64_t prefill_keep_slots() {
     return keep;
 }
 
+// A draft at MTP cell c is sampled at counter c+1. The next target starts
+// there and needs one final cell for its bonus. Cap BEFORE any proposal draw;
+// a zero budget therefore means no attempt, never a discarded failed NULL.
+class GatedDraftLimit {
+public:
+    GatedDraftLimit(strata::core::MtpDrafter& mtp, bool active, int configured_mtp,
+                    int64_t next_target_pos, int64_t context_end)
+        : mtp_(mtp), active_(active), configured_(configured_mtp - 1) {
+        if (active_) {
+            const int64_t room = std::max<int64_t>(0, context_end - next_target_pos);
+            mtp_.set_max_drafts((int) std::min<int64_t>(configured_, std::max<int64_t>(0, room - 1)));
+        }
+    }
+    ~GatedDraftLimit() { if (active_) mtp_.set_max_drafts(configured_); }
+    GatedDraftLimit(const GatedDraftLimit&) = delete;
+    GatedDraftLimit& operator=(const GatedDraftLimit&) = delete;
+private:
+    strata::core::MtpDrafter& mtp_;
+    bool active_;
+    int configured_;
+};
+
+// Prepare one gated window from the last successful producer result. Context room
+// is fixed before consulting D; the producer was already capped before drawing.
+// No max_new/output-cap shortening: the ordinary emission loop owns that limit.
+static bool prepare_gated_window(strata::core::gated::Packet& packet,
+                                 const strata::core::MtpDrafter::DraftResult& generation,
+                                 strata::spec::SuffixDrafter& suffix, const strata::spec::DraftPolicy& policy,
+                                 bool suffix_enabled, bool initial, int room, int configured_mtp,
+                                 int vocab, float threshold, const int32_t* q, const int32_t* drafts,
+                                 const float* scores, int32_t* suffix_tokens, int& match, std::string& err) {
+    if (room < 1 || generation.budget < 0 || generation.generated < 0 ||
+        generation.generated > generation.budget || generation.budget >= room) {
+        err = "gated proposal: invalid context room or producer result";
+        return false;
+    }
+    strata::core::gated::RootChoice root;
+    match = 0;
+    if (suffix_enabled && !initial && room > 1) {
+        const int k = suffix.propose(room - 1, suffix_tokens);
+        match = suffix.last_match();
+        if (k > 0) {
+            // Prefix/configuration only: never inspect a draw or its gated width.
+            const auto pick = policy.choose(std::min(configured_mtp, room), k, match);
+            root.eligible = pick.lookup;
+            root.rescue_id = suffix_tokens[0];
+            root.window = pick.t;
+        }
+    }
+    if (!strata::core::gated::make_packet(packet, q, drafts, scores, generation.generated, generation.budget,
+                                         room, vocab, threshold, initial, root)) {
+        err = std::string("gated proposal: ") + packet.error;
+        return false;
+    }
+    return true;
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -4010,6 +4082,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: invalid sampling or resource parameter\n");
         return 2;
     }
+#if defined(STRATA_GPU_METAL)
+    if (!o.serve && o.spec >= 2 && !o.mtp.empty() && !o.greedy && o.temperature > 0.0f &&
+        o.temperature >= strata::core::spec_min_temp() && strata::core::spec_prob_env() && strata::core::spec_gate_pick()) {
+        std::fprintf(stderr, "strata generate: probabilistic gated proposals are unsupported on Metal\n");
+        return 2;
+    }
+#endif
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
         std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe or layer\n");
         return 2;
@@ -10357,6 +10436,7 @@ int main(int argc, char** argv) {
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
+        const strata::core::PoolMultiFn invariant_win_pool_fn = n_stages > 1 ? &drive_pool_split_invariant : &drive_pool_multi_invariant;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
         ver.set_split(o.spec_split);
@@ -14280,6 +14360,14 @@ int main(int argc, char** argv) {
                 std::printf("ERR dflash2_reference requires DFlash2 and a value of 0 or 1\n");
                 continue;
             }
+#if defined(STRATA_GPU_METAL)
+            if (use_mtp && req_temperature > 0.0f && req_temperature >= strata::core::spec_min_temp() &&
+                strata::core::spec_prob_env() && strata::core::spec_gate_pick()) {
+                std::printf("ERR probabilistic gated proposals are unsupported on Metal\n");
+                std::fflush(stdout);
+                continue; // before image/prompt work, preserve later greedy requests
+            }
+#endif
             std::vector<float> req_bias;
             std::string bias_error;
             if (req_bias_present && (batch_mtp ||
@@ -16109,6 +16197,15 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick();
+            if (gated_proposal && (o.pipeline_windows >= 2 || o.batch != 0 || n_stages != 1 ||
+                multi_gpu || drive.d.remote_count != 0 || o.lookup_chain != 0 || o.adapt_swaps != 0 ||
+                req_pcie_frac != 0.0 || o.pcie_frac_auto || S > strata::core::gated::kRows ||
+                !std::isfinite(req_spec_min_p) || req_spec_min_p < 0.0)) {
+                std::printf("ERR gated proposals require serial single-device decode, lookup-chain/swaps/PCIe off, and a finite nonnegative threshold\n");
+                return 1;
+            }
+
             {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
                 // threads only.  An enabled placement is swept at every request: it catches threads created since.
                 static const bool aux_start = strata::aux_cpus::enabled();
@@ -16344,6 +16441,10 @@ int main(int argc, char** argv) {
                 extra_sources_reset();
                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
             }
+            // This request's draws, including discarded lookahead, must not feed its source planner.
+            const auto source_policy = policy;
+            strata::core::MtpDrafter::DraftResult generation;
+            strata::core::gated::Packet proposal; // immutable through the synchronous verifier call
             bool first_window = true;
             bool dflash_ready = false;
             const bool df_auto = req_dflash && o.dflash_block == 0 && !req_dflash_block_set && req_spec_min_p <= 0.0;
@@ -17053,23 +17154,36 @@ int main(int argc, char** argv) {
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
-                int T = req_dflash && dflash_ready ? df_pending_k + 1 : use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
-                if (use_mtp && req_spec_min_p > 0.0) {
-                    T = 1;
-                    while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
-                }
-                if (first_window) T = merge_T > 0 ? merge_T : 1;
+                int T = 1;
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
-                // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
-                // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (o.suffix_draft > 0 && !first_window) {
-                    const int k = sfx.propose(S - 1, sbuf.data());
-                    sfx_match = sfx.last_match();
-                    if (k > 0 && (!(use_mtp || (req_dflash && dflash_ready)) || sbuf[0] == drafts[0])) {
-                        const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
-                        if (pk.lookup) { T = pk.t; from_sfx = true; }
+                if (gated_proposal) {
+                    const int room = (int) std::min<int64_t>(S, o.max_context - p);
+                    if (!prepare_gated_window(proposal, generation, sfx, source_policy, o.suffix_draft > 0,
+                                               first_window, room, S_mtp, (int) ver.vocab(), (float) req_spec_min_p,
+                                               mtp.spec_q(), drafts.data(), dprob.data(), sbuf.data(), sfx_match, err)) {
+                        std::printf("ERR %s\n", err.c_str()); return 1;
+                    }
+                    T = proposal.T; from_sfx = proposal.from_sfx;
+                } else {
+                    T = req_dflash && dflash_ready ? df_pending_k + 1 : use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
+                    if (use_mtp && req_spec_min_p > 0.0) {
+                        T = 1;
+                        while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
+                    }
+                    if (first_window) T = merge_T > 0 ? merge_T : 1;
+                    // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
+                    // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
+                    if (o.suffix_draft > 0 && !first_window) {
+                        const int k = sfx.propose(S - 1, sbuf.data());
+                        sfx_match = sfx.last_match();
+                        const bool probabilistic = use_mtp && mtp.prob();
+                        if (k > 0 && (probabilistic || !(use_mtp || (req_dflash && dflash_ready)) || sbuf[0] == drafts[0])) {
+                            const strata::spec::DraftPolicy::Pick pk = probabilistic
+                                ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
+                            if (pk.lookup) { T = pk.t; from_sfx = true; }
+                        }
                     }
                 }
                 // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
@@ -17272,9 +17386,11 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw0 = Clock::now();
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
-                // (never on a first window: a merged one holds prompt tokens, not drafts)
-                if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-                if (!ver.run(T, window.data(), p, win_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
+                else if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                const auto decode_pool_fn = use_mtp && mtp.prob()
+                    ? invariant_win_pool_fn : win_pool_fn;
+                if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
                 }
@@ -17393,8 +17509,11 @@ int main(int argc, char** argv) {
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                generation = {}; // skipped or failed production must not expose an older q view
+                const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
                 bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+                               mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
+                                         nullptr, gated_proposal ? &generation : nullptr);
                 if (has_dflash) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     // The next proposal waits on this same stream. Keep an explicit wait when
@@ -18504,6 +18623,17 @@ int main(int argc, char** argv) {
         mem_mark("the verifier and the drafter's binding");
         ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
         if (use_mtp) mtp.set_draft_sampling(sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+        const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick();
+        if (gated_proposal && (o.pipeline_windows >= 2 || o.batch != 0 || multi_gpu ||
+            drive.d.remote_count != 0 || o.lookup_chain != 0 || o.adapt_swaps != 0 ||
+            o.pcie_frac != 0.0 || o.pcie_frac_auto || o.spec > strata::core::gated::kRows ||
+            o.spec_corrupt > 0 || !std::isfinite(o.spec_min_p) || o.spec_min_p < 0.0)) {
+            std::fprintf(stderr, "strata generate: gated proposals require serial single-device decode, lookup-chain/swaps/PCIe/corruption off, and a finite nonnegative threshold\n");
+            return 1;
+        }
+        if (gated_proposal && !follow.empty())
+            std::fprintf(stderr, "strata generate: --spec-follow replaces outputs before acceptance (teacher-forced diagnostic, not sampling-law evidence)\n");
+
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
@@ -18758,10 +18888,17 @@ int main(int argc, char** argv) {
         bool first_window = native_pack || use_dflash;
         double ms_dflash = 0;
         int64_t dflash_proposes = 0;
-        if (use_mtp && !first_window &&
-            !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p)) {
-            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-            return 1;
+        strata::core::MtpDrafter::DraftResult generation;
+        strata::core::gated::Packet proposal;
+        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+        {   // Non-native prefill already emitted x; draft_first(cell=p-1) samples at p.
+            const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p, o.max_context);
+            if (use_mtp && !first_window &&
+                !mtp.draft_first(o.spec, ss.R, x, p - 1, drafts.data(), err, dprob.data(), (float) o.spec_min_p,
+                                 nullptr, gated_proposal ? &generation : nullptr)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
         }
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
         std::vector<uint8_t> fdiff((size_t) o.spec, 0);
@@ -18773,10 +18910,10 @@ int main(int argc, char** argv) {
         std::vector<float> hash_rows;
         std::vector<int64_t> accepted_hist((size_t) o.spec, 0);
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
-        const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
+        const auto source_policy = policy;   // fixed for this generation
         std::vector<int32_t> sbuf((size_t) o.spec, 0);
         int64_t sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
         int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
@@ -18797,28 +18934,40 @@ int main(int argc, char** argv) {
         bool dflash_ready = false;
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
-            int T = use_dflash ? (dflash_ready ? dflash_k + 1 : 1) : S_mtp;
-            if ((use_mtp || use_dflash) && o.spec_min_p > 0.0) {
-                const int max_t = use_dflash ? (dflash_ready ? dflash_k + 1 : 1) : S_mtp;
-                T = 1;
-                while (T < max_t && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
-            }
-            if (first_window) T = 1;
+            const int room = (int) std::min<int64_t>(o.spec, o.max_context - p);
+            int T = 1;
             bool from_sfx = false;
             int sfx_match = 0;
-            if (o.suffix_draft > 0 && !first_window) {
-                const int k = sfx.propose(o.spec - 1, sbuf.data());
-                sfx_match = sfx.last_match();
-                if (k > 0 && (!(use_mtp || use_dflash) || (use_dflash && T == 1) || sbuf[0] == drafts[0])) {
-                    const strata::spec::DraftPolicy::Pick pk = policy.choose(T, k, sfx_match);
-                    if (pk.lookup) { T = pk.t; from_sfx = true; }
+            if (gated_proposal) {
+                if (!prepare_gated_window(proposal, generation, sfx, source_policy, o.suffix_draft > 0,
+                                           first_window, room, S_mtp, (int) ver.vocab(), (float) o.spec_min_p,
+                                           mtp.spec_q(), drafts.data(), dprob.data(), sbuf.data(), sfx_match, err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1;
                 }
+                T = proposal.T; from_sfx = proposal.from_sfx;
+            } else {
+                T = use_dflash ? (dflash_ready ? dflash_k + 1 : 1) : S_mtp;
+                if ((use_mtp || use_dflash) && o.spec_min_p > 0.0) {
+                    const int max_t = use_dflash ? (dflash_ready ? dflash_k + 1 : 1) : S_mtp;
+                    T = 1;
+                    while (T < max_t && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
+                }
+                if (first_window) T = 1;
+                if (o.suffix_draft > 0 && !first_window) {
+                    const int k = sfx.propose(o.spec - 1, sbuf.data());
+                    sfx_match = sfx.last_match();
+                    const bool probabilistic = use_mtp && mtp.prob();
+                    if (k > 0 && (probabilistic || !(use_mtp || use_dflash) || (use_dflash && T == 1) || sbuf[0] == drafts[0])) {
+                        const strata::spec::DraftPolicy::Pick pk = probabilistic
+                            ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
+                        if (pk.lookup) { T = pk.t; from_sfx = true; }
+                    }
+                }
+                // The window's rows sit at p .. p + T - 1, and past the context there is no cell to verify them in: near
+                // its end the window takes only the rows that fit (the admission checked the prompt and max_new, which a
+                // full window can overrun)
+                T = std::min(T, room);
             }
-            // The window's rows sit at p .. p + T - 1, and past the context there is no cell to verify them in: near
-            // its end the window takes only the rows that fit (the admission checked the prompt and max_new, which a
-            // full window can overrun)
-            const int room = (int) std::min<int64_t>(o.spec, o.max_context - p);
-            T = std::min(T, room);
             // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
             int chain_n = 0, cm = 0;
             if (o.lookup_chain > 0 && use_mtp && !first_window && !from_sfx && T < room) {
@@ -18892,8 +19041,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata: fetch verify: %lld admitted slots read back, %lld differ\n",
                                  (long long) checked, (long long) bad);
             }
-            if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-            if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
+            if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
+            else if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            const auto decode_pool_fn = use_mtp && mtp.prob() ? &drive_pool_multi_invariant : &drive_pool_multi;
+            if (!ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -18993,8 +19144,11 @@ int main(int argc, char** argv) {
                 total_ms += std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
                 break;
             }
+            generation = {};
+            const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
             bool drafted = !use_mtp || (int64_t) produced.size() >= max_new ||
-                            mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p);
+                           mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) o.spec_min_p,
+                                     nullptr, gated_proposal ? &generation : nullptr);
             if (!use_dflash) {
                 if (adapt_thr.joinable()) adapt_thr.join();
                 if (!adapt_ok) return 1;
