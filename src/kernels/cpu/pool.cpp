@@ -3,6 +3,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/numa_pool.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -80,6 +81,60 @@ std::atomic<int> g_host_core{(int) HostCore::First};
 
 void set_host_core(HostCore where) { g_host_core.store((int) where); }
 HostCore host_core_setting() { return (HostCore) g_host_core.load(); }
+
+namespace {
+std::vector<int> g_pool_cores;   // --pool-cores: set once at start-up, before the pool exists
+}  // namespace
+void set_pool_cores(const std::vector<int>& cpus) { g_pool_cores = cpus; }
+const std::vector<int>& pool_cores_setting() { return g_pool_cores; }
+
+std::vector<LogicalCpuInfo> logical_cpu_layout() {
+    std::vector<LogicalCpuInfo> out;
+#if defined(_WIN32)
+    DWORD len = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+    if (len == 0) return out;
+    std::vector<char> buf(len);
+    if (!GetLogicalProcessorInformationEx(RelationProcessorCore, (PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX) buf.data(), &len))
+        return out;
+    // a `start /affinity` or a job limit on a PC with one processor group: only those processors are the process's
+    DWORD_PTR proc_mask = 0, sys_mask = 0;
+    const bool limited = GetActiveProcessorGroupCount() == 1 && GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask);
+    long core = 0;
+    for (const char* p = buf.data(); p < buf.data() + len; p += ((const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p)->Size) {
+        const auto* e = (const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*) p;
+        if (e->Relationship != RelationProcessorCore) continue;
+        for (WORD group = 0; group < e->Processor.GroupCount; ++group) {
+            const GROUP_AFFINITY& g = e->Processor.GroupMask[group];
+            for (int bit = 0; bit < 64; ++bit)
+                if ((g.Mask & (KAFFINITY(1) << bit)) && (!limited || (proc_mask & (DWORD_PTR(1) << bit))))
+                    out.push_back({(int) (g.Group * 64 + bit), core});
+        }
+        ++core;
+    }
+#elif defined(__linux__)
+    std::vector<unsigned long> mask;
+    std::vector<int> allowed;
+    if (detail::get_thread_affinity(mask, &allowed) != 0) return out;
+    auto read = [](int cpu, const char* what) -> long {
+        char path[96];
+        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/topology/%s", cpu, what);
+        long v = -1;
+        if (std::FILE* f = std::fopen(path, "r")) {
+            if (std::fscanf(f, "%ld", &v) != 1) v = -1;
+            std::fclose(f);
+        }
+        return v;
+    };
+    for (int cpu : allowed) {
+        const long pkg = read(cpu, "physical_package_id"), core = read(cpu, "core_id");
+        out.push_back({cpu, pkg >= 0 && core >= 0 ? pkg * 1000000 + core : -1});
+    }
+#else
+    for (unsigned i = 0; i < std::thread::hardware_concurrency(); ++i) out.push_back({(int) i, -1});
+#endif
+    return out;
+}
 
 static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affinity);
 
@@ -230,6 +285,10 @@ static CpuTopology detect_cpu_topology_impl(bool skip_first, PoolAffinity affini
             topo.host_core = topo.worker_cores.front();
             topo.worker_cores.erase(topo.worker_cores.begin());
         }
+        // The OS did not say which logical processors share a core, and every one is listed as a core above: the default
+        // worker count must not count them as cores (30 workers on a 16c/32t PC would sit two to a core).  With the layout
+        // unknown the plan takes half the logical processors (pool_plan.hpp), as on Linux without sysfs.
+        topo.layout_known = false;
         return topo;
     }
     std::vector<char> buf(len);
@@ -532,17 +591,53 @@ bool pin_this_thread(int core, [[maybe_unused]] int worker = -1) {
 }
 
 #if defined(__linux__)
+// Where the NUMA topology is read from: /sys. STRATA_TEST_SYSFS_ROOT=<dir> reads <dir>/devices/system/{node,cpu} instead,
+// so a test can give the pool a made-up two-node machine (pool_tasks_test); nobody sets it for real.
+std::string sysfs_root() {
+    const char* e = std::getenv("STRATA_TEST_SYSFS_ROOT");
+    return e != nullptr && *e != '\0' ? std::string(e) : std::string("/sys");
+}
+
 // The NUMA node of a logical CPU (sysfs), or -1.
 int cpu_numa_node(int cpu) {
     if (cpu < 0) return -1;
-    char path[96];
+    const std::string root = sysfs_root();
+    char path[512];
     for (int node = 0; node < 64; ++node) {
-        std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/node%d", cpu, node);
+        std::snprintf(path, sizeof path, "%s/devices/system/cpu/cpu%d/node%d", root.c_str(), cpu, node);
         if (access(path, F_OK) == 0) return node;
     }
     return -1;
 }
 #endif
+
+// The NUMA nodes with CPUs this machine has (0.2.2: the split is tried by itself from 2 on).  Linux: the sysfs node folder
+// (numa_pool.hpp); Windows: GetNumaHighestNodeNumber; any other system, or a sandbox that hides the folder: 1.
+int numa_node_count() {
+#if defined(__linux__)
+    return (std::max)(1, numa_cpu_node_count_at(sysfs_root() + "/devices/system/node"));
+#elif defined(_WIN32)
+    ULONG highest = 0;
+    return GetNumaHighestNodeNumber(&highest) ? (int) highest + 1 : 1;
+#else
+    return 1;
+#endif
+}
+
+// The real-node split for threads on `thread_core` (numa_pool.hpp).  Linux only: the placement of the experts' memory
+// (first touch by threads pinned to a node, move_pages to check) has no Windows or macOS version.
+NumaSplitDecision decide_real_numa_split([[maybe_unused]] const std::vector<int>& thread_core, [[maybe_unused]] int n_workers,
+                                         [[maybe_unused]] bool pinned) {
+#if defined(__linux__)
+    // the expert source's own reading of it (expert_source.cpp): exactly "1"
+    const char* rotate = std::getenv("STRATA_EXCHANGE_ROTATE");
+    return decide_numa_split(thread_core, n_workers, pinned, rotate != nullptr && std::strcmp(rotate, "1") == 0, cpu_numa_node);
+#else
+    NumaSplitDecision d;
+    d.why = "the split needs Linux";
+    return d;
+#endif
+}
 
 }  // namespace
 
@@ -648,68 +743,104 @@ void ExpertPool::diag(std::FILE* f) const {
 ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity affinity, int tasks)
     : tasks_(tasks), host_works_(host_works), affinity_(affinity), topo_(detect_cpu_topology(true, affinity)) {
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
+    pinned_ = pin;
+    layout_ = logical_cpu_layout();   // now, before anything pins the caller (Linux reads the calling thread's allowed CPUs)
     if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
-    // STRATA_NUMA_POOL, read here for the worker count (the split itself is decided below, once the count is known):
-    // unset or 1 splits on a machine with 2 NUMA nodes, 0 turns it off, test splits without real nodes
-    const char* env = std::getenv("STRATA_NUMA_POOL");
-    const bool env_set = env != nullptr && *env != '\0';
-    const bool env_off = env_set && std::strcmp(env, "0") == 0;
-    const bool env_test = env_set && std::strcmp(env, "test") == 0;
-    const bool env_bad = env_set && !env_off && !env_test && std::strcmp(env, "1") != 0;
-    // the machine's side of the split, checked before the count: the default spread over both sockets without the
-    // split is slower than one socket (#3201), so the count spans them only when the split will follow
-    int machine_nodes = 0;
-    std::string pre_why = env_off ? "STRATA_NUMA_POOL=0" : "";
-    if (!env_off && !env_bad && !env_test) {
-#if defined(__linux__)
-        std::vector<int> nodes;
-        for (int c : topo_.worker_cores) nodes.push_back(cpu_numa_node(c));
-        if (topo_.host_core >= 0) nodes.push_back(cpu_numa_node(topo_.host_core));
-        std::sort(nodes.begin(), nodes.end());
-        nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
-        nodes.erase(std::remove(nodes.begin(), nodes.end(), -1), nodes.end());
-        machine_nodes = (int) nodes.size();
-        // the expert source's own reading of it (expert_source.cpp): exactly "1"
-        const char* rotate = std::getenv("STRATA_EXCHANGE_ROTATE");
-        if (rotate != nullptr && std::strcmp(rotate, "1") == 0)
-            pre_why = "STRATA_EXCHANGE_ROTATE=1 moves experts between slots, the split needs fixed slots";
-        else if (!pin) pre_why = "the pool's threads are not pinned";
-        else if (machine_nodes != 2)
-            pre_why = "the pool's CPUs span " + std::to_string(machine_nodes) + " NUMA node(s), the NUMA split supports "
-                      "exactly 2";
-#else
-        pre_why = "the split needs Linux";
-#endif
-    }
-    const bool want = env_test || (!env_bad && pre_why.empty());
+    // STRATA_NUMA_SPLIT, read here for the worker count (the split itself is decided below, once the count is known).
+    // 0.2.2: with 2 or more NUMA nodes and neither variable set the split is tried by itself, and STRATA_NUMA_POOL=0 turns that
+    // off (numa_pool.hpp).  One node: pick_numa_pool says Unchanged and nothing below differs from the pool before the split.
+    const char* env = std::getenv("STRATA_NUMA_SPLIT");
+    const int numa_nodes = numa_node_count();
+    const NumaPoolPick pool_pick = pick_numa_pool(std::getenv("STRATA_NUMA_POOL"), env, numa_nodes);
+    if (!pool_pick.log.empty()) std::fprintf(stderr, "%s\n", pool_pick.log.c_str());
+    if (pool_pick.choice == NumaPoolChoice::Off) env = nullptr;
+    bool auto_pool = pool_pick.choice == NumaPoolChoice::Auto;   // the split without STRATA_NUMA_SPLIT: only if it can run
+    bool env_off = !auto_pool && (env == nullptr || *env == '\0' || std::strcmp(env, "0") == 0);
+    bool env_known = auto_pool || (!env_off && (std::strcmp(env, "1") == 0 || std::strcmp(env, "test") == 0));
     const PoolPlanInput plan_in = pool_plan_input(topo_);
     const PoolPlan wplan = plan_pool_workers(plan_in);
-    // the split needs workers on both nodes: its cores are taken round-robin over the packages, so any count under
-    // the core count (the default or a configured one) spans them evenly (one package: the order is kept)
-    if (want && topo_.worker_package.size() == topo_.worker_cores.size()) {
+    // --pool-cores (experimental, off by default): the person's own list of logical processors for the workers.  The plan above
+    // was made from the real topology; only the cores the workers are pinned to (and, by default, their count) come from the list.
+    if (!pool_cores_setting().empty()) {
+        const PoolCoresCheck chk = check_pool_cores(pool_cores_setting(), layout_, topo_.host_core);
+        static std::atomic<bool> told{false};   // (a throw-away pool of --pool-affinity measure builds the same list again)
+        const bool say = !told.exchange(true);
+        if (say)
+            for (const std::string& w : chk.warnings) std::fprintf(stderr, "strata cpu pool: --pool-cores: %s\n", w.c_str());
+        if (chk.cpus.empty()) {
+            if (say)
+                std::fprintf(stderr, "strata cpu pool: --pool-cores: no usable logical processor in the list; the pool uses its "
+                                     "default placement\n");
+        } else {
+            topo_.worker_cores = chk.cpus;
+            topo_.worker_package.assign(chk.cpus.size(), -1);
+            explicit_cores_ = true;
+        }
+    }
+    // the split needs workers on both nodes: its cores are taken round-robin over the nodes (the packages when a core's node
+    // is unknown), so any count under the core count (the default or a configured one) spans them evenly (one node: the order
+    // is kept)
+    auto interleave_cores = [&] {
+        if (explicit_cores_) return;   // --pool-cores: the person's order stays
+        if (topo_.worker_package.size() != topo_.worker_cores.size()) return;
+        std::vector<int> key = topo_.worker_package;
+#if defined(__linux__)
+        std::vector<int> by_node;
+        for (int c : topo_.worker_cores) by_node.push_back(cpu_numa_node(c));
+        if (std::none_of(by_node.begin(), by_node.end(), [](int n) { return n < 0; })) key = by_node;
+#endif
         std::vector<int> cores, pkgs;
-        for (size_t i : interleave_packages(topo_.worker_package)) {
+        for (size_t i : interleave_packages(key)) {
             cores.push_back(topo_.worker_cores[i]);
             pkgs.push_back(topo_.worker_package[i]);
         }
         topo_.worker_cores = std::move(cores);
         topo_.worker_package = std::move(pkgs);
+    };
+    // the worker count: configured, else the hybrid P cores, else the plan (`span`: every socket counts, the split's default)
+    auto pick_workers = [&](bool span, const char** limit) -> int {
+        if (n_workers > 0) return n_workers;
+        if (explicit_cores_) {
+            *limit = "your --pool-cores list";
+            return (int) topo_.worker_cores.size();
+        }
+        if (topo_.is_hybrid && affinity_ != PoolAffinity::All) return (std::max)(1, topo_.p_cores - 1);
+        if (span) {
+            PoolPlanInput span_in = plan_in;
+            span_in.span_packages = true;
+            const PoolPlan sp = plan_pool_workers(span_in);
+            *limit = sp.limit;
+            return (std::min)(sp.workers, (std::max)(1, (int) topo_.worker_cores.size()));
+        }
+        *limit = wplan.limit;
+        return (std::min)(wplan.workers, (std::max)(1, (int) topo_.worker_cores.size()));
+    };
+    if (auto_pool) {
+        // try the split on a copy: when it cannot run the cores, the count and the plan stay exactly what they were
+        const CpuTopology plain_topo = topo_;
+        interleave_cores();
+        const char* try_limit = nullptr;
+        const int try_n = pick_workers(true, &try_limit);
+        std::vector<int> thread_core;
+        for (int j = 0; j < try_n; ++j)
+            thread_core.push_back(pin && j < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) j] : -1);
+        if (host_works_) thread_core.push_back(topo_.host_core);
+        const NumaSplitDecision tried = decide_real_numa_split(thread_core, try_n, pin);
+        if (!tried.on) {
+            topo_ = plain_topo;
+            auto_pool = env_known = false;
+            env_off = true;
+            std::fprintf(stderr, "strata cpu pool: NUMA pool off: %s (%d NUMA nodes found), the pool runs as before\n",
+                         tried.why.c_str(), numa_nodes);
+        }
+    } else if (env_known) {
+        interleave_cores();
     }
-    if (n_workers > 0) {
-        n_ = n_workers;
-    } else if (topo_.is_hybrid && affinity_ != PoolAffinity::All) {
-        n_ = (std::max)(1, topo_.p_cores - 1);
-    } else if (want) {
-        // ... and the default spans every socket (the plan's other bounds stay)
-        PoolPlanInput span_in = plan_in;
-        span_in.span_packages = true;
-        const PoolPlan sp = plan_pool_workers(span_in);
-        n_ = (std::min)(sp.workers, (std::max)(1, (int) topo_.worker_cores.size()));
-        plan_limit_ = sp.limit;
-    } else {
-        n_ = (std::min)(wplan.workers, (std::max)(1, (int) topo_.worker_cores.size()));
-        plan_limit_ = wplan.limit;
+    {
+        const char* limit = nullptr;
+        n_ = pick_workers(env_known, &limit);
+        if (limit != nullptr) plan_limit_ = limit;
     }
     plan_cores_ = wplan.cores;
     plan_logical_ = plan_in.logical;
@@ -724,64 +855,34 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     strata::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
-    // STRATA_NUMA_POOL: decided here, before any worker starts (a worker counts into its slice's `parked` from its
-    // first instruction), and never revised.  Off: the plan stays empty and nothing below runs.
+    // STRATA_NUMA_SPLIT: decided here, before any worker starts (a worker counts into its slice's `parked` from its
+    // first instruction), and never revised.  Unset: the plan stays empty and nothing below runs.
     NumaSplitPlan plan;
-    if (env_bad) {
-        plan.why = std::string("unknown STRATA_NUMA_POOL value '") + env + "' (use 0, 1 or test)";
+    if (!env_off && !env_known) {
+        plan.why = std::string("unknown STRATA_NUMA_SPLIT value '") + env + "' (use 1 or test)";
         std::fprintf(stderr, "strata cpu pool: NUMA split off: %s\n", plan.why.c_str());
-    } else if (!want) {
-        plan.why = pre_why;
-        // unset on a one-node machine: silent, the pool runs exactly as before
-        if (!env_off && (env_set || machine_nodes >= 2))
-            std::fprintf(stderr, "strata cpu pool: NUMA split off: %s\n", plan.why.c_str());
-    } else {
-        plan.test = env_test;
+    } else if (env_known) {
+        plan.test = !auto_pool && std::strcmp(env, "test") == 0;
         const int threads = n_ + (host_works_ ? 1 : 0);   // thread j < n_: worker j; j == n_: the host
-        [[maybe_unused]] auto core_of = [&](int j) {
-            if (j == n_) return topo_.host_core;
-            return pin && j < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) j] : -1;
-        };
         std::vector<int> slice((size_t) threads, 0);
-        char why[160] = "";
+        std::string why;
         if (threads < 2) {
-            std::snprintf(why, sizeof why, "the pool has %d thread, the split needs 2 or more", threads);
+            why = "the pool has " + std::to_string(threads) + " thread, the split needs 2 or more";
         } else if (plan.test) {
             for (int j = 0; j < threads; ++j) slice[(size_t) j] = j % 2;
         } else {
-#if defined(__linux__)
-            std::vector<int> node((size_t) threads, -1);
-            for (int j = 0; j < threads && why[0] == '\0'; ++j) {
-                const int c = core_of(j);
-                if (c < 0 && j < n_) std::snprintf(why, sizeof why, "worker %d has no core to be pinned to", j);
-                else if (c < 0) std::snprintf(why, sizeof why, "the host thread has no core");
-                else if ((node[(size_t) j] = cpu_numa_node(c)) < 0)
-                    std::snprintf(why, sizeof why, "CPU %d has no known NUMA node", c);
+            std::vector<int> thread_core;
+            for (int j = 0; j < threads; ++j)
+                thread_core.push_back(j == n_ ? topo_.host_core
+                                              : pin && j < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) j] : -1);
+            const NumaSplitDecision d = decide_real_numa_split(thread_core, n_, pin);
+            why = d.why;
+            if (d.on) {
+                slice = d.slice;
+                plan.nodes[0] = d.nodes[0];
+                plan.nodes[1] = d.nodes[1];
+                for (int j = 0; j < threads; ++j) plan.cores[slice[(size_t) j]].push_back(thread_core[(size_t) j]);
             }
-            if (why[0] == '\0') {
-                std::vector<int> nodes = node;
-                std::sort(nodes.begin(), nodes.end());
-                nodes.erase(std::unique(nodes.begin(), nodes.end()), nodes.end());
-                if (nodes.size() != 2) {
-                    std::snprintf(why, sizeof why, "the pool's threads span %zu NUMA node(s), the NUMA split supports exactly 2",
-                                  nodes.size());
-                } else {
-                    plan.nodes[0] = nodes[0];
-                    plan.nodes[1] = nodes[1];
-                    int per[2] = {0, 0};
-                    for (int j = 0; j < threads; ++j) {
-                        slice[(size_t) j] = node[(size_t) j] == nodes[1] ? 1 : 0;
-                        plan.cores[slice[(size_t) j]].push_back(core_of(j));
-                        ++per[slice[(size_t) j]];
-                    }
-                    if (!numa_slices_balanced(per[0], per[1]))
-                        std::snprintf(why, sizeof why, "slices too unbalanced (node %d: %d thread%s, node %d: %d thread%s)",
-                                      nodes[0], per[0], per[0] == 1 ? "" : "s", nodes[1], per[1], per[1] == 1 ? "" : "s");
-                }
-            }
-#else
-            std::snprintf(why, sizeof why, "the split needs Linux");
-#endif
         }
         plan.why = why;
         plan.on = plan.why.empty();
@@ -797,6 +898,9 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
             hslice_ = host_works_ ? slice[(size_t) n_] : 0;
             slice_threads_.assign(2, 0);
             for (int k : slice) ++slice_threads_[(size_t) k];
+            if (auto_pool)
+                std::fprintf(stderr, "strata cpu pool: NUMA pool on: %d NUMA nodes found, one slice of the pool per node "
+                                     "(STRATA_NUMA_POOL=0 turns it off)\n", numa_nodes);
             if (plan.test)
                 std::fprintf(stderr, "strata cpu pool: NUMA split on (test, no real nodes): slice 0 = %d threads, "
                                      "slice 1 = %d threads\n", slice_threads_[0], slice_threads_[1]);
@@ -809,7 +913,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     }
     if (n_workers > 0) {
         // recommend, never force: a count above what this CPU uses well runs as configured, with a plain warning
-        // (STRATA_NUMA_POOL on: workers on the other socket are the point, that case is not warned about)
+        // (STRATA_NUMA_SPLIT on: workers on the other socket are the point, that case is not warned about)
         PoolPlanInput warn_in = plan_in;
         warn_in.span_packages = plan.on;
         static std::atomic<bool> warned{false};
@@ -822,6 +926,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     for (int i = 0; i < n_; ++i) {
         const int core = pin ? (i < (int) topo_.worker_cores.size() ? topo_.worker_cores[(size_t) i] : -1) : -1;
         threads_.emplace_back([this, i, core] {
+            strata::platform::name_this_thread("strata-pool", i);
             strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
             // a failed pin only costs locality under the split: the worker keeps the slice it was given
             if (!pin_this_thread(core, i) && core >= 0 && numa_n_ > 0)
@@ -830,6 +935,16 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
             worker(i);
         });
     }
+}
+
+std::string ExpertPool::placement_line() const {
+    if (n_ <= 0) return "";
+    if (!pinned_) return "CPU workers: " + std::to_string(n_) + " workers, not pinned to logical processors (the OS places them)";
+    // a worker beyond the cores listed runs unpinned (more --pool-workers than --pool-cores entries)
+    std::vector<int> on(topo_.worker_cores.begin(), topo_.worker_cores.begin() + (std::min)((size_t) n_, topo_.worker_cores.size()));
+    std::string s = describe_worker_placement(on, topo_.host_core, layout_, explicit_cores_);
+    if ((int) on.size() < n_) s += " (" + std::to_string(n_ - (int) on.size()) + " more workers run unpinned)";
+    return s;
 }
 
 ExpertPool::~ExpertPool() {
@@ -1089,7 +1204,7 @@ void ExpertPool::wait_done(int n) {
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     const int s = numa_n_ == 0 ? 0 : id >= 0 ? wslice_[(size_t) id] : hslice_;
     for (;;) {
-        // STRATA_NUMA_POOL: a mode-5/6 batch lives on the slice heads, any other on `head_`; the epoch tag makes the
+        // STRATA_NUMA_SPLIT: a mode-5/6 batch lives on the slice heads, any other on `head_`; the epoch tag makes the
         // other family's claim fail, so `mode_` is never read before a claim has succeeded (pool.hpp)
         int ci = numa_n_ > 0 ? claim_slice(epoch, s) : -1;
         const bool sliced = ci >= 0;
@@ -1369,3 +1484,23 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
 }
 
 }  // namespace strata::kernels::cpu
+
+#if defined(_WIN32)
+// strata/platform/thread_name.hpp: the Windows half lives here, where <windows.h> is already included.  SetThreadDescription
+// (Windows 10 1607 and later) is looked up, not linked: older SDKs and toolchains lack the import.
+namespace strata::platform {
+void name_this_thread(const char* base, int index) {
+    char name[64];
+    if (index >= 0) std::snprintf(name, sizeof name, "%s-%d", base, index);
+    else std::snprintf(name, sizeof name, "%s", base);
+    using SetDesc = HRESULT(WINAPI*)(HANDLE, PCWSTR);
+    static const SetDesc fn = (SetDesc) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription");
+    if (fn == nullptr) return;
+    wchar_t wide[64];
+    int i = 0;
+    for (; name[i] != '\0' && i < 63; ++i) wide[i] = (wchar_t) (unsigned char) name[i];
+    wide[i] = L'\0';
+    (void) fn(GetCurrentThread(), wide);
+}
+}  // namespace strata::platform
+#endif

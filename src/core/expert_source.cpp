@@ -619,7 +619,7 @@ void log_complement_memory(const char* stage, uint64_t requested) {
 }
 
 #if defined(__linux__)
-/// STRATA_NUMA_POOL step B: each NUMA slice of every complement slot (numa_slice_ranges) is first-touched by a helper
+/// STRATA_NUMA_SPLIT step B: each NUMA slice of every complement slot (numa_slice_ranges) is first-touched by a helper
 /// thread pinned to one core of that slice's node, so the default local policy puts its pages there (no mbind: ~113k
 /// ranges would split the arena into more VMAs than vm.max_map_count allows).  Inactive (`place` false) unless the
 /// live pool split on real nodes; then the paced fault loop hands it each step to touch.
@@ -1294,6 +1294,7 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, bool ahead) {
 // A read-ahead worker: takes a predicted (layer, expert), skips it when its pages are cached or it is already
 // staged, and otherwise reads the whole blob into a staging buffer (copy_from_files preads what is not cached).
 void FileExpertSource::io_worker() {
+    strata::platform::name_this_thread("strata-io");
     for (;;) {
         int32_t layer, expert;
         bool ahead = true;   // a prediction (marked for the used / unused count), not a layer's own demand read
@@ -3182,6 +3183,7 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     src_ = src;
     x_.assign((size_t) (8 * n_embd), 0.f);
     thread_ = std::thread([this] {
+        strata::platform::name_this_thread("strata-lookahead");
         strata::aux_cpus::pin_current_thread();
         run();
     });
@@ -3996,7 +3998,7 @@ bool FileExpertSource::pin_cache_complement_attempt(
     bool vmem = false;          ///< path 2 on Windows: the copy is VirtualAlloc'd
     std::string note;
 #if defined(__linux__)
-    NumaComplementPlacement numa;   ///< STRATA_NUMA_POOL step B; inert unless the live pool split on real nodes
+    NumaComplementPlacement numa;   ///< STRATA_NUMA_SPLIT step B; inert unless the live pool split on real nodes
 #endif
     auto release = [&]() {
         if (arena == nullptr) return;
@@ -4056,7 +4058,7 @@ bool FileExpertSource::pin_cache_complement_attempt(
         // does not cover the complement, register it in steps, each only while the RAM left stays above the reserve.
         // STRATA_PIN_GUARD=0 pages-locks in one go as before, =2 always registers in steps (a test); STRATA_PIN_RESERVE_GIB
         // is the RAM that must stay above every step (default: the resident headroom, at least 2 GiB)
-        // STRATA_NUMA_POOL placement forces the drop and the paced path whatever the guard (STRATA_PIN_GUARD=0 included)
+        // STRATA_NUMA_SPLIT placement forces the drop and the paced path whatever the guard (STRATA_PIN_GUARD=0 included)
         const uint64_t pace_reserve = [&] {
             const char* v = std::getenv("STRATA_PIN_RESERVE_GIB");
             return v != nullptr && std::atof(v) > 0 ? (uint64_t) (std::atof(v) * 1073741824.0)
@@ -4069,7 +4071,7 @@ bool FileExpertSource::pin_cache_complement_attempt(
                 return v == nullptr ? 1 : std::atoi(v);
             }();
             uint64_t free_now = 0;
-            numa.init(offsets, n_expert_, layer_blob_bytes_, role_bytes_);   // STRATA_NUMA_POOL: placed by the paced loop
+            numa.init(offsets, n_expert_, layer_blob_bytes_, role_bytes_);   // STRATA_NUMA_SPLIT: placed by the paced loop
             if (numa.place) {
                 // the engine's own mapped model pages sit on whichever node read them, and a toucher on a full node
                 // gets its pages from the other one (no local reclaim): give them back first, as the guard=1 path does
@@ -4088,7 +4090,7 @@ bool FileExpertSource::pin_cache_complement_attempt(
             if (guard == 2 || numa.place) {
                 paced = true;
                 std::fprintf(stderr, "FileExpertSource: %s: page-locking the complement in steps\n",
-                             guard == 2 ? "STRATA_PIN_GUARD=2" : "STRATA_NUMA_POOL");
+                             guard == 2 ? "STRATA_PIN_GUARD=2" : "STRATA_NUMA_SPLIT");
             } else if (guard != 0 && free_memory_bytes(free_now) &&
                        detail::pin_depends_on_reclaim(free_now, bytes, pace_reserve)) {
                 drop_file_cache();
@@ -4938,6 +4940,7 @@ bool FileExpertSource::ram_queued(int64_t layer, int64_t expert) const {
 }
 
 void FileExpertSource::ram_worker() {
+    strata::platform::name_this_thread("strata-ram");
     for (;;) {
         RamJob* job = nullptr;
         {
@@ -7008,6 +7011,7 @@ ForesightSwap::~ForesightSwap() {
 }
 
 void ForesightSwap::fill_loop() {
+    strata::platform::name_this_thread("strata-fill");
     int cur_dev = -1;
     for (;;) {
         int64_t idx;
