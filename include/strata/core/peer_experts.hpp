@@ -17,6 +17,7 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/peer_link.hpp"
 
 #include <cuda_runtime.h>
 
@@ -51,11 +52,19 @@ public:
               ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
               std::string& err);
     void close();
-    bool valid() const { return device_ >= 0; }
+    /// --peer-link: the tier is the OTHER engine's card (another process, see peer_link.hpp) instead of a card of this
+    /// one: `has` reads what that card holds, `launch`/`finish` post the rows to that engine and wait for them.  No
+    /// device of its own (no prompt-path share, no adaptive tier here: the other engine adapts its own cache).
+    void open_link(PeerLink* link) { close(); link_ = link; }
+    bool linked() const { return link_ != nullptr; }
+    bool valid() const { return device_ >= 0 || link_ != nullptr; }
     int device() const { return device_; }
 
     /// Whether the peer holds (layer, expert) right now.
-    bool has(int64_t layer, int64_t expert) const { return res_[(size_t) (layer * n_expert_ + expert)] >= 0; }
+    bool has(int64_t layer, int64_t expert) const {
+        if (link_ != nullptr) return link_->partner_has(layer, expert);
+        return res_[(size_t) (layer * n_expert_ + expert)] >= 0;
+    }
 
     /// The device address of (layer, expert)'s blob on the peer, or null when it is not resident.
     const uint8_t* slot_ptr(int64_t layer, int64_t expert) {
@@ -106,6 +115,7 @@ public:
     int64_t launches = 0;                             ///< layer launches that gave the peer at least one row
 
 private:
+    PeerLink* link_ = nullptr;
     int device_ = -1;
     bool p2p_ = false;
     int64_t n_layers_ = 0, n_expert_ = 0;

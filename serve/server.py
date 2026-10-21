@@ -9542,13 +9542,22 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
-        from serve import replicas as rp
-        try:
-            groups = rp.gpu_groups(cfg)
-        except rp.ReplicaConfigError as e:
-            raise SystemExit(f"[strata] config {e}")
-        if groups:
-            engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
+        if cfg.get("elastic"):                          # opt-in: the elastic peer pair (serve/elastic.py)
+            from serve import elastic as _elastic
+
+            def _exe_of(c):
+                return c["exe"] if os.path.isabs(c["exe"]) else os.path.abspath(os.path.join(c.get("cwd") or ".",
+                                                                                              c["exe"]))
+            engine = _elastic.build(cfg, StrataEngine, lambda c: engine_args(c) + (effort_end or []), child_env,
+                                    _exe_of, silence)
+        else:
+            from serve import replicas as rp
+            try:
+                groups = rp.gpu_groups(cfg)
+            except rp.ReplicaConfigError as e:
+                raise SystemExit(f"[strata] config {e}")
+            if groups:
+                engine = start_replicas(cfg, groups, exe, effort_end or [], lazy, offline=a.offline)
         else:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
