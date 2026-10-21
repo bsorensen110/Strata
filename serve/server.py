@@ -9543,6 +9543,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         except ValueError as e:
             raise SystemExit(f"[strata] config {e}")
         if cfg.get("elastic"):                          # opt-in: the elastic peer pair (serve/elastic.py)
+            groups = []                                 # (no replica groups on this path; see the note below)
             from serve import elastic as _elastic
 
             def _exe_of(c):
