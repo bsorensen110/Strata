@@ -6538,6 +6538,9 @@ class LogprobEntries:
     def spell(self, eng, text: str) -> list:
         """The entries whose tokens spell `text`, the next piece of the reply."""
         self.pending += self.take(eng)
+        if not text:
+            return []                             # an empty piece is spelled by no tokens; taking `pending` here
+                                                  # would hand the whole drained buffer to the caller and lose sync
         at = [0]
         for e in self.pending:
             at.append(at[-1] + len(e["token"]))
@@ -6647,7 +6650,10 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
         if opened:
             return ()
         opened = True
-        return (with_lp(chunk({"role": "assistant", "content": ""}), "content"),)
+        # no with_lp here: an empty role delta spells no text, and asking `lp` to spell it used to hand
+        # this chunk the whole drained token buffer - the tokens of the answer's first piece, tagged as
+        # "content", out of sync with the reply (#1395 logprobs plumbing vs #2480's deferred role chunk)
+        return (chunk({"role": "assistant", "content": ""}),)
 
     calls = 0
     streamed = {}                                  # tool call id -> index, for calls sent piece by piece
