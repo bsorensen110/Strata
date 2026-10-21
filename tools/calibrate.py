@@ -34,6 +34,9 @@ MTP/plain-DFlash defaults and does not select a drafter quantization.
 The PCIe share, probability floor, DFlash block and prompt chunks are measured through one engine (per-request `strata_tune` keys); the worker
 count, the adaptive tier and the shared-expert stream need a restart per value.  Those are decode speed: the prompt
 path streams every expert whatever they say.
+The first two and the prompt chunks are measured through one engine (per-request `strata_tune` keys); the worker
+count and the adaptive tier need a restart per value.  Those are decode speed: the prompt path streams every expert
+whatever they say.
 
 A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
 adaptive expert tier and the OS make single measurements noisy by a few percent.
