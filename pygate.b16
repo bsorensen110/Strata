@@ -1,0 +1,63 @@
+..........F...F........................................... [ 37%]
+...........................................................s....................................                                      [100%]
+=================================== FAILURES ===================================
+___________ Api.test_json_schema_answer_as_written_with_its_logprobs ___________
+
+self = <serve.test_logprobs.Api testMethod=test_json_schema_answer_as_written_with_its_logprobs>
+
+    def test_json_schema_answer_as_written_with_its_logprobs(self):
+        # MockEngine appends the stop token to the script it is built with, and reports
+        # finish_reason=length when it runs out -- so the engine is rebuilt with this answer
+        # rather than re-pointed at a raw token list (which would drop the stop token).
+        written = '```json\n{"rent": "$1,250", "quote": "x"}\n```'
+        self.engine = self.svc.engine = LpEngine(self.tok, written)
+        out = self.post({"logprobs": True, "temperature": 0, "response_format": SCHEMA})
+        choice = out["choices"][0]
+        content = choice["message"]["content"]
+        self.assertEqual(content, '{"rent": "$1,250", "quote": "x"}')   # the JSON as written
+>       self.assertEqual("".join(e["token"] for e in choice["logprobs"]["content"]), content)
+E       AssertionError: '`{"rent": "$1,250", "quote": "x"}' != '{"rent": "$1,250", "quote": "x"}'
+E       - `{"rent": "$1,250", "quote": "x"}
+E       ? -
+E       + {"rent": "$1,250", "quote": "x"}
+
+serve/test_logprobs.py:243: AssertionError
+----------------------------- Captured stdout call -----------------------------
+[strata] response_format json_schema: the Python package jsonschema is not installed, so answers are only checked to be one JSON object (python -m pip install "jsonschema>=4.23,<5")
+[strata] done: 45 tokens in 0 s (70217.1 tok/s) (stop, cancel=False)
+__________ Api.test_with_thinking_each_part_is_spelled_by_its_tokens ___________
+
+self = <serve.test_logprobs.Api testMethod=test_with_thinking_each_part_is_spelled_by_its_tokens>
+
+    def test_with_thinking_each_part_is_spelled_by_its_tokens(self):
+        tok = ThinkTokenizer()
+        svc = Service(LpEngine(tok, "Two times three.</think>\n\nSix."), tok,
+                      TEMPLATE)
+        httpd = serve(svc, port=0)
+        try:
+            self.base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            for stream in (False, True):
+                out = self.post({"logprobs": True, "chat_template_kwargs": {"enable_thinking": True}},
+                                 stream)
+                chunks = out if stream else [{"choices": [{"delta": out["choices"][0]["message"],
+                                                           "logprobs": out["choices"][0]["logprobs"]}]}]
+                for key in ("content", "reasoning_content"):
+                    text = "".join(c["choices"][0]["delta"].get(key) or "" for c in chunks if c.get("choices"))
+                    toks = "".join(e["token"] for c in chunks if c.get("choices")
+                                   for e in (c["choices"][0].get("logprobs") or {}).get(key, []))
+                    self.assertTrue(text)
+>                   self.assertEqual(toks, text, (key, stream))
+E                   AssertionError: 'TSix.' != 'Six.'
+E                   - TSix.
+E                   ? -
+E                   + Six.
+E                    : ('content', False)
+
+serve/test_logprobs.py:206: AssertionError
+----------------------------- Captured stdout call -----------------------------
+[strata] done: 24 tokens in 0 s (61870.5 tok/s) (stop, cancel=False)
+=========================== short test summary info ============================
+FAILED serve/test_logprobs.py::Api::test_json_schema_answer_as_written_with_its_logprobs
+FAILED serve/test_logprobs.py::Api::test_with_thinking_each_part_is_spelled_by_its_tokens
+2 failed, 151 passed, 1 skipped, 25 subtests passed in 107.11s (0:01:47)
+PY_EXIT=1

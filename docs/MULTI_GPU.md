@@ -438,7 +438,8 @@ most. `--pipeline-windows 1` overlaps only the short prompt reads that go throug
 Two or more cards, `--serve`. With three or more stages every stage but the last is a front stage: the guessed
 window follows the verified one through them one card behind (each front stage keeps its own pair of recurrent-state
 copies and puts its state back on a wrong guess), and only the last stage waits for the verdict. `--pipeline-windows 1`
-and the asynchronous tier stay two-stage. In the config:
+and the asynchronous tier stay two-stage. A main process with a layer split on another PC (`--remote-stage`) takes
+it on one card: [REMOTE_STAGE.md](REMOTE_STAGE.md#overlapping-the-decode-windows---pipeline-windows-2). In the config:
 
 ```
 "args": [ ..., "--pipeline-windows", "2" ],
@@ -570,3 +571,14 @@ stops (longest gap 0.07 s). The second request's first token comes after those 4
 Where it does not help: unsloth Q4_K_XL on the same cards. A `--layer-split` already spends both cards' memory
 bandwidth on one conversation (95 t/s); the pair gives 87-88 t/s for two together (and 75-79 for one on the peer pair).
 Its dense weights and head (~2.9 GB) are read per verify window per engine, so two engines read them twice.
+## Cards in different PCs (remote stage, experimental)
+
+The later layers can also run on cards in **other PCs**, over the network (opt-in, Linux and Windows, the
+Qwen3.8-Flash-Next family): `--layer-split K --split-device 0 --remote-stage HOST:PORT` here, `strata --serve
+--stage-worker PORT --stage-begin K` there, and relay workers for a third PC. Each PC loads and caches only its own
+layers. On an RTX 3080 + an RTX 2080 Ti in two PCs on 1 GbE (RVN IQ3_S, 128K context), decode ran at 45-55 tok/s
+against 37-40 on the 3080 alone, and 100K-token prompts read at 1,374-1,633 tok/s against 1,120 with 5888-8192-token
+chunks (slower than one card for 8K prompts). With UD-Q4_K_XL, which one 10 GB card caches poorly, two PCs decoded at
+34-39 tok/s against 21-27 and read 100K prompts 3.6x faster; a third PC (an RTX 3070 under Windows) added prompt speed
+at 64K and up. A worker GPU under Windows needs its clocks locked. How to run it, the tools and the limits:
+[REMOTE_STAGE.md](REMOTE_STAGE.md).
