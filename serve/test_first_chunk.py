@@ -28,7 +28,7 @@ class FakeSvc:
     def model_for(self, req):
         return "m"
 
-    def run(self, ids, thinking, tools, max_new, req, cancel, force=None):
+    def run(self, ids, thinking, tools, max_new, req, cancel, force=None, declared_only=False):
         for item in self.items:
             if item == "prompt-read":
                 self.read = True
