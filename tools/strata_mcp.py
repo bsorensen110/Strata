@@ -22,6 +22,7 @@ This file is an MCP *server* for the AI assistant you already use.
 from __future__ import annotations
 
 import argparse
+import http.client
 import importlib.util
 import json
 import os
@@ -399,7 +400,10 @@ def http_json(url: str, method="GET", body=None, api_key=None, timeout=3.0):
             status = r.status
     except urllib.error.HTTPError as e:
         raw, status = e.read(), e.code
-    except (OSError, ValueError):
+    # `HTTPException` (#probe): a port that answers with something that is not HTTP - on Windows a loopback
+    # self-connect (the client's own ephemeral port is the port being probed) hands the request straight back, so
+    # `http.client` reads it as a status line.  Probing must not throw: 0, nothing answers.
+    except (OSError, ValueError, http.client.HTTPException):
         return 0, None
     try:
         return status, json.loads(raw or b"null")
