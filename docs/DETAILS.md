@@ -3014,6 +3014,22 @@ tokens, the default before it became 768):
   already waited for (the issuer is joined when the chunk ends); setting and unsetting the variable beside a
   `--bench` A/B is how to check it costs nothing.
 
+- **The advisory VRAM plan (#796 part C, opt-in):** set `STRATA_ADVISORY_PLAN=1` to print, before the expert cache
+  takes what is left of the VRAM, the free figure, the draft head, the prompt path's predicted mode and cost
+  (owned buffers at the exact `Prefill::bytes_needed_owned` price beside the sizing rule's reservation, or the
+  loan the auto scan is expected to pick), and the predicted cache. It is WARNINGS ONLY: a configuration the
+  arithmetic cannot confirm (a short card, an over-large `--expert-cache`, a chunk no cache can lend) is one
+  `warning:` line with the knobs that make room, and the engine starts anyway - the sizing branches, the loan
+  scan and the existing error paths stay the only authorities. When the runtime later resolves something else
+  than the prediction (a loan that became owned buffers, a bigger chunk), that is reported the same way.
+  `STRATA_ADVISORY_PLAN=1` opts in; unset/empty/0 leaves startup output and runtime decisions unchanged.
+  `STRATA_POSTTOUCH=1` additionally writes an explicit cache's slots before the free read (the deep WDDM check;
+  it costs the write's time at startup, so it is off by default). On Linux with an RTX 4070 Ti SUPER (16 GB),
+  IQ3_XXS and a 12,288-ID prompt file, one run with the option unset and one with it enabled both processed 12,287
+  prompt tokens, used an 8192-token chunk and 2,489 loan slots, opened 5,537 cache slots (8.98 GiB), and generated
+  token 198. The enabled run predicted those chunk, loan and cache values exactly. One run per mode is not a
+  performance comparison.
+
 The full story, with measurements, bottlenecks and what comes next: **[docs/paper/Strata-Paper.pdf](paper/Strata-Paper.pdf)**.
 
 ---
