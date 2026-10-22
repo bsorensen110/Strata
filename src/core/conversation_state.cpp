@@ -248,38 +248,7 @@ bool conversation_session_sizes(const ModelGeometry& g, const SessionState& ss, 
     return true;
 }
 
-bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const SessionState& ss,
-                                      const ModelGeometry& g, std::string& error) {
-    ConversationStateSizes z;
-    if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
-    const size_t layers = owned_qsa(ss);
-#if defined(STRATA_GPU_METAL)
-    if (c.gdn.size() != z.gdn || c.ple.size() != z.ple || c.tails.size() != layers * z.tail ||
-        c.dead.size() != layers * z.dead || !c.block_pos.empty() || !image_keys(c.imgs, c.ids.size()))
-        return fail(error, "invalid checkpoint running-state payload");
-    return true;
-#endif
-    if (c.gdn.size() != z.gdn || c.ple.size() != (ss.ple_hist ? z.ple : 0) ||
-        c.tails.size() != layers * z.tail || c.dead.size() != layers * z.dead ||
-        c.block_pos.size() != layers * z.block_pos || !image_keys(c.imgs, c.ids.size()))
-        return fail(error, "invalid checkpoint running-state payload");
-    return true;
-}
 
-#if defined(STRATA_GPU_METAL)
-}  // namespace strata::core
-namespace strata::metal_engine {
-// the running state lives in the Metal decode window (metal/src/engine/window.cpp), not in the session's buffers
-bool window_checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& error);
-bool window_checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& error);
-// the payload sizes the window saves and restores (its own geometry, not the generic CUDA session's)
-bool window_checkpoint_sizes(size_t& gdn, size_t& ple, size_t& tails, size_t& dead, size_t& block_pos);
-}  // namespace strata::metal_engine
-namespace strata::core {
-#endif
-
-// The byte sizes of a checkpoint's five running-state arrays: the one rule the validator (save side) and the read limits
-// (restore side) share. Metal: the decode window's own geometry; elsewhere the session's carve.
 static bool checkpoint_payload_sizes(const SessionState& ss, const ConversationStateSizes& z, std::array<size_t, 5>& m,
                                      std::string& error) {
     m = {z.gdn, ss.ple_hist ? z.ple : 0, owned_qsa(ss) * z.tail, owned_qsa(ss) * z.dead, owned_qsa(ss) * z.block_pos};
@@ -616,11 +585,6 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     return ConversationRestore::restored;
 }
 
-bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
-                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
-                                   const QsaState& draft, std::string& error) {
-    return conversation_snapshot_sources(meta, sources, view, ss, g, &draft, error);
-}
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error) {

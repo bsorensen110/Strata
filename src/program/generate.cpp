@@ -17292,8 +17292,6 @@ int main(int argc, char** argv) {
                             slot_ck = &c;
                         }
                 }
-            const auto parked = conversations.best(ids, req_imgs, want_cvec);
-            if (parked.tokens > std::max(resume, slot_tokens)) slot_source = -1;
             // --kv-pool-tokens: the main session reads the prompt and decodes past it (each window grows it further);
             // refused here, before anything is parked or taken out of the conversation cache. A conversation coming
             // back from a slot brings its chunks along (copy_from_slot), so that reservation waits until it has.
@@ -17382,6 +17380,7 @@ int main(int argc, char** argv) {
                              (long long) parked.tokens, parked.partial ? 1 : 0,
                              (long long) parked.checkpoint_length, parked.live ? 1 : 0,
                              (long long) resume, (long long) slot_tokens);
+            if (parked.tokens > std::max(resume, slot_tokens)) slot_source = -1;   // the parked conversation beats the slots
             std::optional<strata::core::SavedConversation> incoming;
             // A disk entry: the payload is a session file.  It is read while the entry is still in the cache; the
             // entry leaves with remove_at the moment the read worked (the park below may evict or reindex entries,
@@ -17613,6 +17612,7 @@ int main(int argc, char** argv) {
                 } else {
                     checks.clear();   // the main session's checkpoints were of the conversation it held before
                     const bool slot_partial = bs[(size_t) slot_source].partial;   // (the branch below ends it)
+                    const bool carry_chain = kv_pool.active() && !slot_partial;   // #1614: under --kv-pool-tokens the slot's K/V is back in main, so its checkpoint chain moves with it
                     state_checks.clear();   // FW-2b: same conversation, same fate
                     // a read that gave way, the same request again (into its own slot): on with it - its segments and
                     // checkpoints as if it had not stopped
@@ -18234,7 +18234,6 @@ int main(int argc, char** argv) {
             // (MtpDrafter::prefill skips the cells before n - window - 64); 128 more for the groups' alignment
             if (remote_main)
                 sp.set_remote_rows_from(!use_mtp ? INT64_MAX : o.mtp_window > 0 ? n - o.mtp_window - 128 : 0);
-            const int64_t read_from = reread_to > 0 ? 0 : resume;
             // STRATA_MTP_ROOM_MIN: opened here, once the reused prefix is known - the threshold counts the tokens this
             // request reads (an agent turn on a long conversation reads a few hundred and gains nothing from the room).
             // Before `lend()` below, so a relayout re-carves with the room (its slots are the drafter's own bytes).
@@ -20907,7 +20906,7 @@ int main(int argc, char** argv) {
                     // main session cannot offer any more.  Without the pool the main session keeps its copy and parks it.
                     const ConvCheckpoint* best = nullptr;
                     size_t best_at = 0;   // its place in `checks` (STRATA_SLOT_CKPT_MOVE)
-                    bool best_lent = false, move_best = false;
+                    bool best_lent = false, move_best = false, moved = false;   // #1614: the trace line below reports whether the chain moved
                     const auto tc3 = Clock::now();
                     if (kv_pool.active()) {   // the chain moves whole; the checkpoint move/copy below is the no-pool path
                         if (!sl.img) strata::core::conversation_checkpoints_carry(checks, live, sl.checks);
@@ -20933,7 +20932,7 @@ int main(int argc, char** argv) {
                         move_best = !slot_multi && slot_ckpt_move_env() && best != nullptr && !best_lent && !sl.img &&
                                     !best->pinned && ((turn_at > 0 && (int64_t) best->ids.size() == turn_at) ||
                                      (int64_t) best->ids.size() == moved_in);
-                        bool moved = move_best;
+                        moved = move_best;
                         if (move_best) {
                             sl.checks.push_back(std::move(checks[best_at]));
                             checks.erase(checks.begin() + (std::ptrdiff_t) best_at);

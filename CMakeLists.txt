@@ -812,9 +812,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # C++ runtime sit beside the exe (tools/hip/package_windows.py) and stay normal imports.
     target_link_libraries(strata PRIVATE delayimp)
     target_link_options(strata PRIVATE "LINKER:/DELAYLOAD:hipblas.dll" "LINKER:/DELAYLOAD:libhipblaslt.dll" "LINKER:/DELAYLOAD:rocblas.dll")
+  endif()
   if(WIN32)
     target_link_libraries(strata PRIVATE ws2_32)   # the remote stage's sockets (src/net/stage_link.cpp)
-  endif()
   endif()
   # 2026-10-12 splice hotfix round 2: generate.cpp is a G++ (host) TU even in a CUDA build, so
   # the __CUDACC__ per-TU trigger in kv_splice_transport.hpp never fires for it.  Mark the
