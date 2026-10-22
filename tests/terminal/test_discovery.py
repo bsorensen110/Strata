@@ -79,9 +79,13 @@ class GuiLayout(unittest.TestCase):
         p = mock.patch.object(models, "ROOT", self.terminal)
         p.start()
         self.addCleanup(p.stop)
-        # the launch screens look "here" in the folder they run from, this checkout, which may hold the developer's own run configs
-        real_places = discovery.places
-        p = mock.patch.object(discovery, "places", lambda *, here=None, **kw: real_places(here=self.terminal, **kw))
+        # the Catalog finds its own folder from the package file, not models.ROOT: make it this fake Terminal folder
+        # too, so a real checkout with its own run configs cannot become a "here" install under the test.
+        real = Path(models.__file__).resolve().parents[1]
+        shutil.copy(real / "setup.py", self.terminal)
+        (self.terminal / "tools").mkdir()
+        shutil.copy(real / "tools" / "strata_mcp.py", self.terminal / "tools")
+        p = mock.patch("strata_cli.launch.catalog.installer_folder", return_value=self.terminal)
         p.start()
         self.addCleanup(p.stop)
         self.install = discovery.app_install_dir()
