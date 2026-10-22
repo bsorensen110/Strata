@@ -7,12 +7,14 @@
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>   // [SFX-DBG] probe: fprintf in best_with_partial's candidate scan
 #include <deque>
 #include <filesystem>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 #include <vector>
