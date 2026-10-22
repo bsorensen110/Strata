@@ -84,6 +84,8 @@ public:
     /// Target-independent check that the parsed geometry is one this runtime implements.
     /// The canonical fast path is the published PixelML Flash-Next drafter geometry.
     static bool validate_supported(const DFlashGeometry& g, std::string& err);
+    /// Recognize the published Qwen3.8 DFlash2 geometry when a third-party GGUF omits its HC-mean tag.
+    static bool infer_target_hc_mean(const DFlashGeometry& g);
 
     bool loaded() const { return file_ != nullptr; }
     const std::string& path() const { return path_; }
@@ -157,6 +159,12 @@ public:
     /// Native-protocol diagnostic A/B; independent graphs keep switching from
     /// charging either mode for the other's graph capture. No effect on plain DFlash.
     void set_reference_mode(bool on) { reference_mode_ = on; }
+    /// Configure optional sampled draft proposals (STRATA_DFLASH_SPEC_PROB=1): when enabled,
+    /// the selector samples each proposal row from its top-k distribution q using Philox(seed, pos|1<<61)
+    /// and exports q (kSpecQStride int32s/row) for exact Leviathan rejection sampling in Verifier.
+    void set_draft_sampling(uint64_t seed, bool prob_on) { sample_seed_ = seed; prob_on_ = prob_on; }
+    bool prob() const { return prob_on_; }
+    const int32_t* spec_q() const { return h_out_ ? h_out_ + 2 * max_rows_ : nullptr; }
     /// Frees every resource this drafter holds (device buffers, the five K/V states' arenas and
     /// their pinned staging, the stream) and unbinds the device state. The parsed artifact is retained
     /// for a later upload or load. Safe on a partially-uploaded
@@ -192,11 +200,13 @@ public:
     }
     /// The mask token id this drafter proposes with (metadata, or the CLI override set at upload).
     int64_t mask_token() const { return mask_; }
+    /// End position (pos0 + rows) of the most recent committed context batch, or -1 before any commit.
+    int64_t last_committed_end() const { return last_committed_end_; }
 
 private:
     /// ctx = hidden_norm(fc(tapin_)) for `rows` rows already staged in `tapin_` ([rows][F] bf16),
     /// then each draft layer's context K/V appended at [pos0, pos0+rows).
-    bool fusion_rows(int64_t pos0, int rows, std::string& err);
+    bool fusion_rows(int64_t pos0, int rows, std::string& err, bool build_pos = true);
 
     void project(const uint16_t* x, const uint16_t* w, float* y, int ni, int no, int rows, void* stream, bool prepared = false);
     void prepare_projection(const uint16_t* x, int ni, int rows, void* stream);
@@ -216,8 +226,13 @@ private:
     cudaStream_t cs_ = nullptr;
     std::array<cudaGraphExec_t, 18> graph_exec_{};
     std::array<int64_t, 18> graph_chunks_{}, graph_cap_{};
+    std::array<cudaGraphExec_t, 9> ctx_graph_exec_{};
+    std::array<const float*, 9> ctx_graph_taps_{};
+    std::array<int64_t, 9> ctx_graph_stride_{};
     bool graph_prob_ = false;
     bool reference_mode_ = false;
+    bool prob_on_ = false;
+    uint64_t sample_seed_ = 0;
     void clear_graphs();
 
     // the target's shared modules
@@ -231,6 +246,8 @@ private:
     uint16_t* w_ = nullptr;
     std::vector<std::pair<std::string, const uint16_t*>> wt_;   ///< canonical name -> device pointer
     std::vector<std::pair<std::string, const float*>> wf_;      ///< canonical name -> device f32 (norms)
+    // Q4_K_M codebooks are expanded to BF16 for the selector kernel; backbone matrices stay packed.
+    uint16_t *selector_predecessor_bf16_ = nullptr, *selector_successor_bf16_ = nullptr;
 
     // the drafter's own K/V: ONE STATE PER DRAFT LAYER (a QsaState is one layer's pools)
     std::vector<QsaState> st_;
@@ -266,6 +283,7 @@ private:
     uint64_t scratch_bytes(int64_t cells) const;
     int64_t max_rows_ = 0;
     int64_t cycle_ = 0;              ///< proposes so far (the parity fixture's cycle selector)
+    int64_t last_committed_end_ = -1;
     char parity_dir_[512] = {};      ///< STRATA_DF_PARITY: the stage-dump directory (empty: off)
 };
 

@@ -52,6 +52,30 @@ void convolve() {
                 near(got[row * hidden + c], expected);
             }
         }
+        // Fused side-0 (direct BF16 output) and side-1 (direct residual accumulation, no D2D copy).
+        Device<uint16_t> out16(x.size());
+        dflash2_convolve_fused(dx.p, dd.p, db.p, nullptr, out16.p, nullptr, rows, hidden, taps, group, 0, width, nullptr);
+        checked(cudaGetLastError());
+        dflash2_convolve(dx.p, dd.p, db.p, result.p, rows, hidden, taps, group, 0, width, nullptr);
+        const auto ref0 = result.read(x.size());
+        const auto got16 = out16.read(x.size());
+        for (size_t i = 0; i < x.size(); ++i) {
+            uint32_t u;
+            std::memcpy(&u, &ref0[i], 4);
+            const uint16_t want16 = (uint16_t)((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+            if (got16[i] != want16) throw std::runtime_error("fused conv side-0 BF16 output differs");
+        }
+        std::vector<float> init_res(x.size(), 1.25f);
+        Device<float> dres(init_res);
+        dflash2_convolve_fused(dx.p, dd.p, db.p, nullptr, nullptr, dres.p, rows, hidden, taps, group, 1, width, nullptr);
+        checked(cudaGetLastError());
+        dflash2_convolve(dx.p, dd.p, db.p, result.p, rows, hidden, taps, group, 1, width, nullptr);
+        const auto ref1 = result.read(x.size());
+        const auto got_res = dres.read(x.size());
+        for (size_t i = 0; i < x.size(); ++i) {
+            if (got_res[i] != init_res[i] + ref1[i])
+                throw std::runtime_error("fused conv side-1 residual accumulation differs");
+        }
     }
 }
 void selector(bool timing) {
@@ -159,6 +183,45 @@ void selector(bool timing) {
         for (auto id : output.read(rows - 1)) if (id != -1) throw std::runtime_error("nonfinite selector produced a token");
     }
     if (!reranked) throw std::runtime_error("fixture did not exercise selector reranking");
+    // Beam selector (B=2..4) and q-list export / Philox sampling tests.
+    {
+        // Construct a 3-row (2 proposal) problem where candidate 0 at row 1 has slightly higher
+        // unary score (0.2 vs 0.0), but candidate 1 at row 1 unlocks a much stronger transition
+        // at row 2 (+4.0 vs -4.0). Greedy (B=1) picks candidate 0 at row 1; beam (B=2) picks candidate 1.
+        const int rows = 3, top_k = 2, rank = 1;
+        const std::vector<int32_t> h_ids = {0, 1,  1, 2,  3, 4};
+        const std::vector<float> h_unary = {0.0f, 0.0f,  0.2f, 0.0f,  0.0f, 0.0f};
+        const std::vector<float> h_hidden = {1.0f, 1.0f, 1.0f};
+        // Tokens: 0=anchor, 1=greedy row1, 2=beam row1, 3=good row2, 4=alt row2
+        // prev[1] = -2.0, prev[2] = +2.0; next[3] = +2.0, next[4] = -2.0
+        std::vector<uint16_t> p16(5, 0x3f80), n16(5, 0x3f80);
+        auto to_bf16 = [](float f) {
+            uint32_t u; std::memcpy(&u, &f, 4);
+            return (uint16_t)((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+        };
+        p16[0] = to_bf16(0.0f); p16[1] = to_bf16(0.0f); p16[2] = to_bf16(2.0f);
+        n16[1] = to_bf16(0.0f); n16[2] = to_bf16(0.0f);
+        n16[3] = to_bf16(2.0f); n16[4] = to_bf16(-2.0f);
+        Device<int32_t> dids(h_ids), danchor(std::vector<int32_t>{0}), dout(2), dq(2 * 128);
+        Device<float> dunary(h_unary), dhidden(h_hidden), dconf(2);
+        Device<uint16_t> dp16(p16), dn16(n16);
+        dflash2_select_bf16_ex(dids.p, dunary.p, dhidden.p, dp16.p, dn16.p, danchor.p,
+                               dout.p, dconf.p, dq.p, rows, top_k, rank, 1, 0, -1, nullptr, false);
+        const auto greedy_picks = dout.read(2);
+        if (greedy_picks[0] != 1) throw std::runtime_error("beam=1 did not match greedy row-1 pick");
+        const auto q_host = dq.read(2 * 128);
+        if (q_host[0] != 1 || q_host[1] != 2 || q_host[2] != -1)
+            throw std::runtime_error("selector q-list candidate IDs malformed");
+        float q0, q1;
+        std::memcpy(&q0, &q_host[64], 4);
+        std::memcpy(&q1, &q_host[65], 4);
+        near(q0 + q1, 1.0);
+        dflash2_select_bf16_ex(dids.p, dunary.p, dhidden.p, dp16.p, dn16.p, danchor.p,
+                               dout.p, dconf.p, nullptr, rows, top_k, rank, 2, 0, -1, nullptr, false);
+        const auto beam_picks = dout.read(2);
+        if (beam_picks[0] != 2 || beam_picks[1] != 3)
+            throw std::runtime_error("beam=2 did not find higher joint log-probability path");
+    }
 }
 void target_features_and_attention() {
     using namespace strata::kernels;

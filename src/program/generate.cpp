@@ -3945,7 +3945,11 @@ int main(int argc, char** argv) {
         } else (void) cudaGetLastError();
     }
 #endif
-    if (!o.dflash.empty() && o.mtp.empty() && !o.serve && !o.greedy && o.temperature > 0.0f) {
+    static const bool dflash_sampled_fallback = [] {
+        const char* e = std::getenv("STRATA_DFLASH_SAMPLED_FALLBACK");
+        return e && e[0] == '1';
+    }();
+    if (dflash_sampled_fallback && !o.dflash.empty() && o.mtp.empty() && !o.serve && !o.greedy && o.temperature > 0.0f) {
         std::fprintf(stderr, "dflash: sampled CLI requests use target-only decoding\n");
         o.dflash.clear();
         o.dflash_head.clear();
@@ -16787,7 +16791,7 @@ int main(int argc, char** argv) {
             std::vector<uint64_t> req_img_keys;
             bool req_pcie_set = false;   // the request names its own share (the measured one holds meanwhile)
             int req_dflash_k = dflash_k;
-            bool req_dflash_block_set = false, bad_dflash_block = false, bad_tune = false;
+            bool req_dflash_block_set = false, req_dflash_auto = false, bad_dflash_block = false, bad_tune = false;
             bool req_df2_reference = false, bad_df2_reference = false;
 
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
@@ -16870,6 +16874,9 @@ int main(int argc, char** argv) {
                         req_dflash_block_set = true;
 
                     }
+                    else if (key == "dflash_auto") {
+                        req_dflash_auto = std::atoi(tok.c_str() + eq + 1) != 0;
+                    }
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
@@ -16916,10 +16923,10 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
-            // Speculative target windows failed the seeded-output parity gate.
-            // Keep sampling target-only while that discrepancy is investigated.
-            // Still maintain draft context for a later greedy continuation.
-            const bool req_dflash = has_dflash && req_temperature <= 0.0f;
+            // DFlash proposes point masses (argmax tokens). The verifier samples the target with
+            // this request's chain and position-keyed RNG; exact-match acceptance is valid at any
+            // temperature. Set STRATA_DFLASH_SAMPLED_FALLBACK=1 to force target-only parity mode.
+            const bool req_dflash = has_dflash && (!dflash_sampled_fallback || req_temperature <= 0.0f);
             if (has_dflash) dflash.set_reference_mode(req_df2_reference);
             df_request = has_dflash;
             if (has_dflash && !req_dflash)
@@ -19443,6 +19450,17 @@ int main(int argc, char** argv) {
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+            static const bool df_spec_prob = [] {
+                const char* v = std::getenv("STRATA_DFLASH_SPEC_PROB");
+                return v && v[0] == '1';
+            }();
+            if (has_dflash) {
+                const bool df_prob_on = req_dflash && df_spec_prob && !req_sp.greedy &&
+                                        req_sp.temperature > 0.0f &&
+                                        req_sp.temperature >= strata::core::spec_min_temp() &&
+                                        dflash.artifact().geom().is_dflash2();
+                dflash.set_draft_sampling(req_sp.seed, df_prob_on);
+            }
             const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick();
             if (gated_proposal && (o.pipeline_windows >= 2 || o.batch != 0 || n_stages != 1 ||
                 multi_gpu || drive.d.remote_count != 0 || o.lookup_chain != 0 || o.adapt_swaps != 0 ||
@@ -19774,9 +19792,25 @@ int main(int argc, char** argv) {
             strata::core::gated::Packet proposal; // immutable through the synchronous verifier call
             bool first_window = true;
             bool dflash_ready = false;
-            const bool df_auto = req_dflash && o.dflash_block == 0 && !req_dflash_block_set && req_spec_min_p <= 0.0;
+            static const bool df_no_auto_gate = std::getenv("STRATA_DFLASH_NO_AUTO_GATE") != nullptr;
+            static const bool df_conf_adapt = std::getenv("STRATA_DFLASH_CONF_ADAPT") != nullptr;
+            static const float df_depth_slope = std::getenv("STRATA_DFLASH_DEPTH_SLOPE")
+                ? std::strtof(std::getenv("STRATA_DFLASH_DEPTH_SLOPE"), nullptr) : 0.0f;
+            static const float df_min_cum_p = std::getenv("STRATA_DFLASH_MIN_CUM_P")
+                ? std::strtof(std::getenv("STRATA_DFLASH_MIN_CUM_P"), nullptr) : 0.0f;
+            const bool df_auto = req_dflash && (req_dflash_auto || (o.dflash_block == 0 && !req_dflash_block_set)) &&
+                                 (!df_no_auto_gate || req_spec_min_p <= 0.0);
             df_policy.reset();
+            strata::spec::DFlashConfidencePolicy df_conf_policy(
+                has_dflash ? std::min(o.spec - 1, dflash.max_block()) : 1,
+                req_dflash_k > 0 ? req_dflash_k : 3);
+            strata::spec::DFlashTelemetry df_tel;
+            const char* srv_df_trace_path = req_dflash ? std::getenv("STRATA_DF_CYCLES") : nullptr;
+            const auto close_srv_trace = [](FILE* f) { if (f) std::fclose(f); };
+            std::unique_ptr<FILE, decltype(close_srv_trace)> srv_df_trace(
+                srv_df_trace_path ? std::fopen(srv_df_trace_path, "a") : nullptr, close_srv_trace);
             int df_pending_k = 0;
+            int df_proposed_k = 0;
             double df_pending_ms = 0;
             int64_t df_windows[8] = {};
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
@@ -20724,6 +20758,7 @@ int main(int argc, char** argv) {
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
                 else if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                else if (req_dflash && dflash.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(dflash.spec_q(), T_mtp - 1);
                 const auto decode_pool_fn = use_mtp && mtp.prob()
                     ? invariant_win_pool_fn : win_pool_fn;
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
@@ -20763,8 +20798,23 @@ int main(int argc, char** argv) {
                 }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
-                if (!from_sfx && !first_window)
+                if (!from_sfx && !first_window) {
                     for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
+                    if (req_dflash) df_tel.record_window(T_mtp - 1, std::min(a, T_mtp - 1));
+                }
+                if (srv_df_trace && !merged) {
+                    std::fprintf(srv_df_trace.get(),
+                                 "{\"anchor_pos\":%lld,\"proposed_K\":%d,\"K\":%d,\"L\":%d,\"bootstrap\":%s,\"correction\":%d,\"emitted\":%lld,\"draft\":[",
+                                 (long long) p, df_proposed_k, T - 1, a, first_window ? "true" : "false", outv[(size_t) a],
+                                 (long long) std::min<int64_t>(a + 1, max_new - produced_n));
+                    for (int i = 1; i < T; ++i) std::fprintf(srv_df_trace.get(), "%s%d", i > 1 ? "," : "", window[(size_t) i]);
+                    std::fprintf(srv_df_trace.get(), "],\"target\":[");
+                    for (int i = 0; i < T; ++i) std::fprintf(srv_df_trace.get(), "%s%d", i ? "," : "", outv[(size_t) i]);
+                    std::fprintf(srv_df_trace.get(), "],\"dprob\":[");
+                    for (int i = 1; i < T; ++i) std::fprintf(srv_df_trace.get(), "%s%.6f", i > 1 ? "," : "", dprob[(size_t) i - 1]);
+                    std::fprintf(srv_df_trace.get(), "]}\n");
+                    std::fflush(srv_df_trace.get());
+                }
                 if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
@@ -20854,31 +20904,39 @@ int main(int argc, char** argv) {
                     if (adapt_thr.joinable()) adapt_thr.join();
                     // The next proposal waits on this same stream. Keep an explicit wait when
                     // there is no proposal or the ungated policy needs the completed context time.
+                    const int max_fit_k = df_conf_adapt ? df_conf_policy.choose() : df_auto ? dflash_k : req_dflash_k;
                     const bool sync_context = !req_dflash || df_auto || eos || produced_n >= max_new || !strata::spec::dflash_proposal_fits(
-                        p + a + 1, req_dflash_k, dflash.artifact().geom().is_dflash2(),
+                        p + a + 1, std::max(1, max_fit_k), dflash.artifact().geom().is_dflash2(),
                         o.max_context, dflash.capacity());
                     drafted = dflash.add_context_f32(ver.taps(), ver.n_taps(), ver.tap_stride(), p, a + 1, err,
                                                     sync_context);
                     const auto ctx_done = Clock::now();
                     if (df_auto && rounds > 1 && !from_sfx) {
                         const double ms = std::chrono::duration<double, std::milli>(ctx_done - tw0).count();
-                        df_policy.observe(T - 1, a + 1, ms + df_pending_ms);
+                        df_policy.observe(df_proposed_k, a + 1, ms + df_pending_ms);
                     }
                     ++df_windows[T - 1];
-                    df_pending_k = df_auto ? df_policy.choose() : req_dflash_k;
+                    df_pending_k = df_conf_adapt ? df_conf_policy.choose() : df_auto ? df_policy.choose() : req_dflash_k;
                     // Finish near the context limit with target-only windows rather than
                     // proposing a block which the next verification window cannot fit.
                     dflash_ready = req_dflash && drafted && !eos && produced_n < max_new && df_pending_k > 0 &&
                                    strata::spec::dflash_proposal_fits(p + a + 1, df_pending_k,
                                        dflash.artifact().geom().is_dflash2(), o.max_context, dflash.capacity());
                     const bool proposed = dflash_ready;
+                    df_proposed_k = proposed ? df_pending_k : 0;
+                    const bool want_dprob = req_spec_min_p > 0 || df_depth_slope > 0.0f || df_min_cum_p > 0.0f ||
+                                            df_conf_adapt || srv_df_trace != nullptr;
                     if (dflash_ready)
                         drafted = dflash.propose(outv[(size_t) a], p + a + 1, df_pending_k, drafts.data(), err,
-                                                 req_spec_min_p > 0 ? dprob.data() : nullptr);
-                    if (dflash_ready && drafted && req_spec_min_p > 0) {
-                        const float min_p = (float) req_spec_min_p;
-                        int prefix = 0;
-                        while (prefix < df_pending_k && dprob[(size_t) prefix] >= min_p) ++prefix;
+                                                 want_dprob ? dprob.data() : nullptr);
+                    if (dflash_ready && drafted) {
+                        int prefix = df_pending_k;
+                        if (req_spec_min_p > 0 || df_depth_slope > 0.0f || df_min_cum_p > 0.0f) {
+                            prefix = strata::spec::dflash_truncate_prefix(
+                                dprob.data(), df_pending_k, (float) req_spec_min_p, df_depth_slope, df_min_cum_p);
+                        }
+                        df_tel.record_proposal(df_pending_k, prefix);
+                        if (df_conf_adapt) df_conf_policy.observe(df_pending_k, prefix, dprob.data());
                         df_pending_k = prefix;
                         dflash_ready = prefix > 0;
                     }
@@ -20928,6 +20986,18 @@ int main(int argc, char** argv) {
                 for (int k = 0; k <= dflash_k; ++k)
                     if (df_windows[k] > 0) std::fprintf(stderr, " %d:%lld", k, (long long) df_windows[k]);
                 std::fprintf(stderr, "\n");
+            }
+            if (req_dflash && (df_auto || df_conf_adapt || std::getenv("STRATA_DF_TELEMETRY") != nullptr)) {
+                std::fprintf(stderr, "dflash: telemetry (K:accepted/windows):");
+                for (int k = 0; k <= 7; ++k)
+                    if (df_tel.windows_by_k[(size_t) k] > 0)
+                        std::fprintf(stderr, " %d:%lld/%lld", k,
+                                     (long long) df_tel.accepted_by_k[(size_t) k],
+                                     (long long) df_tel.windows_by_k[(size_t) k]);
+                std::fprintf(stderr, " proposed=%lld gate_truncated=%lld target_only=%lld\n",
+                             (long long) df_tel.proposed_rows,
+                             (long long) df_tel.gate_truncated_rows,
+                             (long long) df_tel.target_only_rounds);
             }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
@@ -21456,11 +21526,16 @@ int main(int argc, char** argv) {
             if (o.lookup_chain > 0)
                 std::fprintf(stderr, "strata serve: lookup chain: %lld of %lld windows, %lld of %lld chained drafts accepted\n",
                              (long long) chain_windows, (long long) dec_windows, (long long) chain_ok, (long long) chain_drafts);
-            if (std::getenv("STRATA_SPEC_DEPTH") != nullptr)
-                std::fprintf(stderr, "strata serve: spec depth: accepted/tested %lld/%lld %lld/%lld %lld/%lld %lld/%lld %lld/%lld\n",
+            if (std::getenv("STRATA_SPEC_DEPTH") != nullptr) {
+                std::fprintf(stderr, "strata serve: spec depth: accepted/tested %lld/%lld %lld/%lld %lld/%lld %lld/%lld %lld/%lld",
                              (long long) dp_ok[0], (long long) dp_tested[0], (long long) dp_ok[1], (long long) dp_tested[1],
                              (long long) dp_ok[2], (long long) dp_tested[2], (long long) dp_ok[3], (long long) dp_tested[3],
                              (long long) dp_ok[4], (long long) dp_tested[4]);
+                if (has_dflash || dp_tested[5] > 0 || dp_tested[6] > 0)
+                    std::fprintf(stderr, " %lld/%lld %lld/%lld",
+                                 (long long) dp_ok[5], (long long) dp_tested[5], (long long) dp_ok[6], (long long) dp_tested[6]);
+                std::fprintf(stderr, "\n");
+            }
             if (strata::core::MtpDrafter::top2_env())
                 std::fprintf(stderr, "strata serve: mtp top2: rejected/runner-up by depth %lld/%lld %lld/%lld %lld/%lld %lld/%lld "
                                      "of %lld windows\n", (long long) t2_rej[0], (long long) t2_hit[0], (long long) t2_rej[1],
@@ -22024,6 +22099,13 @@ int main(int argc, char** argv) {
         mem_mark("the verifier and the drafter's binding");
         ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
         if (use_mtp) mtp.set_draft_sampling(sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
+        if (use_dflash) {
+            const char* df_sp = std::getenv("STRATA_DFLASH_SPEC_PROB");
+            const bool df_prob_on = df_sp && df_sp[0] == '1' && !sp.greedy && sp.temperature > 0.0f &&
+                                    sp.temperature >= strata::core::spec_min_temp() &&
+                                    dflash.artifact().geom().is_dflash2();
+            dflash.set_draft_sampling(sp.seed, df_prob_on);
+        }
         const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick();
         if (gated_proposal && (o.pipeline_windows >= 2 || o.batch != 0 || multi_gpu ||
             drive.d.remote_count != 0 || o.lookup_chain != 0 || o.adapt_swaps != 0 ||
@@ -22377,10 +22459,17 @@ int main(int argc, char** argv) {
                 T = proposal.T; from_sfx = proposal.from_sfx;
             } else {
                 T = use_dflash ? (dflash_ready ? dflash_k + 1 : 1) : S_mtp;
-                if ((use_mtp || use_dflash) && o.spec_min_p > 0.0) {
-                    const int max_t = use_dflash ? (dflash_ready ? dflash_k + 1 : 1) : S_mtp;
+                static const float cli_df_depth_slope = std::getenv("STRATA_DFLASH_DEPTH_SLOPE")
+                    ? std::strtof(std::getenv("STRATA_DFLASH_DEPTH_SLOPE"), nullptr) : 0.0f;
+                static const float cli_df_min_cum_p = std::getenv("STRATA_DFLASH_MIN_CUM_P")
+                    ? std::strtof(std::getenv("STRATA_DFLASH_MIN_CUM_P"), nullptr) : 0.0f;
+                if (use_mtp && o.spec_min_p > 0.0) {
+                    const int max_t = S_mtp;
                     T = 1;
                     while (T < max_t && dprob[(size_t) T - 1] >= (float) o.spec_min_p) ++T;
+                } else if (use_dflash && dflash_ready && (o.spec_min_p > 0.0 || cli_df_depth_slope > 0.0f || cli_df_min_cum_p > 0.0f)) {
+                    T = 1 + strata::spec::dflash_truncate_prefix(
+                        dprob.data(), dflash_k, (float) o.spec_min_p, cli_df_depth_slope, cli_df_min_cum_p);
                 }
                 if (first_window) T = 1;
                 if (o.suffix_draft > 0 && !first_window) {
@@ -22473,6 +22562,7 @@ int main(int argc, char** argv) {
             }
             if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
             else if (use_mtp && mtp.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            else if (use_dflash && dflash.prob() && !from_sfx && T_mtp > 1 && o.spec_corrupt <= 0) ver.set_spec_q(dflash.spec_q(), T_mtp - 1);
             const auto decode_pool_fn = use_mtp && mtp.prob() ? &drive_pool_multi_invariant : &drive_pool_multi;
             if (!ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -22523,6 +22613,8 @@ int main(int argc, char** argv) {
                 for (int i = 1; i < T; ++i) std::fprintf(df_trace.get(), "%s%d", i > 1 ? "," : "", window[(size_t) i]);
                 std::fprintf(df_trace.get(), "],\"target\":[");
                 for (int i = 0; i < T; ++i) std::fprintf(df_trace.get(), "%s%d", i ? "," : "", outv[(size_t) i]);
+                std::fprintf(df_trace.get(), "],\"dprob\":[");
+                for (int i = 1; i < T; ++i) std::fprintf(df_trace.get(), "%s%.6f", i > 1 ? "," : "", dprob[(size_t) i - 1]);
                 std::fprintf(df_trace.get(), "]}\n");
             }
             if (use_dflash && std::getenv("STRATA_DF_DBG") != nullptr) {
@@ -22599,10 +22691,13 @@ int main(int argc, char** argv) {
                     const Clock::time_point td = Clock::now();
                     dflash_ready = strata::spec::dflash_proposal_fits(p, dflash_k,
                         dflash.artifact().geom().is_dflash2(), o.max_context, dflash.capacity());
+                    const bool cli_want_dprob = o.spec_min_p > 0 || df_trace != nullptr ||
+                        std::getenv("STRATA_DFLASH_DEPTH_SLOPE") != nullptr ||
+                        std::getenv("STRATA_DFLASH_MIN_CUM_P") != nullptr;
                     const bool ok = dflash.add_context_f32(ver.taps(), ver.n_taps(), ver.tap_stride(),
                                                            p - (a + 1), a + 1, err, !dflash_ready) &&
                                     (!dflash_ready || (drafted = dflash.propose(x, p, dflash_k, drafts.data(), err,
-                                                                o.spec_min_p > 0 ? dprob.data() : nullptr)));
+                                                                cli_want_dprob ? dprob.data() : nullptr)));
                     if (ok && dflash_ready && std::getenv("STRATA_DF_DBG") != nullptr) {
                         std::fprintf(stderr, "df dbg: anchor=%d at %lld proposals:", x, (long long) p);
                         for (int i = 0; i < dflash_k; ++i) std::fprintf(stderr, " %d", drafts[(size_t) i]);

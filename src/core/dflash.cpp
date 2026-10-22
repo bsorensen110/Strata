@@ -116,10 +116,14 @@ bool DFlashArtifact::require(const char* canon, std::vector<const char*> aliases
         err += " in " + path_ + ")";
         return false;
     }
-    if (found->type != 30 && !(shape.size() == 2 && shape[0] % 32 == 0 &&
-                              (found->type == 2 || found->type == 6 || found->type == 8))) {
+    const bool f32_aux = found->type == 0 && (shape.size() == 1 || shape.size() == 3);
+    const bool q4q5q8 = shape.size() == 2 && shape[0] % 32 == 0 &&
+                        (found->type == 2 || found->type == 6 || found->type == 8);
+    const bool q4kq6k = shape.size() == 2 && shape[0] % 256 == 0 &&
+                        (found->type == 12 || found->type == 14);
+    if (found->type != 30 && !f32_aux && !q4q5q8 && !q4kq6k) {
         err = std::string("dflash: tensor '") + found->name + "' is " + found->type_name() +
-              "; expected BF16 norms and BF16, Q8_0, Q5_0 or Q4_0 matrices";
+              "; expected BF16/F32 norms or bases, or BF16/Q4_0/Q5_0/Q8_0/Q4_K/Q6_K matrices";
         return false;
     }
     if (!shape_is(*found, shape)) {
@@ -213,7 +217,7 @@ bool DFlashArtifact::open(const std::string& path, std::string& err) {
         {&g.n_head, {"dflash.attention.head_count", "qwen3.attention.head_count"}, "attention.head_count", true},
         {&g.n_head_kv, {"dflash.attention.head_count_kv", "qwen3.attention.head_count_kv"}, "attention.head_count_kv", true},
         {&g.intermediate, {"dflash.feed_forward_length", "qwen3.feed_forward_length"}, "feed_forward_length", true},
-        {&g.vocab, {"dflash.vocab_size", "qwen3.vocab_size"}, "vocab_size", true},
+        {&g.vocab, {"dflash.vocab_size", "qwen3.vocab_size"}, "vocab_size", false},
         {&g.block_size, {"dflash.block_size"}, "block_size", true},
         {&g.head_dim, {"dflash.attention.key_length", "qwen3.attention.key_length"}, "attention.key_length", false},
         {&g.sliding_window, {"dflash.attention.sliding_window"}, "attention.sliding_window", false},
@@ -238,6 +242,20 @@ bool DFlashArtifact::open(const std::string& path, std::string& err) {
             if (n.out == &g.head_dim) g.head_dim = 0;   // derived below from hidden / n_head
         }
     }
+    if (g.vocab <= 0) {
+        if (!g.is_dflash2()) {
+            err = "dflash: missing metadata key (any of dflash.vocab_size...) in " + path_;
+            return false;
+        }
+        const TensorInfo* codebook = f.find("selector_predecessor.weight");
+        if (!codebook) codebook = f.find("candidate_selector.predecessor_codebook.weight");
+        if (!codebook || codebook->shape.size() != 2 || codebook->shape[1] == 0 ||
+            (g.selector_rank > 0 && codebook->shape[0] != (uint64_t) g.selector_rank)) {
+            err = "dflash2: missing vocab_size and cannot infer it from the predecessor codebook";
+            return false;
+        }
+        g.vocab = (int64_t) codebook->shape[1];
+    }
     if (g.head_dim <= 0) {
         if (meta(f, {"dflash.attention.key_length", "qwen3.attention.key_length"})) {
             err = "dflash: attention.key_length must be positive when present";
@@ -249,7 +267,8 @@ bool DFlashArtifact::open(const std::string& path, std::string& err) {
         }
         g.head_dim = g.hidden / g.n_head;
     }
-    const std::vector<const char*> rope_keys = {"dflash.rope.frequency_base", "qwen3.rope.frequency_base"};
+    const std::vector<const char*> rope_keys = {"dflash.rope.frequency_base", "dflash.rope.freq_base",
+                                                 "qwen3.rope.frequency_base", "qwen3.rope.freq_base"};
     if (meta(f, rope_keys) && (!meta_f64(f, rope_keys, &g.rope_theta) ||
                               !std::isfinite(g.rope_theta) || g.rope_theta <= 0.0)) {
         err = "dflash: rope.frequency_base must be a finite positive number";
@@ -376,6 +395,7 @@ bool DFlashArtifact::open(const std::string& path, std::string& err) {
             return false;
         }
         if (!meta(f, {"dflash.target_layer_inputs"})) g.target_layer_inputs = true;
+        if (!meta(f, {"dflash.target_hc_mean"})) g.target_hc_mean = infer_target_hc_mean(g);
 #endif
     } else if (g.sliding_window != 0 || g.target_hc_mean || g.selector_top_k < 0 || g.selector_rank != 0 || g.conv_kernel_size != 0 || g.conv_group_size != 0) {
         err = "dflash2: incomplete conv/selector metadata";
@@ -462,8 +482,11 @@ bool DFlashArtifact::open(const std::string& path, std::string& err) {
             if (hf != llama) aliases.push_back(hf.c_str());
             if (bare != hf && bare != llama) aliases.push_back(bare.c_str());
             if (!require(canon.c_str(), aliases, shape, &t, err)) return false;
-            if (t.type != 30) {
-                err = "dflash2: extension tensors must be BF16 in the experimental runtime: " + t.file_name;
+            const bool base = canon.ends_with(".base_kernel");
+            const bool quant_matrix = t.type == 12 || t.type == 14;
+            if (t.type != 30 && !(base && t.type == 0) &&
+                !(quant_matrix && shape.size() == 2 && shape[0] % 256 == 0)) {
+                err = "dflash2: extension tensor type is unsupported: " + t.file_name;
                 return false;
             }
             add(0);
@@ -503,6 +526,16 @@ bool DFlashArtifact::open(const std::string& path, std::string& err) {
     // every check passed: the guard keeps the parsed state
     rb.keep = true;
     return true;
+}
+
+bool DFlashArtifact::infer_target_hc_mean(const DFlashGeometry& g) {
+    static const std::vector<int32_t> input_taps{6, 16, 26, 36, 46};
+    static const std::vector<int32_t> output_taps{5, 15, 25, 35, 45};
+    const bool official_geometry = g.is_dflash2() && g.hidden == 2560 && g.layers == 5 && g.n_head == 32 &&
+        g.n_head_kv == 8 && g.head_dim == 128 && g.intermediate == 7680 && g.selector_top_k == 16 &&
+        g.selector_rank == 256 && g.conv_kernel_size == 2 && g.conv_group_size == 16 && g.sliding_window == 2048;
+    if (!official_geometry) return false;
+    return g.target_layer_inputs ? g.target_layers == input_taps : g.target_layers == output_taps;
 }
 
 bool DFlashArtifact::validate_supported(const DFlashGeometry& g, std::string& err) {
