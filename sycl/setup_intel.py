@@ -28,6 +28,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -57,9 +58,77 @@ INTEL_ARC = {"e223": ("Arc Pro B70", 32.0), "e222": ("Arc Pro B65", 32.0), "e221
 ALCHEMIST_IDS = frozenset({"56a0", "56a1", "56a2", "56a5", "56a6", "5690"})
 
 
+def intel_gpus_windows(adapters=None, registry=None):
+    adapters = S._win_display_adapters() if adapters is None else adapters
+    registry = S._win_display_registry() if registry is None else registry
+    found = []
+    used = set()
+    for ad in adapters:
+        match = re.search(r"VEN_8086&DEV_([0-9A-F]{4})", ad.get("pnp", ""), re.I)
+        if not match or match[1].lower() not in INTEL_ARC:
+            continue
+        devid = match[1].lower()
+        name, vram = INTEL_ARC[devid]
+        for i, entry in enumerate(registry):
+            if i in used or not re.search(r"VEN_8086&DEV_" + devid, entry.get("MatchingDeviceId", ""), re.I):
+                continue
+            used.add(i)
+            mem = entry.get("HardwareInformation.qwMemorySize")
+            if isinstance(mem, bytes):
+                mem = int.from_bytes(mem[:8], "little")
+            if isinstance(mem, int) and mem > 0:
+                vram = mem / 2**30
+            break
+        found.append({"index": len(found), "name": ad.get("name") or f"Intel {name}", "vram_gb": vram,
+                      "arch": "sycl", "driver": "unknown", "devid": devid})
+    return found
+
+
+def ensure_windows_engine(force=False):
+    exe, _ = sycl_engine()
+    if exe is None or force:
+        S.say("  Building the native Intel SYCL engine (Visual Studio C++, oneAPI DPC++ and oneMKL required) ...")
+        rc = subprocess.call(["cmd", "/d", "/c", str(ROOT / "sycl" / "tools" / "build_windows.bat")], cwd=ROOT)
+        if rc:
+            S.fail("the native Intel engine could not be built", "install the tools in docs/INTEL_ARC.md and rerun START-HERE.bat")
+        exe, _ = sycl_engine()
+    if exe is None:
+        S.fail("the native Intel build did not produce strata.exe", "docs/INTEL_ARC.md")
+    if not intel_gpus():
+        S.fail("the native SYCL runtime found no Intel GPU", "check the Intel GPU driver and oneAPI runtime")
+    return exe
+
+
 def intel_gpus():
     """Intel discrete GPUs from sysfs: vendor 0x8086 under the xe or i915 driver, named by PCI device id. VRAM comes
     from the id table, else from the size of the card's VRAM BAR."""
+    if S.WIN:
+        exe, why = sycl_engine()
+        if exe is None:
+            return intel_gpus_windows()
+        env = os.environ.copy()
+        env["PATH"] = os.pathsep.join(sycl_runtime_dirs() + [env.get("PATH", "")])
+        env.setdefault("ONEAPI_DEVICE_SELECTOR", "level_zero:gpu")
+        env.setdefault("ZES_ENABLE_SYSMAN", "1")
+        try:
+            result = subprocess.run([str(exe), "--list-devices"], env=env, capture_output=True, text=True, timeout=60)
+            if result.returncode:
+                S.fail(f"native SYCL GPU probe failed ({result.returncode}): {result.stderr.strip()}",
+                       "check the Intel GPU driver and oneAPI runtime; docs/INTEL_ARC.md")
+            cards = json.loads(result.stdout)
+            for card in cards:
+                if card.get("driver") != "level_zero":
+                    S.fail(f"native Windows inference requires Level Zero, not {card.get('driver', 'unknown')}",
+                           "set ONEAPI_DEVICE_SELECTOR=level_zero:gpu and check the Intel GPU driver and oneAPI runtime")
+                if card.get("free_memory_supported") is not True:
+                    S.fail("native Intel GPU free VRAM query is unavailable (ext_intel_free_memory)",
+                           "rebuild the native engine and check the Intel GPU driver and oneAPI runtime")
+                if card.get("command_graph_supported") is not True:
+                    S.fail("native Intel GPU command graphs are unavailable (ext_oneapi_graph)",
+                           "rebuild the native engine and check the Intel GPU driver and oneAPI runtime")
+            return cards
+        except (OSError, ValueError, subprocess.TimeoutExpired) as ex:
+            S.fail(f"cannot query the native SYCL engine: {ex}", "docs/INTEL_ARC.md")
     found = []
     for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
         if "-" in card.name:                            # connectors (card0-DP-1) share the card's device
@@ -98,16 +167,39 @@ def real_mem_have(mem_have, real_ram: float, fake_ram: float):
 def sycl_engine():
     """The SYCL build: (binary, why-not)."""
     if S.WIN:
-        return None, "the SYCL port runs on Linux only"
+        override = os.environ.get("STRATA_SYCL_BIN")
+        candidates = ([Path(override)] if override else []) + [
+            ROOT / "build-sycl-win" / "strata.exe", ROOT / "build-sycl" / "strata.exe",
+            ROOT / "build-sycl" / "sycl" / "strata.exe", ROOT / "build-sycl-aot" / "strata.exe"]
+        exe = next((p.resolve() for p in candidates if p.is_file()), None)
+        return (exe, None) if exe else (None, "native strata.exe is not built; see docs/INTEL_ARC.md")
     exe = next((b for b in (ROOT / "build-sycl-aot" / "strata", ROOT / "build-sycl" / "strata") if b.exists()), None)
     if exe is None:
         return None, "it is not built (docs/INTEL.md, \"How to build it\": Docker, then sycl/tools/build.sh in the image)"
     return exe, None
 
 
-def sycl_path(path) -> str:
+def sycl_runtime_dirs():
+    dirs = os.environ.get("STRATA_SYCL_LIB_DIRS", "").split(os.pathsep)
+    if os.environ.get("STRATA_ONEAPI_ROOT"):
+        dirs.append(str(Path(os.environ["STRATA_ONEAPI_ROOT"]) / "bin"))
+    compiler = shutil.which("icx")
+    if compiler:
+        dirs.append(str(Path(compiler).parent))
+    if os.environ.get("MKLROOT"):
+        dirs.append(str(Path(os.environ["MKLROOT"]) / "bin"))
+    oneapi = Path(os.environ.get("ONEAPI_ROOT", r"C:\Program Files (x86)\Intel\oneAPI"))
+    dirs += [str(oneapi / "compiler" / "latest" / "bin"), str(oneapi / "mkl" / "latest" / "bin"),
+             str(oneapi / "tbb" / "latest" / "bin"), str(oneapi / "tcm" / "latest" / "bin"),
+             str(Path(os.environ.get("LOCALAPPDATA", "")) / "Strata-tools" / "oneapi" / "Library" / "bin")]
+    return list(dict.fromkeys(p for p in dirs if p and Path(p).is_dir()))
+
+
+def sycl_path(path, native=False) -> str:
     """A host path as the engine's container sees it: the folder above the Strata checkout (or STRATA_SYCL_ROOT) is
     mounted at /work."""
+    if native:
+        return str(Path(path).resolve())
     p, root = Path(path).resolve(), MOUNT.resolve()
     try:
         return "/work/" + p.relative_to(root).as_posix()
@@ -285,6 +377,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
     chunks so DG2's >3 GiB single pinned-host allocation limit is not hit, and the build passes
     -ze-opt-greater-than-4GB-buffer-required so the prompt path is correct past the cache's 4 GiB (docs/INTEL.md,
     "Kernels misread memory more than 4 GiB into an allocation")."""
+    native = exe.suffix.lower() == ".exe"
     args = list(cfg["args"])
     for f in ("--resident-experts", "--mmap-experts"):  # setup's low-RAM mode is the CUDA engine's
         drop(args, f)
@@ -303,7 +396,7 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         if f in args:
             v = args[args.index(f) + 1]
             path, _, scale = v.rpartition(":") if f == "--control-vector-scaled" else (v, "", "")
-            args[args.index(f) + 1] = sycl_path(path) + (f":{scale}" if scale else "")
+            args[args.index(f) + 1] = sycl_path(path, native) + (f":{scale}" if scale else "")
     ctx = int(flag(args, "--max-context") or 32768)
     kv = flag(args, "--kv") or "int8"
     asked_reserve = flag(args, "--vram-reserve-mib")    # setup writes it only when the user gave it
@@ -357,7 +450,11 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         else:
             args += ["--prefill", new_prefill]
     out = {k: v for k, v in cfg.items() if k not in ("lib_dirs", "env", "gpus")}   # "vision" stays: the CPU reader runs on the host
-    out.update({"backend": "sycl", "exe": str(SYCL_WRAPPER), "args": args, "sycl_root": str(MOUNT)})
+    out.update({"backend": "sycl", "exe": str(exe if native else SYCL_WRAPPER), "args": args})
+    if native:
+        out["lib_dirs"] = list(dict.fromkeys(cfg.get("lib_dirs", []) + sycl_runtime_dirs()))
+    else:
+        out["sycl_root"] = str(MOUNT)
     env = {}
     if alchemist:
         if driver == "i915":
@@ -368,9 +465,16 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
         # first launch - "'double' is not supported in ... device", the engine dies on the first request with a
         # temperature - unless the driver emulates it (docs/INTEL.md)
         env.update({"IGC_EnableDPEmulation": "1", "OverrideDefaultFP64Settings": "1", "NEOReadDebugKeys": "1"})
-    if exe != ROOT / "build-sycl-aot" / "strata":
+    if native:
+        selector = f"level_zero:{cfg['gpu']}" if isinstance(cfg.get("gpu"), int) else "level_zero:gpu"
+        env.update({"ONEAPI_DEVICE_SELECTOR": os.environ.get("ONEAPI_DEVICE_SELECTOR", selector),
+                    "ZES_ENABLE_SYSMAN": "1",
+                    "STRATA_VERIFY_DEVICE_PLAN": "1", "STRATA_VERIFY_NO_HOST": "1",
+                    "STRATA_STAGER_THREADS": "12"})
+        env.update(cfg.get("env", {}))
+    elif exe != ROOT / "build-sycl-aot" / "strata":
         env["STRATA_SYCL_BIN"] = exe.relative_to(ROOT).as_posix()
-    if MOUNT.resolve() != ROOT.parent.resolve():
+    if not native and MOUNT.resolve() != ROOT.parent.resolve():
         env["STRATA_SYCL_ROOT"] = str(MOUNT)
     if env:
         out["env"] = env
@@ -379,12 +483,16 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
 
 
 def install(argv) -> None:
-    intel = [] if S.WIN else intel_gpus()
+    intel = intel_gpus()
     if not intel:
-        S.fail("no Intel Arc found (an xe or i915 card in /sys/class/drm)", "on an NVIDIA or AMD card, run ./setup.sh")
+        S.fail("no Intel GPU found by the SYCL runtime" if S.WIN else "no Intel Arc found (an xe or i915 card in /sys/class/drm)",
+               "docs/INTEL_ARC.md: check the Intel GPU driver" if S.WIN else "on an NVIDIA or AMD card, run ./setup.sh")
     exe, why = sycl_engine()
     if exe is None:
-        S.fail(f"Strata's SYCL engine cannot be used: {why}", "docs/INTEL.md: build it, then run this again")
+        if S.WIN:
+            exe = ROOT / "build-sycl-win" / "strata.exe"
+        else:
+            S.fail(f"Strata's SYCL engine cannot be used: {why}", "docs/INTEL.md: build it, then run this again")
     for name in ("gpus", "amd_gpus", "amd_problem", "hip_vision", "build_engine_hip", "hipblaslt_table", "ram_gb",
                  "write_run_script", "start", "say", "main"):
         if not callable(getattr(S, name, None)):
@@ -410,14 +518,16 @@ def install(argv) -> None:
     (stub / "BUILD.json").write_text(json.dumps({**stamped, "version": sycl_version(), "source": "local", "lib_dirs": []}))
 
     say = S.say
-    fake_ram = max(real_ram, 1024.0)
+    fake_ram = real_ram if S.WIN else max(real_ram, 1024.0)
     alch = intel[0]["driver"] == "i915" or intel[0].get("devid") in ALCHEMIST_IDS
 
     def say_intel(msg=""):
         """setup's words for its AMD path and its RAM rule, said for the Intel card."""
         msg = str(msg).replace("(AMD, experimental: docs/AMD_HIP.md)", "(Intel Arc: the SYCL port, docs/INTEL.md)")
+        if S.WIN:
+            msg = msg.replace(str(stub / S.EXE), str(exe))
         msg = msg.replace("Your AMD GPUs:", "Your Intel GPUs:").replace("just run ./setup.sh", "just run ./setup.sh --backend sycl")
-        msg = re.sub(r"\b(xe|i915) \(AMD: docs/AMD_HIP\.md\)", r"\1 driver (Intel Arc: docs/INTEL.md)", msg)
+        msg = re.sub(r"\b(xe|i915|sycl) \(AMD: docs/AMD_HIP\.md\)", r"\1 driver (Intel Arc: docs/INTEL.md)", msg)
         where = ("the experts the card does not hold are computed on the CPU" if alch
                  else "the experts are streamed into VRAM")
         msg = msg.replace(f"RAM: {fake_ram:.0f} GB", f"RAM: {real_ram:.0f} GB ({where})")
@@ -438,7 +548,13 @@ def install(argv) -> None:
     S.gpus = lambda *a, **k: []
     S.amd_gpus = lambda *a, **k: intel
     S.amd_problem = lambda g: None
-    S.hip_vision = intel_vision                         # pictures on by default, read on the CPU (setup's hip_reader settles it)
+    if S.WIN:
+        # The native Windows engine is built by build_windows.bat, which builds the engine only: the picture readers
+        # (setup's build_vision_cpu and the SYCL GPU reader) have no Windows build path yet, so pictures stay off
+        # there rather than writing a config that points at a reader nobody built (docs/INTEL_ARC.md, "Windows").
+        S.hip_vision = lambda asked, vram_gb=0.0: "none"
+    else:
+        S.hip_vision = intel_vision                     # pictures on by default, read on the CPU (setup's hip_reader settles it)
 
     def build_engine_hip(gpu, llama, vision="none"):
         """No engine to compile here (the SYCL build is separate); the picture readers are: the portable CPU reader, once, and for
@@ -451,6 +567,16 @@ def install(argv) -> None:
                 build_vision_sycl(stub, stamp, llama, vsrc)
         return stub
     S.build_engine_hip = build_engine_hip
+
+    if S.WIN:
+        def native_engine(*a, **k):
+            nonlocal exe
+            exe = ensure_windows_engine(force="--build" in argv)
+            return stub
+        S.get_prebuilt_hip = native_engine
+        S.build_engine_hip = native_engine
+        S.hip_card = lambda eng, gpu, listed: {**gpu, "count": len(intel)}
+        S.hip_lib_dirs = lambda *a, **k: []
     S.hipblaslt_table = lambda *a, **k: None
     S.ram_gb = lambda: fake_ram                         # the experts are in VRAM: setup's RAM rule does not apply
     # Gyro (mem_total) counts VRAM + RAM together and is the one family whose experts are NOT streamed from the file into VRAM: on
@@ -524,6 +650,8 @@ def install(argv) -> None:
     def start_sycl(cfg_path, *a, **k):
         cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8-sig"))
         if cfg.get("backend") != "sycl":
+            return start(cfg_path, *a, **k)
+        if S.WIN:
             return start(cfg_path, *a, **k)
         script = ROOT / f"run-{Path(cfg_path).stem[len('strata-'):]}.sh"
         S.say(f"\nstarting {script.name} ...")

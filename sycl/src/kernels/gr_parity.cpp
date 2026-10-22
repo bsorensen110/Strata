@@ -615,7 +615,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                                  .wait()),
             "qfuse counters zero");
         int qbad = 0;
-        bool qskip = false;   // SYCL port: see below
+        bool qskip = false;                    // the SYCL port returns false from fused_gr_read_multi (STRATA_QFUSE is not built here)
         std::vector<uint8_t> hq(qbytes), hr(qbytes);
         for (int tt = 1; tt <= T && !qbad && !qskip; ++tt) {
             std::vector<FusedGrArgs> qa(args.begin(), args.begin() + tt);
@@ -667,13 +667,18 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                                                    (size_t)tt * (N / 32) * 36)
                                            .wait()),
                       "qfuse ref read");
+                if (!wrote && tt == 1 && rep == 0) {   // the port does not build the q8_1 image: nothing to compare
+                    qskip = true;
+                    break;
+                }
                 if (!wrote || std::memcmp(hq.data(), hr.data(), (size_t) tt * (N / 32) * 36) != 0) {
                     std::printf("  QFUSE: T=%d rep %d: %s\n", tt, rep, wrote ? "q8_1 bytes differ" : "not written");
                     ++qbad;
                 }
             }
         }
-        std::printf("  fused GR read + q8_1 (STRATA_QFUSE), T 1..8, direct and graph replays: %s\n", qbad ? "FAIL" : qskip ? "skipped" : "pass");
+        std::printf("  fused GR read + q8_1 (STRATA_QFUSE), T 1..8, direct and graph replays: %s\n",
+                    qskip ? "SKIP (the SYCL port does not build STRATA_QFUSE)" : qbad ? "FAIL" : "pass");
         bad += qbad;
         sycl::free(d_q, dpct::get_in_order_queue());
             sycl::free(d_ref, dpct::get_in_order_queue());

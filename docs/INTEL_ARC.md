@@ -5,8 +5,10 @@ maxfridbe wrote it in [#423](https://github.com/Niko1221/Strata/pull/423), with 
 The code is in `sycl/`, and the port's own notes, measurements and maintenance procedure are in
 [docs/INTEL.md](INTEL.md). This page covers what you need, how to build it, and what has been tested.
 
-**Experimental means:** the Intel engine is still young and Linux only. When the port arrived (0.1.39) the maintainers had no
-Intel GPU and every result on Arc hardware came from the community. Since 0.1.40.2 the maintainers also test on an Arc Pro B70
+**Experimental means:** the Intel engine is still young. It runs on Linux, and this fork adds a native Windows build
+(see "Windows" below) that builds and whose setup path works; Coder IQ1_M and IQ3_XXS have been run on an Arc Pro B70
+through Level Zero, with the numbers below. When the port arrived (0.1.39) the maintainers had no Intel GPU and every
+result on Arc hardware came from the community. Since 0.1.40.2 the maintainers also test on an Arc Pro B70
 (32 GB, `xe`) and an Arc A750 (8 GB, `i915`); the results from those two cards are marked in the table below. Other cards
 are still community reports. The NVIDIA and AMD engines are unchanged: the Intel build is a separate CMake target, off by default.
 
@@ -14,7 +16,8 @@ are still community reports. The NVIDIA and AMD engines are unchanged: the Intel
 use): you build it from source on Linux, as described below. The Docker route is a ready-made image,
 `ghcr.io/niko1221/strata:0.2.2-sycl`, which is published only for a release that carries a Linux Intel engine package; with none, [build
 the image yourself](DOCKER.md#build-it-yourself) from the engine you built (the image needs prepared model files; see
-[Docker: Intel Arc](DOCKER.md#intel-arc)). The Mac and Windows builds have no Intel engine.
+[Docker: Intel Arc](DOCKER.md#intel-arc)). The Mac build has no Intel engine; Windows builds one from source with
+`sycl\tools\build_windows.bat` (see "Windows" below).
 
 ## What has been run, and by whom
 
@@ -27,6 +30,7 @@ the image yourself](DOCKER.md#build-it-yourself) from the engine you built (the 
 | Community | 2x Arc Pro B60 24 GB, `--layer-split` | Coder IQ1_M: 56.6 tok/s decode, 428 tok/s prompt (2,129 tokens); Flash-Next IQ2_XS: 58.6-61.3 tok/s decode, 436 tok/s prompt; all experts in VRAM; 8K context | [bench/results/2026-10-04-community-2x-arc-pro-b60](../bench/results/2026-10-04-community-2x-arc-pro-b60/README.md) |
 | Community | one Arc Pro B60 24 GB | Coder IQ1_M with 4,042 of 12,288 experts mirrored in RAM: 11.9 tok/s decode (needs the ring-wait fix from the same report) | same |
 | Strata maintainers (0.1.40.2 and later) | Arc Pro B70 32 GB (xe) and Arc A750 8 GB (i915), test machines | Flash-Next IQ3_S on the B70 with 11.5k of 24.6k experts resident: 10-prompt gate passes, prompt 980-1,000 tok/s on 4K tokens, decode 30 (prose) to 41 (code) tok/s; the xe aliased-pages fix and the `NO_HOST` requirement are in [INTEL.md](INTEL.md) | INTEL.md, "Arc Pro B70 with a model that does not fit" |
+| Strata on Windows (this fork's native port, engine 0.1.47) | Arc Pro B70 32 GB (xe), Core i9-9900, 64 GB, Windows 11 25H2, oneAPI 2026.2, Level Zero V2 | Coder IQ1_M, 32K, 11,264 of 12,288 experts in VRAM (12,131 with `--prefill 2048` and a 512 MiB reserve): prompt 1,451 / 1,407 tok/s (4K / 16K) as installed and 1,340 / 1,351 tuned; decode 51 as installed / 62 tuned on the suite's chat questions, 66 / 79 on nine short-answer questions, agent session 58 / 64. IQ3_XXS (its experts stream): 906 / 955 tok/s prompt, 38 tok/s decode | [Coder IQ1_M](../bench/results/2026-10-21-community-arc-pro-b70-coder-iq1_m/), [all experts resident](../bench/results/2026-10-21-community-arc-pro-b70-coder-iq1_m-all-resident/), [IQ3_XXS](../bench/results/2026-10-21-community-arc-pro-b70-iq3_xxs/) |
 
 The 0.1.39 port re-migrates 0.1.38's port onto the 0.1.39 engine sources (the #606 NaN fix, the #649 verify
 trace, the new prompt paths). 0.1.39's `sycl/` did not compile against 0.1.39's own engine sources (#784: the
@@ -170,11 +174,108 @@ Things that matter on an Arc (details in INTEL.md):
 
 ## Windows
 
-There is no Windows path yet. `setup --backend sycl` on Windows stops and points here. oneAPI exists for Windows,
-but `sycl/CMakeLists.txt` uses GCC-style flags (`-mavx512f`, `-fp-model=precise`, `-qmkl`) and the runner is a
-bash/Docker script, so a native Windows build would need work. Nobody has tried it. WSL2 with an Arc has been
-used by one tester (the B580 row above), but setup cannot detect the card there, because it reads `/sys/class/drm`,
-which WSL2 does not have.
+Windows has a native path: no Docker, no WSL, no bash. `START-HERE.bat` finds an Intel Arc through the display
+registry and offers it beside NVIDIA / AMD when both are present, then hands the run to `sycl/setup_intel.py` as on
+Linux. The engine is `build-sycl-win\strata.exe`, which setup builds with `sycl\tools\build_windows.bat` when it is
+missing, and the run config carries the oneAPI runtime folders in `lib_dirs` instead of the container's `sycl_root`.
+The build uses MSVC and oneAPI (`icx` + oneMKL); SYCL's GCC-style flags are spelled for icx on Windows in
+`sycl/CMakeLists.txt` (`/fp:precise`, `/Qmkl:sequential`), and the few POSIX calls are behind `#ifdef _WIN32`.
+
+What has been run — measured on 2026-10-20 on Windows 11 25H2, Core i9-9900, Arc Pro B70 32 GB, driver 32.0.101.8976,
+oneAPI 2026.2, MSVC 14.51 (Visual Studio 18):
+
+- `sycl\tools\build_windows.bat`: the whole `sycl` project, 232 targets, 0 errors, 50 executables, among them
+  `strata.exe` (40 MB) and the kernel parity tests.
+- `positioned_file_test.exe`: PASS — 8 threads on one shared handle, an offset past 4 GiB, short reads, end of file,
+  an invalid handle, a missing file.
+- `python tools\test_setup_*.py`: all pass except `test_setup_golden.py` (19) and `test_setup_menu.py` (1), which fail
+  the same way on upstream main without the Windows work.
+- the model: Coder IQ1_M on the B70 through Level Zero (11,264 experts resident, 21.46 GiB of VRAM, ready in about
+  58 s from a cold start), `tools/strata_bench.py`, 3 runs per test, medians: chat decode 51.3 tok/s (34.1-66.6),
+  first token 0.45 s; a 4K prompt 1,451 tok/s, first token 2.81 s; a 16K prompt 1,407 tok/s, first token 11.47 s; an
+  agent session 57.7 tok/s decode (26.8-74.4), 69.3% of each turn's prompt read from the conversation cache. The
+  Linux B70 row for the same model is 70-78 tok/s decode and ~790 tok/s prompt: prompt reading is clearly ahead on
+  Windows, and decode depends heavily on the question mix (see the next line). This PC is a Core i9-9900 with 64 GB
+  of RAM and the JIT build (`STRATA_SYCL_AOT` not set); the 32K prompt test skipped itself because the context is
+  exactly 32,768 tokens.
+- Two follow-ups on that decode figure. The AOT build (`STRATA_SYCL_AOT=bmg-g31`, built beside the JIT one) measured
+  the same (chat 50.0 vs 51.3 tok/s, 4K prompt 1,394 vs 1,451, agent decode 61.4 vs 57.7: within run-to-run noise), so
+  JIT is not what the decode number is about. And the chat median moves with the questions asked: a fixed nine-question
+  set (three prompts, three rounds) gave 66.0 tok/s (56.6-70.5) on the same server, which overlaps the Linux figure.
+  `--spec 2` instead of 4 gave 56.3 tok/s on those nine, so the default T=4 is the better setting here.
+- Fitting every expert changes the balance. The default `--prefill 4096` and 1 GiB reserve leave 11,264 of the Coder
+  IQ1_M's 12,288 experts in VRAM (21.46 GiB of 31.16). With `--prefill 2048 --vram-reserve-mib 512` the cache holds
+  12,131 (23.12 GiB), and on the same suite chat decode is 61.6 tok/s (53.2-82.8, against 51.3), the agent session
+  63.8 (57.7), first token 0.39 s (0.45); the 4K prompt falls to 1,340 tok/s (from 1,451) and 16K to 1,351 (from
+  1,407), because the chunk is half the size. On the nine fixed short questions the same change is 78.6 against 66.0.
+  That is a trade for chat-heavy use, not a default: the prompt path wants the bigger chunk. The tuned figures are
+  engine 0.1.47; the default ones they compare against are 0.1.46.1, and the engine measured the same on both
+  (chat 61.8 -> 61.6).
+- Three tuning checks on the same unit, so nobody has to repeat them. The prompt chunk trades directly against decode:
+  `--prefill 2048` holds 12,219 experts and gives 76.9 tok/s on the nine questions with 1,284 tok/s on 4K; 4096 holds
+  11,524 and gives 71.2 / 1,350; 8192 holds 10,015 and gives 53.3 / 1,423; `auto` holds 12,086 and gives 75.9 / 1,244.
+  `--batch 4` is a loss on this port: four concurrent 100-token requests total 29.5 tok/s (7-9 each) against 71 for
+  one stream, and the batch path drops the cache to 10,223 slots, so serial is the setting for agents here. The card
+  is not clock-limited: under decode Sysman reports the GPU at its 2,800 MHz TDP ceiling (driver request 4,250, no
+  throttle reasons) and memory at 19,000 MHz, so power and clocks leave nothing on the table.
+
+**Check Level Zero first: the engine needs it.** The port's config asks for the free-VRAM query and command graphs,
+so `sycl/setup_intel.py` refuses a card that SYCL offers only through OpenCL. `sycl-ls` is the check: a
+`[level_zero:gpu]` line for the card means the engine will run, an `[opencl:gpu]` line on its own means it will not.
+On the PC measured here it works: `sycl-ls` lists the Arc as `[level_zero:gpu] ... Unified Runtime over Level-Zero V2
+... 20.2.0 [1.15.39183+4]`, and `strata.exe --list-devices` reports `"driver":"level_zero"` with
+`free_memory_supported` and `command_graph_supported` both true, against the driver's Level Zero API 1.15.
+
+If the card appears as OpenCL only, check `HKLM\SOFTWARE\Intel\oneAPI\LevelZero\1\LevelZeroLoaderPath`: it has to be
+the **folder** that holds `ze_loader.dll` (`C:\Windows\System32`), not the DLL itself. The 2026 adapter carries a
+static loader that appends `ze_loader.dll` to that value (`create_library_path` in `source/inc/ze_util.h` of Level
+Zero), so a file path makes it look for `...\ze_loader.dll\ze_loader.dll`, `zeInit` then answers
+`ZE_RESULT_ERROR_UNINITIALIZED`, and SYCL reports no Level Zero platform while a direct `zeInit` through the loader
+still succeeds. That was the whole failure measured here: the value had been written by hand as a file path.
+`UR_L0_DEBUG=1 sycl-ls` prints the adapter's own reason, and `ZEL_LIBRARY_PATH` set to the folder is the per-process
+equivalent. Fixing it needs an administrator:
+
+```powershell
+Set-ItemProperty 'HKLM:\SOFTWARE\Intel\oneAPI\LevelZero\1' -Name LevelZeroLoaderPath -Value 'C:\Windows\System32'
+```
+
+The kernel parity tests that need no model were run on the B70 through Level Zero the same day with `ctest`, which
+applies each test's own arguments and environment: 30 of 31 pass (rope, sampler, elementwise, cvec, kv_q8 / q4 /
+hybrid / steps / stream, quantize_act, router_top10, s_gemv and its q8k form, s2_gemv and its q8 form, bf16_gemv,
+dequant_s2, gr_multi, gdn, verify, qsa, esimd_moe, resident_plan, shared_expert, sycl_router_fast, esimd_moe_mode and
+sycl_payload_pairs; `xmx_group` skips itself without the AOT build). One fails: `s2_expert_grouped_parity`'s 20-group
+`moe_grouped_s2` and resident cases, where the new grouped kernel differs bitwise from the previous one on Battlemage.
+Measured: the worst absolute difference is 5.7e-06 on an output scale of 38 (1.5e-7, one to two float32 ULPs), it is
+identical across runs (deterministic, not a race), and with an fp16 output the result is bit-identical; both kernels
+also stay within 1e-7 of the host reference, and the "hit" variants are bitwise identical. So it is how the new kernel
+associates the sum, not a wrong answer; the test's bitwise contract is left as it is. `gr_parity`'s
+`STRATA_QFUSE` block prints `SKIP (the SYCL port does not build STRATA_QFUSE)` instead of failing, because the kernels
+return false with "SYCL port: never writes the q8_1 images". Run them through `ctest`: `sycl_payload_pairs`
+needs `STRATA_DOORBELL_CHECK=1`, because its resident-publish path copies `x` only with that check, and a bare run then
+reports 120 failures that are not there. `qsa_prompt_attn_parity` prints PASS for int8 and fp16 at 32K and exits 2.
+
+**If the engine dies with `0xC0000005` at startup, look at `C:\Windows\System32\ze_loader.dll`.** Windows keeps one
+Level Zero loader there and every process uses it. A graphics driver installed from a manual extraction can leave an
+old one behind (1.2.3, 2021, in the case measured here) while the driver ships its own beside `ze_intel_gpu64.dll` in
+the DriverStore (1.32.0, the same driver that ships `ze_intel_gpu64.dll` 32.0.101.8976). The old loader has no
+`zeInitDrivers`, which the 2026 SYCL runtime asks for, so the runtime crashes instead of reporting no device. Compare
+the two `FileVersion`s; replacing the System32 copy with the driver's needs an administrator, and the file is owned by
+`TrustedInstaller` and usually mapped by Intel Graphics Software, so it has to be renamed aside rather than
+overwritten. `sycl-ls` stops crashing with the driver's loader in place.
+
+Re-checked after merging upstream's 291 commits (0.2.2, engine 0.1.47) on 2026-10-21: the build is clean again (234
+targets, 51 executables, upstream's new `tq_sycl_parity` among them and passing on the B70), `positioned_file_test`
+passes, 30 of 31 model-free parity tests pass, and the tuned figures above come from that engine. The default
+configuration was re-measured too and did not move either: chat decode 50.1 tok/s against 51.3, first token 0.45 s both
+times, 4K prompt 1,436 against 1,451, 16K 1,387 against 1,407, agent session 62.1 against 57.7, cache 11,258 experts
+against 11,264 - every pair inside the run-to-run spread, which is wider than the difference between the two engines
+(the same question measured 34 to 68 tok/s within one configuration). Upstream's trellis and Gyro kernels do not apply
+to the models measured here. One workflow note: a running server holds
+`build-sycl-win\strata.exe`, so the link fails with `LNK1104` until it is stopped.
+
+What has **not** been run on Windows: pictures, the Arc A-series (Windows uses Level Zero for every Arc, `i915` is a
+Linux driver), two cards, and the Docker path. WSL2 with an Arc has been used by one tester (the B580 row above), but
+setup cannot detect the card there, because it reads `/sys/class/drm`, which WSL2 does not have.
 
 ## Reporting a problem
 
