@@ -366,6 +366,18 @@ Windows 11, Swift 1.5 IQ3_XXS at 128K):**
   It does not look again during a session, so where the E-cores' speed changes while the engine runs,
   `--pool-affinity p-cores` is the steady choice. Not measured: other CPUs, Linux, AMD cards.
 
+- `STRATA_VRAM_FREE=device` (Windows, NVIDIA): `--expert-cache auto` reads the free VRAM of the whole card through NVML.
+  Under WDDM CUDA's own figure counts this process only: with 6 GiB held by another process it still read 30,994 MiB
+  free where NVML read 24,348. With the image encoder loaded (1,547 MiB) the cache was therefore sized too large and
+  shrunk by guesses: six starts of one config (engine 0.1.40.3 and 0.1.41, the default 700 MiB reserve) ended with
+  9,002 to 14,454 slots and 93 MiB to 10 GiB free. With the switch and `--vram-reserve-mib 1500` (0.1.41 built from
+  source): one pass, 13,007 to 13,188 slots and 973 to 1,392 MiB free over seven starts. On 0.1.42 with this switch
+  built in, three interleaved starts each: the default sized 13,543 slots after two shrink steps and ended with 336,
+  602 and 602 MiB free; the switch with a 1,500 MiB reserve 13,102 to 13,130 slots after one step and 1,107 to 1,288
+  MiB free. A run that filled the card to
+  0 MiB free decoded 80-115 tok/s where the same text ran at 205-230 with 900 MiB or more free. Not measured: AMD
+  cards, Linux (the switch is compiled for Windows CUDA builds only).
+
 **Exact one-token expert rows (0.1.45, opt-in, `STRATA_CPU_IQ_ALL_EXACT1=1`, #1415 #1544):** below the #152 rule
 (a lone token in an expert's group) an AVX-2 CPU without AVX-512 runs ggml-cpu's `vec_dot` for the i-quant gate/up rows.
 With the switch, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S take Strata's AVX-2 decode instead, with ggml's float order
