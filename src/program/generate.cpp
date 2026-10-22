@@ -4396,6 +4396,63 @@ int main(int argc, char** argv) {
         o.prefill_auto = false;       // nothing to lend from: the buffers are reserved for the session, so keep them small
         o.prefill_chunk = 2048;
     }
+    const int64_t prefill_chunk_ceiling = o.prefill_chunk;
+    // The first prompt's resolved chunk (auto may reduce its ceiling to a shape such as 4,352).  A later repeat
+    // loan should replay that proven startup geometry after it has temporarily released decode-only allocations.
+    int64_t prefill_startup_chunk = 0;
+    auto env_one = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v != nullptr && std::strcmp(v, "1") == 0;
+    };
+    // Aggressive prompt-only VRAM lending is deliberately manual. It changes cache residency at request boundaries,
+    // so it is restricted to the serialized one-GPU NVIDIA server path that can keep an elastic cache throughout.
+    const bool prefill_elastic_requested = env_one("STRATA_PREFILL_ELASTIC_LOAN");
+    const char* prefill_loan_why = !o.serve ? "it requires --serve"
+        : !o.vram_elastic ? "it requires --vram-elastic"
+        : o.prefill_head_alias ? "it does not combine with --prefill-head-alias"
+        : o.batch > 0 ? "it does not support --batch"
+        : o.pipeline_windows > 0 ? "it does not support --pipeline-windows"
+        : multi_gpu ? "it does not support --layer-split"
+        : remote_caches ? "it does not support --expert-cache-remote"
+        : o.peer_device >= 1 ? "it does not support --peer-device"
+        : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64"
+        : !o.dflash.empty() ? "it does not combine with --dflash (its head binds at start and taps at verifier init)"
+        : nullptr;
+#if defined(STRATA_USE_HIP)
+    if (prefill_loan_why == nullptr) prefill_loan_why = "it is NVIDIA-only";
+#endif
+    if (prefill_elastic_requested && prefill_loan_why != nullptr) {
+        std::fprintf(stderr, "strata generate: STRATA_PREFILL_ELASTIC_LOAN=1 is unavailable: %s\n", prefill_loan_why);
+        return 2;
+    }
+    const bool prefill_elastic_loan = prefill_elastic_requested;
+    const bool prefill_mtp_loan = prefill_elastic_loan && env_one("STRATA_PREFILL_MTP_LOAN");
+    const bool prefill_head_loan = prefill_mtp_loan && env_one("STRATA_PREFILL_HEAD_LOAN");
+    const bool prefill_retain_startup_chunk = prefill_elastic_loan && env_one("STRATA_PREFILL_RETAIN_STARTUP_CHUNK");
+    const bool prefill_repeat_loan = prefill_head_loan && env_one("STRATA_PREFILL_REPEAT_LOAN");
+    int64_t prefill_repeat_min = 1024;
+    if (const char* v = std::getenv("STRATA_PREFILL_REPEAT_MIN_TOKENS")) {
+        prefill_repeat_min = std::max<int64_t>(256, std::atoll(v));
+    }
+    if ((env_one("STRATA_PREFILL_MTP_LOAN") && !prefill_elastic_loan) ||
+        (env_one("STRATA_PREFILL_HEAD_LOAN") && !prefill_mtp_loan) ||
+        (env_one("STRATA_PREFILL_RETAIN_STARTUP_CHUNK") && !prefill_mtp_loan) ||
+        (env_one("STRATA_PREFILL_REPEAT_LOAN") && !prefill_head_loan)) {
+        std::fprintf(stderr, "strata generate: prefill sub-loans require STRATA_PREFILL_ELASTIC_LOAN=1; "
+                             "the head loan and retained startup chunk also require STRATA_PREFILL_MTP_LOAN=1, and "
+                             "the repeat loan also requires STRATA_PREFILL_HEAD_LOAN=1\n");
+        return 2;
+    }
+    if ((prefill_mtp_loan && (o.mtp.empty() || o.spec < 2)) ||
+        (prefill_head_loan && o.native_head_gguf.empty() && o.native_preset.empty())) {
+        std::fprintf(stderr, "strata generate: the MTP/head prefill loans require --mtp with --spec T (T >= 2) and "
+                             "a native head (--native or --native-head-gguf)\n");
+        return 2;
+    }
+    bool mtp_deferred = false;
+    bool native_head_deferred = false;
+    uint64_t native_head_deferred_bytes = 0;
+    int64_t mtp_deferred_reserve_mib = 0;
     if (!have_tokens && o.serve) {   // plan v0.3 P8: requests bring their own tokens
         o.tokens = {248045};
         o.max_new = 1;
@@ -6900,7 +6957,15 @@ int main(int argc, char** argv) {
         // the next window's drafts), and the round/step graphs carry the forcing kernel
         const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err,
+                                        o.mtp_window, nullptr, prefill_mtp_loan)) {
+            std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
+            return 1;
+        }
+        if (!o.mtp.empty()) mtp.set_prompt_weights(last_st && !mtp_first ? last_st->wt : wt);
+        mtp_deferred = !o.mtp.empty() && prefill_mtp_loan;
+        if (mtp_deferred)
+            std::fprintf(stderr, "strata mtp: manual prefill loan: routed experts and draft head load after prompt\n");
         mtp.set_ple_session(&ss);
         if (batch_mtp) {
             // Slot b's drafter lives where the solo drafter does (the guard above: the last stage's GPU), carved from the
@@ -7052,7 +7117,17 @@ int main(int argc, char** argv) {
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu && !stage_worker) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
-        if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
+        if (prefill_head_loan) {
+            native_head_deferred_bytes = strata::core::NativeHead::weight_bytes_for(
+                o.native_head_shards, g.n_embd, n_vocab, err);
+            if (native_head_deferred_bytes == 0) {
+                std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
+                return 1;
+            }
+            native_head_deferred = true;
+            std::fprintf(stderr, "strata generate: native head deferred for manual prefill loan, %llu bytes\n",
+                         (unsigned long long) native_head_deferred_bytes);
+        } else if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
             std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str());
             return 1;
         }
@@ -7060,6 +7135,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        if (!native_head_deferred)
         std::fprintf(stderr, "strata generate: experimental native %s head, %llu bytes, in %.1f s\n",
                      strata::ggml_type_name(native_head.type()),
                      (unsigned long long) native_head.weight_bytes(),
@@ -7545,6 +7621,17 @@ int main(int argc, char** argv) {
     strata::core::ExpertCache xcache;
     // THE HEAD BEFORE THE CACHE: the native head and the logits are allocated above, before the expert arena (#620)
     const bool auto_cache = o.expert_cache < 0;
+    if (mtp_deferred) {
+        const uint64_t head_row_bytes = native_head.loaded()
+            ? native_head.row_bytes()
+            : (n_vocab > 0 ? native_head_deferred_bytes / (uint64_t) n_vocab : 0);
+        const uint64_t late = mtp.deferred_bytes(head_row_bytes, n_vocab) +
+                              (native_head_deferred ? native_head_deferred_bytes : 0);
+        mtp_deferred_reserve_mib = (int64_t) ((late + (1u << 20) - 1) >> 20) + 32;
+        std::fprintf(stderr, "strata mtp: late-load budget %.0f MiB (including margin%s)\n",
+                     (double) mtp_deferred_reserve_mib, native_head_deferred ? ", native head" : "");
+    }
+    const int vram_cache_reserve_mib = prefill_elastic_loan ? 0 : o.vram_reserve_mib;
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib).  remote-stage: both of the
     // main process's stages are on CUDA0, so both second verifiers are (the head stage's arena is a full window's)
@@ -7630,14 +7717,15 @@ int main(int argc, char** argv) {
         const int64_t prefill_mib = owned_prefill_mib();
         // the draft layer's head and logits are allocated when it binds, after this: 0.1.27's CJK subset made them
         // ~110-180 MiB larger, and out of the reserve they left 16 GB cards below the stall line (#199)
-        int64_t mtp_bind = (!o.mtp.empty() && native_head.loaded())
+        int64_t mtp_bind = (!mtp_deferred && !o.mtp.empty() && native_head.loaded())
                                ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab)
-                               : (mtp_first && last_st->head.loaded()) ? (int64_t) mtp.bind_bytes(last_st->head.row_bytes(), n_vocab) : 0;
+                               : (!mtp_deferred && mtp_first && last_st->head.loaded())
+                                     ? (int64_t) mtp.bind_bytes(last_st->head.row_bytes(), n_vocab) : 0;
         // (with a layer split the slot drafters bind on the last stage, whose cache is sized from what is free there)
         if (stages.empty())
             for (const auto& d : slot_mtp)
                 mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
-        const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
+        const int64_t reserve = (((int64_t) vram_cache_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
 
 
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
@@ -7646,7 +7734,7 @@ int main(int argc, char** argv) {
         o.expert_cache = (int) std::max<int64_t>(slots, 0);
         std::fprintf(stderr, "strata generate: expert cache auto: %.2f GiB free, %d MiB reserved (+%lld MiB for the "
                              "draft head) -> %d slots\n",
-                     (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
+                     (double) free_b / 1073741824.0, vram_cache_reserve_mib, (long long) (mtp_bind >> 20), o.expert_cache);
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not
         // subtract ordinary CPU allocations (the host expert arena), so a cache sized from it alone can ask the OOM killer
@@ -7682,7 +7770,8 @@ int main(int argc, char** argv) {
         const int64_t min_slots = (o.prefill_chunk > 0 && pf_borrow)
             ? ((int64_t) strata::prefill::Prefill::bytes_needed(g, ss, 256) + blob - 1) / blob + prefill_keep_slots()
             : 1;
-        if (o.expert_cache < min_slots && !o.vram_reserve_given && o.vram_reserve_mib > kSmallReserveMib) {
+        if (o.expert_cache < min_slots && !prefill_elastic_loan && !o.vram_reserve_given &&
+            o.vram_reserve_mib > kSmallReserveMib) {
             // the largest reserve (in MiB) that still leaves min_slots
             const int64_t fit_mib = ((int64_t) free_b - mtp_bind - pipe_first - min_slots * blob) / (1 << 20) - prefill_mib;
             if (fit_mib >= kSmallReserveMib) {
@@ -7750,7 +7839,8 @@ int main(int argc, char** argv) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int asked = o.expert_cache;
         const uint64_t budget = (uint64_t) asked * nibble_max_slot_bytes();
-        size_t free_room = free_b > ((size_t) o.vram_reserve_mib << 20) ? free_b - ((size_t) o.vram_reserve_mib << 20) : 0;
+        size_t free_room = free_b > ((size_t) vram_cache_reserve_mib << 20)
+                               ? free_b - ((size_t) vram_cache_reserve_mib << 20) : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         uint64_t sum = 0;
         for (int64_t l = 0; l < g.n_layers; ++l)
@@ -7779,7 +7869,7 @@ int main(int argc, char** argv) {
         // held one slot fewer than asked (--expert-cache 1: none)
         const uint64_t budget = (uint64_t) o.expert_cache * ((nibble_max_slot_bytes() + 255) / 256 * 256);
         uint64_t used = 0;
-        const size_t keep_free = ((size_t) o.vram_reserve_mib << 20) + (size_t) pipe_first;
+        const size_t keep_free = ((size_t) vram_cache_reserve_mib << 20) + (size_t) pipe_first;
         size_t free_room = free_b > keep_free ? free_b - keep_free : 0;
         const uint64_t cap = std::min<uint64_t>(budget, (uint64_t) free_room);
         for (const auto& pr : profile) {
@@ -7835,7 +7925,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: +%lld B guard per sized slot (STRATA_MMQ_DIRECT)\n", (long long) slot_guard);
         else   // xcache.open below: every slot is the largest blob's size, and no guard is added
             std::fprintf(stderr, "strata generate: uniform expert slots, no guard (STRATA_MMQ_DIRECT): an expert is read "
-                                 "in its slot where the slot's slack covers the over-read\n");
+                                  "in its slot where the slot's slack covers the over-read\n");
+    }
+    // Admission above mirrors every reason --vram-elastic can be switched off. Keep a defensive gate here so a
+    // future elastic-cache restriction cannot leave the verifier or MTP weights deferred without a return boundary.
+    if (prefill_elastic_loan && !o.vram_elastic) {
+        std::fprintf(stderr, "strata generate: the manual prefill loan needs an active segmented expert cache\n");
+        return 2;
     }
     if (o.expert_cache > 0) {
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
@@ -7925,7 +8021,7 @@ int main(int argc, char** argv) {
             cudaDeviceSynchronize();
             size_t free_b = 0, total_b = 0;
             free_b = strata::core::device_free_bytes(); (void) total_b;
-            const int64_t want = ((int64_t) o.vram_reserve_mib << 20) + pipe_first;
+            const int64_t want = ((int64_t) vram_cache_reserve_mib << 20) + pipe_first;
             if ((int64_t) free_b >= want - (64ll << 20)) break;
             // short by (want - free); a figure of 0 only says "at least": the first two such reads give back 1 GiB
             // each (under WDDM the free figure read before the allocation runs ~0.7 GiB high), later ones a quarter
@@ -10872,6 +10968,7 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
+        prefill_startup_chunk = o.prefill_chunk;
         // The peer's streaming and a split's helpers live INSIDE the layout (`set_peer` / `set_stage_helper` build
         // them in the path's own Impl), so a path that is laid out again - the prompt room, below - has to be armed
         // again.  Both calls start by dropping what they built before, and both leave `err` clear on a decline.
@@ -11279,14 +11376,18 @@ int main(int argc, char** argv) {
         if (has_dflash) {
             ver.set_tap_layers(dflash_capture_layers.data(), (int) dflash_capture_layers.size(), dflash.artifact().geom().target_hc_mean);
         }
-        if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err) ||
-            (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
+        if ((!native_head_deferred &&
+             !ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
+                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err)) ||
+            (!mtp_deferred && use_mtp && !prefill_head_alias_bound &&
+             !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                                   pipe ? pl_mtp_R : ver.final_R_all(), err))) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
+        if (native_head_deferred)
+            std::fprintf(stderr, "strata serve: verifier and native head deferred until prompt completion\n");
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
@@ -14663,21 +14764,35 @@ int main(int argc, char** argv) {
             int dev;               // the engine's device number (the main card is 0)
             size_t idx;            // its index in the target list: 0 = CUDA0, k = stages[k-1] (= stage_of(layer))
         };
-        const int64_t chunk_full = o.prefill_chunk;              // the loan's chunk with the whole cache
+        // Set while a repeat prefill loan has released decode-only resources.  The prompt loan planner may use the
+        // otherwise-reserved decode guard slots while those resources are absent.
+        bool repeat_resources_deferred = false;
+        // `bytes_needed` prices the borrowed cache region, while Prefill::init also has a few small device-owned
+        // allocations and allocator-page boundaries. Remember the first repeat chunk that actually initialized so
+        // a production configuration does not rediscover the same boundary miss on every long follow-up.
+        int64_t repeat_chunk_hint = 0;
+        const int64_t chunk_full = prefill_startup_chunk > 0 ? prefill_startup_chunk
+                                                              : std::max(o.prefill_chunk, prefill_chunk_ceiling);
         // the prompt path's loan: the end of the slots left in every cache it borrows from, at the largest chunk
         // all of those caches can lend (a smaller chunk only reads slower)
         auto relend = [&]() {
             if (pf_parts.empty()) return;
+            // A repeat loan has already released the verifier, native head and MTP decode-only allocations.  The
+            // ordinary guard (prefill_keep_slots, the slots a prompt leaves for the resident decode side) is for
+            // a prompt that must share with that side; with it deferred, those slots are useful prompt loan
+            // capacity.  Keeping the guard here can demote a subsequent request from the startup 4,352-token
+            // plan to 2,048 even though the prompt path itself fits.
+            const int64_t decode_guard = repeat_resources_deferred ? 0 : prefill_keep_slots();
             auto fits_all = [&](int64_t c) {
                 for (const PfPart& p : pf_parts) {
                     if (p.first < 0) continue;   // this part keeps its own buffers, not cache slots
                     const int64_t k = part_slots(p, c);
-                    if (k <= 0 || k + prefill_keep_slots() > p.cache->slots()) return false;
-                    if (o.prefill_auto && k * 100 > kAutoLendPct * p.cache->slots()) return false;
+                    if (k <= 0 || k + decode_guard > p.cache->slots()) return false;
+                    if (o.prefill_auto && !repeat_resources_deferred && k * 100 > kAutoLendPct * p.cache->slots()) return false;
                 }
                 return true;
             };
-            int64_t c = chunk_full;
+            int64_t c = repeat_chunk_hint > 0 ? std::min(chunk_full, repeat_chunk_hint) : chunk_full;
             while (c > 256 && !fits_all(c)) c = std::max<int64_t>(256, c / 2 / 256 * 256);
             o.prefill_chunk = c;
             for (PfPart& p : pf_parts) {
@@ -14702,7 +14817,7 @@ int main(int argc, char** argv) {
         };
         // what each cache gave up, per target: (residency index, slot) the shrinks took, so a grow puts them back
         std::vector<std::vector<std::pair<int32_t, int32_t>>> vram_evicted(1 + stages.size());
-        auto vram_command = [&](const std::string& cmd, std::string& e) -> bool {
+        auto vram_command = [&](const std::string& cmd, std::string& e, bool emit = true) -> bool {
             // `VRAM` alone: the reserve the engine started with (--vram-reserve-mib), on every card of the run.
             // `VRAM - [device]`: that reserve named so a device can follow it.  The dash is the only way to say
             // "the start's reserve, on this one card": a number in the first slot IS the reserve, so the server's
@@ -14763,7 +14878,9 @@ int main(int argc, char** argv) {
             for (const PfPart& p : pf_parts)
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             // every card that will move finishes its window and its swaps in flight first
-            if (!ver.wait_commit(e)) return false;
+            // A deferred verifier (manual prefill head loan) has no window to finish: it
+            // initializes after the prompt.
+            if (!native_head_deferred && !ver.wait_commit(e)) return false;
             for (auto& st : stages) {
                 bool moves = false;
                 for (const VramTarget& t : targets) moves = moves || t.dev == st->dev;
@@ -14820,7 +14937,8 @@ int main(int argc, char** argv) {
                              (double) xcache.full_bytes() / 1073741824.0, (long long) ((kvg.released * G) >> 20),
                              (long long) (free_b >> 20),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), note.c_str());
-                std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
+                if (emit)
+                    std::printf("VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
                             "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n", reserve,
                             (long long) held, (long long) xcache.slots(), (long long) (mapped_now >> 20),
                             (long long) (xcache.full_bytes() >> 20), (long long) (free_b >> 20),
@@ -14924,13 +15042,15 @@ int main(int argc, char** argv) {
                              (double) t.cache->full_bytes() / 1073741824.0, (long long) (free_b >> 20),
                              (long long) o.prefill_chunk,
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), notes[k].c_str());
+                if (emit)
                 std::printf("VRAM reserve_mib=%lld gpu=%d expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
                             "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld\n", reserve, t.dev,
                             (long long) t.cache->slots(), (long long) t.cache->full_slots(),
                             (long long) (t.cache->mapped_bytes() >> 20), (long long) (t.cache->full_bytes() >> 20),
                             (long long) (free_b >> 20), (long long) o.prefill_chunk);
             }
-            std::printf("VRAM-DONE\n");
+            if (emit)
+                            std::printf("VRAM-DONE\n");
             std::fflush(stdout);
             return true;
         };
@@ -16019,6 +16139,10 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
             }
         };
+        // Set only while a repeat prefill loan has released the decode-only head/MTP resources. The normal path
+        // clears this at the prompt/decode boundary; keeping it outside the request body lets an error path fail
+        // closed instead of accidentally trying to decode with an unloaded head.
+        bool repeat_prompt_reinit = false;
         for (;;) {
             line_drain_ms = 0.0;
             if (batch_on() || (piped && pipe_inflight())) {
@@ -17268,6 +17392,87 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            // A completed request normally keeps the native head, MTP routed experts and draft-head rows resident
+            // for fast generation. For a genuinely long next prompt, release those decode-only allocations before
+            // growing the elastic expert tier. The verifier and MTP graphs are invalidated because they capture the
+            // old device addresses; their ordinary buffers/KV state remain resident and are rebound below.
+            const bool retain_deferred_chunk = prefill_retain_startup_chunk &&
+                                               (mtp_deferred || native_head_deferred);
+            const bool repeat_substantial = n - resume >= prefill_repeat_min;
+            if (prefill_repeat_loan && repeat_substantial && !mtp_deferred && !native_head_deferred) {
+                std::string ve;
+                if (!ver.release_decode_resources(ve)) {
+                    std::printf("ERR prefill decode-resource loan failed: %s\n", ve.c_str());
+                    std::fflush(stdout);
+                    return 1;
+                }
+                if (!mtp.release_decode_resources(ve)) {
+                    std::printf("ERR prefill decode-resource loan failed: %s\n", ve.c_str());
+                    std::fflush(stdout);
+                    return 1;
+                }
+                // The prompt path owns a persistent cuBLAS handle and, on SM75 with BF16 tensor cores, its
+                // conversion cache. Rebuild it after the cache has grown so those first-request scratch buffers do
+                // not permanently consume the repeat-loan headroom. The chunk buffers themselves remain borrowed
+                // from the cache and are laid out again below.
+                sp.reset();
+                repeat_prompt_reinit = true;
+                drive.d.plan = nullptr;
+                native_head.unload();
+                repeat_resources_deferred = true;
+                std::fprintf(stderr, "strata serve: repeat prefill loan: verifier arena, native head, MTP experts "
+                                     "and draft head released for %lld prompt tokens\n", (long long) (n - resume));
+            }
+            // Mutate the cache only after the complete request has passed input validation. Retaining the startup
+            // layout applies only while decode-only weights are still deferred; repeat loans release them above.
+            if (prefill_elastic_loan && xcache.segmented() && !retain_deferred_chunk) {
+                std::string ve;
+                if (!vram_command("VRAM 0", ve, false)) {
+                    std::printf("ERR prefill cache loan grow failed: %s\n", ve.c_str());
+                    std::fflush(stdout);
+                    if (repeat_resources_deferred) return 1;
+                    continue;
+                }
+            }
+            if (repeat_prompt_reinit) {
+                // The cache-slot estimate is intentionally conservative, but it cannot price every small owned
+                // allocation and 2 MiB allocator boundary in Prefill::init. Retry a fitting error with the next
+                // 256-token step instead of terminating the server; retain the successful value for later turns.
+                int64_t retry_chunk = o.prefill_chunk;
+                for (;;) {
+                    if (!pf_parts.empty()) {
+                        PfPart& p = pf_parts[0];
+                        p.first = (int32_t) std::max<int64_t>(0, xcache.slots() - part_slots(p, retry_chunk));
+                        p.first_now = -1;
+                    }
+                    lend_first = pf_parts.empty() ? -1 : pf_parts[0].first;
+                    borrow = lend_first >= 0 ? xcache.device_slot(lend_first) : nullptr;
+                    borrow_bytes = lend_first >= 0 ? part_bytes(pf_parts[0], lend_first) : 0;
+                    o.prefill_chunk = retry_chunk;
+                    if (sp.init(wt, g, ss, srcp, &xcache, host_res.data(), retry_chunk, main_cs, err, borrow,
+                                borrow_bytes)) {
+                        repeat_chunk_hint = retry_chunk;
+                        break;
+                    }
+                    const std::string init_err = err;
+                    const bool fit_failure = init_err.find("do not fit") != std::string::npos ||
+                                             init_err.find("scratch does not fit") != std::string::npos;
+                    sp.reset();
+                    (void) cudaGetLastError();
+                    if (!fit_failure || retry_chunk <= 256) {
+                        err = init_err;
+                        std::printf("ERR repeat prefill prompt-resource reload failed: %s\n", err.c_str());
+                        std::fflush(stdout);
+                        return 1;
+                    }
+                    const int64_t next = std::max<int64_t>(256, ((retry_chunk - 1) / 256) * 256);
+                    std::fprintf(stderr, "strata serve: repeat loan: prompt chunk %lld did not fit; retrying %lld\n",
+                                 (long long) retry_chunk, (long long) next);
+                    retry_chunk = next;
+                }
+                if (!multi_gpu && o.batch <= 0 && !o.no_pool) sp.set_cpu_pool(&pool);
+                repeat_prompt_reinit = false;
+            }
             // --batch: an idle slot that holds the start of this prompt (the conversation it served last) is a
             // source too - its sessions are copied back below, so only the new part is read.  STRATA_SLOT_CKPT_MOVE: an
             // active slot's checkpoints too (its windows write its cells from p on, so the ones below a checkpoint still
@@ -18302,7 +18507,7 @@ int main(int argc, char** argv) {
                                      "whole prompt through the batched path, none of it through the verify windows\n");
             }
             auto windows_ok = [&](int64_t a, int64_t b) -> bool {
-                if (no_short || b - a > req_short_read) return false;
+                if (native_head_deferred || repeat_resources_deferred || no_short || b - a > req_short_read) return false;
                 if (sp.embd_rows != nullptr)
                     for (int64_t i = a; i < b; ++i)
                         if (sp.embd_rows[i] != nullptr) return false;
@@ -18601,12 +18806,15 @@ int main(int argc, char** argv) {
                         // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
                         // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
                         // lent even then is halved until it can, instead of ending the engine.
+                        // A repeat loan has already removed the verifier/head/MTP allocations, so the ordinary
+                        // decode-side cache guard is not needed until those resources are restored after refill.
+                        const int64_t decode_guard = repeat_resources_deferred ? 0 : 128;
                         int64_t need_p = part_slots(p, want_p);
-                        while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
+                        while ((need_p <= 0 || need_p + decode_guard > p.cache->slots()) && want_p > 256) {
                             want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
                             need_p = part_slots(p, want_p);
                         }
-                        if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
+                        if (need_p <= 0 || need_p + decode_guard > p.cache->slots()) {
                             e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
                             return false;
                         }
@@ -19452,6 +19660,87 @@ int main(int argc, char** argv) {
             }
             if (mtp_room_open && room_close("prompt done") != 0) return 1;
             if (head_restore() != 0) return 1;
+            if (prefill_elastic_loan && xcache.segmented()) {
+                std::string ve;
+                // A repeat loan temporarily grows the cache while decode resources are absent.  Before restoring
+                // those resources, return to the same headroom used by the startup deferred boundary; otherwise the
+                // native head, verifier and MTP allocations are reloaded with only a few MiB free, which can make
+                // Windows/WDDM page the decode path even though the prompt itself was fast.
+                const bool reload_deferred_decode = mtp_deferred || native_head_deferred || repeat_resources_deferred;
+                const int64_t reserve = (int64_t) o.vram_reserve_mib +
+                                        (reload_deferred_decode ? mtp_deferred_reserve_mib : 0);
+                if (!vram_command("VRAM " + std::to_string(reserve), ve, false)) {
+                    std::printf("ERR prefill cache loan shrink failed: %s\n", ve.c_str());
+                    return 1;
+                }
+                vh.cache_base = xcache.device_slot(0);
+                vh.slot_off = xcache.slot_offsets();
+                vh.n_slots = xcache.slots();
+                auto prepare_verifier_reload = [&]() {
+                    ver.set_remote_expert_opt(remote_opt.get());
+                    if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
+                    if (batch_mtp) ver.set_batch_graph_limit(64);
+                };
+                auto finish_verifier_reload = [&]() -> bool {
+                    ver.set_split(o.spec_split);
+                    ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                    ver.set_sampling(req_sp);
+                    ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
+                    if (!ver.set_logit_bias(req_bias, err)) return false;
+                    drive.d.plan = ver.plan_sink();
+                    if (aov && !ver.set_adapt_gate(&agate)) {
+                        err = "verify: adaptive overlap could not be restored after the prefill loan";
+                        return false;
+                    }
+                    if (drive.d.evict_sync || res_checking)
+                        ver.set_pre_launch([&](cudaStream_t, std::string& e) { return res_sync(res_checking, e); });
+                    return true;
+                };
+                if (native_head_deferred) {
+                    std::fprintf(stderr, "strata serve: deferred boundary: loading native output head\n");
+                    prepare_verifier_reload();
+                    if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err) ||
+                        !ver.init(wt, g, ss, vh, &native_head, std::max(o.spec, o.batch), err) ||
+                        !finish_verifier_reload()) {
+                        std::printf("ERR deferred native head load failed: %s\n", err.c_str());
+                        return 1;
+                    }
+                    native_head_deferred = false;
+                }
+                if (mtp_deferred) {
+                    std::fprintf(stderr, "strata mtp: deferred boundary: loading routed experts and draft head\n");
+                    if (!mtp.load_experts(err) || !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
+                        std::printf("ERR deferred MTP load failed: %s\n", err.c_str());
+                        return 1;
+                    }
+                    mtp.set_draft_sampling(req_sp);
+                    mtp_deferred = false;
+                }
+                if (repeat_resources_deferred) {
+                    std::fprintf(stderr, "strata serve: repeat loan boundary: reloading verifier, native output head "
+                                 "and MTP decode resources\n");
+                    prepare_verifier_reload();
+                    if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err) ||
+                        !ver.init(wt, g, ss, vh, &native_head,
+                                  batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                        !finish_verifier_reload()) {
+                        std::printf("ERR repeat prefill verifier/head reload failed: %s\n", err.c_str());
+                        return 1;
+                    }
+                    if (!mtp.load_experts(err) || !mtp.bind(wt, &native_head, ver.final_R_all(), err)) {
+                        std::printf("ERR repeat prefill decode-resource reload failed: %s\n", err.c_str());
+                        return 1;
+                    }
+                    mtp.set_draft_sampling(req_sp);
+                    repeat_resources_deferred = false;
+                }
+                // A loan reloads the drafter's routed experts at a new address: the prompt room's slots ARE
+                // those bytes (STRATA_MTP_ROOM_MIN), so point the room's prompt path at the reloaded block -
+                // the address captured at start is gone.  In MTP-loan starts the room is refused at startup
+                // (no experts to lend), so this is the repeat-loan path that needs it.
+                if (mtp_room_slots > 0 && room_path != nullptr)
+                    room_path->set_ring_room_base(mtp.experts_base(), mtp.experts_bytes());
+            }
             tr("prompt done (slots refilled)");
             if (il_parts > 0)
                 std::fprintf(stderr, "strata batch: the prompt was read in %lld parts, the slots decoding %.0f ms between "
