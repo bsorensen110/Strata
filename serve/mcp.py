@@ -22,6 +22,7 @@ from __future__ import annotations
 import collections
 import base64
 import hashlib
+import http.client
 from pathlib import Path
 import json
 import os
@@ -314,7 +315,10 @@ class HttpTransport:
             if slot is None:
                 raise err from None
             slot.error = err
-        except (OSError, ValueError, McpError) as e:
+        except (OSError, ValueError, McpError, http.client.HTTPException) as e:
+            # `HTTPException`: the address answers with something that is not HTTP (on Windows a loopback
+            # self-connect on a port in the ephemeral range hands the request straight back).  That is the same
+            # "cannot talk to this server" as a refused connection: the tools are left out, the chat goes on.
             err = e if isinstance(e, McpError) else McpError(f"could not reach {self.url}: {e}")
             if slot is None:
                 raise err from None
@@ -492,6 +496,12 @@ def _picture(block: dict, images: list) -> tuple[str, str | None]:
     return f"[image ({mime}, {size:,} bytes)]", url
 
 
+def result_text(result: dict) -> str:
+    """An MCP tool result as the text the model reads: the text blocks as they are, other blocks named.  With the
+    picture cache off (`image_results` false, serve/test_mcp_media.py) a result is exactly this: text alone."""
+    return result_parts(result)[0]
+
+
 def result_parts(result: dict) -> tuple[str, list | None]:
     """An MCP tool result as (text, parts): the text the model reads - the text blocks as they are, other blocks named
     - and, when the result carries pictures, that same content in the form the prompt takes (serve/frontend.py's
@@ -656,12 +666,17 @@ class McpHub:
 
     def call(self, name: str, arguments: dict, cancel: threading.Event | None = None) -> dict:
         """Run one tool -> {"ok", "text" (what the model reads, capped), "chars" (its full length), "truncated",
-        "ms", "server", "tool", "parts" (the tool message's content when the result carried pictures, else None),
-        "images" (those pictures as data: URLs)}.  Errors become text starting with "error:", and a result that
-        reports one is text alone as it always was; only McpCancelled is raised."""
+        "ms", "server", "tool"}.  A result that carried pictures adds the way to the model: with no picture cache on
+        disk (`media_dir` is None) that is `parts` (the tool message's content, pictures as data: URLs) and `images`
+        (those URLs); with the cache configured (`image_results`, serve/test_mcp_media.py) it is `images` (the cached
+        files) and `model_content` (the tool message's content pointing at them).  With the cache configured and
+        `image_results` off a picture stays what it always was - a line in the text - and neither key appears.
+        Errors become text starting with "error:", and a result that reports one is text alone as it always was;
+        only McpCancelled is raised."""
         t0 = time.monotonic()
         server, tool = self._routes.get(name) or self.routes().get(name, (None, name))
         out = {"server": server.name if server else None, "tool": tool}
+        cached = self.settings["image_results"] and self.media_dir is not None
         if server is None:
             text, parts, ok = f"error: there is no tool named {name!r}", None, False
         else:
@@ -670,7 +685,7 @@ class McpHub:
                                   float(self.settings["timeout_s"]), cancel)
                 text, parts = result_parts(res)
                 ok = not res.get("isError")
-                if ok and self.settings["image_results"] and self.media_dir is not None:
+                if ok and cached:
                     try:
                         images = cache_images(res, self.media_dir)
                     except OSError as e:
@@ -696,9 +711,11 @@ class McpHub:
             out["model_content"] = [{"type": "text", "text": text.replace(": not shown to the model]", ": image attached]")}] + [
                 {"type": "image", "source": str(Path(self.media_dir) / im["url"].split("/")[-1])}
                 for im in out["images"]]
-        out.update(ok=ok, text=text, chars=full, truncated=bool(note), parts=parts,
-                   images=[p["source"] for p in parts or () if p["type"] == "image"],
+        out.update(ok=ok, text=text, chars=full, truncated=bool(note),
                    ms=int((time.monotonic() - t0) * 1000))
+        if self.media_dir is None:      # no cache on disk: the pictures ride to the model as data: URLs
+            out["parts"] = parts
+            out["images"] = [p["source"] for p in parts or () if p["type"] == "image"]
         return out
 
     def status(self) -> dict:

@@ -173,7 +173,13 @@ def http_server(port: int = 0) -> ThreadingHTTPServer:
             self.send_response(200)
             self.end_headers()
 
-    httpd = ThreadingHTTPServer(("127.0.0.1", port), H)
+    class Server(ThreadingHTTPServer):
+        # as serve/server.py's Server: on Windows SO_REUSEADDR lets a second server bind a port that is already
+        # serving, and a port at the bottom of the ephemeral range then answers a loopback self-connect with an
+        # echo of the request (WinError 10048 / a status line that is our own request line)
+        allow_reuse_address = os.name != "nt"
+
+    httpd = Server(("127.0.0.1", port), H)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd
 

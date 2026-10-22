@@ -60,13 +60,18 @@ class Elastic(unittest.TestCase):
     def picture(self):
         self.svc.prepare([{"role": "user", "content": [{"type": "text", "text": "what is it"}, IMAGE]}], None, {})
 
+    def reserves(self):
+        """The VRAM sizes the engine was asked for, in order.  serve/test_vram.py's VramEngine (the multi-GPU wave)
+        records each call as (reserve_mib, gpu); this file is about the sizes, so it reads the first half."""
+        return [c[0] for c in self.engine.calls]
+
     def test_the_first_picture_makes_room_then_starts_the_encoder(self):
         self.picture()
-        self.assertEqual(self.engine.calls, [2048])         # the cache keeps the encoder's share free first
+        self.assertEqual(self.reserves(), [2048])           # the cache keeps the encoder's share free first
         self.assertEqual(self.vision.starts, 1)
         self.assertTrue(self.svc.vision_held)
         self.picture()                                      # the next one uses the running encoder
-        self.assertEqual(self.engine.calls, [2048])
+        self.assertEqual(self.reserves(), [2048])
         self.assertEqual(self.vision.starts, 1)
 
     def test_an_idle_encoder_stops_and_the_cache_grows_back_whole(self):
@@ -78,21 +83,21 @@ class Elastic(unittest.TestCase):
         self.assertEqual(self.svc._vision_idle_down(), "down")
         self.assertFalse(self.vision.up)
         self.assertFalse(self.svc.vision_held)
-        self.assertEqual(self.engine.calls, [2048, 0])      # 0, not None: the full size, not the start's reserve
+        self.assertEqual(self.reserves(), [2048, 0])        # 0, not None: the full size, not the start's reserve
         self.assertEqual(self.svc._vision_idle_down(), "nothing")
         self.picture()                                      # and the next picture starts it again
         self.assertEqual(self.vision.starts, 2)
-        self.assertEqual(self.engine.calls, [2048, 0, 2048])
+        self.assertEqual(self.reserves(), [2048, 0, 2048])
 
     def test_a_vram_reserve_stacks_on_the_encoders_share(self):
         self.svc.vram(4000)
         self.picture()
-        self.assertEqual(self.engine.calls, [4000, 6048])
+        self.assertEqual(self.reserves(), [4000, 6048])
         self.svc.vram(1000)                                 # asked while the encoder runs
-        self.assertEqual(self.engine.calls[-1], 3048)
+        self.assertEqual(self.reserves()[-1], 3048)
         self.svc.last_image_at = 0
         self.svc._vision_idle_down()
-        self.assertEqual(self.engine.calls[-1], 1000)       # back to the asked reserve, not to 0
+        self.assertEqual(self.reserves()[-1], 1000)         # back to the asked reserve, not to 0
 
     def test_an_engine_that_cannot_shrink_still_gets_its_encoder(self):
         self.engine.elastic = False
@@ -101,7 +106,7 @@ class Elastic(unittest.TestCase):
         self.assertFalse(self.svc.vision_held)
         self.svc.last_image_at = 0
         self.assertEqual(self.svc._vision_idle_down(), "down")
-        self.assertEqual(self.engine.calls, [2048])         # the refused shrink only: nothing to give back
+        self.assertEqual(self.reserves(), [2048])           # the refused shrink only: nothing to give back
 
     def test_an_encoder_that_fails_to_start_is_a_503_not_a_dropped_connection(self):
         def fail():
@@ -112,7 +117,7 @@ class Elastic(unittest.TestCase):
         self.assertIn("the image encoder failed to start", str(e.exception))
         self.svc.last_image_at = 0
         self.assertEqual(self.svc._vision_idle_down(), "down")
-        self.assertEqual(self.engine.calls, [2048, 0])      # the share made for it goes back
+        self.assertEqual(self.reserves(), [2048, 0])        # the share made for it goes back
 
     def test_the_stop_is_logged_when_the_cache_never_made_room(self):
         self.engine.elastic = False                         # a layer split: the engine refuses --vram-elastic
@@ -217,7 +222,8 @@ class Elastic(unittest.TestCase):
         msg = self.tool_picture()
         self.svc._note_unreadable_tool_images(msg)          # the start's RuntimeError must not escape: the method's
         self.assertEqual(msg[1]["content"][0],              # contract is a note in the picture's place, not a 500
-                         {"type": "text", "text": "[image omitted: the vision encoder did not start]"})
+                        {"type": "text", "text":           # _vision_up's own prefix, as on the 503 path (see above)
+                         "[image omitted: the image encoder failed to start: the vision encoder did not start]"})
 
 
 if __name__ == "__main__":

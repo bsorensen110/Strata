@@ -7085,11 +7085,11 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             if "r" not in box:
                 break
             r = box["r"]
-            n_pic = len(r["images"])
+            n_pic = len(r.get("images") or ())
             pics = f", {n_pic} picture{'s' if n_pic != 1 else ''} for the model" if n_pic else ""
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters{pics} in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            results.append(r.get("model_content", r["text"]) if svc.vision is not None else r["text"])
+            results.append(r.get("model_content") or r.get("parts") or r["text"])
             yield "mcp", {"event": "result", "id": c.id,
                           **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
                           **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}
@@ -7099,8 +7099,9 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
         messages.append({"role": "assistant", "content": "".join(text).strip(),
                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
-        # a result's pictures ride along as the prompt's image parts (serve/mcp.py's result_parts)
-        messages += [{"role": "tool", "content": r["parts"] or r["text"]} for r in results]
+        # a result's pictures ride along as the prompt's image parts: the cached files (serve/test_mcp_media.py) or
+        # the data: URLs (serve/mcp.py's result_parts); text-only results carry their text, as they always did
+        messages += [{"role": "tool", "content": r} for r in results]
         try:
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
         except ClientGone:                                      # #1999: the client left while a picture was prepared
@@ -8489,8 +8490,8 @@ def make_handler(svc: Service):
                     return
                 if path in ("/v1/chat/completions", "/v1/completions", "/v1/messages", "/v1/responses"):
                     svc.request_trace.peer_ip = self.client_address[0]
-                    self.record = svc.begin_request(path, req, self.headers)
-                    self.record = svc.begin_request(path, req)
+                    self.record = svc.begin_request(path, req, self.headers)   # the headers carry the caller's
+                    # traceparent, which becomes this request's span's parent (serve/tracing.py)
                     # thinking_token_budget (vLLM), thinking_budget (Qwen) and thinking_budget_tokens (llama.cpp):
                     # other providers' names for #123's thinking budget (pi's compat.thinkingTokenBudgetField
                     # sends one of them).  The request's own reasoning_budget_tokens wins; if a client sends
@@ -8953,7 +8954,9 @@ def make_handler(svc: Service):
                     self._note(outcome="disconnected")
             except ValueError as e:
                 err = {"error": {"type": "server_error", "message": str(e)}}
-                self._note(error=err["error"])
+                if isinstance(e, PoolFull):                  # the KV pool's refusal is retryable: the headers are out,
+                    err["error"].update(code="kv_pool_full", retry_after=POOL_RETRY_S)   # so the code and the wait
+                self._note(error=err["error"])               # ride in the event, as on the legacy /v1/completions path
                 try:
                     self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
                 except OSError:

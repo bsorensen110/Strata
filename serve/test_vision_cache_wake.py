@@ -71,6 +71,11 @@ class CacheWake(unittest.TestCase):
         content = [{"type": "text", "text": "what is it"}] + [{"type": "image", "source": s} for s in sources]
         return self.svc.prepare([{"role": "user", "content": content}], None, {})
 
+    def reserves(self):
+        """The VRAM sizes the engine was asked for, in order.  serve/test_vram.py's VramEngine (the multi-GPU wave)
+        records each call as (reserve_mib, gpu); this file is about the sizes, so it reads the first half."""
+        return [c[0] for c in self.engine.calls]
+
     def test_a_re_sent_picture_does_not_wake_the_idle_encoder(self):
         ids1 = self.send("a.png")
         self.assertEqual(self.vision.starts, 1)                          # a new picture: the normal start
@@ -80,7 +85,7 @@ class CacheWake(unittest.TestCase):
         self.assertEqual(self.vision.starts, 1)                          # already encoded: no start
         self.assertFalse(self.vision.up)
         self.assertFalse(self.svc.vision_held)
-        self.assertEqual(self.engine.calls, [2048, 0])                   # and no fresh share request either
+        self.assertEqual(self.reserves(), [2048, 0])                 # and no fresh share request either
         self.assertEqual(ids2, ids1)                                     # the prompt is built the same, from the cache
 
     def test_a_new_picture_alongside_cached_ones_still_wakes_it(self):
@@ -95,7 +100,7 @@ class CacheWake(unittest.TestCase):
         self.send("a.png")
         self.send("a.png")                                               # the encoder is up: nothing to reserve, start or encode
         self.assertEqual(self.vision.starts, 1)
-        self.assertEqual(self.engine.calls, [2048])
+        self.assertEqual(self.reserves(), [2048])
 
     def test_the_cache_lookup_needs_no_encoder_process(self):
         v = Vision({"exe": "e", "mmproj": "m", "model": "t", "elastic": True}, lazy=True)
