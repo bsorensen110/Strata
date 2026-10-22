@@ -122,6 +122,9 @@
 #if !defined(__APPLE__)   // major() / minor(): <sys/types.h> on macOS
 #include <sys/sysmacros.h>
 #endif
+#if defined(__APPLE__)
+#include <mach/mach.h>   // the watchdog's memory readings: macOS has no /proc (file_tier_activity, mem_sample)
+#endif
 #endif
 
 #include <cuda_runtime.h>
@@ -1355,6 +1358,21 @@ static std::string ram_note(const std::optional<strata::core::HostMemoryReading>
     return std::to_string(mem->available >> 20) + " MiB available, source " + strata::core::memory_source_name(mem->source);
 }
 
+// STRATA_PARK_DEBUG only: ask libmalloc whether its zones are intact.  A park writes a fresh
+// snapshot's worth of vectors; if a later request dies in operator new, this says whether the
+// damage predates the park or happened inside it (a corrupt zone prints its own line too).
+#if defined(__APPLE__)
+extern "C" int malloc_zone_check(void*);
+#endif
+static void park_canary(const char* where) {
+#if defined(__APPLE__)
+    if (!std::getenv("STRATA_PARK_DEBUG")) return;
+    std::fprintf(stderr, "strata metal park: malloc integrity check %d (%s)\n", malloc_zone_check(nullptr), where);
+#else
+    (void) where;
+#endif
+}
+
 // ---- issue #31: what the watchdog prints before it stops a stalled engine
 struct MemSample {
     unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard (Linux) / all (Windows)
@@ -1371,6 +1389,29 @@ MemSample mem_sample() {
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
     if (GlobalMemoryStatusEx(&ms)) m.avail_mib = ms.ullAvailPhys >> 20;
+#elif defined(__APPLE__)
+    // macOS has no /proc: task_info gives the process's faults, footprint and compressed pages (the same reading
+    // the Metal stream's proc_mem uses, window.cpp), and vm_statistics64 the RAM macOS can hand over without
+    // paging anything out - arena_avail's rule (metal/src/engine/arena_budget.h): free + purgeable + min(inactive
+    // + speculative, the pages macOS keeps outside its anonymous set).
+    task_vm_info_data_t tvi;
+    mach_msg_type_number_t tn = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &tvi, &tn) == KERN_SUCCESS) {
+        m.rss_mib = tvi.phys_footprint >> 20;
+        m.commit_mib = tvi.compressed >> 20;   // the bytes macOS parked out of RAM for this process
+    }
+    task_events_info_data_t tei;
+    mach_msg_type_number_t en = TASK_EVENTS_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t) &tei, &en) == KERN_SUCCESS)
+        m.faults = tei.faults;   // counts soft faults too, like Windows: the page-ins drive it
+    vm_statistics64_data_t vs;
+    mach_msg_type_number_t vn = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &vn) == KERN_SUCCESS) {
+        const double pg = (double) vm_page_size;
+        m.avail_mib = (unsigned long long) ((vs.free_count + vs.purgeable_count) * pg +
+                                            std::min((vs.inactive_count + vs.speculative_count) * pg,
+                                                     vs.external_page_count * pg)) >> 20;
+    }
 #else
     if (std::FILE* f = std::fopen("/proc/self/stat", "r")) {
         char buf[4096];
@@ -1437,8 +1478,17 @@ static uint64_t file_tier_activity() {
     // thread waiting on one page at a time), which at >> 6 is 3 a second and never counted as busy
     if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) total += pmc.PageFaultCount >> 3;
     return total;
+#elif defined(__APPLE__)
+    // the gap #1984 closed for Windows, on macOS too: the process fault counter is the signal - a host paging the
+    // 47 GB expert file back in under memory pressure drives it at hundreds a second, and >> 3 (like Windows, where
+    // 200 faults/s read at 3/s on the /8 scale) clears the busy test; a truly stuck engine makes almost none.
+    task_events_info_data_t tei;
+    mach_msg_type_number_t en = TASK_EVENTS_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_EVENTS_INFO, (task_info_t) &tei, &en) != KERN_SUCCESS) return 0;
+    // pageins (the hard, storage-backed faults) plus soft-fault churn /8: the Windows #1984 formula's Mac form
+    return (uint64_t) (unsigned) tei.pageins + ((uint64_t) (unsigned) tei.faults >> 3);
 #else
-    return 0;
+    return 0;   // no /proc, no Win32 counters, no Mach: the watchdog keeps the plain 60 s limit
 #endif
 }
 
@@ -1610,6 +1660,8 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
                      m.commit_mib,
 #if defined(_WIN32)
                      "committed", m.avail_mib, m.faults, "page faults so far"
+#elif defined(__APPLE__)
+                     "in swap", m.avail_mib, m.faults, "page faults so far"   // task_info counts soft faults too
 #else
                      "in swap", m.avail_mib, m.faults, "major page faults so far"
 #endif
@@ -1754,7 +1806,14 @@ bool adapt_overlap() {
         // decode on an A4000, +4.4% on a P100) until an RTX 5090 Laptop (WSL2, Core Ultra 9 275HX, native IQ3_XXS pack,
         // --expert-cache-per-layer) decoded 21% slower with it: 84.6 vs 106.6 tok/s medians of 5 generations of 256
         // tokens from one build, the slowest of the fast run above the fastest of the slow one.
-        return e && e[0] == '1';
+        // This fork: on by default on Metal.  An M1 Max decoded 24..28% faster with it (tg128, IQ3_XXS pack, t357
+        // prompt, medians of paired runs; same tokens - only when the copies land changes).  CUDA stays opt-in (#2010).
+#if defined(STRATA_GPU_METAL)
+        const bool dflt = true;
+#else
+        const bool dflt = false;
+#endif
+        return e ? e[0] == '1' : dflt;
     }();
     return v;
 }
@@ -4094,6 +4153,12 @@ int main(int argc, char** argv) {
     }
     strata::core::qsa_set_kv_int8(o.kv == "int8");
     strata::core::qsa_set_kv_q4(o.kv == "q4_0");   // PR #21: 4-bit codes after a Hadamard rotation (kv_q4.hpp)
+#if defined(STRATA_GPU_METAL)
+    // the Metal window's kernels store int8 codes with an fp16 scale per 64 whatever --kv says (qsa.metal), so
+    // the default fp16 mode's session states must describe those bytes: the conversation snapshot's layout
+    // arithmetic and the window's cells then agree, and park repacks them without inventing fp16 zeros.
+    if (o.kv == "fp16") strata::core::qsa_set_kv_int8(true);
+#endif
     // STRATA_KV_ROT=1: INT8 K/V through the Hadamard rotation --kv q4_0 already uses. Opt-in: first-token KL to
     // fp16 K/V improved on an NVFP4 pack (0.0066 -> 0.0051) but not on IQ2_XS (0.0022 -> 0.0054)
     const char* kv_rot = std::getenv("STRATA_KV_ROT");
@@ -11281,6 +11346,7 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
+                park_canary("before park");
                 if (!strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
                         std::move(reuse), &reused_bytes)) return false;
                 if (has_dflash) {
@@ -11289,6 +11355,7 @@ int main(int argc, char** argv) {
                         if (!strata::core::conversation_kv_save(image.dflash_kv[j], dflash.kv_states()[j],
                                 dflash.pool_geometry(), (int64_t) live.size(), false, err)) return false;
                 }
+                park_canary("after park");
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
@@ -11300,6 +11367,7 @@ int main(int argc, char** argv) {
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
+                park_canary("after stage images");
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
@@ -16881,6 +16949,173 @@ int main(int argc, char** argv) {
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
                 strata::core::progress_beat();
                 std::fflush(stdout);
+                return true;
+            };
+            // the batched path's slots are lent just before its first run and given back (refilled) before a window
+            // reads - so the windows always see the whole expert cache - or once the prompt is read
+            // Every participant gives its loan back here: the rows it lent are refilled into the SAME slots from
+            // the arena, the residency table is restored, and one upload puts it on every device.  A stage refills
+            // through its own cache and its own device - a slot refilled into the wrong cache would leave that
+            // stage's cache holding an expert it does not own, which is silent and produces plausible tokens.
+            // (split in two halves so a layer split can queue every stage's copies before it waits for any: #340)
+            // STRATA_REFILL_PARTS=1 (gfx1151's table): a lent slot of a GGUF read in place is refilled from the pieces in the mapping.
+            // The default assembles the blob in a staging buffer first (a 4 MB copy on this thread), then copies that.
+            static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
+            auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
+                tr("refill start", (long long) p.lent.size());
+                const strata::core::OnDevice on(p.dev);
+                for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
+                    strata::core::BlobPart parts[3];
+                    const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
+                    if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
+                        if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
+                        host_res[(size_t) i] = slot;
+                        continue;
+                    }
+                    const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
+                    const int64_t nb = (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(i / g.n_expert);
+                    if (b == nullptr || !(refill_blocking() ? p.cache->fill_slot_blocking(slot, b, e, nb)
+                                                            : p.cache->fill_slot_queued(slot, b, e, nb)))
+                        return false;
+                    if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
+                    host_res[(size_t) i] = slot;
+                }
+                return true;
+            };
+            auto refill_wait = [&](PfPart& p, std::string& e) -> bool {
+                const strata::core::OnDevice on(p.dev);
+                if (!p.cache->sync_queued(e)) return false;
+#if defined(_WIN32)
+                // The copies have landed: the file pages touched by the loan need not stay in the working set.
+                for (const auto& [i, slot] : p.lent)
+                    srcp->release(i / g.n_expert, i % g.n_expert);
+#endif
+                p.lent.clear();
+                p.lent_chunk = 0;
+                return true;
+            };
+            auto refill_one = [&](PfPart& p, std::string& e) -> bool {
+                if (p.lent.empty()) return true;
+                return refill_issue(p, e) && refill_wait(p, e);
+            };
+            // #340: with several stages every stage's copies go out first (each card on its own link), then each is
+            // waited for - the same copies into the same slots, so the same cache; one stage: refill_one exactly.
+            // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
+            static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
+            auto refill = [&](std::string& e) -> bool {
+                const auto t_rf = Clock::now();
+                int64_t n_lent = 0, n_parts = 0;
+                for (PfPart& p : pf_parts)
+                    if (!p.lent.empty()) { n_lent += (int64_t) p.lent.size(); ++n_parts; }
+                if (n_parts > 1 && !refill_serial) {
+                    for (PfPart& p : pf_parts)
+                        if (!p.lent.empty() && !refill_issue(p, e)) return false;
+                    for (PfPart& p : pf_parts)
+                        if (!p.lent.empty() && !refill_wait(p, e)) return false;
+                } else {
+                    for (PfPart& p : pf_parts)
+                        if (!p.lent.empty() && !refill_one(p, e)) return false;
+                }
+                if (n_parts > 0) res_upload();
+                if (trace && n_parts > 0) {
+                    std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
+                                 (long long) n_lent, (long long) n_parts,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t_rf).count());
+                    std::fflush(stderr);
+                }
+                return true;
+            };
+            // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
+            // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
+            // participant's own cache, and marking only that participant's own layers
+            int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
+            auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
+                seg_lend = 0;
+                if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+                const auto t_ln = Clock::now();
+                // what this segment needs, capped by the configured chunk: a request lends only what its own
+                // prompt needs, so a large chunk costs a short prompt nothing
+                const int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
+                // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
+                const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
+                                       : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
+                                                                                     : want_full;
+                // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
+                const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+                if (want <= 0) {
+                    e = "prefill: cannot lend buffers for an empty request segment";
+                    return false;
+                }
+                bool any = false;
+                for (PfPart& p : pf_parts) {
+                    if (p.first < 0) continue;
+                    if (!p.lent.empty()) {
+                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                        // ONLY this participant's loan goes back: `refill` would return the other participants'
+                        // loans too, and their buffers are still laid out in their caches - marking those slots
+                        // resident again would hand the next window a prompt buffer in place of an expert
+                        if (!refill_one(p, e)) return false;
+                    }
+                    const strata::core::OnDevice on(p.dev);
+                    int64_t want_p = want;
+                    int32_t first = p.first_now;
+                    // --prefill-head-alias: the loan laid out at start (slot 1 on) is kept; a hybrid layout cannot relayout
+                    if (!o.prefill_head_alias) {
+                        // #2090: the loan a chunk needs is NOT monotonic in the chunk: a chunk above the scan's small_max
+                        // lays out the byte-budget ring (199 slots at 5120), one at or below it 0.1.39's (384 at 4096), so
+                        // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
+                        // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
+                        // lent even then is halved until it can, instead of ending the engine.
+                        int64_t need_p = part_slots(p, want_p);
+                        while ((need_p <= 0 || need_p + 128 > p.cache->slots()) && want_p > 256) {
+                            want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
+                            need_p = part_slots(p, want_p);
+                        }
+                        if (need_p <= 0 || need_p + 128 > p.cache->slots()) {
+                            e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
+                            return false;
+                        }
+                        if (want_p != want)
+                            std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
+                                         "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
+                                         (long long) want_p);
+                        if (need_p > p.cache->slots() - p.first)   // the case that ended the engine before (#2090)
+                            std::fprintf(stderr, "strata serve: the loan for a chunk of %lld tokens (%lld slots) is larger than the "
+                                         "auto chunk's (%lld slots): starting it earlier (#2090)\n", (long long) want_p,
+                                         (long long) need_p, (long long) (p.cache->slots() - p.first));
+                        first = (int32_t) (p.cache->slots() - need_p);
+                    }
+                    if (want_p != p.sp->chunk() || first != p.first_now) {
+                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                        p.first_now = first;
+                    }
+#if !defined(STRATA_GPU_METAL)
+                    for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
+                        for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                            const size_t i = (size_t) (l * g.n_expert + ex);
+                            if (host_res[i] >= first) {
+                                p.lent.emplace_back((int32_t) i, host_res[i]);
+                                host_res[i] = strata::core::kNotResident;
+                                any = true;
+                            }
+                        }
+#else
+                    // Metal: the window's prompt buffers live in the Metal arena, the Metal window reads no host
+                    // residency table, and the Metal engine gave these device slots back for its arena - the loan
+                    // takes no slots, so nothing is marked, and the read leaves nothing to refill after it.
+#endif
+                    p.lent_chunk = want_p;
+                }
+                for (const PfPart& p : pf_parts)
+                    if (p.first >= 0) seg_lend = std::max(seg_lend, p.lent_chunk);
+                if (any) res_upload();
+                if (trace) {
+                    int64_t n_lent = 0;
+                    for (const PfPart& p : pf_parts) n_lent += (int64_t) p.lent.size();
+                    std::fprintf(stderr, "strata trace: lent %lld slots for %lld tokens in %.1f ms\n", (long long) n_lent,
+                                 (long long) want, std::chrono::duration<double, std::milli>(Clock::now() - t_ln).count());
+                    std::fflush(stderr);
+                }
                 return true;
             };
             // --batch: a prompt read while slots are decoding goes one prompt chunk at a time (the same chunks as one
