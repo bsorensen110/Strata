@@ -1270,7 +1270,11 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
                 cudaStreamSynchronize(cs_);
                 std::fprintf(stderr, "df dbg: after attn h0=%.3e bo0=%.3e\n", hb[0], ab[0]);
             }
+#ifdef STRATA_ENABLE_DFLASH2
             if (!dg.is_dflash2() || !fuse_conv) {
+#else
+            if (!dg.is_dflash2()) {   // the fused-conv path (and its flag) only exists with DFlash2
+#endif
                 DFlashSection section("L*.residual_add");
                 add_inplace(h_, bo_, K * N, cs_);
             }
@@ -1314,7 +1318,11 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
 #ifdef STRATA_ENABLE_DFLASH2
             if (dg.is_dflash2()) conv(pre, "mlp_conv", bo_, 1, nullptr, fuse_conv ? h_ : nullptr);
 #endif
+#ifdef STRATA_ENABLE_DFLASH2
             if (!dg.is_dflash2() || !fuse_conv) {
+#else
+            if (!dg.is_dflash2()) {   // the fused-conv path (and its flag) only exists with DFlash2
+#endif
                 DFlashSection section("L*.residual_add");
                 add_inplace(h_, bo_, K * N, cs_);
             }
