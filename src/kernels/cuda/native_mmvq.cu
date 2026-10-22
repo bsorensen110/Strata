@@ -30,7 +30,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "s26_tsum.cuh"
-#if !defined(__HIPCC__)
+#if !defined(STRATA_HIP_GFX906)
 #include "q8_1_il.cuh"
 #endif
 #include "strata/kernels/pdl.hpp"
@@ -1673,7 +1673,7 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
     }
 }
 
-#if !defined(__HIPCC__)   // CUDA only: the HIP paths keep native_mmvq's kernels
+#if !defined(STRATA_HIP_GFX906)   // wave32 (CUDA and RDNA HIP): gfx906 wave64 keeps native_mmvq's kernels
 // ============================ ncols = 2..4 from interleaved activations (fork F4, Eddoursul) ============================
 //
 // `native_quantize_q8_1_il` also writes the columns interleaved (native_mmvq.hpp), so one load reads the same int of
@@ -1965,7 +1965,7 @@ __global__ void native_quantize_q8_1_il_kernel(const float* __restrict__ x, Q81B
     if (lane == 0) dl[std::size_t(b) * cp + c] = __low2float(ds);
 }
 
-#endif  // !__HIPCC__
+#endif  // !STRATA_HIP_GFX906
 
 void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
@@ -3143,7 +3143,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     }
 }
 
-#if !defined(__HIPCC__)
+#if !defined(STRATA_HIP_GFX906)
 std::size_t native_q8_1_il_bytes(int n_in, int ncols) {
     validate_shape(n_in, ncols);
     return std::size_t(n_in / Q8K) * std::size_t(native_q8_1_il_cp(ncols)) * (16 * sizeof(int) + sizeof(float));
@@ -3379,9 +3379,10 @@ int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
     if (type == 8) {
         static const bool q8_head = [] {
             const char* v = std::getenv("STRATA_MMVQ_IL_Q8_HEAD");
-            return v && v[0] == '1';
+            const char* h = std::getenv("STRATA_DFLASH_HEAD_IL");
+            return (v && v[0] == '1') || (h && h[0] == '1');
         }();
-        return q8_head && cc == 89 && n_out == 248320 && ncols >= 3 ? 2 : 0;
+        return q8_head && (cc == 89 || cc >= 120) && n_out == 248320 && ncols >= 3 ? 2 : 0;
     }
     const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
     if (ncols > 4) {   // 147-verify: 5..8 columns, only where a card measured its table
@@ -3452,6 +3453,15 @@ bool sm60_table_on() { const char* v = std::getenv("STRATA_SM60_TABLE"); return 
 // native_mmvq's, mmvq_il_parity), its own table kIlRows_61.  STRATA_SM61_TABLE=0 keeps native_mmvq's kernels.
 bool sm61_table_on() { const char* v = std::getenv("STRATA_SM61_TABLE"); return v == nullptr || std::atoi(v) != 0; }
 bool il_arch_ok() {
+#if defined(__HIPCC__)
+    static const bool hip_il = [] {
+        const char* a = std::getenv("STRATA_DFLASH_HEAD_IL");
+        const char* b = std::getenv("STRATA_MMVQ_IL_Q8_HEAD");
+        const char* c = std::getenv("STRATA_HIP_MMVQ_IL");
+        return (a && a[0] == '1') || (b && b[0] == '1') || (c && c[0] == '1');
+    }();
+    if (!hip_il && g_tune_rows == 0) return false;
+#endif
     static int ok[16] = {};   // 0 unknown, 1 yes, -1 no, by device ordinal
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
@@ -3498,7 +3508,7 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
     launch_check();
 }
 
-#else  // HIP: no interleaved path
+#else  // STRATA_HIP_GFX906 (wave64): no interleaved path
 std::size_t native_q8_1_il_bytes(int n_in, int ncols) { return native_q8_1_bytes(n_in, ncols) * 2; }
 void native_quantize_q8_1_il(const float*, void*, void*, int, int, void*) {
     throw std::invalid_argument("native_quantize_q8_1_il is CUDA only");

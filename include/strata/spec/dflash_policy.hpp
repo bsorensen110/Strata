@@ -82,4 +82,108 @@ private:
     std::array<double, 8> tokens_{}, ms_{};
 };
 
+// Truncate a proposed block [0..k) using a base probability floor, an optional
+// per-depth linear slope (depth_slope >= 0 raises the bar for deeper positions),
+// and an optional cumulative survival floor (product of prefix confidences).
+inline int dflash_truncate_prefix(const float* dprob, int k, float min_p,
+                                  float depth_slope = 0.0f, float min_cum_p = 0.0f) {
+    if (k <= 0) return 0;
+    if (!dprob || (min_p <= 0.0f && depth_slope <= 0.0f && min_cum_p <= 0.0f)) return k;
+    int prefix = 0;
+    float cum = 1.0f;
+    for (int i = 0; i < k; ++i) {
+        const float p = dprob[i];
+        if (!std::isfinite(p)) break;
+        const float thr = std::clamp(min_p + depth_slope * (float) i, 0.0f, 0.98f);
+        cum *= p;
+        if (p < thr || (min_cum_p > 0.0f && cum < min_cum_p)) break;
+        ++prefix;
+    }
+    return prefix;
+}
+
+// Per-request DFlash acceptance and truncation telemetry (up to K=7 proposals).
+struct DFlashTelemetry {
+    int64_t proposed_rows = 0;
+    int64_t gate_truncated_rows = 0;
+    int64_t target_only_rounds = 0;
+    std::array<int64_t, 8> windows_by_k{};
+    std::array<int64_t, 8> accepted_by_k{};
+    std::array<int64_t, 7> depth_tested{};
+    std::array<int64_t, 7> depth_ok{};
+
+    void reset() { *this = DFlashTelemetry{}; }
+
+    void record_proposal(int proposed_k, int offered_k) {
+        const int pk = std::clamp(proposed_k, 0, 7);
+        const int ok = std::clamp(offered_k, 0, pk);
+        proposed_rows += pk;
+        gate_truncated_rows += (pk - ok);
+    }
+
+    void record_window(int offered_k, int accepted_a) {
+        const int k = std::clamp(offered_k, 0, 7);
+        const int a = std::clamp(accepted_a, 0, k);
+        ++windows_by_k[(size_t) k];
+        accepted_by_k[(size_t) k] += a;
+        if (k == 0) ++target_only_rounds;
+        for (int d = 0; d < k && d < 7 && d <= a; ++d) {
+            ++depth_tested[(size_t) d];
+            depth_ok[(size_t) d] += (d < a);
+        }
+    }
+};
+
+// Deterministic confidence-adaptive block controller: grows toward max_k when
+// two consecutive proposals survive the confidence gate with high minimum
+// confidence, and shrinks toward prefix + 1 after two consecutive truncations
+// (hysteresis avoids single-round width oscillation and graph churn).
+class DFlashConfidencePolicy {
+public:
+    explicit DFlashConfidencePolicy(int max_k, int init_k = 3, float expand_prob = 0.80f)
+        : max_k_(std::clamp(max_k, 1, 7)),
+          init_k_(std::clamp(init_k > 0 ? init_k : 3, 1, max_k_)),
+          expand_prob_(expand_prob) {
+        reset();
+    }
+
+    void reset() {
+        cur_k_ = init_k_;
+        high_streak_ = 0;
+        trunc_streak_ = 0;
+    }
+
+    int choose() const { return cur_k_; }
+
+    void observe(int proposed_k, int prefix_k, const float* dprob) {
+        if (proposed_k <= 0) return;
+        float min_conf = 1.0f;
+        if (dprob) {
+            for (int i = 0; i < prefix_k; ++i)
+                min_conf = std::min(min_conf, dprob[i]);
+        }
+        if (prefix_k >= proposed_k && min_conf >= expand_prob_) {
+            trunc_streak_ = 0;
+            if (++high_streak_ >= 2 && cur_k_ < max_k_) {
+                ++cur_k_;
+                high_streak_ = 0;
+            }
+        } else if (prefix_k < proposed_k) {
+            high_streak_ = 0;
+            if (++trunc_streak_ >= 2) {
+                cur_k_ = std::clamp(prefix_k + 1, 1, max_k_);
+                trunc_streak_ = 0;
+            }
+        } else {
+            high_streak_ = 0;
+            trunc_streak_ = 0;
+        }
+    }
+
+private:
+    int max_k_, init_k_, cur_k_ = 3;
+    int high_streak_ = 0, trunc_streak_ = 0;
+    float expand_prob_ = 0.80f;
+};
+
 }  // namespace strata::spec

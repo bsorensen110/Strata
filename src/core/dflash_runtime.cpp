@@ -255,7 +255,12 @@ void DFlashDrafter::clear_graphs() {
         if (graph) cudaGraphExecDestroy(graph);
         graph = nullptr;
     }
+    for (auto& graph : ctx_graph_exec_) {
+        if (graph) cudaGraphExecDestroy(graph);
+        graph = nullptr;
+    }
     graph_chunks_.fill(0); graph_cap_.fill(0);
+    ctx_graph_taps_.fill(nullptr); ctx_graph_stride_.fill(0);
 }
 
 void DFlashDrafter::release() {
@@ -321,7 +326,7 @@ void DFlashDrafter::release() {
     head_ = nullptr;
     window_ = cap_ = scratch_cap_ = attn_scratch_floats_ = 0;
     parity_dir_[0] = 0;
-    cycle_ = 0; max_rows_ = 0; graph_prob_ = false; mask_ = -1;
+    cycle_ = 0; max_rows_ = 0; graph_prob_ = false; mask_ = -1; last_committed_end_ = -1;
 }
 
 bool DFlashDrafter::upload(const ModelGeometry& target_g, SessionState& ss, int device, int64_t window,
@@ -549,7 +554,7 @@ bool DFlashDrafter::upload(const ModelGeometry& target_g, SessionState& ss, int 
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, shapes_);
     const int64_t R = max_rows_, N = dg.hidden, F = dg.fusion_in(), I = dg.intermediate;
     const int64_t Q = dg.n_head * dg.head_dim, KVW = dg.n_head_kv * dg.head_dim;
-    if (!dflash_mapped(R * 4 + 64, (void**) &h_out_, (void**) &out_) ||
+    if (!dflash_mapped((2 * R + R * 128) * 4 + 64, (void**) &h_out_, (void**) &out_) ||
         cudaHostAlloc(&h_tok_, (size_t)(R + 4) * 4, cudaHostAllocDefault) != cudaSuccess) {
         return bail("dflash: mapped staging failed");
     }
@@ -578,8 +583,7 @@ bool DFlashDrafter::upload(const ModelGeometry& target_g, SessionState& ss, int 
               take(strata::kernels::argmax_rows_scratch_bytes((int) R), (void**) &arg_scratch_) &&
               take(strata::kernels::row_top_prob_scratch_bytes((int) R), (void**) &top_scratch_) &&
               take(strata::kernels::native_q8_1_bytes((int) N, (int) R) +
-                   (dg.is_dflash2() ? strata::kernels::native_q8_1_il_bytes((int) N,
-                       (int) std::min<int64_t>(R, 4)) : 0), (void**) &xq_);
+                   (dg.is_dflash2() ? strata::kernels::native_q8_1_il_bytes((int) N, (int) R) : 0), (void**) &xq_);
     if (ok && dg.is_dflash2()) {
         const int64_t coeffs = 2 * dg.conv_kernel_size * (N / dg.conv_group_size);
         ok = take(R * coeffs * 4, (void**) &conv_dynamic_) && take(R * N * 4, (void**) &conv_result_) &&
@@ -761,6 +765,57 @@ bool DFlashDrafter::add_context_f32(const float* taps, int n_taps, int64_t strid
     if (!taps || rows < 1 || stride_floats < rows * N || pos0 < 0 || rows > cap_ - pos0) {
         err = "dflash: invalid verify tap layout or context range"; return false;
     }
+    if (st_[0].kv_elastic >= 0 && pos0 + rows > qsa_kv_elastic_cells()) {
+        err = "dflash: context cells past the window cap (" + std::to_string(pos0 + rows) + " > " +
+              std::to_string(cap_) + ") - raise --dflash-window";
+        return false;
+    }
+    const bool ctx_graph_on = (!std::getenv("STRATA_DFLASH_GRAPH") ||
+                               std::getenv("STRATA_DFLASH_GRAPH")[0] != '0') &&
+                              !parity_dir_[0] && !std::getenv("STRATA_DF_DBG") && !df_timing().on &&
+                              !st_[0].kv_q4 && !st_[0].kv_int8 && rows >= 1 && rows <= 8;
+    if (ctx_graph_on) {
+        strata::kernels::dflash_build_positions(poskv_, (int) rows, (int) dg.n_head_kv, pos0, cs_);
+        strata::kernels::dflash_build_steps(step_, (int) rows, pos0, (int) shapes_.page_size, cs_);
+        const int slot = (int) rows;
+        if (ctx_graph_exec_[slot] &&
+            (ctx_graph_taps_[slot] != taps || ctx_graph_stride_[slot] != stride_floats)) {
+            cudaGraphExecDestroy(ctx_graph_exec_[slot]);
+            ctx_graph_exec_[slot] = nullptr;
+        }
+        if (!ctx_graph_exec_[slot]) {
+            cudaGraph_t graph = nullptr;
+            if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) == cudaSuccess) {
+                strata::kernels::dflash_gather_taps(taps, tapin_, n_taps, (int) N, (int) rows, stride_floats, cs_);
+                const bool ok = fusion_rows(pos0, (int) rows, err, false);
+                const cudaError_t captured = cudaStreamEndCapture(cs_, &graph);
+                cudaGraphExec_t candidate = nullptr;
+                if (ok && captured == cudaSuccess && graph &&
+                    cudaGraphInstantiate(&candidate, graph, 0) == cudaSuccess) {
+                    ctx_graph_exec_[slot] = candidate;
+                    ctx_graph_taps_[slot] = taps;
+                    ctx_graph_stride_[slot] = stride_floats;
+                } else if (candidate) cudaGraphExecDestroy(candidate);
+                if (graph) cudaGraphDestroy(graph);
+                if (!ok) return false;
+                cudaGetLastError();
+            } else cudaGetLastError();
+        }
+        if (ctx_graph_exec_[slot]) {
+            if (cudaGraphLaunch(ctx_graph_exec_[slot], cs_) != cudaSuccess) {
+                err = "dflash: context graph launch failed";
+                return false;
+            }
+            last_committed_end_ = pos0 + rows;
+            if (!synchronize) return true;
+            if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+                err = std::string("dflash: the context update failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            cudaGetLastError();
+            return true;
+        }
+    }
     {
         DFlashSection s("ctx.tap_gather");
         strata::kernels::dflash_gather_taps(taps, tapin_, n_taps, (int) N, (int) rows, stride_floats, cs_);
@@ -797,7 +852,7 @@ void DFlashDrafter::project(const uint16_t* x, const uint16_t* w, float* y,
     bf16_gemv_batch(x, w, y, ni, no, rows, stream);
 }
 
-bool DFlashDrafter::fusion_rows(int64_t pos0, int rows, std::string& err) {
+bool DFlashDrafter::fusion_rows(int64_t pos0, int rows, std::string& err, bool build_pos) {
     using namespace strata::kernels;
     const DFlashGeometry& dg = artifact_.geom();
     const int64_t N = dg.hidden, F = dg.fusion_in(), KVW = dg.n_head_kv * dg.head_dim;
@@ -861,8 +916,10 @@ bool DFlashDrafter::fusion_rows(int64_t pos0, int rows, std::string& err) {
         f32_to_bf16_bulk(ctx_, xn16_, (int64_t) rows * N, cs_);
     }
     prepare_projection(xn16_, (int) N, rows, cs_);   // all layers share the same context activation
-    dflash_build_positions(poskv_, rows, (int) dg.n_head_kv, pos0, cs_);
-    dflash_build_steps(step_, rows, pos0, (int) shapes_.page_size, cs_);
+    if (build_pos) {
+        dflash_build_positions(poskv_, rows, (int) dg.n_head_kv, pos0, cs_);
+        dflash_build_steps(step_, rows, pos0, (int) shapes_.page_size, cs_);
+    }
 
     for (int64_t l = 0; l < dg.layers; ++l) {
         const std::string pre = "layers." + std::to_string(l);
@@ -935,12 +992,18 @@ bool DFlashDrafter::fusion_rows(int64_t pos0, int rows, std::string& err) {
             }
         }
     }
+    last_committed_end_ = pos0 + rows;
     return true;
 }
 
 bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std::string& err, float* probabilities) {
     if (!cs_ || st_.empty() || !head_ || !head_->loaded() || !emb_ref_ || !out) {
         err = "dflash: upload and bind a head and embeddings before proposing"; return false;
+    }
+    if (last_committed_end_ >= 0 && pos != last_committed_end_ && std::getenv("STRATA_DF_DBG")) {
+        err = "dflash: propose pos (" + std::to_string(pos) + ") != last committed context end (" +
+              std::to_string(last_committed_end_) + ")";
+        return false;
     }
     using namespace strata::kernels;
     const DFlashGeometry& dg = artifact_.geom();
@@ -1013,15 +1076,20 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
 
     const bool graph_on = (!std::getenv("STRATA_DFLASH_GRAPH") ||
                            std::getenv("STRATA_DFLASH_GRAPH")[0] != '0') &&
-                          !parity_dir_[0] && !std::getenv("STRATA_DF_DBG") && !df_timing().on;
+                          !parity_dir_[0] && !std::getenv("STRATA_DF_DBG") && !df_timing().on && !prob_on_;
     const bool probs = probabilities != nullptr;
     static const bool graph_buckets_enabled = [] {
         const char* value = std::getenv("STRATA_DFLASH_GRAPH_BUCKET");
-        return value && value[0] == '1';   // measured opt-in; no change to other backends
+        return !value || value[0] != '0';   // default-on for DFlash2; STRATA_DFLASH_GRAPH_BUCKET=0 disables
     }();
+    static const int64_t env_attn_window = [] {
+        const char* w = std::getenv("STRATA_DFLASH_ATTN_WINDOW");
+        return w ? std::atoll(w) : -1;
+    }();
+    const int64_t eff_sliding_window = env_attn_window >= 0 ? env_attn_window : dg.sliding_window;
     const bool graph_buckets = dg.is_dflash2() && !reference && graph_buckets_enabled;
-    const bool local_attention = dg.is_dflash2() && dg.head_dim == 128 && dg.sliding_window > 0;
-    const int64_t attention_capacity = local_attention ? std::min<int64_t>(scratch_cap_, dg.sliding_window + K)
+    const bool local_attention = dg.is_dflash2() && dg.head_dim == 128 && eff_sliding_window > 0;
+    const int64_t attention_capacity = local_attention ? std::min<int64_t>(scratch_cap_, eff_sliding_window + K)
                                                       : scratch_cap_;
     const int64_t visible_cells = std::min<int64_t>(pos + K, attention_capacity);
     const int64_t attention_cells = graph_on && graph_buckets
@@ -1033,12 +1101,21 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
         cudaGraphExecDestroy(graph_exec_[graph_slot]); graph_exec_[graph_slot] = nullptr;
     }
 #ifdef STRATA_ENABLE_DFLASH2
-    auto conv = [&](const std::string& pre, const char* name, float* input, int side) {
+    const bool fuse_conv = dg.is_dflash2() && !parity_want(cycle_) && !std::getenv("STRATA_DF_DBG");
+    auto conv = [&](const std::string& pre, const char* name, float* input, int side,
+                    uint16_t* out_bf16 = nullptr, float* accum = nullptr) {
+        DFlashSection section(side == 0 ? "L*.conv_pre" : "L*.conv_post");
         const std::string cn = pre + "." + name;
         if (side == 0) {
             f32_to_bf16_bulk(input, xn16_, (int64_t) K * N, cs_);
             project(xn16_, wp((cn + ".kernel_projection").c_str()), conv_dynamic_,
                     (int) N, (int) (2 * dg.conv_kernel_size * (N / dg.conv_group_size)), K, cs_);
+        }
+        if (fuse_conv && (out_bf16 || accum)) {
+            dflash2_convolve_fused(input, conv_dynamic_, wf((cn + ".base_kernel").c_str()),
+                                   nullptr, out_bf16, accum,
+                                   K, (int) N, (int) dg.conv_kernel_size, (int) dg.conv_group_size, side, K, cs_);
+            return;
         }
         dflash2_convolve(input, conv_dynamic_, wf((cn + ".base_kernel").c_str()), conv_result_,
                          K, (int) N, (int) dg.conv_kernel_size, (int) dg.conv_group_size, side, K, cs_);
@@ -1058,7 +1135,10 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
                     parity_dump(parity_dir_, name, xn_, K * N, cs_);
                 }
 #ifdef STRATA_ENABLE_DFLASH2
-                if (dg.is_dflash2()) conv(pre, "attention_conv", xn_, 0);
+                if (dg.is_dflash2()) {
+                    conv(pre, "attention_conv", xn_, 0, fuse_conv ? xn16_ : nullptr, nullptr);
+                    if (!fuse_conv) f32_to_bf16_bulk(xn_, xn16_, (int64_t) K * N, cs_);
+                } else
 #endif
                 f32_to_bf16_bulk(xn_, xn16_, (int64_t) K * N, cs_);
             }
@@ -1159,7 +1239,7 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
                     dflash2_attention(q_, pools.k_pool, pools.v_pool, pools.page_table, attn_step_,
                         attn_, (float*) attn_scratch_, K, dg.n_head, dg.n_head_kv,
                         shapes_.page_size, attention_cells,
-                        dg.sliding_window, cs_);
+                        (int) eff_sliding_window, cs_);
                 else
 #endif
                 dflash_attn_batch(q_, pools, attn_step_, attention_cells, scratch_cap_, shapes_, (float*) attn_scratch_, attn_, K, cs_);
@@ -1181,7 +1261,7 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
                 project(attn16_, wp((pre + ".self_attn.o_proj").c_str()), bo_, Q, N, K, cs_);
             }
 #ifdef STRATA_ENABLE_DFLASH2
-            if (dg.is_dflash2()) conv(pre, "attention_conv", bo_, 1);
+            if (dg.is_dflash2()) conv(pre, "attention_conv", bo_, 1, nullptr, fuse_conv ? h_ : nullptr);
 #endif
             if (l == 0 && df_dbg) {
                 std::vector<float> hb(4), ab(4);
@@ -1190,7 +1270,7 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
                 cudaStreamSynchronize(cs_);
                 std::fprintf(stderr, "df dbg: after attn h0=%.3e bo0=%.3e\n", hb[0], ab[0]);
             }
-            {
+            if (!dg.is_dflash2() || !fuse_conv) {
                 DFlashSection section("L*.residual_add");
                 add_inplace(h_, bo_, K * N, cs_);
             }
@@ -1204,7 +1284,10 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
                 DFlashSection s("L*.mlp_norm");
                 native_qsa_rms_norm_weighted(h_, wf((pre + ".post_attention_layernorm").c_str()), xn_, (int) N, K, kEps, cs_);
 #ifdef STRATA_ENABLE_DFLASH2
-                if (dg.is_dflash2()) conv(pre, "mlp_conv", xn_, 0);
+                if (dg.is_dflash2()) {
+                    conv(pre, "mlp_conv", xn_, 0, fuse_conv ? xn16_ : nullptr, nullptr);
+                    if (!fuse_conv) f32_to_bf16_bulk(xn_, xn16_, (int64_t) K * N, cs_);
+                } else
 #endif
                 f32_to_bf16_bulk(xn_, xn16_, (int64_t) K * N, cs_);
             }
@@ -1229,9 +1312,9 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
                 project(xn16_, wp((pre + ".mlp.down_proj").c_str()), bo_, I, N, K, cs_);
             }
 #ifdef STRATA_ENABLE_DFLASH2
-            if (dg.is_dflash2()) conv(pre, "mlp_conv", bo_, 1);
+            if (dg.is_dflash2()) conv(pre, "mlp_conv", bo_, 1, nullptr, fuse_conv ? h_ : nullptr);
 #endif
-            {
+            if (!dg.is_dflash2() || !fuse_conv) {
                 DFlashSection section("L*.residual_add");
                 add_inplace(h_, bo_, K * N, cs_);
             }
@@ -1305,16 +1388,29 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
         }
 #ifdef STRATA_ENABLE_DFLASH2
         if (dg.is_dflash2()) {
-            f32_to_bf16_bulk(head_input, xn16_, (int64_t) head_rows * N, cs_);
-            project(xn16_, wp("selector.hidden"), selector_hidden_ + head_begin * dg.selector_rank,
-                    (int) N, (int) dg.selector_rank, head_rows, cs_);
-            dflash2_topk(head_output, selector_ids_ + head_begin * dg.selector_top_k,
-                        selector_unary_ + head_begin * dg.selector_top_k,
-                        head_rows, vocab, (int) dg.selector_top_k, cs_, reference ? nullptr : selector_scratch_,
-                        reference ? 0 : dflash2_topk_scratch_bytes((int) max_rows_, vocab, (int) dg.selector_top_k));
-            dflash2_select_bf16(selector_ids_, selector_unary_, selector_hidden_, wp("selector.predecessor"),
-                           wp("selector.successor"), tok_, out_, probs ? (float*) (out_ + max_rows_) : nullptr,
-                           K, (int) dg.selector_top_k, (int) dg.selector_rank, cs_, reference);
+            {
+                DFlashSection s("out.selector_proj");
+                f32_to_bf16_bulk(head_input, xn16_, (int64_t) head_rows * N, cs_);
+                project(xn16_, wp("selector.hidden"), selector_hidden_ + head_begin * dg.selector_rank,
+                        (int) N, (int) dg.selector_rank, head_rows, cs_);
+            }
+            {
+                DFlashSection s("out.topk");
+                dflash2_topk(head_output, selector_ids_ + head_begin * dg.selector_top_k,
+                            selector_unary_ + head_begin * dg.selector_top_k,
+                            head_rows, vocab, (int) dg.selector_top_k, cs_, reference ? nullptr : selector_scratch_,
+                            reference ? 0 : dflash2_topk_scratch_bytes((int) max_rows_, vocab, (int) dg.selector_top_k));
+            }
+            {
+                DFlashSection s("out.select");
+                dflash2_select_bf16_ex(
+                    selector_ids_, selector_unary_, selector_hidden_,
+                    wp("selector.predecessor"), wp("selector.successor"), tok_,
+                    out_, (probs || prob_on_) ? (float*) (out_ + max_rows_) : nullptr,
+                    prob_on_ ? (out_ + 2 * max_rows_) : nullptr,
+                    K, (int) dg.selector_top_k, (int) dg.selector_rank, 1,
+                    sample_seed_, prob_on_ ? (pos + 1) : -1, cs_, reference);
+            }
             if (output_parity) {
                 parity_dump(parity_dir_, "selector_hidden", selector_hidden_, K * dg.selector_rank, cs_);
                 parity_dump(parity_dir_, "selector_ids", (const float*) selector_ids_, K * dg.selector_top_k, cs_);
@@ -1347,6 +1443,12 @@ bool DFlashDrafter::propose(int32_t x, int64_t pos, int block, int32_t* out, std
                 cudaGraphInstantiate(&candidate, graph, 0) == cudaSuccess) {
                 graph_exec_[graph_slot] = candidate;
                 graph_chunks_[graph_slot] = chunks; graph_cap_[graph_slot] = scratch_cap_;
+                if (std::getenv("STRATA_DF_KERNEL_CENSUS")) {
+                    size_t num_nodes = 0;
+                    if (cudaGraphGetNodes(graph, nullptr, &num_nodes) == cudaSuccess)
+                        std::fprintf(stderr, "dflash graph census: slot %d (K=%d, chunks=%lld) captured %zu nodes\n",
+                                     graph_slot, K, (long long) chunks, num_nodes);
+                }
             } else if (candidate) cudaGraphExecDestroy(candidate);
             if (graph) cudaGraphDestroy(graph);
             if (!ok) return false;

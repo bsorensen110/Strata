@@ -8,6 +8,11 @@ namespace strata::kernels {
 // dynamic: [rows][2][kernel][hidden/group], base: [2][kernel][hidden].
 void dflash2_convolve(const float* x, const float* dynamic, const float* base, float* out,
                      int rows, int hidden, int kernel, int group, int side, int block_rows, void* stream);
+// Fused convolution: optionally writes BF16 output (side 0) and/or accumulates into `accum` (side 1 residual add),
+// eliminating intermediate D2D copies and separate conversion/addition launches.
+void dflash2_convolve_fused(const float* x, const float* dynamic, const float* base,
+                            float* out, uint16_t* out_bf16, float* accum,
+                            int rows, int hidden, int kernel, int group, int side, int block_rows, void* stream);
 // Top-k unary candidates for each row, with deterministic smaller-token tie breaking.
 // Optional caller-owned workspace enables parallel vocabulary tiles followed by
 // an exact candidate merge. No allocation or synchronization inside the call.
@@ -25,6 +30,14 @@ void dflash2_select_bf16(const int32_t* candidates, const float* unary, const fl
                          const uint16_t* predecessor, const uint16_t* successor, const int32_t* anchor,
                          int32_t* out, float* confidence, int rows, int top_k, int rank, void* stream,
                          bool reference = false);
+// Extended BF16 selector supporting beam search (beam_width in 1..4), q-list export (kSpecQStride = 128 int32/row),
+// and optional position-keyed Philox draft sampling from q (when sample_pos >= 0).
+void dflash2_select_bf16_ex(const int32_t* candidates, const float* unary, const float* hidden,
+                            const uint16_t* predecessor, const uint16_t* successor, const int32_t* anchor,
+                            int32_t* out, float* confidence, int32_t* q_out,
+                            int rows, int top_k, int rank, int beam_width,
+                            uint64_t sample_seed, int64_t sample_pos,
+                            void* stream, bool reference = false);
 // Completed target residual [rows][hc][hidden], before the next layer's learned HC read.
 void dflash2_hc_mean(const float* residual, float* out, uint16_t* out_bf16,
                      int rows, int hidden, int hc, void* stream);
