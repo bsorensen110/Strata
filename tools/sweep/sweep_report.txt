@@ -1,0 +1,80 @@
+open upstream PRs: 359; of those merged into integ: 190
+
+[fix] 21 open PRs
+[perf] 67 open PRs
+[gpu] 75 open PRs
+[prefix] 23 open PRs
+[api] 12 open PRs
+[web] 16 open PRs
+[feature] 41 open PRs
+
+REMAINING wanted (open, not merged): 69
+  #1579 [gpu] [Benchmark] record dual-GPU auto-layout measurements for #1352
+  #1849 [gpu,web] [Benchmark] RTX 4090 Laptop GPU follow-up, engine 0.1.41, defaults and --calibrate settings (IQ
+  #1887 [perf] [Engine] Remote stage: conversation checkpoints across the link (--prompt-cache), stacked on #1
+  #2079 [feature,gpu] [Engine] add native Windows support for Intel SYCL GPUs
+  #2114 [prefix] [Engine] sycl: run on an integrated Arc (Arc 140T, xe): free memory from /proc/meminfo, no prom
+  #2115 [perf] [Other] setup: the SYCL setup on an integrated Arc (xe): native launcher, a RAM fit rule, no KV
+  #2240 [gpu] Remote stage: a worker for the SYCL build (Intel Arc), stacked on #1748 / #1887 (protocol 7); S
+  #2683 [gpu] [Engine] tests: cuda_spill_guard fails the CUDA test build when a Strata kernel spills or keeps
+  #2769 [feature,gpu] [Engine] add experimental Muse Spark CPU/CUDA reference runtime
+  #2784 [gpu] [Engine] HIP: the RX 6600 / 6650 XT (gfx1032) in setup's cards
+  #3029 [feature] [Docs] add a Windows Strix Halo (gfx1151) deployment guide
+  #3182 [perf] [Other] setup: say that --kv, --context and --vision are not applied when starting an installed
+  #3220 [feature,gpu,perf] [Engine] perf(hip): vectorize HC_Q8 prefill dequant and enable gfx12 Q8_0 gr_upmix
+  #3222 [perf] [Engine] perf(prefill): use single LDS-only barrier per stage in native_w11_kernel
+  #3223 [perf] [Engine] perf(prefill): port wmma_gemm and gdn_chunked WMMA kernels to RDNA4 gfx12
+  #3224 [gpu,perf] [Engine] perf(hip): tune RDNA4 QSA prompt WMMA kernel in qsa_prompt_attn.cu
+  #3225 [feature,fix,gpu,perf] [Engine] perf(hip): enable fused_gr tsum on gfx12, fix q8_inject guard, and use LDS-only barrie
+  #3226 [feature,gpu,perf] [Engine] perf(hip): optimize GDN verify kernels with LDS-only barriers and enable batched commi
+  #3230 [feature,gpu,perf,prefix] [Engine] perf(hip): enable exact wave32 QSA decode kernels and B6 MMVQ fragment reuse on gfx12
+  #3233 [gpu,perf] [Engine] perf(hip): optimize exact QSA block scoring and top-k selection on gfx12
+  #3235 [fix] [Benchmark] strata_bench: both Windows start-up paths crash (NameError port, GBK decode of CMak
+  #3241 [perf] [TUI] serve: keepawake primes its daemon before the first acquire (a fast request could miss th
+  #3247 [fix] [Benchmark] NCM feasibility study: stop/document, no engine change
+  #3250 [gpu] [Benchmark] strata_bench: read CUDA UMD version, storage and GPU power/PCIe detail
+  #3259 [feature,gpu,perf] [Engine] perf(hip): optimize EXPDEC routed-expert kernels and enable by default on gfx12
+  #3264 [gpu,perf] [Engine] perf(hip): optimize MTP draft, shared expert, and verify/sampler head kernels on RDNA4
+  #3265 [gpu] [Benchmark] Experts in VRAM ahead of time: oracle run 3.0x prose, 4.1x code decode, same output
+  #3276 [gpu] [Other] setup: calibrate a dual config whose gpu is the string 0,1
+  #3281 [feature,gpu] [Engine] add request-scoped prefill VRAM loans
+  #3290 [gpu] [Benchmark] 3x GPU (RTX 5060 Ti + 2080 Ti + 3080 Ti): 0.2.0-beta, Qwen3.8-Flash-Next IQ3_XXS at
+  #3299 [gpu] Metal: run Gyro (trellis TQ2_T/TQK6/TQK7) models on Apple Silicon
+  #3305 [fix,gpu] [Other] fix(setup AMD): engine probes get the engine's lib_dirs on LD_LIBRARY_PATH on Linux (th
+  #3311 [perf] [Docs] --prompt-cache-every does not set the prompt piece size
+  #3322 [feature] [Engine] support the official Flash-Next DFlash2 checkpoint
+  #3324 [perf] [Benchmark] RTX 4090 with the model in the page cache: experts read in place from the GGUF cost
+  #3334 [perf,web] [Docs] Explain cache settings for long-context batch handoffs
+  #3355 [feature] [Docs] add Polish README translation
+  #3388 [perf] [Engine] Rebase Qwen3.6 bounded low-memory expert cache onto main
+  #3390 [feature,gpu] [Other] Add Fedora 44 CUDA setup support
+  #3392 [feature,gpu] [Engine] add opt-in advisory VRAM plan
+  #3396 [feature] [Engine] Add opt-in Galahad session storage
+  #3414 [fix] [Benchmark] Fix startup crashes and Windows version detection
+  #3436 [feature] [Benchmark] add rx 7900 xtx qwen3.8 flash-next iq3xxs community + standard-v1 results (v0.2.1, 
+  #3457 [gpu] [Engine] Metal: opt-in --dflash DFlash2 drafter in place of the MTP layer
+  #3466 [api] [Other] tools: the busbar gateway, one OpenAI address in front of several providers
+  #3495 [gpu] [Benchmark] 2x NVIDIA TITAN RTX / Qwen3.8-Flash-Next / IQ3_S / strata-qwen38-thinking-v1-draft.
+  #3519 [gpu] [Benchmark] name the AMD card and its ROCm runtime in the standard report
+  #3521 [fix] [Other] tests: stop the wizard-discovery test from reading the checkout's own run configs
+  #3522 [fix] [Other] calibrate: keep the PCIe/draft-floor winner only when it beats this run's own noise ins
+  #3547 [feature] Add benchmarks
+  #3557 [perf] setup.sh: fail fast with a clear message on non-x86_64 (ARM) before downloading
+  #3562 [perf] [Benchmark] Four RTX 4090: v0.2.1.4 TTFT and cache-hit comparison
+  #3564 [gpu,perf] [Engine] Metal: working session cache, and the 12 GiB its arena was reserving for nothing
+  #3571 [gpu] [Benchmark] Apple M4 Max 64 GB / Qwen3.8-Flash-Next Q2_0 / strata-qwen38-thinking-v1-draft.1 (c
+  #3616 [perf] [Benchmark] 2x Tesla P40, Flash-Next IQ3_XXS at 262K: #1469 on a second P40 pair, 0.1.44.1, str
+  #3621 [feature] bench: add RTX 5080 16 GB community report (15 models)
+  #3630 [gpu] [Benchmark] bench.sh: name the AMD card on ROCm 7+, where only amd-smi exists
+  #3633 [gpu] [Benchmark] AMD Radeon AI PRO R9700 / Qwen3.8-Flash-Next IQ3_S / strata-qwen38-thinking-v1-draf
+  #3643 [api] [Engine] Jev System One decision endpoint (/v1/systemone): typed decisions with calibrated prob
+  #3646 [gpu] [Benchmark] RX 6800 XT (gfx1030) / Flash-Next IQ3_S / ROCm 10.0 / v0.2.1 + v0.2.2 (vibe-coded)
+  #3650 [gpu] [Benchmark] community report: Apple M1 Max, 32 GiB RAM, Q2_0 streaming
+  #3662 [feature,gpu] [Engine] support Qwen3.8-Flash-Next Coder (256 experts) on Apple Silicon Metal
+  #3663 [feature] [TUI] preserve log config and add indexed log rotation on launch
+  #3668 [fix,web] [Docs] Share Companion Codex Reload Fix And Verified 200K Evidence
+  #3677 [perf] [Benchmark] RTX 4070 Ti 12 GB + i7-13700K, 64 GB — Ornith-1.5-35B-A3B Q4_K_M on the q36 engine,
+  #3678 [perf] [Engine] q36: quantized KV caches behind --kv (int8 / fp8 / rk4v4-e8 q4)
+  #3686 [fix,gpu] [Engine] Metal: honor a client cancel during the prompt read (stop at the next chunk)
+  #3717 [feature] [Benchmark] Add RTX 5060 Ti IQ3_S standard-v1
+  #3729 [gpu,perf] [Engine] SYCL: flag Intel iGPUs as integrated so the expert cache is sized from MemAvailable
