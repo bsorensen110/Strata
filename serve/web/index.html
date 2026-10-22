@@ -40,6 +40,21 @@
 <main>
   <!-- ============================ Chat ============================ -->
   <section class="view view--chat" id="view-chat" role="tabpanel" aria-labelledby="tab-btn-chat">
+    <!-- the conversations kept in this browser: the open one is the chat on the right -->
+    <aside class="chat-sidebar" id="sidebar" data-open="true" aria-label="Chats" hidden>
+      <div class="sidebar-head">
+        <button class="st-btn st-btn--icon" id="sidebar-toggle" title="Collapse the chat list" aria-label="Collapse the chat list">
+          <svg class="st-icon"><use href="web/sprite.svg#i-chevron"/></svg></button>
+        <span class="card-title sidebar-title">Chats</span>
+        <button class="st-btn st-btn--icon" id="sidebar-new" title="New chat" aria-label="New chat">
+          <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
+      </div>
+      <input class="st-input sidebar-search" id="sidebar-search" type="search" placeholder="Search chats"
+             autocomplete="off" aria-label="Search chats">
+      <div class="sidebar-list" id="sidebar-list"></div>
+      <p class="muted small sidebar-foot" id="sidebar-foot"></p>
+    </aside>
+    <div class="chat-main">
     <div class="chat-scroll" id="chat-scroll">
       <div class="chat" id="chat">
         <div class="chat-empty" id="chat-empty">
@@ -72,6 +87,7 @@
             <svg class="st-icon"><use href="web/sprite.svg#i-send"/></svg></button>
         </div>
       </form>
+      </div>
     </div>
   </section>
 
@@ -194,6 +210,8 @@
           <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
           <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed">
         </div>
+        <div class="toggle-row"><span>Chat history sidebar<br><span class="muted small">keeps every chat in this browser; off = one chat, as before</span></span>
+          <button class="st-toggle" id="history-toggle" role="switch" aria-checked="false" aria-label="Chat history sidebar"></button></div>
         <div class="toggle-row"><span>Dark theme</span>
           <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
         <p class="muted small">Chats, settings and the key are kept in this browser only.
