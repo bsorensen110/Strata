@@ -78,6 +78,13 @@ function setup({enabled = true, history = [], sampling} = {}) {
   };
   const context = vm.createContext({
     console, AbortController, TextDecoder, TextEncoder, Blob, Date, JSON, performance,
+    window: {addEventListener: () => {}},   // #2473's pagehide hook: the VM never navigates away
+    paintLive: () => {},   // integ's Monitor repaint: no Monitor machinery runs in the VM
+    ws: {on: false}, searchPhase: null, liveQueued: 0, modelOp: null,   // integ globals the Chat slice borrows from the Monitor section
+    setSearchPhase: () => {}, endSearchPhase: () => {},                 // integ's websearch hooks: first token calls
+    setSearchBubble: () => {}, clearSearchBubble: () => {},             // clearSearchBubble inside the stream loop
+
+
     $: get, document: {createElement: tag => new Element(tag), querySelectorAll: () => []},
     store: {get: (k, fallback) => saved.has(k) ? saved.get(k) : fallback, set: (k, v) => saved.set(k, JSON.parse(JSON.stringify(v)))},
     icon: name => `<svg data-icon="${name}"></svg>`,
