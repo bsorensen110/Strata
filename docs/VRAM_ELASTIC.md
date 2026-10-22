@@ -119,7 +119,9 @@ and starts the encoder with the model, as before) the GPU encoder is not started
 - **A picture's turn** (the same FIFO turn an encode always takes): if the encoder is not running, the engine's
   `VRAM` command first keeps `"elastic_mib"` (default 2048) free on top of the reserve - the last `POST /v1/vram`, or 0
   when none was made - and then the encoder starts. If the cache cannot shrink (the resident low-RAM mode, an engine
-  without `--vram-elastic`) it starts anyway, as a non-elastic encoder would, and the log says why.
+  without `--vram-elastic`, a layer split) it starts anyway, as a non-elastic encoder would, and the log says why; on a
+  layer split the server says at start that the encoder's VRAM has to be kept free with `--vram-reserve-mib`. An
+  encoder that fails to start (out of VRAM) ends the request with a `503`; the next picture tries again.
 - **Pictures the hash cache already knows never wake it**: the cache and its `.sve` files survive a stop, and most
   clients re-send the conversation's pictures on every turn - such a turn (every picture a hit, elastic only) takes
   neither the FIFO turn nor a start **(code; `serve/test_vision_cache_wake.py`)**. A turn with one picture the cache
