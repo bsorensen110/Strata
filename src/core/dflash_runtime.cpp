@@ -17,6 +17,8 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/kernels/native_rope.hpp"
+#include "strata/artifact/dequant.hpp"
+#include "strata/kernels/bf16_bits.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
@@ -268,6 +270,8 @@ void DFlashDrafter::release() {
     clear_graphs();
     auto free_dev = [](void* p) { if (p) cudaFree(p); };
     free_dev(w_); free_dev(head_ids_); head_ids_ = nullptr; head_rows_ = 0;
+    free_dev(selector_predecessor_bf16_); free_dev(selector_successor_bf16_);
+    selector_predecessor_bf16_ = selector_successor_bf16_ = nullptr;
     for (auto& [name, p] : wf_) free_dev((void*) p);
     for (auto& st : st_) {
         qsa_state_release_elastic(st);
@@ -364,11 +368,13 @@ bool DFlashDrafter::upload(const ModelGeometry& target_g, SessionState& ss, int 
             return bail(std::string("dflash: the weight upload of '") + t.name + "' failed: " +
                         cudaGetErrorString(cudaGetLastError()));
         }
-        if (t.type != 30) quant_types_.push_back({w_ + at / 2, t.type});
+        const bool selector_codebook = t.name == "selector.predecessor" || t.name == "selector.successor";
+        if (t.type != 30 && t.type != 0 && !selector_codebook)
+            quant_types_.push_back({w_ + at / 2, t.type});
         at += (t.bytes + 31) & ~size_t(31);
     }
-    // The rms_norm gammas run as F32 device vectors (the kernel's contract); widen the small ones
-    // at upload.  Qwen3 norms apply `y * w` with NO Gemma +1.
+    // Norms/base kernels are consumed as F32. Native BF16 artifacts widen exactly;
+    // third-party Q4_K_M GGUFs store these auxiliary tensors as F32 already.
     auto is_norm = [](const std::string& n) {
         return n == "hidden_norm" || n == "norm" || n.find("layernorm") != std::string::npos ||
                n.find("q_norm") != std::string::npos || n.find("k_norm") != std::string::npos;
@@ -379,16 +385,66 @@ bool DFlashDrafter::upload(const ModelGeometry& target_g, SessionState& ss, int 
         if (cudaMalloc(&f32d, (size_t) t.rows * t.cols * 4) != cudaSuccess)
             return bail("dflash: the norm weights do not fit");
         vram_ += (size_t) t.rows * t.cols * 4;
-        const uint16_t* host = (const uint16_t*) artifact_.host_data(t);
+        const uint8_t* host = artifact_.host_data(t);
         std::vector<float> wide((size_t) t.rows * t.cols);
-        for (int64_t i = 0; i < t.rows * t.cols; ++i) {
-            uint32_t bits = (uint32_t) host[i] << 16;
-            std::memcpy(&wide[(size_t) i], &bits, 4);
+        if (t.type == 0) {
+            std::memcpy(wide.data(), host, wide.size() * sizeof(float));
+        } else {
+            const uint16_t* bf16 = (const uint16_t*) host;
+            for (size_t i = 0; i < wide.size(); ++i) wide[i] = strata::kernels::f32_from_bf16(bf16[i]);
         }
         wf_.push_back({t.name, f32d});
         if (cudaMemcpyAsync(f32d, wide.data(), wide.size() * 4, cudaMemcpyHostToDevice, cs_) != cudaSuccess)
             return bail("dflash: the norm weight upload failed");
     }
+#ifdef STRATA_ENABLE_DFLASH2
+    if (dg.is_dflash2()) {
+        // The selector kernel currently consumes BF16 [vocab][rank] codebooks.  Q4_K_M
+        // stores these as Q4_K/Q6_K; dequantize those two small-table tensors at upload,
+        // while leaving every matrix used by project() in its original packed type.
+        auto expand_selector = [&](const char* name, uint16_t** device) -> bool {
+            const DFlashTensor* t = artifact_.tensor(name);
+            if (!t) { err = std::string("dflash2: missing selector tensor ") + name; return false; }
+            if (t->type == 30) return true;
+            if ((t->type != 12 && t->type != 14) || t->rows <= 0 || t->cols <= 0 || t->cols % 256 != 0 ||
+                (uint64_t) t->rows > SIZE_MAX / (uint64_t) t->cols) {
+                err = std::string("dflash2: unsupported quantized selector geometry for ") + name;
+                return false;
+            }
+            const size_t count = (size_t) t->rows * (size_t) t->cols;
+            if (count > SIZE_MAX / sizeof(uint16_t)) { err = "dflash2: selector expansion size overflow"; return false; }
+            std::vector<uint16_t> expanded(count);
+            std::vector<float> row(256);
+            const uint8_t* src = artifact_.host_data(*t);
+            const size_t block_bytes = t->type == 12 ? 144 : 210;
+            const size_t blocks_per_row = (size_t) t->cols / 256;
+            for (int64_t r = 0; r < t->rows; ++r) {
+                for (size_t b = 0; b < blocks_per_row; ++b) {
+                    const uint8_t* block = src + ((size_t) r * blocks_per_row + b) * block_bytes;
+                    if (t->type == 12) strata::dequantize_q4_K(block, row.data());
+                    else strata::dequantize_q6_K(block, row.data());
+                    for (size_t j = 0; j < row.size(); ++j)
+                        expanded[(size_t) r * (size_t) t->cols + b * 256 + j] =
+                            strata::kernels::bf16_from_f32(row[j]);
+                }
+            }
+            const size_t bytes = expanded.size() * sizeof(uint16_t);
+            if (cudaMalloc(device, bytes) != cudaSuccess) { err = "dflash2: selector tables do not fit in VRAM"; return false; }
+            vram_ += bytes;
+            if (cudaMemcpyAsync(*device, expanded.data(), bytes, cudaMemcpyHostToDevice, cs_) != cudaSuccess ||
+                cudaStreamSynchronize(cs_) != cudaSuccess) {
+                err = std::string("dflash2: expanding selector table failed: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            bool rebound = false;
+            for (auto& [n, p] : wt_) if (n == name) { p = *device; rebound = true; break; }
+            if (!rebound) { err = std::string("dflash2: cannot bind expanded selector table ") + name; return false; }
+            return true;
+        };
+        if (!expand_selector("selector.predecessor", &selector_predecessor_bf16_) ||
+            !expand_selector("selector.successor", &selector_successor_bf16_)) return bail(err);
+    }
+#endif
 
     // ---- the drafter's own K/V: the target's QSA pool shapes, but only `layers` pools.  The pool
     // geometry is the target's with n_layers shrunk so is_qsa_layer counts exactly 5 pools

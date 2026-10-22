@@ -22,15 +22,34 @@ Run `./setup.sh --setup` and select DFlash2, or use:
 ```
 
 Setup downloads the pinned checkpoint, checks its hash, converts it to GGUF and builds
-the local CUDA engine with `STRATA_ENABLE_DFLASH2=ON`. It offers BF16, Q8_0 and Q4_0.
-Q8_0 is the balanced recommendation from the local comparison; Q4_0 saves more memory.
-Only the 36 backbone matrices are quantized. The 45 norm, convolution and selector
-tensors remain BF16. A local compatible GGUF can be supplied with `--dflash2 FILE`.
-The old plain-DFlash installer and separate-head choices are no longer offered.
+the local engine with `STRATA_ENABLE_DFLASH2=ON`. Its converter offers BF16, Q8_0 and
+Q4_0. The direct runtime also accepts the Inco AI Q4_K_M GGUF described below; setup's
+conversion menu is unchanged. Q8_0 is the balanced recommendation from the local
+comparison; Q4_0 saves more memory. The old plain-DFlash installer and separate-head
+choices are no longer offered.
 
-DFlash2 currently requires one NVIDIA GPU and serial requests. HIP and SYCL cannot
-build the DFlash2 extension. Compilation and hardware execution of the shared DFlash
-prerequisite on those backends still require validation. Windows was not tested.
+DFlash2 requires one GPU and serial requests. The setup/release path is CUDA-oriented;
+this integration branch also builds the shared DFlash2 runtime on HIP. Its Q4_K_M
+path is validated on the Radeon AI PRO R9700 (gfx1201), not on other HIP architectures,
+SYCL, multi-GPU, or Windows. DFlash2 remains experimental and opt-in.
+
+## Direct Inco AI Q4_K_M GGUF (integration branch)
+
+The direct runtime accepts
+`incoai/Qwen3.8-Flash-Next-DFlash2-GGUF/Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf`
+(repo revision `4f5a39be8f0a9e9a573ac9824251830a8f4096d9`, SHA-256
+`2f174e593998c77df0eb7ca13961915a26f25f7944d784a1838e1856e857ff0d`). It contains
+45 Q4_K matrices, four Q6_K matrices and 32 F32 auxiliary tensors. Set
+`--dflash /path/to/Qwen3.8-Flash-Next-DFlash2-Q4_K_M.gguf` and
+`--dflash-mask-token 248077`; this file omits the mask-token metadata. The engine
+infers vocabulary from the selector codebook, accepts `dflash.rope.freq_base`, and
+recognizes the official HC-mean tap geometry when its explicit tag is absent.
+
+Q4_K/Q6_K projection weights stay packed. The current selector primitive expects
+BF16 codebooks, so the two quantized selector tables are dequantized to BF16 at
+upload (242.5 MiB extra VRAM, included in expert-cache sizing). F32 norms and
+convolution bases are uploaded as F32. The Q4_K_M file is a direct runtime input;
+the setup conversion menu remains BF16/Q8_0/Q4_0.
 
 `./setup.sh --calibrate` measures settings for the installed artifact on this PC.
 After the decode sweep, DFlash2 also compares fresh short and long requests. It tries
@@ -119,7 +138,10 @@ the unary top-K candidates, scores predecessor transitions and follows a greedy 
 Top-K ties prefer the smaller token ID. The GPU selector keeps codebooks in BF16,
 uses caller-owned scratch and preserves the reference reduction order. Greedy proposals
 are point masses verified by the target; only its accepted prefix is committed.
-Sampled requests use target-only decoding and maintain draft context for later greedy reuse.
+Sampled speculation is enabled by default in the integrated runtime; set
+`STRATA_DFLASH_SAMPLED_FALLBACK=1` to force target-only sampling. Same-seed identity
+against a one-row target-only baseline is not guaranteed across different verify widths
+and expert placement.
 
 In-memory prompt and conversation snapshots include the drafter's five committed K/V
 prefixes. Rewind overwrites later cells. Disk SAVE/RESTORE remains unsupported.

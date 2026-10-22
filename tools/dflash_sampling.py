@@ -31,15 +31,18 @@ def replace(args: list[str], key: str, value: str | None) -> None:
         args.extend((key, value))
 
 
-def validate_residency(info, requested, reference=None):
-    """A requested budget is not evidence of identical CPU/GPU expert placement."""
-    for key in ("expert_slots", "expert_slots_primary"):
-        if int(info.get(key, -1)) != requested:
-            raise AssertionError(f"{key}={info.get(key)}; requested {requested}. "
-                                 "Reduce --expert-cache so every arm fits without automatic shrinking.")
+def validate_residency(info, budget_slots, reference=None):
+    """`--expert-cache` budgets largest-blob equivalents, not the resulting slot count."""
+    for key in ("expert_slots", "expert_slots_primary", "expert_cache_mib", "expert_cache_primary_mib"):
+        try:
+            valid = int(info.get(key, -1)) > 0
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise AssertionError(f"invalid {key}={info.get(key)} for --expert-cache budget {budget_slots}")
     if reference is not None:
         for key in ("context", "kv", "kv_resident", "expert_slots", "expert_slots_primary",
-                    "spec", "pcie_frac", "pool_workers"):
+                    "expert_cache_mib", "expert_cache_primary_mib", "spec", "pcie_frac", "pool_workers"):
             if key not in reference or key not in info or reference[key] != info[key]:
                 raise AssertionError(f"incomparable engine setting {key}: "
                                      f"{reference.get(key)} versus {info.get(key)}")
@@ -155,7 +158,8 @@ def main() -> None:
         replace(target_args, key, None)
     cwd = Path(cfg.get("cwd", root)).resolve()
     env = dict(os.environ, STRATA_IQ_MT_MIN="1", STRATA_PREFILL_CPU_SHARE="0",
-               STRATA_SPEC_PROB="0", STRATA_SPEC_COUPLED="0", STRATA_SPEC_GUMBEL="0")
+               STRATA_SPEC_PROB="0", STRATA_SPEC_COUPLED="0", STRATA_SPEC_GUMBEL="0",
+               STRATA_DFLASH_SAMPLED_FALLBACK="1")
     cases = [
         ("greedy", "temperature=0 seed=1234"),
         ("cold", "temperature=0.3 seed=1234 top_k=20 top_p=0.95"),

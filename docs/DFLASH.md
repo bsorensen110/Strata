@@ -30,8 +30,14 @@ build/strata --pack /path/to/target-pack --native /path/to/target-shard.gguf \
 The reference plain-DFlash artifact emits its row-zero prediction. DFlash2 reserves
 row zero for its anchor and excludes it from emitted proposals. The effective block
 must fit both the trained artifact and the verifier's window. Greedy proposals are
-checked by the target, and only the accepted prefix is committed. Sampled requests
-use target-only decoding; a later greedy request can reuse committed draft context.
+checked by the target, and only the accepted prefix is committed. In the integrated
+runtime, sampled requests also use DFlash proposals by default: the target sampler
+chooses each verified row with the request's filters, penalties, and position-keyed
+Philox draw. Set `STRATA_DFLASH_SAMPLED_FALLBACK=1` to force target-only sampling
+while retaining draft context. Batched verify arithmetic, route-tail skipping, and
+CPU/GPU expert placement can change logits versus a one-row target-only run, so
+same-seed token identity with that baseline is not guaranteed; fallback is the
+strict comparison mode.
 
 ## Context, cache and memory
 

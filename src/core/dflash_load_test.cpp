@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <vector>
 
 using namespace strata::core;
 namespace fs = std::filesystem;
@@ -117,6 +118,61 @@ std::vector<fixture::Tensor> tensors2() {
     ts.push_back({"selector_hidden.weight", {kH, 4}, 30, 5});
     return ts;
 }
+
+// A tiny but block-aligned DFlash2 artifact mirroring the quantization layout of
+// the external Q4_K_M release: Q4_K/Q6_K matrices and F32 norms/convolution bases.
+constexpr int kQH = 256, kQD = 64, kQQ = 256, kQKV = 256, kQI = 256, kQF = 512, kQV = 256;
+std::vector<fixture::Kv> meta_q4km() {
+    auto kv = meta(false, false, 0, 16);
+    for (auto& item : kv) {
+        if (item.key == "dflash.embedding_length") item.u = kQH;
+        else if (item.key == "dflash.attention.head_count_kv") item.u = 4;
+        else if (item.key == "dflash.attention.key_length") item.u = kQD;
+        else if (item.key == "dflash.feed_forward_length") item.u = kQI;
+        else if (item.key == "dflash.vocab_size") item.u = kQV;
+    }
+    kv.push_back(fixture::u32("dflash.conv_kernel_size", 2));
+    kv.push_back(fixture::u32("dflash.conv_group_size", 16));
+    kv.push_back(fixture::u32("dflash.selector_rank", 256));
+    kv.push_back(fixture::f32("dflash.rope.freq_base", 10000.0f));
+    return kv;
+}
+std::vector<fixture::Tensor> tensors_q4km() {
+    std::vector<fixture::Tensor> ts = {
+        {"fc.weight", {(uint64_t) kQF, (uint64_t) kQH}, 12, 1},
+        {"enc.output_norm.weight", {(uint64_t) kQH}, 0, 2},
+        {"output_norm.weight", {(uint64_t) kQH}, 0, 3},
+    };
+    char buf[128];
+    for (int l = 0; l < kL; ++l) {
+        struct M { const char* fmt; std::vector<uint64_t> shape; uint32_t type; };
+        const M ms[] = {
+            {"blk.%d.attn_norm.weight", {(uint64_t) kQH}, 0},
+            {"blk.%d.ffn_norm.weight", {(uint64_t) kQH}, 0},
+            {"blk.%d.attn_q.weight", {(uint64_t) kQH, (uint64_t) kQQ}, 12},
+            {"blk.%d.attn_k.weight", {(uint64_t) kQH, (uint64_t) kQKV}, 12},
+            {"blk.%d.attn_v.weight", {(uint64_t) kQH, (uint64_t) kQKV}, 14},
+            {"blk.%d.attn_output.weight", {(uint64_t) kQQ, (uint64_t) kQH}, 12},
+            {"blk.%d.attn_q_norm.weight", {(uint64_t) kQD}, 0},
+            {"blk.%d.attn_k_norm.weight", {(uint64_t) kQD}, 0},
+            {"blk.%d.ffn_gate.weight", {(uint64_t) kQH, (uint64_t) kQI}, 12},
+            {"blk.%d.ffn_up.weight", {(uint64_t) kQH, (uint64_t) kQI}, 12},
+            {"blk.%d.ffn_down.weight", {(uint64_t) kQI, (uint64_t) kQH}, 14},
+        };
+        for (const auto& m : ms) {
+            std::snprintf(buf, sizeof buf, m.fmt, l);
+            ts.push_back({buf, m.shape, m.type, (uint8_t) (71 + ts.size())});
+        }
+        for (const char* side : {"attn", "ffn"}) {
+            ts.push_back({"blk." + std::to_string(l) + "." + side + "_conv_base", {(uint64_t) kQH, 2, 2}, 0, 9});
+            ts.push_back({"blk." + std::to_string(l) + "." + side + "_conv_proj.weight", {(uint64_t) kQH, 64}, 12, 10});
+        }
+    }
+    ts.push_back({"selector_predecessor.weight", {(uint64_t) kQH, (uint64_t) kQV}, 12, 11});
+    ts.push_back({"selector_successor.weight", {(uint64_t) kQH, (uint64_t) kQV}, 14, 12});
+    ts.push_back({"selector_hidden.weight", {(uint64_t) kQH, (uint64_t) kQH}, 12, 13});
+    return ts;
+}
 }  // namespace
 
 int main() {
@@ -161,7 +217,25 @@ int main() {
         }
         auto quant = tensors2(); quant.back().type = 8;
         fixture::write(dir / "dflash2_quant.gguf", meta2(), quant);
-        check(!a.open((dir / "dflash2_quant.gguf").string(), err), "quantized extension refused");
+        check(!a.open((dir / "dflash2_quant.gguf").string(), err), "unsupported quantized extension refused");
+        const auto q4km = dir / "dflash2_q4km.gguf";
+        auto q4meta = meta_q4km();
+        q4meta.erase(std::remove_if(q4meta.begin(), q4meta.end(), [](const auto& kv) {
+            return kv.key == "dflash.vocab_size";
+        }), q4meta.end());
+        fixture::write(q4km, q4meta, tensors_q4km());
+        DFlashGeometry q4geom;
+        check(loads(q4km, &q4geom) && q4geom.vocab == kQV && q4geom.rope_theta == 10000.0,
+              "Q4_K_M infers vocabulary and reads rope.freq_base");
+        DFlashGeometry official;
+        official.hidden = 2560; official.layers = 5; official.n_head = 32; official.n_head_kv = 8;
+        official.head_dim = 128; official.intermediate = 7680; official.selector_top_k = 16;
+        official.selector_rank = 256; official.conv_kernel_size = 2; official.conv_group_size = 16;
+        official.sliding_window = 2048; official.target_layers = {6, 16, 26, 36, 46};
+        official.target_layer_inputs = true;
+        check(DFlashArtifact::infer_target_hc_mean(official), "official DFlash2 with input taps infers HC mean");
+        official.hidden = 2048;
+        check(!DFlashArtifact::infer_target_hc_mean(official), "nonofficial DFlash2 does not infer HC mean");
         auto hf = tensors2();
         for (auto& t : hf) {
             if (t.name == "selector_predecessor.weight") t.name = "candidate_selector.predecessor_codebook";
@@ -337,7 +411,7 @@ int main() {
     }
     {   // a non-BF16 tensor
         auto ts = tensors_llama();
-        ts[4].type = 0;   // F32
+        ts[5].type = 0;   // F32 projection matrix (F32 norms are valid in Q4_K_M)
         check(refuses([&] { fixture::write(dir / "f32.gguf", meta(), ts); return dir / "f32.gguf"; }(),
                       "F32 tensor"),
               "non-BF16 tensor refused");

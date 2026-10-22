@@ -84,6 +84,8 @@ public:
     /// Target-independent check that the parsed geometry is one this runtime implements.
     /// The canonical fast path is the published PixelML Flash-Next drafter geometry.
     static bool validate_supported(const DFlashGeometry& g, std::string& err);
+    /// Recognize the published Qwen3.8 DFlash2 geometry when a third-party GGUF omits its HC-mean tag.
+    static bool infer_target_hc_mean(const DFlashGeometry& g);
 
     bool loaded() const { return file_ != nullptr; }
     const std::string& path() const { return path_; }
@@ -231,6 +233,8 @@ private:
     uint16_t* w_ = nullptr;
     std::vector<std::pair<std::string, const uint16_t*>> wt_;   ///< canonical name -> device pointer
     std::vector<std::pair<std::string, const float*>> wf_;      ///< canonical name -> device f32 (norms)
+    // Q4_K_M codebooks are expanded to BF16 for the selector kernel; backbone matrices stay packed.
+    uint16_t *selector_predecessor_bf16_ = nullptr, *selector_successor_bf16_ = nullptr;
 
     // the drafter's own K/V: ONE STATE PER DRAFT LAYER (a QsaState is one layer's pools)
     std::vector<QsaState> st_;
