@@ -40,6 +40,9 @@ EDITABLE = [
     ("api_monitor", "bool", "Keep the last 100 requests' prompts and answers in memory for /api-monitor"),
     ("trace_otlp", "str", "Send OpenTelemetry traces of every /v1 request to this OTLP endpoint"
      " (\"default\" = http://localhost:4318/v1/traces; off by default, and off until the next start changes it)"),
+    ("usage_stats", "bool", "Keep lifetime request/token statistics in a JSON file beside this config, for the "
+                            "Monitor's Usage panel (lifetime and 1 day / 7 day / 30 day counts across restarts; "
+                            "counters only, no prompts)"),
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
      "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
