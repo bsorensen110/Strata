@@ -25,6 +25,7 @@
 #if defined(STRATA_HYBRID)
 extern "C" int strata_hybrid_is_hip_device(int ordinal);
 #endif
+#endif
 
 namespace strata::core {
 namespace {

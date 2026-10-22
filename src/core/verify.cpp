@@ -4509,11 +4509,12 @@ void Verifier::diag_pipelined(std::FILE* f, const char* name) const {
         const cudaError_t q = cudaEventQuery(e);
         return q == cudaSuccess ? "done" : q == cudaErrorNotReady ? "PENDING" : "error";
     };
-    std::fprintf(f, "  %s: %s T=%d pos %lld served %lld/%lld; GPU rang %u, flags served %u A %u B %u; window event %s, "
+    const std::string parked = h_pflag_ != nullptr ? " P " + std::to_string(rd(h_pflag_)) : "";
+    std::fprintf(f, "  %s: %s T=%d pos %lld served %lld/%lld; GPU rang %u, flags served %u A %u B %u%s; window event %s, "
                     "commit event %s (commit launched %d)\n", name,
                  !fl_active_ ? "idle" : rl_wait_ ? "IN FLIGHT (waiting for the remote stage's rows)" : "IN FLIGHT", last_t_,
                  (long long) last_pos0_, (long long) fl_k_, (long long) fl_total_, rd(h_seq_), rd(h_flag_), rd(h_flagA_),
-                 rd(h_flagB_), h_pflag_ != nullptr ? (" P " + std::to_string(rd(h_pflag_))).c_str() : "", ev(ev_done_),
+                 rd(h_flagB_), parked.c_str(), ev(ev_done_),
                  ev(ev_commit_), (int) commit_live_);
 }
 
