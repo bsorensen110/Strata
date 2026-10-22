@@ -475,7 +475,7 @@ control and a checksum that shows whether the two builds computed the same resul
 - `--kv-grow` (or `STRATA_KV_GROW=1`; `--no-kv-grow` turns it off): the K/V takes VRAM only for the cells the requests
   reach, and the expert cache holds the rest, giving slots back as the context grows. It needs one GPU, an expert
   profile, the whole K/V in VRAM (no KV streaming) and every expert in RAM (not the resident low-RAM mode); otherwise,
-  and with `--batch`, `--vram-elastic` or `--peer-device`, the engine says so and stays off.
+  and with `--batch` or `--peer-device`, the engine says so and stays off.
   On HIP (ROCm 6+) it runs through hipMemAddressReserve / hipMemCreate / hipMemMap (2 MiB chunks; the card must report
   virtual memory management, `STRATA_HIP_VMM=0` turns it off); until then every AMD card printed "--kv-grow is off".
   Radeon AI PRO R9700 with `--vram-reserve-mib 17084` (a 16 GB card), Q2_0 pack, `--max-context 196608`, 5 interleaved pairs:
@@ -3083,3 +3083,5 @@ STRATA_PF_FUSED_SM75=1` (fused int8 prompt experts for the Q2_0 pack, #2145; onl
 
 The optional DFlash2 extension and its validation limits are in [DFLASH2.md](DFLASH2.md).
 Enable it at build time with `STRATA_ENABLE_DFLASH2=ON`; no Flash-Next DFlash2 checkpoint is included.
+
+With both `--kv-grow` and `--vram-elastic`, VRAM borrows from the same region the K/V grows into. See [VRAM_ELASTIC.md](VRAM_ELASTIC.md#with---kv-grow).
