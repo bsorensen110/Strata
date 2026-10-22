@@ -11675,9 +11675,18 @@ int main(int argc, char** argv) {
             }
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
+            // #3321: retain() is empty after a prompt-cache restore, so keep the largest superseded copy's K/V pages
+            // and recopy into them.  checks is still whole here; the split below moves it.
+            strata::core::ConversationCache::SupersededReuse harvested;
+            if (conversations.retained_bytes() == 0)
+                harvested = conversations.take_superseded_reuse(src.ids, src.imgs, src.checks, src.cvec);
             if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec, lora_cached))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
+            if (harvested.dropped > 0)
+                std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
+                             "conversation; parked=%zu\n", harvested.dropped, harvested.dropped == 1 ? "y" : "ies",
+                             conversations.size());
             // --conversation-cache-disk-mib: the parked form is a session file, so only the deepest checkpoint goes
             // with it (the next turn's resume point) and the K/V streams off the authoritative pools straight into the
             // file - no host copy of the session is ever made.  Every refusal here is the same skip-park success the
@@ -11811,6 +11820,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: conversation cache: retained K/V reused for %lld of its %lld tokens "
                                      "(the rest is not this conversation's)\n", (long long) reuse.unchanged_tokens,
                              (long long) retained_n);
+            if (reuse.kv.empty() && !harvested.reuse.kv.empty()) reuse = std::move(harvested.reuse);
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
             reuse.stages.clear();
@@ -14987,6 +14997,28 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
+        // #3321: the host path below used to allocate a fresh ConversationKv per layer per admission.  Each 16 MiB
+        // segment was a new mapping, and the device-to-host copy faulted every page.  One image per stage and layer
+        // (and one for the draft ring) stays for the process; a later copy of the same size writes the warm pages.
+        // STRATA_SLOT_SHUTTLE=0 allocates a fresh image each time, as before.  The bytes copied do not change.
+        static const bool slot_shuttle_off = [] {
+            const char* v = std::getenv("STRATA_SLOT_SHUTTLE");
+            return v != nullptr && v[0] == '0';
+        }();
+        std::vector<std::vector<strata::core::ConversationKv>> slot_shuttle;
+        strata::core::ConversationKv mtp_shuttle;
+        auto shuttle_kv = [&](size_t stage, int64_t layer) -> strata::core::ConversationKv& {
+            if (slot_shuttle.size() <= stage) slot_shuttle.resize(stage + 1);
+            auto& layers = slot_shuttle[stage];
+            if ((int64_t) layers.size() <= layer) layers.resize((size_t) layer + 1);
+            return layers[(size_t) layer];
+        };
+        bool shuttle_said = false;
+        auto say_shuttle = [&]() {
+            if (shuttle_said || slot_shuttle_off) return;
+            shuttle_said = true;
+            std::fprintf(stderr, "strata batch: slot copies reuse the host image (STRATA_SLOT_SHUTTLE=0 allocates a fresh one)\n");
+        };
         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             auto sync_all = [&]() {
@@ -15073,7 +15105,8 @@ int main(int argc, char** argv) {
             }
             if (slot_copy_direct && !moved) {   // with a pool the streamed K/V moves by chunks (pool_move), not by a copy
                 if (!direct_slot_copy(true, b, ids, e)) return false;
-            } else
+            } else {
+            say_shuttle();
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                 strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
@@ -15086,24 +15119,28 @@ int main(int argc, char** argv) {
                     return false;
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
                     if (moved && from.qsa_states[from.qsa_ord0 + j].kv_mode == 1) continue;   // the pool carried it
-                    strata::core::ConversationKv img;
-                    if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
+                    strata::core::ConversationKv fresh;
+                    strata::core::ConversationKv* img = &fresh;
+                    if (!slot_shuttle_off) img = &shuttle_kv(k, j);
+                    if (!strata::core::conversation_kv_save(*img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
                     if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
-                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                    if (!strata::core::conversation_kv_restore(*img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch admission: device sync failed"; return false; }
+            }
             }
             if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
                 // are on the drafter's device (the last stage's GPU with a layer split): the copy's ring refill is a
                 // kernel launch there.
                 const strata::core::OnDevice on_mtp(mtp.device());
-                strata::core::ConversationKv image;
+                strata::core::ConversationKv fresh_mtp;
+                strata::core::ConversationKv* image = slot_shuttle_off ? &fresh_mtp : &mtp_shuttle;
                 if (!mtp.idle(e) || !slot_mtp[(size_t) b]->idle(e) ||
-                    !strata::core::conversation_kv_save(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    !strata::core::conversation_kv_restore(image, slot_mtp[(size_t) b]->kv_state(),
+                    !strata::core::conversation_kv_save(*image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+                    !strata::core::conversation_kv_restore(*image, slot_mtp[(size_t) b]->kv_state(),
                                                            draft_geometry, upto, false, e) ||
                     cudaDeviceSynchronize() != cudaSuccess)
                     return false;
@@ -15193,7 +15230,8 @@ int main(int argc, char** argv) {
             if (moved && !pool_move(b, -1, upto, e)) return false;
             if (slot_copy_direct && at == nullptr && !moved) {   // with a pool the streamed K/V moves by chunks, not by a copy
                 if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
-            } else
+            } else {
+            say_shuttle();
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
                 strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
@@ -15211,23 +15249,27 @@ int main(int argc, char** argv) {
                 }
                 for (int64_t j = 0; j < from.qsa_alloc; ++j) {
                     if (moved && from.qsa_states[from.qsa_ord0 + j].kv_mode == 1) continue;   // the pool carried it
-                    strata::core::ConversationKv img;
-                    if (!strata::core::conversation_kv_save(img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
+                    strata::core::ConversationKv fresh;
+                    strata::core::ConversationKv* img = &fresh;
+                    if (!slot_shuttle_off) img = &shuttle_kv(k, j);
+                    if (!strata::core::conversation_kv_save(*img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, e))
                         return false;
                     if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
-                    if (!strata::core::conversation_kv_restore(img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
+                    if (!strata::core::conversation_kv_restore(*img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, e))
                         return false;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) { e = "batch slot restore: device sync failed"; return false; }
             }
+            }
             if (batch_mtp) {
                 // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
                 const strata::core::OnDevice on_mtp(mtp.device());
-                strata::core::ConversationKv image;
+                strata::core::ConversationKv fresh_mtp;
+                strata::core::ConversationKv* image = slot_shuttle_off ? &fresh_mtp : &mtp_shuttle;
                 if (!slot_mtp[(size_t) b]->idle(e) || !mtp.idle(e) ||
-                    !strata::core::conversation_kv_save(image, slot_mtp[(size_t) b]->kv_state(),
+                    !strata::core::conversation_kv_save(*image, slot_mtp[(size_t) b]->kv_state(),
                                                         draft_geometry, upto, false, e) ||
-                    !strata::core::conversation_kv_restore(image, mtp.kv_state(), draft_geometry, upto, false, e) ||
+                    !strata::core::conversation_kv_restore(*image, mtp.kv_state(), draft_geometry, upto, false, e) ||
                     cudaDeviceSynchronize() != cudaSuccess)
                     return false;
                 mtp.set_prompt_len(upto);

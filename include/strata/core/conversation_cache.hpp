@@ -748,6 +748,55 @@ public:
         superseded_ += dropped;
         return dropped;
     }
+    // #3321: the same entries drop_superseded() would free, but the largest one's K/V segments are moved out first.
+    // A prompt-cache restore does not call retain(), so the next park used to erase that copy and allocate a fresh
+    // image; the device-to-host copy then faulted every new page.  The pages move into `reuse` and the bytes are
+    // recopied (unchanged_tokens stays 0: equal token ids do not prove the K/V prefix).  A guarded donor is kept.
+    // `dropped` counts every superseded entry, including the one whose pages were kept.
+    struct SupersededReuse {
+        ConversationKvReuse reuse;
+        size_t dropped = 0;
+    };
+    SupersededReuse take_superseded_reuse(const std::vector<int32_t>& ids,
+                                           const std::vector<ConversationImageKey>& images,
+                                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec, bool lora = true) {
+        SupersededReuse out;
+        std::vector<size_t> hit;
+        size_t best = SIZE_MAX, best_kv = 0;
+        hit.reserve(entries_.size());
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (!superseded_entry(i, ids, images, checkpoints, cvec, lora)) continue;
+            hit.push_back(i);
+            size_t kvb = 0;
+            for (const auto& layer : entries_[i].kv) kvb += layer.bytes();
+            for (const auto& stage : entries_[i].stage_images)
+                for (const auto& layer : stage.kv) kvb += layer.bytes();
+            if (best == SIZE_MAX || kvb > best_kv) { best = i; best_kv = kvb; }
+        }
+        std::vector<size_t> was(hit.size());
+        for (size_t n = 0; n < hit.size(); ++n) was[n] = entries_[hit[n]].bytes();
+        if (best != SIZE_MAX && best_kv > 0) {
+            auto& e = entries_[best];
+            out.reuse.captured_tokens = (int64_t) e.live.ids.size();
+            out.reuse.unchanged_tokens = 0;
+            out.reuse.kv = std::move(e.kv);
+            out.reuse.stages.reserve(e.stage_images.size());
+            for (auto& stage : e.stage_images) {
+                ConversationKvReuse part;
+                part.captured_tokens = out.reuse.captured_tokens;
+                part.unchanged_tokens = 0;
+                part.kv = std::move(stage.kv);
+                out.reuse.stages.push_back(std::move(part));
+            }
+        }
+        for (size_t n = hit.size(); n-- > 0;) {
+            bytes_ -= was[n];
+            erase(hit[n]);
+        }
+        out.dropped = hit.size();
+        superseded_ += out.dropped;
+        return out;
+    }
     size_t superseded() const { return superseded_; }
     /// --conversation-cache-park-gain N: the longest parked entry this conversation's outgoing state supersedes, in
     /// tokens, 0 when it has none.  It is the entry drop_superseded() would remove, so the caller can tell whether a
@@ -795,6 +844,23 @@ private:
         const auto& own = e.live.ids;
         const size_t shared = std::mismatch(own.begin(), own.end(), ids.begin(), ids.end()).first - own.begin();
         return ids.size() > own.size() && own.size() - shared <= own.size() / 10 ? shared : 0;
+}
+
+    bool superseded_entry(size_t i, const std::vector<int32_t>& ids,
+                          const std::vector<ConversationImageKey>& images,
+                          const std::vector<ConversationCheckpoint>& checkpoints, bool cvec,
+                          bool lora = true) const {
+        if (i >= entries_.size() || (guarded_ != 0 && serials_[i] == guarded_)) return false;
+        const auto& e = entries_[i];
+        if (e.cvec != cvec || e.lora != lora) return false;
+        const ConversationCheckpoint* deepest = nullptr;
+        for (const auto& c : e.checkpoints)
+            if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+        if (!deepest || deepest->ids.empty()) return false;
+        if (deepest->ids == ids && deepest->imgs == images) return true;
+        for (const auto& k : checkpoints)
+            if (k.ids == deepest->ids && k.imgs == deepest->imgs) return true;
+        return false;
     }
     void erase(size_t index) {
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
