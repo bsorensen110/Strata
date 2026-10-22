@@ -25,7 +25,7 @@ import collections, glob, json, os, shlex, subprocess, time
 OUT = os.environ.get("GPUSTAT_OUT") or "/run/gpustat.json"
 INTERVAL = float(os.environ.get("GPUSTAT_INTERVAL", "3"))   # each sample scans /proc/*/fd; keep it modest
 POWER_WINDOW = float(os.environ.get("GPUSTAT_POWER_WINDOW", "15"))
-NAMES = {"e223": "Intel(R) Arc(TM) Pro B70 Graphics"}
+NAMES = {"e223": "Intel(R) Arc(TM) Pro B70 Graphics", "e222": "Intel(R) Arc(TM) Pro B65 Graphics"}
 
 
 def find_cards():
