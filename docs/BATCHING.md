@@ -18,7 +18,7 @@ One GPU: add `"parallel": 2` to the model's config (`strata-<model>.json`) and r
 `--parallel 2`. Setup recommends it only where it does not cost speed (below); any number you ask for is kept as
 asked, with a note when it is more than setup would recommend.
 
-```
+```json
 "parallel": 2
 ```
 
@@ -80,7 +80,7 @@ of the same arm.
 
 With a layer split, the engine options go into the config's `args`:
 
-```
+```json
 "args": [ ..., "--batch", "8", "--batch-groups", "4", "--trim-stage-weights" ],
 "layer_split": "12,24,36"
 ```
@@ -332,8 +332,7 @@ without the pool, two lanes beyond 256k, four or more lanes, a single 512K conve
   one whose conversation is cheapest to lose instead: an expired one (idle that long), then the one holding the
   shortest history (the one used longest ago among equals), so a short side request (a title, a summary) does not take
   the slot of a long conversation that is still going.
-- Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`) - with
-  `STRATA_SLOT_CACHE_AFFINITY=1`, by the conversations they hold (below).
+- Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`). Inside a group a request fills a hole below its last busy slot first: the pipelined window spans the slots up to that one, so a leading hole cost a whole row per window (0.1.41, #793). With `STRATA_SLOT_CACHE_AFFINITY=1`, assignment is by the conversations the slots hold (below).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
 
 ## Reading a prompt beside pipelined groups (experimental, opt-in)
@@ -793,6 +792,7 @@ counter-based draw (Philox(seed, position)).
   boundary, and not for pictures.
 - Admissions are one at a time: two new long prompts are read one after the other.
 - `--batch-groups` needs every stage on its own GPU. A pipelined slot is a conversation cache again (0.1.41): a request left alone in its slot goes back to the solo path with its drafts, as on one GPU.
+- It does not combine with `--batch-mtp` (0.1.41, #1413): the pipelined path builds one row per slot, so `--batch-mtp`'s per-slot MTP drafts do not run there while their drafters still hold about 0.9 GB of VRAM per slot. The engine says so at start - drop `--batch-mtp`, or use `--batch-groups 1`.
 - The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
 
 ## Measured
@@ -902,7 +902,7 @@ tests the server's side with a scripted engine (no GPU).
 
 For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000` (and the scripts set `STRATA_IQ_MT_MIN=1`):
 
-```
+```bash
 python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 8 --n 8 \
     --extra "--layer-split 12,24,36 --trim-stage-weights --batch-groups 4 --pcie-frac 0 --adapt-every 1000000"
 python3 tools/batch_interleave_test.py --exe engine/strata --config strata-<model>.json \
@@ -915,7 +915,7 @@ STRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8080
 For single-GPU `--batch-mtp`, use a model with `rt/draft_vocab.bin` to exercise admission with a
 shared draft-vocabulary head. This compares both slots' output against solo decoding:
 
-```
+```bash
 python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 2 --n 2 --max-new 64 \
     --extra "--batch-mtp --pcie-frac 0 --adapt-every 1000000"
 ```
