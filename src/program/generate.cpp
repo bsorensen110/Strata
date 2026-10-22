@@ -3661,7 +3661,11 @@ int main(int argc, char** argv) {
         } else (void) cudaGetLastError();
     }
 #endif
-    if (!o.dflash.empty() && o.mtp.empty() && !o.serve && !o.greedy && o.temperature > 0.0f) {
+    static const bool dflash_sampled_fallback = [] {
+        const char* e = std::getenv("STRATA_DFLASH_SAMPLED_FALLBACK");
+        return e && e[0] == '1';
+    }();
+    if (dflash_sampled_fallback && !o.dflash.empty() && o.mtp.empty() && !o.serve && !o.greedy && o.temperature > 0.0f) {
         std::fprintf(stderr, "dflash: sampled CLI requests use target-only decoding\n");
         o.dflash.clear();
         o.dflash_head.clear();
@@ -15652,10 +15656,10 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
-            // Speculative target windows failed the seeded-output parity gate.
-            // Keep sampling target-only while that discrepancy is investigated.
-            // Still maintain draft context for a later greedy continuation.
-            const bool req_dflash = has_dflash && req_temperature <= 0.0f;
+            // DFlash proposes point masses (argmax tokens). The verifier samples the target with
+            // this request's chain and position-keyed RNG; exact-match acceptance is valid at any
+            // temperature. Set STRATA_DFLASH_SAMPLED_FALLBACK=1 to force target-only parity mode.
+            const bool req_dflash = has_dflash && (!dflash_sampled_fallback || req_temperature <= 0.0f);
             if (has_dflash) dflash.set_reference_mode(req_df2_reference);
             df_request = has_dflash;
             if (has_dflash && !req_dflash)
