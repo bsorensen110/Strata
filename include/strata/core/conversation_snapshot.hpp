@@ -166,6 +166,10 @@ bool conversation_snapshot_validate_meta(const SavedConversation& image, const S
 // rejected as invalid).
 bool conversation_snapshot_bytes(const ConversationView& view, const SessionState& session, const ModelGeometry& g,
                                  const QsaState* draft, size_t& bytes, std::string& error);
+// The disk save with `draft == nullptr`: a session without --mtp, whose file holds the QSA layers' K/V only.
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
 bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const ConversationView& view,
                                          const SessionState& session, const ModelGeometry& g, const QsaState* draft,
                                          size_t& bytes, std::string& error);

@@ -448,6 +448,11 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     sources = std::move(out);
     return true;
 }
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                   const QsaState& draft, std::string& error) {
+    return conversation_snapshot_sources(meta, sources, view, ss, g, &draft, error);
+}
 
 // One stage's read limits from its carve: its layer range, running-state bounds and per-K/V-layer bounds.  It does
 // not touch the top-level max_tokens / max_checkpoints / geometry / max_kv_layers; the caller sets those.  A later
