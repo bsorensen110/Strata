@@ -20,6 +20,9 @@ a result that starts with "error:", so the model can react instead of the chat b
 from __future__ import annotations
 
 import collections
+import base64
+import hashlib
+from pathlib import Path
 import json
 import os
 import re
@@ -35,7 +38,7 @@ import urllib.request
 from serve import lifeline
 
 PROTOCOL = "2025-06-18"               # the MCP revision Strata asks for; the server's answer is used as given
-DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0}
+DEFAULTS = {"timeout_s": 60.0, "max_result_chars": 20000, "max_rounds": 8, "start_timeout_s": 120.0, "image_results": False}
 
 
 class McpError(RuntimeError):
@@ -553,6 +556,42 @@ def _cut_parts(parts: list, cap: int, note: str) -> list:
     return out
 
 
+def cache_images(result, directory):
+    """Keep raster tool outputs outside chat history; never expose arbitrary tool paths."""
+    images = []
+    directory = Path(directory)
+    types = {"image/png": ("png", b"\x89PNG\r\n\x1a\n"), "image/jpeg": ("jpg", b"\xff\xd8\xff"),
+             "image/webp": ("webp", b"RIFF")}
+    for block in result.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        mime = block.get("mimeType")
+        if block.get("type") != "image" or mime not in types or len(images) >= 4:
+            continue
+        encoded = block.get("data")
+        if not isinstance(encoded, str) or len(encoded) > 24_000_000:
+            continue
+        try:
+            data = base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            continue
+        ext, magic = types[mime]
+        if not data.startswith(magic) or (ext == "webp" and data[8:12] != b"WEBP"):
+            continue
+        directory.mkdir(parents=True, exist_ok=True)
+        name = hashlib.sha256(data).hexdigest() + "." + ext
+        target = directory / name
+        if not target.exists():
+            temporary = directory / (name + "." + os.urandom(8).hex() + ".tmp")
+            try:
+                temporary.write_bytes(data)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        images.append({"url": "tool-media/" + name, "mimeType": mime, "name": "tool-image." + ext})
+    return images
+
+
 def _clean(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]", "_", str(name)) or "x"
 
@@ -561,6 +600,7 @@ class McpHub:
     """Every configured server, and the merged, namespaced tool list the model sees."""
 
     def __init__(self, servers: dict[str, dict], settings: dict | None = None):
+        self.media_dir = None
         self.settings = {**DEFAULTS, **(settings or {})}
         self.servers = {name: McpServer(name, cfg, self.settings) for name, cfg in servers.items()}
         self.threads: list[threading.Thread] = []
@@ -630,6 +670,14 @@ class McpHub:
                                   float(self.settings["timeout_s"]), cancel)
                 text, parts = result_parts(res)
                 ok = not res.get("isError")
+                if ok and self.settings["image_results"] and self.media_dir is not None:
+                    try:
+                        images = cache_images(res, self.media_dir)
+                    except OSError as e:
+                        print(f"[strata] MCP image cache unavailable: {e}", file=sys.stderr, flush=True)
+                    else:
+                        if images:
+                            out["images"] = images
                 if not ok:
                     text, parts = "error: " + (text or "the tool reported an error"), None
             except McpCancelled:
@@ -644,6 +692,10 @@ class McpHub:
                     f"{cap:,} are shown]")
             text = text[:cap] + note
             parts = _cut_parts(parts, cap, note) if parts is not None else None
+        if ok and out.get("images"):
+            out["model_content"] = [{"type": "text", "text": text.replace(": not shown to the model]", ": image attached]")}] + [
+                {"type": "image", "source": str(Path(self.media_dir) / im["url"].split("/")[-1])}
+                for im in out["images"]]
         out.update(ok=ok, text=text, chars=full, truncated=bool(note), parts=parts,
                    images=[p["source"] for p in parts or () if p["type"] == "image"],
                    ms=int((time.monotonic() - t0) * 1000))
@@ -701,11 +753,15 @@ def servers_from(block, where: str) -> dict[str, dict]:
 
 
 def settings_from(cfg: dict) -> dict:
-    """The run config's optional `"mcp"` block: timeout_s, max_result_chars, max_rounds, start_timeout_s."""
+    """The run config's optional `"mcp"` block: timeout_s, max_result_chars, max_rounds, start_timeout_s, image_results."""
     out = {}
     for key, value in (cfg.get("mcp") or {}).items():
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
-        if key in ("timeout_s", "start_timeout_s"):
+        if key == "image_results":
+            if not isinstance(value, bool):
+                raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a boolean")
+            out[key] = value
+        elif key in ("timeout_s", "start_timeout_s"):
             if not number or value <= 0:
                 raise SystemExit(f"[strata] config mcp.{key}={value!r}: expected a number of seconds > 0")
             out[key] = float(value)
