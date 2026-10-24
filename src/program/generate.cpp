@@ -771,8 +771,6 @@ struct Options {
     std::string window_hashes;
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
-    /// --dflash: a DFlash2 draft GGUF (tools/dflash_head.py) drafting in place of the MTP layer (Metal --serve only)
-    std::string dflash;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
     /// DFlash (docs/DFLASH.md): the standalone block drafter's GGUF; --mtp and --dflash are exclusive.
     std::string dflash;

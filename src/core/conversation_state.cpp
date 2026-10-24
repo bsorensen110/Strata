@@ -297,20 +297,6 @@ static bool checkpoint_payload_sizes(const SessionState& ss, const ConversationS
     return true;
 }
 
-// The byte sizes of a checkpoint's five running-state arrays: the one rule the validator (save side) and the read limits
-// (restore side) share. Metal: the decode window's own geometry; elsewhere the session's carve.
-static bool checkpoint_payload_sizes(const SessionState& ss, const ConversationStateSizes& z, std::array<size_t, 5>& m,
-                                     std::string& error) {
-    m = {z.gdn, ss.ple_hist ? z.ple : 0, owned_qsa(ss) * z.tail, owned_qsa(ss) * z.dead, owned_qsa(ss) * z.block_pos};
-#if defined(STRATA_GPU_METAL)
-    // the Metal window keeps the running state and the indexer block positions itself: check its geometry
-    if (!strata::metal_engine::window_checkpoint_sizes(m[0], m[1], m[2], m[3], m[4])) return fail(error, "metal window: not up");
-#else
-    (void) error;
-#endif
-    return true;
-}
-
 bool conversation_checkpoint_validate(const ConversationCheckpoint& c, const SessionState& ss,
                                       const ModelGeometry& g, std::string& error) {
     ConversationStateSizes z;

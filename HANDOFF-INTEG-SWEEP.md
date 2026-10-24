@@ -82,3 +82,34 @@ From the repo root:
 - `tools/sweep/done_wave24.txt` — what's merged (driver state)
 - `tools/sweep/sweep_report.txt` / `merged_nums.txt` — classification + coverage
 - `build-cu130.bat` — the quality-build recipe (paths are box-local; adjust if needed)
+
+## Wave 24 status — Linux sweep pass (2026-10-24)
+
+All of 24c/24d/24e are merged on Linux; `tools/sweep/done_wave24.txt` holds 33 entries.
+Merged this pass: 3564, 3678, 2079, 3729, 2114, 2115 (24d), 3299, 3457, 3662, 1887,
+3466 (clean), 3643, 3663 (24e).
+
+**PARKED — #2240** (Remote stage: a worker for the SYCL build): 211 conflicts over 19
+files (`src/net/stage_link.cpp` 40, `src/net/stage_link_test.cpp` 46,
+`src/program/generate.cpp` 53) against an 11.8k-line PR. Needs a dedicated session.
+
+Resolution policy that worked, reuse it:
+- integ already carries a newer version of the PR's feature -> take HEAD
+  (2079 Windows/SYCL setup, 3299 Gyro Metal, 3662 conflicts).
+- both sides add distinct things -> union (2114 doc sections, 2115 setup igpu helpers,
+  3457 Metal drafter members, 1887 struct fields, 3643 routes/imports).
+- After ANY union, grep for a duplicated call at the seam: #3457's union duplicated
+  `gr_read`/`hc_read` of `hc_attn`, which would have applied the mixer read twice.
+
+Follow-ups owed:
+- #3662: `constexpr int NEXP = 512` in `metal/src/engine/window.cpp` needs the runtime
+  `n_expert_` port before 256-expert Coder models work on Metal.
+- `metal/CMakeLists.txt` carries a stray `>` line (pre-existing integ artifact; Metal is
+  not build-gated on Linux).
+
+Linux build gate (the Windows `build-cu130.bat` recipe does not run here):
+`cmake -B build-verify -S . -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON
+ -DCMAKE_HIP_ARCHITECTURES=gfx1201 -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++
+ -DSTRATA_BUILD_TESTS=OFF -DSTRATA_Q6K_EXPERTS=ON`  (Unix Makefiles, do not add -G Ninja)
+then `systemd-run --user --scope -- make -C build-verify -j16 strata` — the agent's shell
+cgroup caps RAM at 4 GiB, so the scope wrapper is required.
