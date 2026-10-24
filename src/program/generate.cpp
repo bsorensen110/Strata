@@ -16814,7 +16814,6 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 continue;
             }
-            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
             if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0 || line.rfind("MIGRATE_YARN4 ", 0) == 0) {
                 const bool save = line[0] == 'S';
                 const bool migrate = line.rfind("MIGRATE_YARN4 ", 0) == 0;
@@ -18782,7 +18781,15 @@ int main(int argc, char** argv) {
             // else-if in 7137d4c - a scope error the tests-only CPU tree cannot catch
             // because it never compiles generate.cpp; only the CUDA engine target does.)
             suffix::NarrowedResumeTarget splice_target{};
-            if (resume == 0) {
+            // remote-stage: the worker's parts of the checkpoints kept here (a Reset or CkptRestore keeps only those)
+            auto remote_keep = [&] {
+                std::vector<int64_t> v;
+                for (const ConvCheckpoint& k : checks)
+                    if (k.remote_id != 0) v.push_back(k.remote_id);
+                return v;
+            };
+            // every session zeroed for a read from token 0 - a remote worker's too, keeping its checkpoint parts `keep`
+            auto session_from0 = [&](const std::vector<int64_t>& keep) -> bool {
                 live_rope_migration = {};
                 strata::core::session_zero(ss, g, nullptr, main_cs);
                 cudaStreamSynchronize(main_stream);
