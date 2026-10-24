@@ -241,6 +241,7 @@ public:
     int64_t vocab() const { return n_vocab_; }
     bool ready() const { return cx_ != nullptr; }
     bool streaming() const { return stream_; }
+    bool supports_metal4() const { return cx_ != nullptr && cx_->supports_metal4(); }
     // --serve's conversation checkpoints: the window's running state (the GDN recurrences and conv histories, the
     // PLE history, each QSA layer's indexer tail and tail-block key); the KV and pooled keys are positional
     bool checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& err);
@@ -439,7 +440,7 @@ private:
     mtl::Buffer hbuf_;          // handshake counters [seq, rel, seen], zeroed at every window
     mtl::Dispatch fseq_, fspin_;
     std::vector<int>* cuts_ = nullptr;
-    mtl::Buffer predL_, predL2_;     // 48 x MAXT x 512: layer l + 1's (l + 2's) router logits from layer l's FFN input
+    mtl::Buffer predL_, predL2_;     // 48 x MAXT x n_expert_: layer l + 1's (l + 2's) router logits from layer l's FFN input
     int seg_T_ = 0;
     bool stream_arena(std::string& err);
     double run_ds(Cached& c);
@@ -497,8 +498,8 @@ public:
     int win_n_[MAXT + 1] = {};
     double win_ms_[MAXT + 1] = {}, win_gpu_[MAXT + 1] = {};
     void at_cut(int s) {
-        st_->at_layer(s, seg_T_, TOPK, cut_ids_ ? cut_ids_ : ids_.as<int32_t>(), st_pred_ && !cut_ids_ ? predL_.as<float>() + (size_t) s * MAXT * 512 : nullptr,
-                      predL2_.ptr && !cut_ids_ ? predL2_.as<float>() + (size_t) s * MAXT * 512 : nullptr);
+        st_->at_layer(s, seg_T_, TOPK, cut_ids_ ? cut_ids_ : ids_.as<int32_t>(), st_pred_ && !cut_ids_ ? predL_.as<float>() + (size_t) s * MAXT * n_expert_ : nullptr,
+                      predL2_.ptr && !cut_ids_ ? predL2_.as<float>() + (size_t) s * MAXT * n_expert_ : nullptr);
     }
 private:
     std::vector<float> ple_hist_;    // NG_HIST x hc_dim normalized rows, row-fastest
@@ -643,10 +644,11 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     ss_ = &ss;
     max_t_ = std::min(max_t, MAXT);
     max_cells_ = max_cells;
-    if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_ff != NFF || g.n_expert != NEXP || g.n_layers != 48) {
+    if (g.n_embd != N || g.hc != HC || g.hc_lr != LR || g.n_ff != NFF || (g.n_expert != 512 && g.n_expert != 256) || g.n_layers != 48) {
         err = "metal window: the geometry differs from Qwen3.8-Flash-Next's";
         return false;
     }
+    n_expert_ = (int) g.n_expert;
     eps_ = 1e-6f;
     const double t0 = now_ms();
     if (const long rp = repack_pid_running(shard1); rp > 0 && !(std::getenv("STRATA_METAL_IGNORE_REPACK") && std::string(std::getenv("STRATA_METAL_IGNORE_REPACK")) == "1")) {
@@ -709,7 +711,7 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
     auto A = [&](size_t bytes) { return cx_->alloc(bytes); };
     R_ = A(4 * MAXT * HC * N); bo_ = A(4 * MAXT * N); inj_[0] = A(4 * MAXT * HC); inj_[1] = A(4 * MAXT * HC);
     xn_ = A(4 * MAXT * HC * N); lo_ = A(4 * MAXT * LR); qkv_ = A(4 * MAXT * 10240); z_ = A(4 * MAXT * 6144);
-    al_ = A(4 * MAXT * 48); be_ = A(4 * MAXT * 48); yg_ = A(4 * MAXT * 6144); logits_ = A(4 * MAXT * 512);
+    al_ = A(4 * MAXT * 48); be_ = A(4 * MAXT * 48); yg_ = A(4 * MAXT * 6144); logits_ = A(4 * MAXT * n_expert_);
     ids_ = A(4 * MAXT * TOPK); wts_ = A(4 * MAXT * TOPK); plan_ = A(4 * P_INTS); h_ = A(4 * MAXT * TOPK * NFF);
     ye_ = A(4 * MAXT * TOPK * N); gsh_ = A(4 * MAXT * NFF); ush_ = A(4 * MAXT * NFF); ysh_ = A(4 * MAXT * N);
     sg_ = A(4 * MAXT * 4); qfull_ = A(4 * MAXT * 12288); kcur_ = A(4 * MAXT * 512); vcur_ = A(4 * MAXT * 512);
@@ -1142,17 +1144,17 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
     const gguf::Tensor& trt = T(b + "ffn_gate_inp.weight");
     const bool rf = routef_ && (trt.type == ref::BF16 || trt.type == ref::F32);
     if (!rf) {
-        gemv(ds, trt, XF_, logits_, 512, ntok);
+        gemv(ds, trt, XF_, logits_, n_expert_, ntok);
         nb_ = true;
     }
     if (stream_ && st_pred_ && l + 1 < 48) {   // the next layer's routing guessed from this layer's FFN input
         nb_ = !rf;   // beside the router GEMV; with router_route it is the first reader of XF_ here: a barrier
-        gemv(ds, T("blk." + std::to_string(l + 1) + ".ffn_gate_inp.weight"), XF_, predL_, 512, ntok,
-             (size_t) l * MAXT * 512 * 4);
+        gemv(ds, T("blk." + std::to_string(l + 1) + ".ffn_gate_inp.weight"), XF_, predL_, n_expert_, ntok,
+             (size_t) l * MAXT * n_expert_ * 4);
         if (predL2_.ptr && l + 2 < 48) {
             nb_ = true;
-            gemv(ds, T("blk." + std::to_string(l + 2) + ".ffn_gate_inp.weight"), XF_, predL2_, 512, ntok,
-                 (size_t) l * MAXT * 512 * 4);
+            gemv(ds, T("blk." + std::to_string(l + 2) + ".ffn_gate_inp.weight"), XF_, predL2_, n_expert_, ntok,
+                 (size_t) l * MAXT * n_expert_ * 4);
         }
         nb_ = true;
     }
@@ -1182,7 +1184,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         a.n_ff = NFF;
         a.n_tok = ntok;
         a.topk = TOPK;
-        a.n_expert = NEXP;
+        a.n_expert = n_expert_;
         const bool dq2 = td.type == ref::Q2_0;
         // the trellis gate/up: 16 lanes a row, 2 rows a lane (expert_parity --bench --sweep, M4, TQK6, 10 experts: 166.6 us a layer
         // against 174.5 for 32,2,4 and 196.8 for 32,1,4; also the fastest at 2 and 3 tokens)
@@ -1201,17 +1203,17 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         if (rf) {
             // the router GEMV + moe_route (bitwise both), beside the shared expert's GEMVs
             r.p = P(lib_, "router_route_" + std::to_string(trt.type), mtl::Constants().i(0, ntok), "router_route_" + std::to_string(trt.type) + "#" + std::to_string(ntok));
-            GemvArgs ga{(uint32_t) N, 512, (uint32_t) ntok, (uint32_t) ref::row_bytes(trt.type, N), (uint32_t) N, 512};
+            GemvArgs ga{(uint32_t) N, (uint32_t) n_expert_, (uint32_t) ntok, (uint32_t) ref::row_bytes(trt.type, N), (uint32_t) N, (uint32_t) n_expert_};
             r.args = {mtl::Arg::B(W_, trt.offset), mtl::Arg::B(XF_.b, 0), mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4),
                       mtl::Arg::B(logits_), mtl::Arg::V(ga), mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(plan_),
                       mtl::Arg::V(a), mtl::Arg::B(rcounter_)};
-            r.grid[0] = 512 / 16;
-            r.tg[0] = 512;
+            r.grid[0] = n_expert_ / 16;
+            r.tg[0] = n_expert_;
             nb_ = true;
         } else {
             r.p = P(lib_, "moe_route", {}, "moe_route");
             r.args = {mtl::Arg::B(logits_), mtl::Arg::B(ids_), mtl::Arg::B(wts_), mtl::Arg::B(plan_), mtl::Arg::V(a)};
-            r.tg[0] = 512;
+            r.tg[0] = n_expert_;
         }
         push(ds, r);
         {
@@ -1246,7 +1248,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
                   mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(XF_.b, XF_.plane_bytes() * 4)};
         if (stream_)
             for (int c = -1; c < 3; ++c)
-                g.args.push_back(c < 0 ? mtl::Arg::B(st_->smap(), (size_t) l * 512 * 4) : mtl::Arg::B(st_->chunk(c + 1)));
+                g.args.push_back(c < 0 ? mtl::Arg::B(st_->smap(), (size_t) l * n_expert_ * 4) : mtl::Arg::B(st_->chunk(c + 1)));
         g.tg[0] = 32 * gs;
         g.indirect = &plan_;
         g.ind_off = P_IGU * 4;
@@ -1260,7 +1262,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         dd.args = {mtl::Arg::B(EW, ebase), mtl::Arg::B(h_), mtl::Arg::B(ye_), mtl::Arg::B(plan_), mtl::Arg::V(a), mtl::Arg::B(h_)};
         if (stream_)
             for (int c = -1; c < 3; ++c)
-                dd.args.push_back(c < 0 ? mtl::Arg::B(st_->smap(), (size_t) l * 512 * 4) : mtl::Arg::B(st_->chunk(c + 1)));
+                dd.args.push_back(c < 0 ? mtl::Arg::B(st_->smap(), (size_t) l * n_expert_ * 4) : mtl::Arg::B(st_->chunk(c + 1)));
         dd.tg[0] = 32 * ds_;
         dd.indirect = &plan_;
         dd.ind_off = P_IDN * 4;
@@ -1629,7 +1631,7 @@ bool Window::stream_arena(std::string& err) {
                                                      "resident of 128)" : "");
     }
     const char* epg = std::getenv("STRATA_METAL_PROMPT_GEMM");
-    const bool pg_on = !(epg && std::string(epg) == "0");
+    const bool pg_on = !(epg && std::string(epg) == "0") && cx_->supports_metal4();
     bool minimal = false;   // the arena's least layout (the min slots) is not shrunk further: it goes ahead, filled in steps
     for (int tries = 0;; ++tries) {
         const double planned = budget;
@@ -2627,6 +2629,7 @@ bool Window::prompt_gemm_on(int64_t n) const {
 
 bool Window::prompt_gemm_init(std::string& err) {
     if (pg_) return true;
+    if (!cx_ || !cx_->supports_metal4()) { err = "metal: prompt gemm requires Metal 4"; return false; }
     if (stream_ && !st_->ready()) return stream_arena(err);   // it makes the prompt buffers after the arena
     const char* ec = std::getenv("STRATA_METAL_PROMPT_CHUNK");
     // Streaming: every chunk makes one pass over the layer's experts that are not in the arena, so a longer chunk
@@ -2715,7 +2718,7 @@ bool Window::prompt_gemm_init(std::string& err) {
         p.WD = F16((size_t) (LR + HC) * HC * N); p.WU = F16((size_t) HC * N * LR); p.Wqkv = F16((size_t) 10240 * N);
         p.Wz = F16((size_t) 6144 * N); p.Wal = F16((size_t) 48 * N); p.Wbe = F16((size_t) 48 * N); p.Wout = F16((size_t) N * 6144);
         p.Wq = F16((size_t) 12288 * N); p.Wk = F16((size_t) 512 * N); p.Wv = F16((size_t) 512 * N); p.Wiq = F16((size_t) 512 * N);
-        p.Wik = F16((size_t) 128 * N); p.Wr = F16((size_t) NEXP * N); p.Wsg = F16((size_t) N); p.Wshg = F16((size_t) NFF * N);
+        p.Wik = F16((size_t) 128 * N); p.Wr = F16((size_t) n_expert_ * N); p.Wsg = F16((size_t) N); p.Wshg = F16((size_t) NFF * N);
         p.Wshu = F16((size_t) NFF * N); p.Wshd = F16((size_t) N * NFF);
         if (strata::kernels::cpu::hadamard_spec().any()) p.xrot = F32(MT * N);   // Gyro: the rotated FFN input
         if (ple_on_) {
@@ -2947,16 +2950,16 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         dq(tg_, p.Wshg);
         dq(tu_, p.Wshu);
         dq(td_, p.Wshd);
-        gemm(p.mixh, p.Wr, p.logits, T, NEXP, N);
+        gemm(p.mixh, p.Wr, p.logits, T, n_expert_, N);
         const uint32_t nt = (uint32_t) T;
-        D(PP(p.lib, "route_topk"), {mtl::Arg::B(p.logits), mtl::Arg::B(p.ids), mtl::Arg::B(p.wts), mtl::Arg::V(nt)}, (T + 7) / 8, 1, 256);
+        D(PP(p.lib, n_expert_ == 256 ? "route_topk_256" : "route_topk"), {mtl::Arg::B(p.logits), mtl::Arg::B(p.ids), mtl::Arg::B(p.wts), mtl::Arg::V(nt)}, (T + 7) / 8, 1, 256);
         const int nent = T * TOPK, nblk = (nent + 1023) / 1024;
-        PgPlan pa{(uint32_t) nent, TOPK, NEXP, (uint32_t) p.TM, (uint32_t) nblk};
+        PgPlan pa{(uint32_t) nent, TOPK, (uint32_t) n_expert_, (uint32_t) p.TM, (uint32_t) nblk};
         const uint32_t nclr = (uint32_t) p.maxrows;
         D(PP(p.lib, "mm_clear"), {mtl::Arg::B(p.stok), mtl::Arg::V(nclr)}, (p.maxrows + 255) / 256, 1, 256);
         D(PP(p.lib, "mm_hist"), {mtl::Arg::B(p.ids), mtl::Arg::B(p.bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024);
         D(PP(p.lib, "mm_scan"), {mtl::Arg::B(p.bcnt), mtl::Arg::B(p.boff), mtl::Arg::B(p.eoff), mtl::Arg::B(p.tiles),
-                                 mtl::Arg::B(p.meta), mtl::Arg::V(pa)}, 1, 1, NEXP);
+                                 mtl::Arg::B(p.meta), mtl::Arg::V(pa)}, 1, 1, n_expert_);
         D(PP(p.lib, "mm_place"), {mtl::Arg::B(p.ids), mtl::Arg::B(p.wts), mtl::Arg::B(p.boff), mtl::Arg::B(p.eoff),
                                   mtl::Arg::B(p.stok), mtl::Arg::B(p.sw), mtl::Arg::B(p.pos), mtl::Arg::V(pa)}, nblk, 1, 1024);
         PgMm ma{eg.offset, TN(b + "ffn_up_exps.weight").offset, ed.offset, 0, 0, (uint32_t) ref::row_bytes(eg.type, N),
@@ -2980,7 +2983,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         const mtl::Buffer& EW = stream_ ? st_->chunk(0) : W_;
         auto arena_args = [&](mtl::Dispatch& d) {
             if (!stream_) return;
-            d.args.push_back(mtl::Arg::B(st_->smap(), (size_t) l * 512 * 4));
+            d.args.push_back(mtl::Arg::B(st_->smap(), (size_t) l * n_expert_ * 4));
             for (int c = 1; c < 4; ++c) d.args.push_back(mtl::Arg::B(st_->chunk(c)));
         };
         const std::string ak = stream_ ? "#arena" : "";
@@ -3300,8 +3303,9 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
     if (g_window == nullptr) { err = "metal prompt: the decode window is not up yet"; return false; }
     static const bool windows = std::getenv("STRATA_METAL_PROMPT") && std::string(std::getenv("STRATA_METAL_PROMPT")) == "window";
     static const int64_t min_rows = std::getenv("STRATA_METAL_PROMPT_MIN") ? std::atoll(std::getenv("STRATA_METAL_PROMPT_MIN")) : 32;
-    if (!windows && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
-    if (!windows && g_window->streaming()) {
+    const bool m4 = g_window->supports_metal4();
+    if (!windows && m4 && !g_window->streaming() && n >= min_rows) return g_window->prompt(tokens, n, pos0, on_chunk, err);
+    if (!windows && m4 && g_window->streaming()) {
         const char* e = std::getenv("STRATA_METAL_PROMPT_GEMM");
         const char* em = std::getenv("STRATA_METAL_PROMPT_GEMM_MIN");
         const int64_t mn = em ? std::atoll(em) : 64;
