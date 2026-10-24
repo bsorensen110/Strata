@@ -777,35 +777,6 @@ template <> inline float deq<T_IQ3_S>(device const uchar* b, int ui, thread floa
     return rdh(b) * float(1 + 2 * ((sc >> (4 * (ib & 1))) & 15));
 }
 
-// Trellis types (TQ2_T K = 8, TQK6 K = 6, TQK7 K = 7): 128 = 4 units of 8 steps.  Step t has a 15-bit state; the state's hash
-// picks two codebook points = weights 4t..4t+3 (times d).  TQ2_T: state t = qs[(t + 31) % 32] << 8 | qs[t].  TQK: the 16
-// stream bits from bit (31 - t) K, LSB first, circular over 32 K bits (a 32-bit window over two ushorts).  q = the fp16
-// codebook values, exact.
-template <int KB>
-static inline float deq_tq(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) {
-    device const uchar* qs = b + 2;
-    device const ushort* us = (device const ushort*)qs;
-    for (int j = 0; j < 8; ++j) {
-        const int t = 8 * ui + j;
-        uint s;
-        if (KB == 8) {
-            s = ((uint(qs[(t + 31) & 31]) << 8) | uint(qs[t])) & 0x7fffu;
-        } else {
-            const int bit = (31 - t) * KB, w = bit >> 4, w1 = w + 1 >= 2 * KB ? w + 1 - 2 * KB : w + 1;
-            s = (((uint(us[w1]) << 16) | uint(us[w])) >> (bit & 15)) & 0x7fffu;
-        }
-        const uint x = s * 0x9e3779b1u;
-        const half2 a = as_type<half2>(g_tq(tab, x >> 21)), c = as_type<half2>(g_tq(tab, (x >> 10) & 2047u));
-        q[4 * j] = float(a.x);
-        q[4 * j + 1] = float(a.y);
-        q[4 * j + 2] = float(c.x);
-        q[4 * j + 3] = float(c.y);
-    }
-    return rdh(b);
-}
-template <> inline float deq<T_TQ2T>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<8>(b, ui, q, tab); }
-template <> inline float deq<T_TQK6>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<6>(b, ui, q, tab); }
-template <> inline float deq<T_TQK7>(device const uchar* b, int ui, thread float* q, threadgroup const uint* tab) { return deq_tq<7>(b, ui, q, tab); }
 
 // IQ4_NL: 32 = 1 unit; low nibbles are elements 0..15, high 16..31 (one half2 lookup per byte).
 template <> inline float deq<T_IQ4_NL>(device const uchar* b, int, thread float* q, threadgroup const uint* tab) {

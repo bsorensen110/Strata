@@ -579,7 +579,6 @@ struct Stager {
         return buf[j % kRing];
     }
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
-    /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     // SYCL port: the copy queue writes a sequence number into page-locked host memory after the DMA and the stager
     // thread polls it, instead of waiting on an event. A stager thread's host wait on the copy queue's events (the
     // CUDA form, cudaEventSynchronize) hung a lent-slot prompt in its first full chunk under the Level Zero v2 adapter

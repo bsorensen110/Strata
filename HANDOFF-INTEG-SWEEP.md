@@ -113,3 +113,12 @@ Linux build gate (the Windows `build-cu130.bat` recipe does not run here):
  -DSTRATA_BUILD_TESTS=OFF -DSTRATA_Q6K_EXPERTS=ON`  (Unix Makefiles, do not add -G Ninja)
 then `systemd-run --user --scope -- make -C build-verify -j16 strata` — the agent's shell
 cgroup caps RAM at 4 GiB, so the scope wrapper is required.
+
+### Auditing a union for duplicated statements
+`git diff --name-only <pre-sweep-base> HEAD | python3 tools/sweep/dup_audit.py`
+reports ADJ (identical line back-to-back), NEAR (within 4 lines), FN (identical function
+definition line twice) and any surviving conflict markers, over just the swept files.
+Expect false positives: `#if defined(_WIN32)` / `#else` pairs define the same function twice
+legitimately, and tests sometimes call a function twice on purpose. Duplicates arrive as whole
+SETS — the Metal trellis block carried two `deq_tq` variants plus two identical
+`deq<T_TQ2T/TQK6/TQK7>` specialisation sets.
