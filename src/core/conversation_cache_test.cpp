@@ -1300,3 +1300,4 @@ int main() {
     }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
+}
