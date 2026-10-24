@@ -149,15 +149,36 @@ EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false":
           "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
+# DeepSeek-V4.1's template takes low, medium, high (its default) and max, or a whole number 1..100 (the "Reasoning
+# Effort: N" line of its prompt).  use_family("deepseek41") switches the table; the other families keep the one above.
+EFFORT_DEEPSEEK = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
+                   "low": "low", "medium": "medium", "high": "high", "xhigh": "max", "max": "max", "maximum": "max"}
+_EFFORT_QWEN = dict(EFFORT)
+_NUMERIC_EFFORT = False
+
+
+def use_family(family: str | None) -> None:
+    """The reasoning-effort words of the model family this server runs (module state, like ENV_TO_USER)."""
+    global _NUMERIC_EFFORT
+    EFFORT.clear()
+    EFFORT.update(EFFORT_DEEPSEEK if family == "deepseek41" else _EFFORT_QWEN)
+    _NUMERIC_EFFORT = family == "deepseek41"
+
+
 def effort_kwargs(value) -> dict:
     """A reasoning effort as given by a client -> the template's kwargs.  Unknown values are a 400, not a crash."""
     if value is None or value == "":
         return {}
     if value is False:
         return {"enable_thinking": False}
+    if _NUMERIC_EFFORT and isinstance(value, int) and not isinstance(value, bool):
+        if not 1 <= value <= 100:
+            raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium, high, max or 1..100")
+        return {"reasoning_effort": value}
     key = str(value).strip().lower()
     if key not in EFFORT:
-        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high")
+        raise ValueError(f"unknown reasoning effort {value!r}: use none, low, medium or high"
+                         + (", max or 1..100" if _NUMERIC_EFFORT else ""))
     level = EFFORT[key]
     return {"enable_thinking": False} if level is None else {"reasoning_effort": level}
 
@@ -168,7 +189,7 @@ def budget_effort(tokens) -> dict:
         n = int(tokens)
     except (TypeError, ValueError):
         return {}
-    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
+    return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else EFFORT["high"]}
 
 
 def _has_image(content) -> bool:
@@ -977,8 +998,9 @@ class OutputParser:
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
         self.declared_only = declared_only
-        self.unread = 0
-        # Accept the native namespace__member spelling without advertising duplicate tools.
+        # PR #3556: the native namespace__member spelling of a declared namespace.member tool is accepted without advertising a
+        # duplicate tool.  Only an unambiguous alias counts (two namespaces can end in the same member), and an exactly declared
+        # name always wins over an alias.
         aliases = {}
         for name in self.schemas:
             if isinstance(name, str) and "." in name:
@@ -986,7 +1008,8 @@ class OutputParser:
                 aliases.setdefault(f"{namespace}__{member}", set()).add(name)
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
-        self._alias = set(self.aliases)
+        self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
+        self.unread_names: list[str] = []   # the names (first few) of those that named a tool the request did not declare
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -1007,10 +1030,11 @@ class OutputParser:
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._reset_scan()
 
-    def reopen_reasoning(self) -> None:
-        """#1814: the tag the parser took as the end of the thinking was ordinary text the model wrote, not the marker.
-        Go back to reasoning, so what the model writes next is reasoning again (Service.run does this and continues)."""
-        self.state, self.lead = "reasoning", False
+    @property
+    def clean(self) -> bool:
+        """Nothing is held back: a clean point to stop the thinking at (a parser that rewrites the model's text, as
+        serve/dsml.py's does, also counts what it holds)."""
+        return not self.buf
 
     def _ok_at(self, p: int) -> bool:
         """self.buf[p] would open a call: at the start of a line, outside a code fence and inline code."""
@@ -1025,7 +1049,7 @@ class OutputParser:
         none declared, only where `declared_only` is off."""
         if not self.schemas:
             return not self.declared_only
-        return name in self.schemas or name in self._alias
+        return name in self.schemas or name in self.aliases
 
     def _loose_open(self, after: str):
         """#3441: `after` (text after a `<tool_call>`, whitespace dropped) opens a call in a drifted form that names a
@@ -1040,7 +1064,7 @@ class OutputParser:
             bare = after[1:].strip().lstrip("=").strip()
             if after[1:].lstrip().startswith(("=", "function")):
                 return "wait"
-            if any(k.startswith(bare) for k in list(self.schemas) + list(self._alias) if isinstance(k, str)):
+            if any(k.startswith(bare) for k in list(self.schemas) + list(self.aliases) if isinstance(k, str)):
                 return "wait"
         return None
 
@@ -1528,6 +1552,9 @@ class OutputParser:
                             self.buf = self.buf[j:]
                         return out
                     if gt >= 0 and (nl < 0 or gt < nl) and not self._callable(after[len(FUNC_START):gt].strip()):
+                        self.unread += 1                 # logged by the server: otherwise "the model ignored my tool" is the only clue
+                        if len(self.unread_names) < 5:
+                            self.unread_names.append(after[len(FUNC_START):gt].strip()[:80])
                         out.append(Event("content", self._track(self.buf[:i + len(CALL_START)])))
                         self.buf = self.buf[i + len(CALL_START):]
                         continue

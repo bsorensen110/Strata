@@ -4,6 +4,9 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/prefill/prefill.hpp"
+#if defined(STRATA_HAVE_DFLASH2)
+#include "strata/kernels/dflash2.hpp"
+#endif
 #include "strata/prefill/warm_policy.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
@@ -760,7 +763,6 @@ struct Stager {
     }
 };
 
-static int g_n_taps = 0;   // set_tap_layers mirrors the Impl count here for the static size counters
 
 // multi-GPU: the peer GPU's share of a prompt chunk's experts.  Per MoE layer the primary copies its normed
 // activations over P2P, the peer quantizes the rows routed to the experts it holds, runs the same MMQ products the
@@ -960,10 +962,6 @@ struct Prefill::Impl {
     const core::ExpertCache* cache = nullptr;
     const int32_t* host_res = nullptr;
     int64_t T = 0, T_max = 0;
-    bool tap_hc_mean_ = false;
-    int tap_layers_[8] = {};
-    int n_taps_ = 0;
-    uint16_t* taps = nullptr;  ///< n_taps_ x T_max x n_embd BF16
     bool borrowed = false, borrow_spill = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
@@ -1177,7 +1175,19 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 }  // namespace
 
 Prefill::Prefill() : impl_(new Impl) {}
-Prefill::~Prefill() { release(); }
+Prefill::~Prefill() {
+    clear_taps();
+    release();
+}
+
+void Prefill::clear_taps() {
+    if (tap_dev_ != nullptr) {
+        cudaFree(tap_dev_);
+        tap_dev_ = nullptr;
+    }
+    tap_layers_.clear();
+    on_taps = nullptr;
+}
 
 void Prefill::reset() {
     release();
@@ -1799,7 +1809,6 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.xn16 = o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); m.lo = o.take<float>(T * LR, ok); m.lo16 = o.take<uint16_t>(T * LR, ok);
     m.gated = o.take<float>(T * D, ok); m.inj = o.take<float>(T * HC, ok);
     m.mixed = o.take<float>(T * N, ok); m.mixed_bf = o.take<uint16_t>(T * N, ok);
-    if (m.n_taps_ > 0) m.taps = o.take<uint16_t>((size_t) m.n_taps_ * (size_t) T * (size_t) N, ok);
     m.mixed_h = o.take<uint16_t>(T * N, ok);
     // Embedding rows are dead after gr_broadcast on m.cs; subsequent half outputs use the same stream.
     m.bo = m.emb;
@@ -2307,17 +2316,6 @@ bool Prefill::bind_stage_helper(int64_t T) {
     return true;
 }
 
-// A borrowed prompt buffer is re-carved for each request's chunk. The tap
-// planes follow that current layout, not the largest chunk accepted at init.
-int64_t Prefill::tap_stride_rows() const { return impl_->T; }
-
-void Prefill::set_tap_layers(const int* layers, int n, bool hc_mean) {
-    Impl& m = *impl_;
-    m.tap_hc_mean_ = hc_mean;
-    m.n_taps_ = n > 8 ? 8 : n;
-    for (int i = 0; i < m.n_taps_; ++i) m.tap_layers_[i] = layers[i];
-    g_n_taps = m.n_taps_;   // the static counters (bytes_needed_impl) read this
-}
 
 bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err) {
     Impl& m = *impl_;
@@ -2663,7 +2661,6 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     }
     o.take<uint16_t>(T * (D + (hc_pad() ? XN_PAD : 0)), ok); f(T * LR); o.take<uint16_t>(T * LR, ok);
     f(T * D); f(T * HC); f(T * N); o.take<uint16_t>(T * N, ok);
-    if (g_n_taps > 0) o.take<uint16_t>((size_t) g_n_taps * T * (size_t) g.n_embd, ok);
     o.take<uint16_t>(T * N, ok);
     if (!emb_reuse_account()) f(T * N);
 
@@ -3109,6 +3106,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     };
 
     if (hand_in_ == nullptr) stopped_at_ = -1;
+#if defined(STRATA_HAVE_DFLASH2)
+    std::vector<int> tap_slot;
+    if (!tap_layers_.empty() && stage_lb_ == 0 && (stage_le_ < 0 || stage_le_ == g.n_layers)) {
+        if (tap_dev_ == nullptr &&
+            cudaMalloc((void**) &tap_dev_, (size_t) tap_cap_ * tap_layers_.size() * (size_t) g.n_embd * 4) != cudaSuccess) {
+            (void) cudaGetLastError();
+            tap_dev_ = nullptr;
+            err = "prefill: the DFlash2 tap staging does not fit in VRAM";
+            return false;
+        }
+        tap_slot.assign((size_t) g.n_layers, -1);
+        for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot[(size_t) tap_layers_[i]] = (int) i;
+    }
+#endif
     for (int64_t c0 = 0; c0 < n; c0 += C) {
         if (should_stop && should_stop()) { err = "cancelled"; return false; }
         // the first stage: end the run before this chunk (every chunk before it is handed on; the caller's drain
@@ -3120,6 +3131,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
         const int64_t T = std::min(C, n - c0), p0 = pos0 + c0;
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
+#if defined(STRATA_HAVE_DFLASH2)
+        // DFlash2 prompt taps: the rows of this chunk at positions >= tap_first_ (the drafter looks back one window)
+        const int64_t tap_t0 = tap_dev_ != nullptr ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : T;
+        const int64_t tap_rows = T - tap_t0;
+        if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
+#else
+        const int64_t tap_t0 = 0, tap_rows = 0;
+#endif
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
         if (m.stages) {   // the chunk's own span, and the sums its line prints the deltas of
@@ -3708,21 +3727,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 } else {
                     gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                              m.mixed_bf_lo);
-                }
-                if (half == 0 && m.n_taps_ > 0) {   // DFlash tap: the attn-half read's contracted residual
-                    const int64_t TN = g.n_embd;
-                    for (int ti = 0; ti < m.n_taps_; ++ti)
-                        if (l == m.tap_layers_[ti]) {
-#ifdef STRATA_ENABLE_DFLASH2
-                            if (m.tap_hc_mean_)
-                                strata::kernels::dflash2_hc_mean(m.R, nullptr,
-                                    m.taps + (size_t) ti * m.T * TN, T, TN, g.hc, m.cs);
-                            else
-#endif
-                            strata::kernels::f32_to_bf16_bulk(
-                                m.mixed, m.taps + ((size_t) ti * (size_t) m.T) * (size_t) TN,
-                                (int64_t) T * TN, m.cs);
-                        }
                 }
 
                 if (wd_q8.data) core::NativeDense::hc_bf16_release(m.cs, 0, 0);
@@ -5447,6 +5451,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 if (steered && !cv_fused)   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+#if defined(STRATA_HAVE_DFLASH2)
+                if (half == 1 && tap_rows > 0 && tap_slot[(size_t) l] >= 0)   // DFlash2: this layer's completed output, mean of the streams
+                    strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D, tap_dev_ + (size_t) tap_slot[(size_t) l] * N, (int64_t) tap_layers_.size() * N, N,
+                                                  (int) HC, (int) tap_rows, m.cs);
+#endif
             }
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
@@ -5595,7 +5604,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fclose(f);
             }
         }
-        if (on_chunk || on_stage_chunk || on_taps) {
+#if defined(STRATA_HAVE_DFLASH2)
+        if (tap_rows > 0 && on_taps) {
+            if (cudaStreamSynchronize(m.cs) != cudaSuccess) { err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+            if (!on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
+        }
+#endif
+        if (on_chunk || on_stage_chunk) {
             const auto toc = Clock::now();
             if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
                 err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
@@ -5604,7 +5619,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const auto toc2 = Clock::now();
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
             if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
-            if (on_taps && m.n_taps_ > 0 && !on_taps(m.taps, m.n_taps_, T, p0, err)) return false;
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
         }

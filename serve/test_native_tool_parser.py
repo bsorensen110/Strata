@@ -42,7 +42,7 @@ class NativeTools(unittest.TestCase):
                                                 for event in events if event.kind == "tool_start"))
 
 
-    def test_padded_and_unpadded_unknown_wrappers_stay_text(self):
+    def test_padded_unknown_wrapper_stays_text_and_unpadded_stays_native(self):
         for recover in (False, True):
             for streaming in (False, True):
                 for step in (1, 7, 4096):
@@ -55,14 +55,17 @@ class NativeTools(unittest.TestCase):
                         events += parser.finish()
                         self.assertFalse(any(event.kind.startswith("tool") for event in events))
                         self.assertEqual("".join(event.text for event in events if event.kind == "content"), text)
-                    parser = OutputParser(thinking=False, tools=TOOLS, stream_tools=streaming, recover=recover)
+                    # an unpadded name nobody declared: text where tools are declared (the 0.2.2 rule, #3075); the Responses
+                    # route of a request with no tools (Codex compaction, declared_only off) keeps it as a native call
                     text = "<tool_call><function=missing></function></tool_call>"
-                    events = []
-                    for i in range(0, len(text), step):
-                        events += parser.feed(text[i:i + step])
-                    events += parser.finish()
-                    self.assertFalse(any(event.kind.startswith("tool") for event in events))
-                    self.assertEqual("".join(event.text for event in events if event.kind == "content"), text)
+                    for tools, declared_only, expected in ((TOOLS, False, []), (TOOLS, True, []), (None, False, ["missing"])):
+                        parser = OutputParser(thinking=False, tools=tools, stream_tools=streaming, recover=recover,
+                                              declared_only=declared_only)
+                        events = []
+                        for i in range(0, len(text), step):
+                            events += parser.feed(text[i:i + step])
+                        events += parser.finish()
+                        self.assertEqual([event.call.name for event in events if event.kind == "tool_call"], expected)
 
 
     def test_padded_unknown_second_call_is_not_announced(self):
@@ -137,8 +140,10 @@ class NativeTools(unittest.TestCase):
         parser = OutputParser(thinking=False, tools=ambiguous)
         text = CALL.replace("mcp__files__read", "a__b__c")
         events = parser.feed(text) + parser.finish()
-        self.assertFalse(any(event.kind.startswith("tool") for event in events))
-        self.assertEqual("".join(event.text for event in events if event.kind == "content"), text)
+        # an ambiguous alias is no declared tool: it does not route to the first namespace; it stays text
+        self.assertFalse(any(e.kind == "tool_call" for e in events))
+        self.assertEqual("".join(e.text for e in events if e.kind == "content"), text)
+        self.assertEqual(parser.unread, 1)                           # and it is counted, so the server logs it
 
 
 if __name__ == "__main__":
