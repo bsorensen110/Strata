@@ -56,6 +56,7 @@ namespace strata::metal_engine {
 namespace {
 
 constexpr int N = 2560, HC = 4, LR = 320, NFF = 640, TOPK = 10, NEXP = 512, MAXT = 8, NVOCAB_MAX = 248320;
+constexpr uint32_t DF_W = 5 * N;   // --dflash: one token's target features (5 layers x n_embd)
 constexpr int P_MAXE = 128, P_GEXP = 16, P_GSTART = P_GEXP + P_MAXE, P_ETOK = P_GSTART + P_MAXE + 4,
               P_EW = P_ETOK + P_MAXE, P_TOKENT = P_EW + P_MAXE, P_INTS = P_TOKENT + P_MAXE, P_IGU = 4, P_IDN = 8;
 struct GemvArgs { uint32_t n_in, n_out, n_tok, row_bytes, x_stride, y_stride; };
@@ -176,6 +177,7 @@ struct PromptBufs {
         Wsg, Wshg, Wshu, Wshd, pemb, pembh, pkey, pval, keyn, qn, gated, normW, Wpk, Wpv, mixr;
     // Buffer has no releasing destructor. Keep each allocation once for workspace growth.
     std::vector<mtl::Buffer> owned;
+    mtl::Buffer F;   // --dflash: the chunk's target features (C rows of 5 x n_embd)
 };
 
 // The vision path (--vision, GENI requests), from the shared host code: the image rows of the prompt being read
@@ -447,6 +449,25 @@ private:
     PromptGemm* pg_ = nullptr;
     const int32_t* cut_ids_ = nullptr;    // the routed ids the handshake reads (a prompt chunk's; else ids_)
     const mtl::Buffer* mtp_src_ = nullptr;   // the rows the draft layer's prompt K/V read (a prompt chunk's; else R_)
+    // --dflash: the target features of the last window or prompt chunk, rows of DF_W floats (dfw_ for a window)
+    bool df_on_ = false;
+    mtl::Buffer dfw_;
+    const mtl::Buffer* df_src_ = nullptr;
+    // the completed output of layer l - 1 (DFlash2's layers 5/15/25/35/45, read at the top of layer l) into F's column
+    // block k: -1 when layer l reads none
+    static int df_col(int l) {
+        switch (l) { case 6: return 0; case 16: return 1; case 26: return 2; case 36: return 3; case 46: return 4; default: return -1; }
+    }
+    mtl::Dispatch df_mean(const mtl::Buffer& R, const mtl::Buffer& F, int k, int ntok) {
+        struct { uint32_t n_embd, hc, stride, col; } a{N, HC, DF_W, (uint32_t) (k * N)};
+        mtl::Dispatch d;
+        d.p = P(lib_, "hc_mean", {}, "hc_mean");
+        d.args = {mtl::Arg::B(R), mtl::Arg::B(F), mtl::Arg::V(a)};
+        d.grid[0] = N / 256;
+        d.grid[1] = (uint32_t) ntok;
+        d.tg[0] = 256;
+        return d;
+    }
     double pg_ms_ = 0;
     int64_t pg_tok_ = 0;
 public:
@@ -458,6 +479,8 @@ public:
         }
         return false;
     }
+    void dflash_enable() { df_on_ = true; }
+    const float* dflash_rows() const { return df_src_ ? df_src_->as<float>() : nullptr; }
     bool prompt_gemm_on(int64_t n) const;
     bool prompt_gemm_init(std::string& err);
     bool prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::string& err);
@@ -1010,6 +1033,11 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
     // ---- the mixer: layer 1's read after the PLE is not applied again (its pending write was applied before it), nor
     // a read after a steered layer (cvec_apply applied it)
     gr_read(ds, b + "hc_attn", l > 0 && !(l == 1 && ple_on_) && !cv_at(l - 1), XA_, false, ntok);
+    if (df_on_ && df_col(l) >= 0) {
+        if (!dfw_.ptr) dfw_ = cx_->alloc((size_t) 4 * MAXT * DF_W);
+        nb_ = true;   // beside the read's GEMVs: both only read R_
+        push(ds, df_mean(R_, dfw_, df_col(l), ntok));
+    }
     if (l % 4 != 3) {
         const int gi = l - l / 4;
         // a one-token window commits in the step; a longer one leaves the state and commit() folds the kept prefix
@@ -1341,6 +1369,7 @@ void Window::ple_cpu(int Tn) {
 bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t* out, std::string& err) {
     in_mtp_ = false;   // this window build may take the NOBARRIER diagnostic
     mtp_src_ = nullptr;
+    df_src_ = df_on_ ? &dfw_ : nullptr;
     if (Tn < 1 || Tn > MAXT || (head && Tn > max_t_)) { err = "metal window: window size out of range"; return false; }
     if (pos0 + Tn + 1 >= max_cells_) { err = "metal window: the window runs past the context"; return false; }
     const double t0 = now_ms();
@@ -2577,6 +2606,8 @@ struct Window::PromptGemm {
         iqr, ikr, qcur, qcurh, qidx, scores, qids, part, XQ, xqh, logits, ids, wts, bcnt, boff, eoff, tiles, meta, stok, sw, pos,
         XS, HS, YE, yr, gsh, ush, hh, ys, sgv, emb, embh, pkey, pval, keyn, qn, gated, normW;
     mtl::Buffer WD, WU, Wqkv, Wz, Wal, Wbe, Wout, Wq, Wk, Wv, Wiq, Wik, Wr, Wsg, Wshg, Wshu, Wshd, Wpk, Wpv, EG, ED;
+    mtl::Buffer F;   // --dflash: the chunk's target features (outside the arena)
+    mtl::Buffer WD, WU, Wqkv, Wz, Wal, Wbe, Wout, Wq, Wk, Wv, Wiq, Wik, Wr, Wsg, Wshg, Wshu, Wshd, Wpk, Wpv;
     mtl::Buffer mixr;   // Gyro: the rotated gate/up input rows [MT][N]
 };
 
@@ -2821,6 +2852,10 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     for (int l = 0; l < 48; ++l) {
         const std::string b = "blk." + std::to_string(l) + ".";
         if (!sk("hc")) hc_read(b + "hc_attn", l > 0 && !(l == 1 && ple_on_) && !cv_at(l - 1));   // (the FFN read counts as moe below)
+        if (df_on_ && df_col(l) >= 0) {
+            if (p.F.bytes < (size_t) 4 * p.MT * DF_W) p.F = cx_->alloc((size_t) 4 * p.MT * DF_W);
+            ds.push_back(df_mean(p.R, p.F, df_col(l), T));
+        }
         if (l % 4 != 3) {
             if (!sk("gdn")) {
             const int gi = l - l / 4;
@@ -3096,6 +3131,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     if (T >= 2) { ss.ple_prev[0] = tokens[T - 2]; ss.ple_prev[1] = tokens[T - 1]; }
     else { ss.ple_prev[0] = ss.ple_prev[1]; ss.ple_prev[1] = tokens[0]; }
     mtp_src_ = &p.R;   // the draft layer's prompt K/V read this chunk's final rows
+    df_src_ = df_on_ ? &p.F : nullptr;
     return true;
 }
 
@@ -3112,7 +3148,15 @@ namespace {
 Window* g_the_window = nullptr;
 // the drafter is loaded before the window exists: its QsaState waits here for window_init
 strata::core::QsaState* g_draft_state = nullptr;
+bool g_dflash = false;
 }
+// --dflash: every window and prompt chunk also writes its rows' target features (before the first window is built:
+// the encoded windows are cached); dflash_rows() reads the last one's, DF_W floats a row
+void dflash_enable() {
+    g_dflash = true;
+    if (g_the_window != nullptr && g_the_window->ready()) g_the_window->dflash_enable();
+}
+const float* dflash_rows() { return g_the_window != nullptr ? g_the_window->dflash_rows() : nullptr; }
 void* window_create() {
     if (g_the_window == nullptr) g_the_window = new Window();
     return g_the_window;
@@ -3134,6 +3178,7 @@ bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::Se
     if (!x->ready()) {
         if (g_shard1.empty()) { err = "metal window: the model shard is not set (--native SHARD1)"; return false; }
         if (!x->init(g, ss, g_shard1, MAXT, max_cells, err)) return false;
+        if (g_dflash) x->dflash_enable();
         window_register(w);
         if (!mtp_load_pending(x, err)) return false;
         x->set_draft_state(g_draft_state);

@@ -423,6 +423,7 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
         const int nT = (int) std::min<int64_t>(C, n - c);
         if (pos0 + c + nT + 1 >= max_cells_) { err = "metal prompt: the prompt runs past the context"; return false; }
         if (!pc_chunk(tokens + c, nT, pos0 + c, err)) return false;
+        df_src_ = df_on_ ? &pb_.F : nullptr;
         if (on_chunk) {
             const double tm0 = now_ms();
             mpsrc_ = &pb_.R;   // the drafter's prompt rows are this chunk's final residuals
