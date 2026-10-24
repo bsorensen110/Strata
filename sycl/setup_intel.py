@@ -57,6 +57,19 @@ INTEL_ARC = {"e223": ("Arc Pro B70", 32.0), "e222": ("Arc Pro B65", 32.0), "e221
 # built in chunks past that limit and the A-series uses the ordinary streamed path; see to_sycl().
 ALCHEMIST_IDS = frozenset({"56a0", "56a1", "56a2", "56a5", "56a6", "5690"})
 
+# Integrated Arc GPUs (docs/INTEL.md, "Integrated Arc"): Intel's integrated GPU sits at PCI 00:02.0 (a discrete card is
+# behind a PCIe port, never there). Its memory is the system RAM. Only the xe driver is supported: the port was
+# measured there (an Arc 140T, Core Ultra 9 285H, 62 GiB); on i915 setup says how to boot with xe instead. The engine
+# runs on the host's oneAPI (sycl/serve/strata-sycl-native.sh), not in the Docker image.
+IGPU_SLOT = "0000:00:02.0"
+INTEL_IGPU = {"7d51": "Arc 140T"}           # the measured one; another integrated GPU is named by its PCI id
+SYCL_NATIVE = ROOT / "sycl" / "serve" / "strata-sycl-native.sh"
+ONEAPI = Path(os.environ.get("ONEAPI_ROOT") or "/opt/intel/oneapi")
+# What a model takes on an integrated GPU beside the experts' file (shard 1): the KV, the prompt buffers, the engine,
+# the OS and the desktop. Measured on the Arc 140T (62 GiB): the Coder IQ1_M and IQ2_XS (shard 1 36.5 GiB) ran with
+# 10-13 GiB of RAM left, IQ3_XXS (43.8 GiB) left 3-4 GiB and did not run well, so shard 1 + 14 GiB is in use and
+# 6 GiB more is the room asked for.
+IGPU_REST_GIB = 20
 
 def intel_gpus_windows(adapters=None, registry=None):
     adapters = S._win_display_adapters() if adapters is None else adapters
@@ -99,6 +112,43 @@ def ensure_windows_engine(force=False):
     return exe
 
 
+def igpu_need_gib(model: str) -> float:
+    """The RAM a model needs on an integrated GPU: its shard 1 (all but the 28.8 GB per-layer lookup table, which is
+    read from the SSD) plus IGPU_REST_GIB."""
+    d = S.MODELS.get(model, {})
+    return (d.get("download_gb", 0) - 28.8) * 1e9 / 2**30 + IGPU_REST_GIB
+
+
+def igpu_fits(model: str, ram: float) -> bool:
+    return igpu_need_gib(model) <= ram
+
+
+def _pci(card: Path):
+    """(vendor, device id, driver, PCI slot) of a /sys/class/drm card, None when unreadable."""
+    dev = card / "device"
+    try:
+        vendor = (dev / "vendor").read_text().strip().lower()
+        devid = (dev / "device").read_text().strip().lower().replace("0x", "")
+        driver = os.path.basename(os.path.realpath(dev / "driver")) if (dev / "driver").exists() else ""
+    except OSError:
+        return None
+    return vendor, devid, driver, os.path.basename(os.path.realpath(dev))
+
+
+def i915_igpus(drm="/sys/class/drm"):
+    """The PCI ids of Intel integrated GPUs that run on i915 (which the port does not support on them)."""
+    out = []
+    for card in sorted(Path(drm).glob("card[0-9]*")):
+        p = None if "-" in card.name else _pci(card)
+        if p and p[0] == "0x8086" and p[2] == "i915" and p[3] == IGPU_SLOT and p[1] not in INTEL_ARC:
+            out.append(p[1])
+    return out
+
+
+def intel_gpus(drm="/sys/class/drm"):
+    """Intel GPUs from sysfs: vendor 0x8086 under the xe or i915 driver, named by PCI device id. A discrete card's VRAM
+    comes from the id table, else from the size of its VRAM BAR. An integrated GPU on xe is listed with "igpu" and
+    setup's unified-memory fields (uma: its memory is the RAM, less what the OS keeps)."""
 def intel_gpus():
     """Intel discrete GPUs from sysfs: vendor 0x8086 under the xe or i915 driver, named by PCI device id. VRAM comes
     from the id table, else from the size of the card's VRAM BAR."""
@@ -130,18 +180,24 @@ def intel_gpus():
         except (OSError, ValueError, subprocess.TimeoutExpired) as ex:
             S.fail(f"cannot query the native SYCL engine: {ex}", "docs/INTEL_ARC.md")
     found = []
-    for card in sorted(Path("/sys/class/drm").glob("card[0-9]*")):
+    for card in sorted(Path(drm).glob("card[0-9]*")):
         if "-" in card.name:                            # connectors (card0-DP-1) share the card's device
             continue
-        dev = card / "device"
-        try:
-            vendor = (dev / "vendor").read_text().strip().lower()
-            devid = (dev / "device").read_text().strip().lower().replace("0x", "")
-            driver = os.path.basename(os.path.realpath(dev / "driver")) if (dev / "driver").exists() else ""
-        except OSError:
+        p = _pci(card)
+        if p is None:
             continue
+        vendor, devid, driver, slot = p
+        dev = card / "device"
         if vendor != "0x8086" or driver not in ("xe", "i915"):
             continue
+        if slot == IGPU_SLOT and devid not in INTEL_ARC:
+            if driver == "xe":
+                ram = S.ram_gb()
+                shared = max(0.0, ram - S.UMA_OS_LEFT_GB)
+                found.append({"index": len(found), "name": f"Intel {INTEL_IGPU.get(devid, f'integrated GPU {devid}')}",
+                              "vram_gb": shared, "arch": driver, "driver": driver, "devid": devid, "igpu": True,
+                              "uma": True, "dedicated_gb": 0.0, "shared_gb": shared})
+            continue                                    # i915: install() says how to boot with xe
         name, vram = INTEL_ARC.get(devid, (None, 0.0))
         if name is None:
             if driver != "xe":                          # i915 without a known Arc id is an integrated GPU
@@ -164,8 +220,8 @@ def real_mem_have(mem_have, real_ram: float, fake_ram: float):
     return lambda model, ram, vram=0.0: mem_have(model, real_ram if ram >= fake_ram else ram, vram)
 
 
-def sycl_engine():
-    """The SYCL build: (binary, why-not)."""
+def sycl_engine(igpu: bool = False):
+    """The SYCL build: (binary, why-not). An integrated GPU runs it on the host's oneAPI, so that must be installed."""
     if S.WIN:
         override = os.environ.get("STRATA_SYCL_BIN")
         candidates = ([Path(override)] if override else []) + [
@@ -174,7 +230,13 @@ def sycl_engine():
         exe = next((p.resolve() for p in candidates if p.is_file()), None)
         return (exe, None) if exe else (None, "native strata.exe is not built; see docs/INTEL_ARC.md")
     exe = next((b for b in (ROOT / "build-sycl-aot" / "strata", ROOT / "build-sycl" / "strata") if b.exists()), None)
+    if igpu and not (ONEAPI / "setvars.sh").is_file():
+        return None, (f"an integrated GPU runs the engine on this PC's Intel oneAPI, and {ONEAPI}/setvars.sh is missing "
+                      "(docs/INTEL.md, \"Integrated Arc\"; ONEAPI_ROOT names another install)")
     if exe is None:
+        if igpu:
+            return None, ("it is not built (docs/INTEL.md, \"Integrated Arc\": BUILD_DIR=build-sycl bash "
+                          "sycl/tools/build.sh, with oneAPI on this PC)")
         return None, "it is not built (docs/INTEL.md, \"How to build it\": Docker, then sycl/tools/build.sh in the image)"
     return exe, None
 
@@ -482,19 +544,66 @@ def to_sycl(cfg: dict, exe: Path, ram: float, keep: dict, vram_gb: float = 0.0, 
     return out
 
 
+def to_sycl_igpu(cfg: dict, exe: Path, keep: dict, devid: str = "") -> dict:
+    """setup's config -> the one for an integrated GPU on xe, run by sycl/serve/strata-sycl-native.sh on the host's
+    oneAPI: the host's own paths (no container), the experts streamed from the GGUF (--stream-experts; the ones the
+    cache does not hold are mirrored in host memory, which is the same RAM), no KV streaming (the KV is in that RAM
+    either way), setup's prompt chunks. The engine sizes its cache from MemAvailable (the iGPU has no free-memory
+    query) and does not lend the prompt the cache's slots there (a prompt that borrowed decoded only token 0 on the
+    Arc 140T). A reserve the user asked for (--vram-reserve-mib) is kept."""
+    args = list(cfg["args"])
+    for f in ("--resident-experts", "--mmap-experts"):  # setup's low-RAM mode is the CUDA engine's
+        drop(args, f)
+    drop(args, "--kv-resident", True)
+    if flag(args, "--ple-io") == "ram" and "--ple-io" not in (cfg.get("user_args") or []):
+        # setup's rule for it read the 1024 GB stand-in; here the 29 GB n-gram table would take that much of the GPU's
+        # own memory (the expert cache's). One the user wrote (user_args) is kept
+        drop(args, "--ple-io", True)
+    if "--expert-profile" in args and (ROOT / "data" / SYCL_PROFILE).is_file():   # as on a card on xe (to_sycl)
+        i = args.index("--expert-profile") + 1
+        if args[i].replace("\\", "/").rsplit("/", 1)[-1] == "expert-profile.bin":
+            args[i] = args[i][:-len("expert-profile.bin")] + SYCL_PROFILE
+    ctx = int(flag(args, "--max-context") or 32768)
+    asked_reserve = flag(args, "--vram-reserve-mib")
+    drop(args, "--vram-reserve-mib", True)
+    drop(args, "--stream-experts")                      # a hand-written one (the docs' config has it): written once
+    args += ["--stream-experts", "--vram-reserve-mib", asked_reserve or ("1024" if ctx <= 32768 else "2048")]
+    out = {k: v for k, v in cfg.items() if k not in ("lib_dirs", "env", "vision", "gpus")}
+    out.update({"backend": "sycl", "exe": str(SYCL_NATIVE), "args": args})
+    env = {}
+    if devid in INTEL_IGPU:
+        # the persistent JIT cache: the Arc 140T's start 79 s -> 7 s from the second start on. Not on Xe2 (it crashed
+        # there in the first compile, "Things that matter on this GPU"), so only on the measured GPU
+        env["SYCL_CACHE_PERSISTENT"] = "1"
+    if exe != ROOT / "build-sycl" / "strata":           # strata-sycl-native.sh's default
+        env["STRATA_SYCL_BIN"] = exe.relative_to(ROOT).as_posix()
+    if env:
+        out["env"] = env
+    out.update(keep)
+    return out
+
+
 def install(argv) -> None:
     intel = intel_gpus()
     if not intel:
+        on_i915 = [] if S.WIN else i915_igpus()
+        if on_i915:
+            d = on_i915[0]
+            S.fail(f"this PC's integrated Intel GPU ({d}) runs on the i915 driver; Strata's SYCL port runs an integrated "
+                   "GPU on the xe driver only",
+                   f"boot with xe for it: add i915.force_probe=!{d} xe.force_probe={d} to the kernel command line, "
+                   "reboot and run this again (docs/INTEL.md, \"Integrated Arc\")")
         S.fail("no Intel GPU found by the SYCL runtime" if S.WIN else "no Intel Arc found (an xe or i915 card in /sys/class/drm)",
                "docs/INTEL_ARC.md: check the Intel GPU driver" if S.WIN else "on an NVIDIA or AMD card, run ./setup.sh")
-    exe, why = sycl_engine()
+    igpu_only = all(g.get("igpu") for g in intel)       # otherwise setup picks the discrete card (amd_rank)
+    exe, why = sycl_engine(igpu_only)
     if exe is None:
         if S.WIN:
             exe = ROOT / "build-sycl-win" / "strata.exe"
         else:
             S.fail(f"Strata's SYCL engine cannot be used: {why}", "docs/INTEL.md: build it, then run this again")
     for name in ("gpus", "amd_gpus", "amd_problem", "hip_vision", "build_engine_hip", "hipblaslt_table", "ram_gb",
-                 "write_run_script", "start", "say", "main"):
+                 "write_run_script", "start", "say", "main", "ask", "confirm_risk"):
         if not callable(getattr(S, name, None)):
             S.fail(f"setup.py has no {name}() any more: sycl/setup_intel.py needs updating for this setup.py")
 
@@ -519,166 +628,34 @@ def install(argv) -> None:
 
     say = S.say
     fake_ram = real_ram if S.WIN else max(real_ram, 1024.0)
-    alch = intel[0]["driver"] == "i915" or intel[0].get("devid") in ALCHEMIST_IDS
-
-    def say_intel(msg=""):
-        """setup's words for its AMD path and its RAM rule, said for the Intel card."""
-        msg = str(msg).replace("(AMD, experimental: docs/AMD_HIP.md)", "(Intel Arc: the SYCL port, docs/INTEL.md)")
+    sizes = {}                                          # the size menu's numbers -> models (an integrated GPU only)
+    if exe is None:
         if S.WIN:
-            msg = msg.replace(str(stub / S.EXE), str(exe))
-        msg = msg.replace("Your AMD GPUs:", "Your Intel GPUs:").replace("just run ./setup.sh", "just run ./setup.sh --backend sycl")
-        msg = re.sub(r"\b(xe|i915|sycl) \(AMD: docs/AMD_HIP\.md\)", r"\1 driver (Intel Arc: docs/INTEL.md)", msg)
-        where = ("the experts the card does not hold are computed on the CPU" if alch
-                 else "the experts are streamed into VRAM")
-        msg = msg.replace(f"RAM: {fake_ram:.0f} GB", f"RAM: {real_ram:.0f} GB ({where})")
-        msg = msg.replace(f"({fake_ram:.0f} GB RAM +", f"({real_ram:.0f} GB RAM +").replace(f"you have {fake_ram:.0f} GB RAM", f"you have {real_ram:.0f} GB RAM")
-        if re.match(r"\s+\S+\s+needs ~\d+ GB RAM:", msg):   # --check's CUDA verdicts: replaced by the Intel one
-            m = msg.split()[0]
-            d = S.MODELS.get(m, {})
-            shard1 = d.get("download_gb", 0) - 28.8          # all but the per-layer lookup table (read from disk)
-            room = intel[0]["vram_gb"] - 3 + max(0.0, real_ram - 10)   # VRAM, plus a pinned host mirror (or the CPU)
-            every = sum(g["vram_gb"] - 1.5 for g in intel)   # a layer split across every card (each keeps its own room)
-            msg = (f"  {m:8s} ~{shard1:.0f} GB of weights: " +
-                   ("fits in VRAM" if shard1 <= intel[0]["vram_gb"] - 1.5 else
-                    f"fits in VRAM across the {len(intel)} cards (--layer-split)" if len(intel) > 1 and shard1 <= every else
-                    "fits, the experts the card does not hold are computed on the CPU (slower)" if alch and shard1 <= room else
-                    "fits with part of its experts mirrored in RAM (slower)" if shard1 <= room else "does not fit"))
-        say(msg)
-    S.say = say_intel
-    S.gpus = lambda *a, **k: []
-    S.amd_gpus = lambda *a, **k: intel
-    S.amd_problem = lambda g: None
-    if S.WIN:
-        # The native Windows engine is built by build_windows.bat, which builds the engine only: the picture readers
-        # (setup's build_vision_cpu and the SYCL GPU reader) have no Windows build path yet, so pictures stay off
-        # there rather than writing a config that points at a reader nobody built (docs/INTEL_ARC.md, "Windows").
-        S.hip_vision = lambda asked, vram_gb=0.0: "none"
-    else:
-        S.hip_vision = intel_vision                     # pictures on by default, read on the CPU (setup's hip_reader settles it)
+            exe = ROOT / "build-sycl-win" / "strata.exe"
+        else:
+            S.fail(f"Strata's SYCL engine cannot be used: {why}", "docs/INTEL.md: build it, then run this again")
+    for name in ("gpus", "amd_gpus", "amd_problem", "hip_vision", "build_engine_hip", "hipblaslt_table", "ram_gb",
+                 "write_run_script", "start", "say", "main", "ask", "confirm_risk"):
+        if not callable(getattr(S, name, None)):
+            S.fail(f"setup.py has no {name}() any more: sycl/setup_intel.py needs updating for this setup.py")
 
-    def build_engine_hip(gpu, llama, vision="none"):
-        """No engine to compile here (the SYCL build is separate); the picture readers are: the portable CPU reader, once, and for
-        --vision gpu the SYCL GPU reader (a few minutes, once; it needs the oneAPI compiler on this PC, else the CPU reader stays)."""
-        if vision != "none":
-            stamp = stub / "BUILD.json"
-            vsrc = S.source_hash(S.VISION_SOURCES)
-            S.build_vision_cpu(stub, stamp, json.loads(stamp.read_text(encoding="utf-8")), llama, vsrc)
-            if vision == "gpu":
-                build_vision_sycl(stub, stamp, llama, vsrc)
-        return stub
-    S.build_engine_hip = build_engine_hip
-
-    if S.WIN:
-        def native_engine(*a, **k):
-            nonlocal exe
-            exe = ensure_windows_engine(force="--build" in argv)
-            return stub
-        S.get_prebuilt_hip = native_engine
-        S.build_engine_hip = native_engine
-        S.hip_card = lambda eng, gpu, listed: {**gpu, "count": len(intel)}
-        S.hip_lib_dirs = lambda *a, **k: []
-    S.hipblaslt_table = lambda *a, **k: None
-    S.ram_gb = lambda: fake_ram                         # the experts are in VRAM: setup's RAM rule does not apply
-    # Gyro (mem_total) counts VRAM + RAM together and is the one family whose experts are NOT streamed from the file into VRAM: on
-    # an Arc they sit in the RAM arena and the CPU computes what the card does not hold.  Its memory warning ("needs 27.6 GB of VRAM +
-    # RAM together, you have ...", never a refusal) therefore reads the real RAM, not the 1024 GB above.
-    S.mem_have = real_mem_have(S.mem_have, real_ram, fake_ram)
-
-    bench_tips = S.bench_tips
-
-    def bench_tips_intel(args, env, ram, *a, **k):
-        """The tips as written for the CUDA engine, said with the real RAM (the 1024 GB above is only for the RAM rule);
-        the --prefill auto:32768 one was measured on the CUDA engine and is left out."""
-        return [t for t in bench_tips(args, env, real_ram, *a, **k) if "auto:32768" not in t]
-    S.bench_tips = bench_tips_intel
-
-    write = S.write_run_script
-
-    def write_run_script(model, cfg_path, port, open_browser=True):   # setup.write_run_script's signature (#870)
-        cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
-        # the card setup selected (--gpu / the first usable), not intel[0]: on a PC with two Arcs the config must match
-        # the chosen one (docs/INTEL.md, "Two cards"). intel_gpus() lists them in sysfs card order and cfg["gpu"] is
-        # that index (setup.py's amd path); a layer split writes a list, and then every listed card is used.
-        gsel = cfg.get("gpu")
-        split = isinstance(gsel, list)
-        idx = gsel if isinstance(gsel, int) and 0 <= gsel < len(intel) else 0
-        sel = intel[idx]
-        fit_notes = []
-        cfg = to_sycl(cfg, exe, real_ram, keep.get(Path(cfg_path).name, {}), sel["vram_gb"], sel["driver"],
-                      sel.get("devid", ""), fit_notes=fit_notes, model=model, ctx_asked=asked_ctx,
-                      auto_reserve=not asked_reserve, fit=not split)
-        for line in fit_notes:                              # one plain line: what was chosen and why (never a refusal)
-            S.say("  " + line)
-        if len(intel) > 1:                                  # pin the SYCL device(s)
-            # the Level Zero order followed the sysfs card order on the tested machines; a machine where it does not
-            # needs an explicit ONEAPI_DEVICE_SELECTOR (kept if the user set one)
-            selector = "level_zero:*" if split else f"level_zero:{idx}"
-            cfg.setdefault("env", {}).setdefault("ONEAPI_DEVICE_SELECTOR", selector)
-        if split:
-            # #1980: without it every card keeps a full copy of the dense weights (1.4 GiB each on Flash-Next IQ2_XS) and the
-            # load stops at 96-97% resident; the later stage's missing experts have no host mirror (STRATA_VERIFY_NO_HOST)
-            cfg.setdefault("env", {}).setdefault("STRATA_STAGE_TRIM", "1")
-            # #1980: a later stage short of VRAM is refused under NO_HOST=1; with the host path on it runs (the host
-            # computes those experts).  Only when the experts will likely not fit; a value the user set is kept.
-            cards = [intel[i]["vram_gb"] for i in gsel if isinstance(i, int) and 0 <= i < len(intel)]
-            arena = S.MODELS.get(model, {}).get("arena_gb", 0)
-            if split_likely_short(arena, cards) and "STRATA_VERIFY_NO_HOST" not in cfg["env"]:
-                cfg["env"]["STRATA_VERIFY_NO_HOST"] = "0"
-                S.say(f"  {model}'s {arena:.0f} GB of experts will likely not all fit the {len(cards)} cards' "
-                      f"{sum(cards):.0f} GB of VRAM: the config sets STRATA_VERIFY_NO_HOST=0, so the CPU computes the "
-                      "experts the later card does not hold instead of the start being refused (#1980). Set it to 1 "
-                      "in the config's env if your cards hold everything; a smaller model fits fully (docs/INTEL_ARC.md)")
-        need = S.MODELS.get(model, {}).get("ram_gb", 0)
-        sel_alch = sel["driver"] == "i915" or sel.get("devid") in ALCHEMIST_IDS
-        if sel_alch and need and real_ram < need:
-            S.warn(f"{model} on this Arc computes the experts the card does not hold on the CPU (about {need} GB of "
-                   f"weights; this PC has {real_ram:.0f} GB of RAM): the start will be slow or fail - a smaller model "
-                   "(--model) fits better (docs/INTEL.md)")
-        if flag(cfg["args"], "--prefill") == "8192":
-            why = recommended_prefill(sel["vram_gb"], int(flag(cfg["args"], "--max-context") or 32768), sel["driver"],
-                                      sel.get("devid", ""))[1]
-            if why:
-                S.say("  " + why)
-        Path(cfg_path).write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-        script = write(model, cfg_path, port, open_browser)
-        script.write_text(script.read_text().replace(str(ROOT / "serve" / "server.py"), str(SERVER)))
-        return script
-    S.write_run_script = write_run_script
-
-    start = S.start
-
-    def start_sycl(cfg_path, *a, **k):
-        cfg = json.loads(Path(cfg_path).read_text(encoding="utf-8-sig"))
-        if cfg.get("backend") != "sycl":
-            return start(cfg_path, *a, **k)
-        if S.WIN:
-            return start(cfg_path, *a, **k)
-        script = ROOT / f"run-{Path(cfg_path).stem[len('strata-'):]}.sh"
-        S.say(f"\nstarting {script.name} ...")
-        os.execv("/bin/sh", ["/bin/sh", str(script)])
-    S.start = start_sycl
-
-    argv = list(argv)
-    if small_card(intel[0]["vram_gb"], intel[0]["driver"]):   # the engine's own advice for a card this size
-        if "--draft-vocab" not in argv:
-            argv += ["--draft-vocab", "en"]             # ~110 MiB less VRAM than the default CJK subset
-        if "--vram-reserve-mib" not in argv:
-            argv += ["--vram-reserve-mib", str(SMALL_RESERVE_MIB)]
-    sys.argv = [str(ROOT / "setup.py"), *argv]
-    if "--backend" not in argv:
-        sys.argv += ["--backend", "hip"]
-    if "--vision" not in argv and not pictures_on_by_default(intel[0]["driver"], intel[0].get("devid", "")):
-        sys.argv += ["--vision", "none"]
-        S.say("  Pictures are off by default on this card (Arc Pro B70 test of 2026-10-19: the first picture reset the GPU, docs/INTEL.md): "
-              "--vision yes turns them on")
-    if "--low-ram" not in argv:
-        sys.argv += ["--low-ram", "off"]
-    sys.exit(S.main())
-
-
-if __name__ == "__main__":
+    real_ram = S.ram_gb()
+    # what the person chose on the command line is kept by the fit rule (vram_fit); the small-card reserve added below is not theirs
+    asked_ctx = any(a == "--context" or a.startswith("--context=") or a == "--max-context" for a in argv)
+    asked_reserve = any(a == "--vram-reserve-mib" or a.startswith("--vram-reserve-mib=") for a in argv)
+    keep = {}                                          # hand-set keys setup does not write: kept across a rerun
+    for p in ROOT.glob("strata-*.json"):
+        try:
+            c = json.loads(p.read_text(encoding="utf-8-sig"))
+            keep[p.name] = {k: c[k] for k in ("model_switcher", "sampling") if k in c}
+        except (OSError, ValueError):
+            pass
+    stub = READER_DIR                                   # setup reads the engine's BUILD.json; the SYCL build has none.  A folder that
+    stub.mkdir(exist_ok=True)                           # stays: the picture reader in it is what the run config points at
     try:
-        install(sys.argv[1:])
-    except KeyboardInterrupt:
-        S.say("\nstopped.")
-        sys.exit(1)
+        stamped = json.loads((stub / "BUILD.json").read_text(encoding="utf-8"))   # keeps what the reader's build recorded
+    except (OSError, ValueError):
+        stamped = {}
+    (stub / "BUILD.json").write_text(json.dumps({**stamped, "version": sycl_version(), "source": "local", "lib_dirs": []}))
+
+    say = S.say
