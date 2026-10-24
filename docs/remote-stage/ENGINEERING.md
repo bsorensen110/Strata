@@ -30,8 +30,9 @@ the head and the drafter on the worker would have saved that return trip and mov
 ### The protocol
 
 One TCP connection per main process. Every message is a 40-byte header (`magic` "STRM", `type`, three int64 fields
-`a b c`, payload `bytes`) and a payload. Protocol version 5 (4 before images: the Positions message and the hello's
-`vision`; 3 before the hello carried the tail-skip rank).
+`a b c`, payload `bytes`) and a payload. Protocol version 6 (3 before the hello carried the tail-skip rank, 4 before
+images, which added the Positions message and the hello's `vision`, 5 before the conversation checkpoints, which
+added `CkptSave` / `CkptRestore`, a keep list on `Reset` and the hello's `ckpt_max`: [CHECKPOINTS.md](CHECKPOINTS.md)).
 
 | message | header fields | payload | reply |
 |---|---|---|---|
@@ -39,8 +40,10 @@ One TCP connection per main process. Every message is a 40-byte header (`magic` 
 | Run (a verify window) | a = T, b = first position | int32 tokens[T], fp32 rows[T x 12,804] | RunOk: a = the worker's time (us), rows[T x 12,804] |
 | Commit | a = accepted count | none | none (an error comes back on the next reply) |
 | Prefill (a prompt chunk) | a = T, b = first position, c = flags (bit 0: the prompt is one chunk) and `skip` << 8 | int64 tokens[T], fp32 rows[T x 10,240] | PrefillOk: a = the worker's time (us), rows[(T - skip) x 10,240] |
-| Reset (a fresh prompt) | | none | ResetOk |
-| Positions (`--vision`: the next request's) | a = cells; b = 1: plain positions (no table) | int32 (t, h, w)[cells] | none (an error comes back on the next reply, a Reset's included) |
+| Reset (a fresh prompt) | | int64 keep[] (empty: none) | ResetOk |
+| Positions (`--vision`: the next request's) | a = cells; b = 1: plain positions (no table) | int32 (t, h, w)[cells] | none (an error comes back on the next reply, a Reset's and a CkptRestore's included) |
+| CkptSave | a = id, b = position | int64 keep[] | CkptSaveOk: a = 1 stored, 0 not |
+| CkptRestore | a = id, b = position | int64 keep[] | CkptRestoreOk |
 | Error | | the message | |
 
 **The hello** carries what both sides must agree on, and each side checks the other's: the protocol, `n_embd`, `hc`,
@@ -79,9 +82,14 @@ polled (50 ms) within 10 s in all: with a blocking read, closing a silent one he
 message for more than 1 s in `stage_link_test` on Windows (by the code, until the hello's 10 s read timeout, and a
 peer sending a byte at a time could hold it longer). The main process
 connects at its start, and again when a
-request's positions or reset finds the link lost (closed, reset, timed out, a send or receive failed, the name did
-not resolve: `stage_link_lost`), with the same hello; nothing else is per connection on either side (the reset zeroes the worker's
-session, the hello carries the tail-skip rank, `--vision` and the chunk), and the request's positions are sent again.
+request's start finds the link lost (closed, reset, timed out, a send or receive failed, the name did
+not resolve: `stage_link_lost`), with the same hello: its check with nothing sent (`StageClient::alive`, a 0 ms poll
+and a 1-byte peek: the worker sends nothing unasked, so anything to read means its end closed, failed or is out of
+step), its positions, its reset or its checkpoint restore. Nothing else is per connection on either side (the reset
+zeroes the worker's session, the hello carries the tail-skip rank, `--vision` and the chunk) but the worker's
+conversation checkpoint parts, which go with the old connection: the main process then drops its live session and
+checkpoints and reads the prompt from token 0 ([CHECKPOINTS.md](CHECKPOINTS.md#after-a-reconnect)). The request's
+positions are sent again.
 While the name does not resolve, nothing listens or the network does not reach the worker, it tries every 2 s for
 `STRATA_REMOTE_CONNECT_S` (180 s), each try with its own watchdog allowance; a refusal is not tried again. That is
 the whole wait: each try's connect and its hello's reply are polled against what is left of it (a hello waiting in a
@@ -102,18 +110,21 @@ another model refused while the old one stays; a peer accepted while the first w
 sent, closed as soon as the first sends again, the first answered at once, and the rest of that hello sent then not
 taking over at the first's next idle second; a chunk's reply held 1.5 s by a relay's handler, then
 0.4 s until the first's next message: not taken over), with `STRATA_REMOTE_TAKEOVER_S=0` (a second main not served
-while the first is silent for 2.5 s), and which errors count as a lost link. The main process's reconnect, its
-`INFO remote_stage_wait` lines and the agent's restarts were run on GPUs later, by injecting faults
-([The recovery's open points](#the-recoverys-open-points-2026-10-13)). The node agent (`tools/stage_node.py`) starts a
+while the first is silent for 2.5 s), which errors count as a lost link, and `alive` (true on an idle link; false,
+as lost, after a take-over, after the worker stopped and after bytes no message asked for; no check over 100 ms).
+The main process's reconnect, its `INFO remote_stage_wait` lines and the agent's restarts were run on GPUs later, by
+injecting faults ([The recovery's open points](#the-recoverys-open-points-2026-10-13)). The node agent
+(`tools/stage_node.py`) starts a
 worker that ended by itself again (5 s, doubling to 300 s; node.json `"restart": false` turns it off), keeping the
 log of its last run that listened as `stage-worker-PORT.prev.log` (a restart that fails before it listens
 overwrites only the current log); a refused `/start` leaves its port's worker and supervision as they were.
 
 The engine's stall watchdog (issue #29, `STRATA_WATCHDOG_S`) watches
-each message a worker serves (a window, a prompt chunk, a commit, a reset, a position table) and is idle between
-them, so a worker stuck on its GPU ends with its stall report instead of holding every later main process at the
-hello. A relay's waits for its next worker (a connect, its taking a prompt chunk, a window's or a reset's reply) get an allowance of
-`STRATA_REMOTE_TIMEOUT_S` + 150 s instead: the link's timeouts end them, and a stuck next worker ends alone, with its
+each message a worker serves (a window, a prompt chunk, a commit, a reset, a position table, a checkpoint save or
+restore) and is idle between them, so a worker stuck on its GPU ends with its stall report instead of holding every
+later main process at the hello. A relay's waits for its next worker (a connect, its taking a prompt chunk, a window's,
+a reset's or a checkpoint's reply) get an allowance of `STRATA_REMOTE_TIMEOUT_S` + 150 s instead: the link's timeouts
+end them, and a stuck next worker ends alone, with its
 own report. `STRATA_REMOTE_STALL_AT=N` (a test hook) blocks the worker's Nth window. Checked on CUDA (the 3080 + 2080 Ti
 pair, `STRATA_REMOTE_STALL_AT=60 STRATA_WATCHDOG_S=20` on the worker): the worker wrote its stall report 20 s into the
 blocked window and exited; the request in flight failed 25-26 s after it was sent (`remote stage: the peer closed the
@@ -815,7 +826,9 @@ it; the wait for the token only on Windows, where the recv it prevents is not wo
 - **Reconnecting** in the middle of a request (a link lost between requests is made again at the next request's
   start; one lost mid-request ends the main engine, and the server starts it again). Faults run on GPUs: two PCs,
   Linux on both ([The recovery's open points](#the-recoverys-open-points-2026-10-13)); a relay's next worker, a
-  network partition and a Windows PC on either side were not; conversation checkpoints across stages.
+  network partition and a Windows PC on either side were not; conversation checkpoints across stages
+  ([CHECKPOINTS.md](CHECKPOINTS.md): built, opt-in with `--prompt-cache N`, checked on two GPUs; a relay is not
+  run).
 - **A ring topology** for three or more PCs.
 - **A bf16 hand-off** (half the traffic); its effect on the answers would need measuring.
 - **Windows as the main PC** (only workers were run on Windows), and the clock behaviour of an in-process split on

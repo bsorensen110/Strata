@@ -40,6 +40,9 @@ struct ConversationCheckpoint {
     // STRATA_BRANCH_CHECKPOINT: taken where the prompt left a conversation the engine held - the point a client that
     // rewrites the end of its history continues from next, so a batch slot keeps its deepest one.  Run-time only.
     bool branch = false;
+    // A remote stage (docs/remote-stage/CHECKPOINTS.md): the id the worker keeps its layers' part under (0 = none).
+    // 32 bits in the padding after `pinned`: the struct's size, which the parking byte counts use, stays as it was.
+    int32_t remote_id = 0;
     // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
     // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
     // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
