@@ -34,7 +34,7 @@ def main():
             raw = open(p, encoding='utf-8', errors='replace').read()
         except OSError:
             continue
-        if '<<<<<<<' in raw:
+        if '<<<<<<<' in raw and not p.endswith('dup_audit.py'):
             out.append(f"MARKERS {p}")
             hits['MARKERS'] += 1
         lines = raw.split('\n')

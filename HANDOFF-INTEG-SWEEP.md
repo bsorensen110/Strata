@@ -122,3 +122,39 @@ Expect false positives: `#if defined(_WIN32)` / `#else` pairs define the same fu
 legitimately, and tests sometimes call a function twice on purpose. Duplicates arrive as whole
 SETS — the Metal trellis block carried two `deq_tq` variants plus two identical
 `deq<T_TQ2T/TQK6/TQK7>` specialisation sets.
+
+## Upstream main merged (8183c6b6, v0.2.4.1) — 2026-10-24
+
+Merge commit `bca6d251` (parents `6f35c688` ours, `8183c6b6` upstream; 391 upstream commits,
+476 files, +68k lines). 26 conflicted files, 55 markers; HIP build of `strata` is GREEN
+(`build-verify`, md5 recorded in the commit messages).
+
+**DFlash2 decision (Brooks, this session):** upstream's drafter is adopted (`--draft dflash2`,
+pack format, `tools/dflash2_pack.py`); the fork's own `--dflash` GGUF drafter is retired. Its
+implementation is preserved on branch `integ/pre-upstream-0.2.4` (== `6f35c688`). `--dflash` and
+`--dflash-*` now exit 2 with a pointer to the replacement instead of being silently accepted.
+
+What the excision cost, so the next merge is cheaper:
+- `verify.hpp/cpp` + `prefill.hpp/cpp`: the fork's tap API is gone (`set_tap_layers`, `n_taps()`,
+  `taps()`, `tap_stride()`, `tap_layers_[8]`, `n_taps_`, `taps_`, `taps` Impl member, `g_n_taps`,
+  the second uint16_t `on_taps`). Upstream's `set_taps` / `tap_dev_` / `tap_on_` / float `on_taps`
+  is what stays — keep those, they are live.
+- `generate.cpp`: ~45 sites. `has_dflash` is now `const bool = false`, `dflash_k`/`use_dflash`
+  survive as inert locals; the dead `if (has_dflash)`/`if (use_dflash)` blocks still compile and
+  are harmless but should be deleted on a quiet pass.
+- CMake: `strata_engine` needed the fork's `peer_link.cpp`, `kv_pool.cpp`, `kv_chunks.cpp`,
+  `rope_cache_migration.cpp` added back — upstream's source list lacks them while the merged
+  `generate.cpp` still calls them. Two duplicate targets had to be unpicked (`dflash2_parity`,
+  and `strata` itself from a keep-both hunk).
+
+Still owed:
+1. Metal side of `--dflash`: `#3457`'s `df_*` members in `metal/src/engine/window.cpp` and
+   `prompt_chain.inc`, and the `STRATA_DFLASH` block in `metal/CMakeLists.txt`. Metal is not built
+   on Linux, so this rots silently — remove or keep deliberately, do not leave it half-there.
+2. ~14 fork dflash sources are still tracked. `include/strata/spec/dflash_policy.hpp` is LIVE
+   (upstream calls `dflash_proposal_fits`/`dflash_truncate_prefix` from it) — keep it. The rest
+   (`core/dflash.hpp`, `core/dflash.cpp`, `core/dflash_runtime.cpp`, `spec/dflash_drafter*.{hpp,cpp}`,
+   `spec/dflash_backend.hpp`, `spec/dflash_ref.hpp`, `kernels/dflash2_parity.cpp`,
+   `kernels/dflash_taps_test.cpp`) appear dead; delete in the same quiet pass.
+3. `serve/` + `tools/` pytest not yet run against the merged tree (system python lacks pytest;
+   use `/home/soren/Strata/.venv/bin/python -m pytest serve/ -q`, excluding the `sys.argv[1]` scripts).
