@@ -9,6 +9,8 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "ggml-common-tq.h"
+
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
 #include "ggml-common.h"
