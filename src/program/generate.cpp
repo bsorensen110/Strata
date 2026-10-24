@@ -3601,15 +3601,15 @@ int main(int argc, char** argv) {
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
         else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
-        else if (a == "--dflash") o.dflash = next("--dflash");
-
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
-        else if (a == "--dflash") o.dflash = next("--dflash");
-        else if (a == "--dflash-vocab") o.dflash_vocab = next("--dflash-vocab");
-        else if (a == "--dflash-head") o.dflash_head = next("--dflash-head");
-        else if (a == "--dflash-block") o.dflash_block = std::max(0, std::atoi(next("--dflash-block")));
-        else if (a == "--dflash-window") o.dflash_window = std::max(0LL, std::atoll(next("--dflash-window")));
-        else if (a == "--dflash-mask-token") o.dflash_mask = std::atoll(next("--dflash-mask-token"));
+        // The fork's own DFlash drafter was retired when upstream's DFlash2 landed: refuse the flags
+        // loudly rather than accepting a path that now does nothing.
+        else if (a == "--dflash" || a == "--dflash-vocab" || a == "--dflash-head" || a == "--dflash-block" ||
+                 a == "--dflash-window" || a == "--dflash-mask-token") {
+            std::fprintf(stderr, "%s was retired when upstream's DFlash2 landed: use --draft dflash2 with "
+                                 "--draft-model PACK (tools/dflash2_pack.py)\n", a.c_str());
+            return 2;
+        }
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
