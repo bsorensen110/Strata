@@ -62,6 +62,9 @@ void qsa_prompt_attn_percell(const float* q, const QsaAttnPools& pools, const in
 #include <chrono>
 #include <stdexcept>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 #include <tuple>
 #include <chrono>
 #include <cmath>
