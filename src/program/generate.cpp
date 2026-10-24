@@ -7038,7 +7038,7 @@ int main(int argc, char** argv) {
         if (o.draft == "dflash2") {
             const char* why = o.mtp.empty() ? "it needs --mtp (the fallback) and --spec 2 or more"
                               : !native_pack ? "it needs a native pack"
-                              : multi_gpu || o.batch > 0 || o.serve ? "it is for one card and the CLI run (not --serve, --batch or a layer split) in this build"
+                              : multi_gpu || o.batch > 0 ? "it is for one card (not --batch or a layer split)"
                               : o.draft_model.empty() ? "it needs --draft-model PACK (tools/dflash2_pack.py)" : nullptr;
             if (why == nullptr) {
                 if (df2.load(o.draft_model, 0, err)) {
@@ -10617,7 +10617,7 @@ int main(int argc, char** argv) {
                          (long long) xcache.slots(), (long long) own_experts);
         if (share_pool && stages.empty() && !multi_gpu && share_has_work && !share_default_ok()) share_has_work = false;   // H11
         strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu && share_has_work);
-        const bool has_dflash = false;   // the fork --dflash drafter is retired: upstream's --draft dflash2 replaced it
+        bool has_dflash = use_df2;   // serve-mode DFlash2 (upstream --draft dflash2); cleared if the bind fails below
         bool df_request = false;   // set before prefill; for both greedy and sampled requests
 
 
@@ -11651,6 +11651,9 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+#if defined(STRATA_HAVE_DFLASH2)
+        if (has_dflash) ver.set_taps(df2.tap_layers());
+#endif
         if ((!native_head_deferred &&
              !ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, std::min(o.batch, (int) strata::kernels::kVerifyMaxT)), err)) ||
@@ -11660,6 +11663,23 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
+#if defined(STRATA_HAVE_DFLASH2)
+        if (has_dflash && !ver.tapping()) {
+            std::fprintf(stderr, "strata serve: --draft dflash2: the verifier keeps no taps here; the MTP drafts instead\n");
+            has_dflash = false;
+        }
+        if (has_dflash && !df2.bind(wt, &native_head, o.mtp_draft_vocab.empty() ? o.mtp + "/draft_vocab.bin" : o.mtp_draft_vocab, err)) {
+            std::fprintf(stderr, "strata serve: --draft dflash2: %s. The MTP drafts instead.\n", err.c_str());
+            has_dflash = false;
+        }
+        if (has_dflash && !df2.prepare(ver.tap_dev(), err)) {
+            std::fprintf(stderr, "strata serve: --draft dflash2: %s. The MTP drafts instead.\n", err.c_str());
+            has_dflash = false;
+        }
+        if (has_dflash)
+            std::fprintf(stderr, "strata serve: DFlash2 drafter on (%s, graphs captured in %.0f ms), the MTP stays as the fallback\n",
+                         o.draft_model.c_str(), df2.ms_capture);
+#endif
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (native_head_deferred)
             std::fprintf(stderr, "strata serve: verifier and native head deferred until prompt completion\n");
@@ -17433,6 +17453,9 @@ int main(int argc, char** argv) {
             // temperature. Set STRATA_DFLASH_SAMPLED_FALLBACK=1 to force target-only parity mode.
             const bool req_dflash = has_dflash && (!dflash_sampled_fallback || req_temperature <= 0.0f);
             df_request = has_dflash;
+#if defined(STRATA_HAVE_DFLASH2)
+            if (has_dflash) df2.reset();   // this request's prompt rows rebuild the context
+#endif
             if (has_dflash && !req_dflash)
                 std::fprintf(stderr, "dflash: sampled request uses target-only decoding\n");
             req_imgs.clear();
@@ -19260,6 +19283,9 @@ int main(int argc, char** argv) {
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+#if defined(STRATA_HAVE_DFLASH2)
+                    if (has_dflash && !df2.context(ver.tap_dev(), T, q, e)) return false;
+#endif
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -21499,7 +21525,20 @@ int main(int argc, char** argv) {
                     df_pending_k = df_conf_adapt ? df_conf_policy.choose() : df_auto ? df_policy.choose() : req_dflash_k;
                     // Finish near the context limit with target-only windows rather than
                     // proposing a block which the next verification window cannot fit.
-                    dflash_ready = false;   // the fork --dflash drafter is retired
+                    dflash_ready = false;
+                    if (!eos && produced_n < max_new) {   // the next block, from the committed rows' taps
+                        int32_t dd[strata::core::Dflash2Drafter::kDrafts];
+                        float pp[strata::core::Dflash2Drafter::kDrafts];
+                        if (!df2.draft(ver.tap_dev(), a + 1, p + a + 1, outv[(size_t) a], dd, pp, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        const int k = std::min<int>(df_pending_k, strata::core::Dflash2Drafter::kDrafts);
+                        for (int i = 0; i < k; ++i) { drafts[(size_t) i] = dd[i]; dprob[(size_t) i] = pp[i]; }
+                        dflash_ready = k > 0;
+                        df_proposed_k = k;
+                        df_pending_k = k;
+                    }
                     const bool proposed = dflash_ready;
                     df_proposed_k = proposed ? df_pending_k : 0;
                     const bool want_dprob = req_spec_min_p > 0 || df_depth_slope > 0.0f || df_min_cum_p > 0.0f ||
