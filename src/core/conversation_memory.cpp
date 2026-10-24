@@ -27,8 +27,8 @@ bool host_memory_now(double& available, double& phys);
 }  // namespace strata::metal_engine
 #elif defined(__APPLE__)
 #include <mach/mach.h>
-#include <mach/mach_host.h>
 #include <sys/sysctl.h>
+#include <unistd.h>
 #endif
 
 namespace strata::core {
@@ -307,19 +307,18 @@ std::optional<HostMemoryReading> sample_host_memory() {
     const uint64_t total = (uint64_t) phys;
     return combine(std::min((uint64_t) std::max(0.0, avail), total), total, CgroupScan{}, memory_limit_bytes());
 #elif defined(__APPLE__)
-    // free (which already counts the speculative pages) + inactive + purgeable: what the kernel hands back without paging
-    vm_statistics64_data_t vm{};
+    // macOS has no /proc/meminfo.  What the kernel can hand out without swapping further: free, inactive and
+    // speculative pages (the same set Activity Monitor counts as available); hw.memsize is the total.
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm), &count) != KERN_SUCCESS)
-        return {};
-    vm_size_t page = 0;
-    if (host_page_size(mach_host_self(), &page) != KERN_SUCCESS || page == 0) return {};
-    uint64_t total_bytes = 0;
-    size_t len = sizeof total_bytes;
-    std::optional<uint64_t> total;
-    if (sysctlbyname("hw.memsize", &total_bytes, &len, nullptr, 0) == 0 && total_bytes != 0) total = total_bytes;
-    const uint64_t pages = (uint64_t) vm.free_count + vm.inactive_count + vm.purgeable_count;
-    return combine(pages * page, total, CgroupScan{}, memory_limit_bytes());
+    vm_statistics64_data_t vm{};
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &count) != KERN_SUCCESS) return {};
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return {};
+    const uint64_t avail = (uint64_t) (vm.free_count + vm.inactive_count + vm.speculative_count) * (uint64_t) page;
+    uint64_t total = 0;
+    size_t len = sizeof total;
+    if (sysctlbyname("hw.memsize", &total, &len, nullptr, 0) != 0) total = 0;
+    return combine(avail, total ? std::optional<uint64_t>(total) : std::nullopt, CgroupScan{}, memory_limit_bytes());
 #else
     return {};
 #endif

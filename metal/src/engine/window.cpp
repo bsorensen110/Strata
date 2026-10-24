@@ -206,55 +206,11 @@ struct SlotState {
     // the pooled-key rows of a window of `cells` (one per block, the moving spare row and one more)
     static int pooled_rows(int cells) { return cells / kBlockCells + 2; }
 
-    std::vector<mtl::Buffer> gst, ghist[2];                          // 36 GDN layers
-    std::vector<mtl::Buffer> kq, vq, ksc, vsc, tail, dead, pooled;   // 12 QSA layers
-    mtl::Buffer pleHist;
-    int n_cells = 0;
-    // the window's cell count for a context of max_cells tokens (the K/V rows, the RoPE and M-RoPE tables)
+    // The buffers themselves live on the Window (flat, one vector per part; the MTP draft's own below), so the
+    // parking and session-file walks read them without a second copy.  This struct holds only the shared constants
+    // and the walk over any QSA cache of this layout.
     static int cells_for(int64_t max_cells) { return (int) std::max<int64_t>(4096, (max_cells + 64) / 4 * 4 + 64); }
     // the buffers for a window of `cells` = cells_for(the slot's context) (zeroed: a new sequence)
-    void alloc(mtl::Context& cx, int cells) {
-        n_cells = cells;
-        pleHist = cx.alloc(kPleHist);
-        for (int l = 0; l < 48; ++l) {
-            if (l % 4 != 3) {
-                gst.push_back(cx.alloc(kGdnState));
-                ghist[0].push_back(cx.alloc(kConvHist));
-                ghist[1].push_back(cx.alloc(kConvHist));
-            } else {
-                kq.push_back(cx.alloc((size_t) cells * kKvCell));
-                vq.push_back(cx.alloc((size_t) cells * kKvCell));
-                ksc.push_back(cx.alloc((size_t) cells * kScaleCell));
-                vsc.push_back(cx.alloc((size_t) cells * kScaleCell));
-                tail.push_back(cx.alloc(kTail));
-                dead.push_back(cx.alloc(kDead));
-                pooled.push_back(cx.alloc((size_t) pooled_rows(cells) * kPooledRow));
-            }
-        }
-    }
-    // The conversation's window state for its first `upto` tokens as byte ranges, fn(void* ptr, size_t bytes), in a
-    // fixed order (two states of one window walk the same sizes): the running state (per GDN layer the recurrence and
-    // the committed conv-history half `hp`, the PLE history, per QSA layer the indexer tail and dead rows), then per QSA
-    // layer the positional part of cells [0, upto) (the int8 K/V, their scales, the pooled keys of the blocks up to
-    // there).  The cells past `upto` are rewritten before anything reads them.  A host image (parking, session
-    // files) is the ranges one after the other.  (The PLE token window, ple_prev, is the session's: the caller's.)
-    template <class F> void parts(int hp, int64_t upto, F&& fn) const {
-        for (size_t i = 0; i < gst.size(); ++i) {
-            fn(gst[i].ptr, kGdnState);
-            fn(ghist[hp][i].ptr, kConvHist);
-        }
-        fn(pleHist.ptr, kPleHist);
-        for (size_t j = 0; j < tail.size(); ++j) {
-            fn(tail[j].ptr, kTail);
-            fn(dead[j].ptr, kDead);
-        }
-        for (size_t j = 0; j < kq.size(); ++j) layer_cells(j, upto, fn);
-    }
-    // QSA layer j's part of cells [0, upto), in parts()' order: the int8 K, V, their fp16 scales (cell-major, so the
-    // first `upto` cells are the leading bytes), the pooled keys of the blocks up to there (with the moving spare row)
-    template <class F> void layer_cells(size_t j, int64_t upto, F&& fn) const {
-        cells_of(kq[j], vq[j], ksc[j], vsc[j], pooled[j], n_cells, upto, fn);
-    }
     // the same walk over any QSA cache of this layout (the MTP draft layer's too)
     template <class F> static void cells_of(const mtl::Buffer& k, const mtl::Buffer& v, const mtl::Buffer& ks,
                                             const mtl::Buffer& vs, const mtl::Buffer& pool, int cells, int64_t upto,
@@ -291,7 +247,14 @@ public:
     CheckpointSizes checkpoint_sizes() const;
     // park/restore: the live K/V cells of the QSA layer that owns this session state, with each buffer's size
     bool kv_pools(const strata::core::QsaState& st, void* out[5], size_t cap[5]);
-    void reset();   // a new sequence (session_zero): the running state zeroed
+    /// Publish this window's K/V and indexer pools into the session's QsaState descriptors (see
+    /// QsaState::page_size): the session-file and parking code then reads the bytes that are really in use,
+    /// instead of an arena this backend never touches.  Idempotent; the caller's SessionState must outlive the
+    /// window (it does: one session per process).
+    void bind_session(strata::core::SessionState& ss);
+    /// The draft layer's K/V descriptor for the session snapshot (the MTP window's own buffers, same shape as a
+    /// main QSA layer's).  False until the MTP window is up.
+    bool mtp_kv_state(strata::core::QsaState& st, std::string& err) const;    void reset();   // a new sequence (session_zero): the running state zeroed
     // The conversation snapshots read the K/V through the session's QsaStates (and the drafter's): describe the
     // window's own K/V buffers there (INT8 codes and scales, full residency), as the CUDA session holds its own
     void bind_kv();
@@ -414,8 +377,13 @@ private:
         emb_, pkey_, pval_, qkvL_, alL_, beL_, zL_, ydump_, keyn_, qn_, gated_, normW_;
     Act XA_, XF_, XY_, XQ_, XH_, XE_;
     int cur_inj_ = 0;
-    // state: the conversation's (slot 0, the only one bound; the window's hp_ picks the committed conv history half)
-    SlotState slot_;
+    // state
+    std::vector<mtl::Buffer> gst_, ghist_[2], kq_, vq_, ksc_, vsc_, tail_, dead_, pooled_;
+    // The indexer's block position per QSA layer (QsaState::idx_block_pos).  This backend derives it from the cell
+    // count at every block completion, so the buffer exists only to describe the session's running state: nothing
+    // here reads it back (see checkpoint_save).
+    std::vector<int32_t> bp_;
+    int64_t cell_end_ = 0;   // the last window's end: pos0 + T, the count of cells this sequence holds
     int hp_ = 0;                     // which of the two history buffers holds the committed conv history (all layers)
     // commit(n) of a window of several tokens: the GDN fold of the kept prefix waits for the next window and runs at
     // the start of its command buffer (one submit and wait less a round).  Nothing else reads the GDN state between
@@ -750,8 +718,22 @@ bool Window::init(const strata::core::ModelGeometry& g, strata::core::SessionSta
         }
     for (int t = 0; t < MAXT; ++t)
         for (int c = 0; c < 2051; ++c) qids_.as<int>()[t * 2051 + c] = c;
-    slot_.alloc(*cx_, MAXC);
-    // ---- the HC read in Q8_0 (the owner's default on Metal, as STRATA_HC_Q8 on gfx12): the BF16 down / up / inject
+    for (int l = 0; l < 48; ++l) {
+        if (l % 4 != 3) {
+            gst_.push_back(A(4 * 128 * 48 * 128));
+            ghist_[0].push_back(A(4 * 10240 * 3));
+            ghist_[1].push_back(A(4 * 10240 * 3));
+        } else {
+            kq_.push_back(A((size_t) MAXC * 2 * 256));
+            vq_.push_back(A((size_t) MAXC * 2 * 256));
+            ksc_.push_back(A(2 * (size_t) MAXC * 2 * 4));
+            vsc_.push_back(A(2 * (size_t) MAXC * 2 * 4));
+            tail_.push_back(A(4 * 4 * 128));
+            dead_.push_back(A(4 * 128));
+            pooled_.push_back(A(4 * (size_t) MB * 128));
+            bp_.push_back(0);
+        }
+    }    // ---- the HC read in Q8_0 (the owner's default on Metal, as STRATA_HC_Q8 on gfx12): the BF16 down / up / inject
     // matrices quantized once at load (ggml's q8_0 rule, ref_quant), read by gr_down_q8 / gr_up_q8
     {
         const char* e = std::getenv("STRATA_HC_Q8");
@@ -996,12 +978,12 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         mtl::Dispatch d;
         d.p = P(lgdn_, "gdn_step", mtl::Constants().i(2, ntok), "gdn_step#" + std::to_string(ntok));
         const int hp = hp_;
-        d.args = {mtl::Arg::B(slot_.gst[(size_t) gi]), mtl::Arg::B(slot_.ghist[hp][(size_t) gi]), mtl::Arg::B(qkvL_, o_qkv),
+        d.args = {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(ghist_[hp][(size_t) gi]), mtl::Arg::B(qkvL_, o_qkv),
                   mtl::Arg::B(alL_, o_ab), mtl::Arg::B(beL_, o_ab), mtl::Arg::B(zL_, o_z),
                   mtl::Arg::B(W_, T(b + "ssm_conv1d.weight").offset),
                   mtl::Arg::B(W_, T(b + "ssm_dt.bias").offset), mtl::Arg::B(W_, T(b + "ssm_a").offset),
                   mtl::Arg::B(W_, T(b + "ssm_norm.weight").offset), mtl::Arg::B(fuse_ ? XY_.b : yg_), mtl::Arg::V(a),
-                  mtl::Arg::B(slot_.ghist[1 - hp][(size_t) gi])};
+                  mtl::Arg::B(ghist_[1 - hp][(size_t) gi])};
         d.grid[0] = 48;
         d.tg[0] = 512;
         push(ds, d);
@@ -1025,9 +1007,9 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         d.args = {mtl::Arg::B(qfull_), mtl::Arg::B(kcur_), mtl::Arg::B(vcur_), mtl::Arg::B(iqr_), mtl::Arg::B(ikr_),
                   mtl::Arg::B(W_, T(b + "attn_q_norm.weight").offset), mtl::Arg::B(W_, T(b + "attn_k_norm.weight").offset),
                   mtl::Arg::B(W_, T(b + "indexer.q_norm.weight").offset), mtl::Arg::B(W_, T(b + "indexer.k_norm.weight").offset),
-                  mtl::Arg::B(cs_), mtl::Arg::B(qcur_), mtl::Arg::B(qidx_), mtl::Arg::B(slot_.kq[(size_t) qi]),
-                  mtl::Arg::B(slot_.vq[(size_t) qi]), mtl::Arg::B(slot_.ksc[(size_t) qi]), mtl::Arg::B(slot_.vsc[(size_t) qi]),
-                  mtl::Arg::B(slot_.tail[(size_t) qi]), mtl::Arg::B(slot_.dead[(size_t) qi]), mtl::Arg::B(slot_.pooled[(size_t) qi]),
+                  mtl::Arg::B(cs_), mtl::Arg::B(qcur_), mtl::Arg::B(qidx_), mtl::Arg::B(kq_[(size_t) qi]),
+                  mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]),
+                  mtl::Arg::B(tail_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]), mtl::Arg::B(pooled_[(size_t) qi]),
                   mtl::Arg::V(a), mtl::Arg::B(mrope_)};
         d.grid[0] = 33;
         d.grid[1] = ntok;
@@ -1036,7 +1018,7 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         if (rec_) rec_->push_back({(int) ds.size() - 1, 0});
         mtl::Dispatch s;
         s.p = P(lqsa_, "qsa_score", {}, "qsa_score");
-        s.args = {mtl::Arg::B(qidx_), mtl::Arg::B(slot_.pooled[(size_t) qi]), mtl::Arg::B(slot_.dead[(size_t) qi]), mtl::Arg::B(scores_),
+        s.args = {mtl::Arg::B(qidx_), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]), mtl::Arg::B(scores_),
                   mtl::Arg::V(a)};
         s.grid[0] = (uint32_t) (((pos0 + ntok) / 4 + 1 + 7) / 8);
         s.grid[1] = ntok;
@@ -1057,8 +1039,8 @@ void Window::layer(std::vector<mtl::Dispatch>& ds, int l, int ntok, int64_t pos0
         }
         mtl::Dispatch at;
         at.p = P(lqsa_, "qsa_attn", {}, "qsa_attn");
-        at.args = {mtl::Arg::B(qcur_), mtl::Arg::B(slot_.kq[(size_t) qi]), mtl::Arg::B(slot_.vq[(size_t) qi]), mtl::Arg::B(slot_.ksc[(size_t) qi]),
-                   mtl::Arg::B(slot_.vsc[(size_t) qi]), mtl::Arg::B(qids_), mtl::Arg::B(part_), mtl::Arg::V(a)};
+        at.args = {mtl::Arg::B(qcur_), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]),
+                   mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(qids_), mtl::Arg::B(part_), mtl::Arg::V(a)};
         at.grid[0] = 33;
         at.grid[1] = 2;
         at.grid[2] = ntok;
@@ -1416,7 +1398,7 @@ bool Window::run(int Tn, const int32_t* tokens, int64_t pos0, bool head, int32_t
         g3.grid[0] = HC; g3.grid[1] = Tn; g3.tg[0] = 256;
         push(ds, g3);
         g4.p = P(lple_, "ple_conv_add", {}, "ple_conv_add");
-        g4.args = {mtl::Arg::B(slot_.pleHist), mtl::Arg::B(normW_), kw_arg(),
+        g4.args = {mtl::Arg::B(pleHist_), mtl::Arg::B(normW_), kw_arg(),
                    mtl::Arg::B(gated_), mtl::Arg::B(R_), mtl::Arg::V(pa)};
         g4.grid[0] = HC * N / 256; g4.grid[1] = Tn; g4.tg[0] = 256;
         push(ds, g4);
@@ -1706,6 +1688,7 @@ bool Window::finish(int Tn, const int32_t* tokens, int64_t pos0, bool head, int3
     for (int t = 0; t < Tn; ++t) out[t] = head ? tokout_.as<int32_t>()[t] : -1;
     last_T_ = Tn;
     head_rows_ = head ? Tn : 0;
+    cell_end_ = pos0 + Tn;   // how many cells the sequence holds now (checkpoint_save's block position)
     for (int t = 0; t < Tn; ++t) last_tokens_[t] = tokens[t];
     static const bool trace = std::getenv("STRATA_METAL_TRACE") != nullptr;
     if (trace && head) {
@@ -1733,11 +1716,11 @@ void Window::fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp) {
         GdnArgs a{16, 48, 10240, 1u, eps_, 0};
         mtl::Dispatch d;
         d.p = P(lgdn_, "gdn_step", mtl::Constants().i(2, n_keep), "gdn_step#" + std::to_string(n_keep));
-        d.args = {mtl::Arg::B(slot_.gst[(size_t) gi]), mtl::Arg::B(slot_.ghist[hp][(size_t) gi]), mtl::Arg::B(qkvL_, o_qkv),
+        d.args = {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(ghist_[hp][(size_t) gi]), mtl::Arg::B(qkvL_, o_qkv),
                   mtl::Arg::B(alL_, o_ab), mtl::Arg::B(beL_, o_ab), mtl::Arg::B(zL_, o_z),
                   mtl::Arg::B(W_, T(b + "ssm_conv1d.weight").offset), mtl::Arg::B(W_, T(b + "ssm_dt.bias").offset),
                   mtl::Arg::B(W_, T(b + "ssm_a").offset), mtl::Arg::B(W_, T(b + "ssm_norm.weight").offset),
-                  mtl::Arg::B(ydump_), mtl::Arg::V(a), mtl::Arg::B(slot_.ghist[1 - hp][(size_t) gi])};
+                  mtl::Arg::B(ydump_), mtl::Arg::V(a), mtl::Arg::B(ghist_[1 - hp][(size_t) gi])};
         d.grid[0] = 48;
         d.tg[0] = 512;
         nb_ = true;   // the layers' folds are independent of each other
@@ -1774,6 +1757,51 @@ Window::CheckpointSizes Window::checkpoint_sizes() const {
     return {gst_.size() * (gs + hs), (size_t) 4 * 9 * 10240, tail_.size() * ts, dead_.size() * dsz, 0};
 }
 
+// The session's QsaState descriptors were carved from an arena this backend never writes (window.cpp's header note):
+// its K/V, indexer pools and rope tables live in the buffers above.  Publishing them here lets the SHARED snapshot
+// code - parking, session files, the state hash - read the bytes that are really in use instead of a second, never
+// written copy.  `page_size = 1` is the whole trick: this backend's pools are [cell][kv_head][head_dim], and at a
+// granule of one cell the arena's [page][kv_head][page_size][head_dim] is the same bytes in the same order.
+void Window::bind_session(strata::core::SessionState& ss) {
+    const int64_t layers = std::min<int64_t>(ss.qsa_alloc, (int64_t) kq_.size());
+    for (int64_t q = 0; q < layers; ++q) {
+        strata::core::QsaState& st = ss.qsa_states[(size_t) ss.qsa_ord0 + (size_t) q];
+        st.k_pool = nullptr; st.v_pool = nullptr; st.k_q4 = nullptr; st.v_q4 = nullptr;
+        st.kv_int8 = true; st.kv_q4 = false; st.kv_hybrid = false; st.kv_rot = false;
+        st.k_q = (int8_t*) kq_[(size_t) q].ptr;
+        st.v_q = (int8_t*) vq_[(size_t) q].ptr;
+        st.k_scale = (uint16_t*) ksc_[(size_t) q].ptr;
+        st.v_scale = (uint16_t*) vsc_[(size_t) q].ptr;
+        st.kv_mode = 0;              // every cell resident: the streaming/ring paths do not apply to this backend
+        st.page_table = nullptr;
+        st.max_cells = max_cells_;
+        st.page_size = 1;
+        st.n_pages = max_cells_;
+        st.n_slots = max_cells_;
+        st.idx_tail = (float*) tail_[(size_t) q].ptr;   // rows 0..2 are the block's first three cells, as in the arena
+        st.idx_dead = (float*) dead_[(size_t) q].ptr;
+        st.idx_pooled = (float*) pooled_[(size_t) q].ptr;
+        st.idx_pooled_rows = max_cells_ / 4 + 2;
+        st.idx_block_pos = &bp_[(size_t) q];
+    }
+}
+
+// The draft layer's K/V, in the same shape as a main QSA layer's - but with no indexer state (its attention is dense).
+bool Window::mtp_kv_state(strata::core::QsaState& st, std::string& err) const {
+    if (!mtp_on_ || mkq_.empty()) { err = "metal window: the MTP draft layer is not loaded"; return false; }
+    st = strata::core::QsaState{};
+    st.kv_int8 = true;
+    st.k_q = (int8_t*) mkq_[0].ptr;
+    st.v_q = (int8_t*) mvq_[0].ptr;
+    st.k_scale = (uint16_t*) mksc_[0].ptr;
+    st.v_scale = (uint16_t*) mvsc_[0].ptr;
+    st.kv_mode = 0;
+    st.max_cells = max_cells_;
+    st.page_size = 1;
+    st.n_pages = max_cells_;
+    st.n_slots = max_cells_;
+    return true;}
+
 bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::string& err) {
     (void) err;
     if (pend_fold_ > 0) {   // the last commit's fold first: the checkpoint is the state after it
@@ -1783,36 +1811,45 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
         cx_->run_graph(ds);
         pend_fold_ = 0;
     }
-    const size_t gs = SlotState::kGdnState, hs = SlotState::kConvHist, ts = SlotState::kTail, dsz = SlotState::kDead;
-    c.gdn.resize(slot_.gst.size() * (gs + hs));
-    for (size_t i = 0; i < slot_.gst.size(); ++i) {
-        std::memcpy(c.gdn.data() + i * (gs + hs), slot_.gst[i].ptr, gs);
-        std::memcpy(c.gdn.data() + i * (gs + hs) + gs, slot_.ghist[hp_][i].ptr, hs);
+    // The checkpoint's running state is the SHARED format (conversation_state.cpp's ConversationStateSizes): the
+    // indexer tail is `idx_block - 1` rows, because the cell that completes a block is consumed by the pool instead
+    // of being kept (src/kernels/cuda/qsa.cu says so verbatim).  This backend stores all four slots - the block's
+    // mean reads them - so the fourth is left behind here, exactly the row the arena does not have either.
+    const size_t gs = 4 * 128 * 48 * 128, hs = 4 * 10240 * 3, ts = 3 * 128 * 4, dsz = 4 * 128;
+    c.gdn.resize(gst_.size() * (gs + hs));
+    for (size_t i = 0; i < gst_.size(); ++i) {
+        std::memcpy(c.gdn.data() + i * (gs + hs), gst_[i].ptr, gs);
+        std::memcpy(c.gdn.data() + i * (gs + hs) + gs, ghist_[hp_][i].ptr, hs);
     }
-    c.ple.assign((const uint8_t*) slot_.pleHist.ptr, (const uint8_t*) slot_.pleHist.ptr + SlotState::kPleHist);
-    c.tails.resize(slot_.tail.size() * ts);
-    c.dead.resize(slot_.dead.size() * dsz);
-    for (size_t j = 0; j < slot_.tail.size(); ++j) {
-        std::memcpy(c.tails.data() + j * ts, slot_.tail[j].ptr, ts);
-        std::memcpy(c.dead.data() + j * dsz, slot_.dead[j].ptr, dsz);
-    }
-    c.block_pos.clear();
+    c.ple.assign((const uint8_t*) pleHist_.ptr, (const uint8_t*) pleHist_.ptr + 4 * 9 * 10240);
+    c.tails.resize(tail_.size() * ts);
+    c.dead.resize(dead_.size() * dsz);
+    // The block position is the roped position of the last completed block's FIRST cell.  This backend derives it
+    // from the cell count when a block completes, so it keeps no copy; the checkpoints record it because a capture
+    // reader and the debug dumps want it (src/kernels/cuda/qsa.cu), so it is reconstructed from the same count.
+    const int32_t block_pos = cell_end_ > 0 ? (int32_t) (4 * ((cell_end_ - 1) / 4)) : 0;
+    c.block_pos.resize(tail_.size() * sizeof(int32_t));
+    for (size_t j = 0; j < tail_.size(); ++j) {
+        std::memcpy(c.tails.data() + j * ts, tail_[j].ptr, ts);
+        std::memcpy(c.dead.data() + j * dsz, dead_[j].ptr, dsz);
+        std::memcpy(c.block_pos.data() + j * sizeof(int32_t), &block_pos, sizeof(block_pos));    }
     return true;
 }
 
 void Window::reset() {
     pend_fold_ = 0;
     last_T_ = 0;
+    cell_end_ = 0;
     auto zero = [](const mtl::Buffer& b, size_t n) { std::memset(b.ptr, 0, n); };
-    for (size_t i = 0; i < slot_.gst.size(); ++i) {
-        zero(slot_.gst[i], SlotState::kGdnState);
-        zero(slot_.ghist[0][i], SlotState::kConvHist);
-        zero(slot_.ghist[1][i], SlotState::kConvHist);
+    for (size_t i = 0; i < gst_.size(); ++i) {
+        zero(gst_[i], SlotState::kGdnState);
+        zero(ghist_[0][i], SlotState::kConvHist);
+        zero(ghist_[1][i], SlotState::kConvHist);
     }
-    zero(slot_.pleHist, SlotState::kPleHist);
-    for (size_t j = 0; j < slot_.tail.size(); ++j) {
-        zero(slot_.tail[j], SlotState::kTail);
-        zero(slot_.dead[j], SlotState::kDead);
+    zero(pleHist_, SlotState::kPleHist);
+    for (size_t j = 0; j < tail_.size(); ++j) {
+        zero(tail_[j], SlotState::kTail);
+        zero(dead_[j], SlotState::kDead);
     }
     for (size_t j = 0; j < mtail_.size(); ++j) {
         zero(mtail_[j], SlotState::kTail);
@@ -1821,23 +1858,27 @@ void Window::reset() {
 }
 
 bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, std::string& err) {
-    const size_t gs = SlotState::kGdnState, hs = SlotState::kConvHist, ts = SlotState::kTail, dsz = SlotState::kDead;
-    if (c.gdn.size() != slot_.gst.size() * (gs + hs) || c.ple.size() != SlotState::kPleHist ||
-        c.tails.size() != slot_.tail.size() * ts || c.dead.size() != slot_.dead.size() * dsz) {
-        err = "metal window: the checkpoint is not this engine's (sizes differ)";
+    // 3 tail rows, 1 block position per layer: the shared format (see checkpoint_save)
+    const size_t gs = 4 * 128 * 48 * 128, hs = 4 * 10240 * 3, ts = 3 * 128 * 4, dsz = 4 * 128;
+    if (c.gdn.size() != gst_.size() * (gs + hs) || c.ple.size() != (size_t) 4 * 9 * 10240 ||
+        c.tails.size() != tail_.size() * ts || c.dead.size() != dead_.size() * dsz ||
+        c.block_pos.size() != tail_.size() * sizeof(int32_t)) {        err = "metal window: the checkpoint is not this engine's (sizes differ)";
         return false;
     }
     pend_fold_ = 0;   // the restored state replaces whatever was pending
     last_T_ = 0;
-    for (size_t i = 0; i < slot_.gst.size(); ++i) {
-        std::memcpy(slot_.gst[i].ptr, c.gdn.data() + i * (gs + hs), gs);
-        std::memcpy(slot_.ghist[hp_][i].ptr, c.gdn.data() + i * (gs + hs) + gs, hs);
+    cell_end_ = (int64_t) c.ids.size();   // the sequence's length: the next block completion derives its position from it
+    for (size_t i = 0; i < gst_.size(); ++i) {
+        std::memcpy(gst_[i].ptr, c.gdn.data() + i * (gs + hs), gs);
+        std::memcpy(ghist_[hp_][i].ptr, c.gdn.data() + i * (gs + hs) + gs, hs);
     }
-    std::memcpy(slot_.pleHist.ptr, c.ple.data(), c.ple.size());
-    for (size_t j = 0; j < slot_.tail.size(); ++j) {
-        std::memcpy(slot_.tail[j].ptr, c.tails.data() + j * ts, ts);
-        std::memcpy(slot_.dead[j].ptr, c.dead.data() + j * dsz, dsz);
-    }
+    std::memcpy(pleHist_.ptr, c.ple.data(), c.ple.size());
+    for (size_t j = 0; j < tail_.size(); ++j) {
+        // rows 0..2 only: the fourth slot belongs to the cell that completes a block, which is consumed by the
+        // pool and rewritten before anything reads it again
+        std::memcpy(tail_[j].ptr, c.tails.data() + j * ts, ts);
+        std::memcpy(dead_[j].ptr, c.dead.data() + j * dsz, dsz);
+        std::memcpy(&bp_[j], c.block_pos.data() + j * sizeof(int32_t), sizeof(int32_t));    }
     return true;
 }
 
@@ -1903,7 +1944,7 @@ bool Window::commit(int n_keep, std::string& err) {
         if (ple_on_) {
             const float* norm = normW_.as<float>() + (size_t) t * NG_HC_DIM;
             for (int c = 0; c < NG_HC_DIM; ++c) {
-                float* col = slot_.pleHist.as<float>() + (size_t) c * NG_HIST;
+                float* col = pleHist_.as<float>() + (size_t) c * NG_HIST;
                 for (int r = 0; r + 1 < NG_HIST; ++r) col[r] = col[r + 1];
                 col[NG_HIST - 1] = norm[c];
             }
@@ -1929,9 +1970,10 @@ bool Window::kv_layer(const strata::core::QsaState* st, bool index, int64_t upto
         return true;
     }
     const strata::core::SessionState& ss = *ss_;
-    for (int64_t j = 0; ss.qsa_states != nullptr && j < ss.qsa_alloc && (size_t) j < slot_.kq.size(); ++j)
+    for (int64_t j = 0; ss.qsa_states != nullptr && j < ss.qsa_alloc && (size_t) j < kq_.size(); ++j)
         if (st == &ss.qsa_states[ss.qsa_ord0 + j]) {
-            slot_.layer_cells((size_t) j, upto, take);
+            SlotState::cells_of(kq_[(size_t) j], vq_[(size_t) j], ksc_[(size_t) j], vsc_[(size_t) j],
+                               pooled_[(size_t) j], (int) max_cells_, upto, take);
             return true;
         }
     err = "metal window: a snapshot's K/V layer that is not the solo conversation's";
@@ -1939,10 +1981,10 @@ bool Window::kv_layer(const strata::core::QsaState* st, bool index, int64_t upto
 }
 
 void Window::checkpoint_sizes(size_t z[4]) const {
-    z[0] = slot_.gst.size() * (SlotState::kGdnState + SlotState::kConvHist);
+    z[0] = gst_.size() * (SlotState::kGdnState + SlotState::kConvHist);
     z[1] = SlotState::kPleHist;
-    z[2] = slot_.tail.size() * SlotState::kTail;
-    z[3] = slot_.dead.size() * SlotState::kDead;
+    z[2] = tail_.size() * SlotState::kTail;
+    z[3] = dead_.size() * SlotState::kDead;
 }
 
 // ================================================================================================ the MTP draft layer
@@ -2739,12 +2781,12 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
             gemm(p.mixh, p.Wbe, p.be, T, 48, N);
             PgGdnP ga{(uint32_t) T, 16, 48, 10240, eps_, 0};
             D(PP(p.lgdn, "gdn_pre"),
-              {mtl::Arg::B(p.qkv), mtl::Arg::B(slot_.ghist[hp_][(size_t) gi]), mtl::Arg::B(W_, TN(b + "ssm_conv1d.weight").offset),
+              {mtl::Arg::B(p.qkv), mtl::Arg::B(ghist_[hp_][(size_t) gi]), mtl::Arg::B(W_, TN(b + "ssm_conv1d.weight").offset),
                mtl::Arg::B(p.al), mtl::Arg::B(p.be), mtl::Arg::B(W_, TN(b + "ssm_dt.bias").offset), mtl::Arg::B(W_, TN(b + "ssm_a").offset),
                mtl::Arg::B(p.gqn), mtl::Arg::B(p.gkn), mtl::Arg::B(p.gvc), mtl::Arg::B(p.ggb), mtl::Arg::B(p.gkq),
-               mtl::Arg::B(slot_.ghist[1 - hp_][(size_t) gi]), mtl::Arg::V(ga)}, 16 + 24, T, 256);
+               mtl::Arg::B(ghist_[1 - hp_][(size_t) gi]), mtl::Arg::V(ga)}, 16 + 24, T, 256);
             D(PP(p.lgdn, "gdn_scanr_4", mtl::Constants().i(6, 0), "gdn_scanr_4"),
-              {mtl::Arg::B(slot_.gst[(size_t) gi]), mtl::Arg::B(p.gqn), mtl::Arg::B(p.gkn), mtl::Arg::B(p.gvc), mtl::Arg::B(p.ggb),
+              {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(p.gqn), mtl::Arg::B(p.gkn), mtl::Arg::B(p.gvc), mtl::Arg::B(p.ggb),
                mtl::Arg::B(p.gkq), mtl::Arg::B(p.go), mtl::Arg::V(ga)}, 48 * 4, 1, 32 * 4);
             D(PP(p.lgdn, "gdn_post"), {mtl::Arg::B(p.go), mtl::Arg::B(p.z), mtl::Arg::B(W_, TN(b + "ssm_norm.weight").offset),
                                        mtl::Arg::B(p.ygh), mtl::Arg::B(p.yg), mtl::Arg::V(ga)}, 48, T, 128);
@@ -2769,11 +2811,11 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
               {mtl::Arg::B(p.qfull), mtl::Arg::B(p.kcur), mtl::Arg::B(p.vcur), mtl::Arg::B(p.iqr), mtl::Arg::B(p.ikr),
                mtl::Arg::B(W_, TN(b + "attn_q_norm.weight").offset), mtl::Arg::B(W_, TN(b + "attn_k_norm.weight").offset),
                mtl::Arg::B(W_, TN(b + "indexer.q_norm.weight").offset), mtl::Arg::B(W_, TN(b + "indexer.k_norm.weight").offset),
-               mtl::Arg::B(cs_), mtl::Arg::B(p.qcur), mtl::Arg::B(p.qidx), mtl::Arg::B(slot_.kq[(size_t) qi]), mtl::Arg::B(slot_.vq[(size_t) qi]),
-               mtl::Arg::B(slot_.ksc[(size_t) qi]), mtl::Arg::B(slot_.vsc[(size_t) qi]), mtl::Arg::B(slot_.tail[(size_t) qi]),
-               mtl::Arg::B(slot_.dead[(size_t) qi]), mtl::Arg::B(slot_.pooled[(size_t) qi]), mtl::Arg::V(a), mtl::Arg::B(mrope_)}, 33, T, 256);
+               mtl::Arg::B(cs_), mtl::Arg::B(p.qcur), mtl::Arg::B(p.qidx), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]),
+               mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(tail_[(size_t) qi]),
+               mtl::Arg::B(dead_[(size_t) qi]), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::V(a), mtl::Arg::B(mrope_)}, 33, T, 256);
             if (pos0 + T > 2051)
-                D(PP(p.lqsa, "qsa_score_mm"), {mtl::Arg::B(p.qidx), mtl::Arg::B(slot_.pooled[(size_t) qi]), mtl::Arg::B(slot_.dead[(size_t) qi]),
+                D(PP(p.lqsa, "qsa_score_mm"), {mtl::Arg::B(p.qidx), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]),
                                                mtl::Arg::B(p.scores), mtl::Arg::V(a)},
                   (uint32_t) (((pos0 + T) / 4 + 1 + 63) / 64), (T + 15) / 16, 128);
             D(PP(p.lqsa, "qsa_topk"), {mtl::Arg::B(p.scores), mtl::Arg::B(p.qids), mtl::Arg::V(a)}, T, 1, 1024);
@@ -2781,16 +2823,16 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
                 const uint32_t nq = (uint32_t) T * 24 * 256;
                 D(PP(p.lqsa, "qsa_q_f16"), {mtl::Arg::B(p.qcur), mtl::Arg::B(p.qcurh), mtl::Arg::V(nq)}, (nq + 255) / 256, 1, 256);
                 D(PP(p.lqsa, "qsa_flash", mtl::Constants().b(7, p.k4), "qsa_flash"),
-                  {mtl::Arg::B(p.qcurh), mtl::Arg::B(slot_.kq[(size_t) qi]), mtl::Arg::B(slot_.vq[(size_t) qi]), mtl::Arg::B(slot_.ksc[(size_t) qi]),
-                   mtl::Arg::B(slot_.vsc[(size_t) qi]), mtl::Arg::B(p.qids), mtl::Arg::B(p.qfull), mtl::Arg::B(p.xqh), mtl::Arg::V(a)},
+                  {mtl::Arg::B(p.qcurh), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]),
+                   mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(p.qids), mtl::Arg::B(p.qfull), mtl::Arg::B(p.xqh), mtl::Arg::V(a)},
                   2, T, 128);
             } else {
                 // v1 attention + merge in slices of QS rows (the partials of a slice only)
                 for (int t0 = 0; t0 < T; t0 += p.QS) {
                     const int ns = std::min(p.QS, T - t0);
                     QsaArgs as{(uint32_t) (pos0 + t0), 0, (uint32_t) max_cells_, (uint32_t) ns, eps_};
-                    D(PP(p.lqsa, "qsa_attn"), {mtl::Arg::B(p.qcur, (size_t) t0 * 24 * 256 * 4), mtl::Arg::B(slot_.kq[(size_t) qi]),
-                                               mtl::Arg::B(slot_.vq[(size_t) qi]), mtl::Arg::B(slot_.ksc[(size_t) qi]), mtl::Arg::B(slot_.vsc[(size_t) qi]),
+                    D(PP(p.lqsa, "qsa_attn"), {mtl::Arg::B(p.qcur, (size_t) t0 * 24 * 256 * 4), mtl::Arg::B(kq_[(size_t) qi]),
+                                               mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]),
                                                mtl::Arg::B(p.qids, (size_t) t0 * 2051 * 4), mtl::Arg::B(p.part), mtl::Arg::V(as)},
                       33, 2, 256, (uint32_t) ns);
                     D(PP(p.lqsa, "qsa_merge"), {mtl::Arg::B(p.part), mtl::Arg::B(p.qfull, (size_t) t0 * 12288 * 4),
@@ -2958,7 +3000,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
               {mtl::Arg::B(p.keyn), mtl::Arg::B(p.qn), mtl::Arg::B(p.pval), mtl::Arg::B(W_, off("blk.1.ple_norm_conv.weight")),
                mtl::Arg::B(p.gated), mtl::Arg::B(p.normW), mtl::Arg::V(pl)}, HC, T, 256);
             D(P(lple_, "ple_conv_add", {}, "ple_conv_add"),
-              {mtl::Arg::B(slot_.pleHist), mtl::Arg::B(p.normW), kw_arg(), mtl::Arg::B(p.gated),
+              {mtl::Arg::B(pleHist_), mtl::Arg::B(p.normW), kw_arg(), mtl::Arg::B(p.gated),
                mtl::Arg::B(p.R), mtl::Arg::V(pl)}, HC * N / 256, T, 256);
         }
     }
@@ -2986,7 +3028,7 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
     hp_ = 1 - hp_;
     if (ple_on_) {
         using namespace strata::kernels;
-        float* hist = slot_.pleHist.as<float>();
+        float* hist = pleHist_.as<float>();
         const float* nw = p.normW.as<float>();
         for (int c = 0; c < NG_HC_DIM; ++c) {
             float col[NG_HIST];
@@ -3044,6 +3086,7 @@ bool window_init(void* w, const strata::core::ModelGeometry& g, strata::core::Se
         x->bind_kv();
     }
     x->set_max_t(max_t);
+    x->bind_session(ss);   // the session's QsaState descriptors now describe this window's real pools
     *n_vocab = x->vocab();
     return true;
 }
@@ -3190,6 +3233,13 @@ bool prompt_run_rows(const int64_t* tokens, int64_t n, int64_t pos0,
 bool mtp_prefill(const int32_t* next_tokens, int64_t n, int64_t cell0, std::string& err) {
     if (g_window == nullptr) { err = "metal mtp: no decode window"; return false; }
     return g_window->mtp_prefill(next_tokens, n, cell0, err);
+}
+// MtpDrafter::st_ is never initialised on this backend (mtp.cpp's load returns through mtp_load before the arena
+// carve), so the session snapshot would read an empty descriptor.  The draft's K/V lives in the MTP window's own
+// buffers; this publishes them, lazily: the buffers exist once the window has loaded the draft layer.
+bool mtp_kv_bind(strata::core::QsaState& st, std::string& err) {
+    if (g_window == nullptr) { err = "metal mtp: no decode window"; return false; }
+    return g_window->mtp_kv_state(st, err);
 }
 bool mtp_draft(int T, const int32_t* tokens, int64_t p, int a, int max_steps, int32_t* drafts, float* probs, float min_p,
                int* n_drafts, std::string& err) {
