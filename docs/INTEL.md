@@ -921,6 +921,72 @@ loans, no adaptive swaps).
 - Through `--tokens` (no server, 32K context), 512 tokens of the BST prompt: 107.3 tok/s; one card with the other
   experts in the RAM mirror: 50.8 (1,024 tokens).
 
+## Integrated Arc: the Arc 140T (`xe`, 2026-10-12, re-run 2026-10-22)
+
+Measured on the Arc 140T (PCI id 7d51, Xe-LPG+) of a Core Ultra 9 285H with 62 GiB of RAM, Fedora 44 (kernel 7.2.9,
+`xe` driver), oneAPI 2026.0 installed on the PC, with the Coder IQ1_M, engine 0.1.43 and again with engine 0.1.47
+(Strata 0.2.2) on 2026-10-22. The GPU's memory is the system
+RAM: it reports 58 GiB of global memory and no free-memory query.
+
+| | Arc Pro B70 (`xe`, 32 GB) | Arc 140T (`xe`, integrated) |
+|---|---|---|
+| where the engine runs | in the `strata-sycl-dev` image (`sycl/serve/strata-sycl.sh`) | on the PC's own oneAPI (`sycl/serve/strata-sycl-native.sh`), no Docker |
+| build | AOT `bmg-g31` | JIT (`BUILD_DIR=build-sycl bash sycl/tools/build.sh`) |
+| experts | `--stream-experts`: from the GGUF into VRAM, the rest in a pinned RAM mirror | the same flags; the cache and the mirror are both in the RAM |
+| how big the cache is | the card's free VRAM | `MemAvailable` from `/proc/meminfo` (`STRATA_SYCL_FREE_MIB` overrides it) |
+| prompt-slot borrowing | from 32K up | off |
+| `SYCL_CACHE_PERSISTENT` | 0 (it crashed on Xe2) | 1 works: the start takes 7 s instead of 79 s from the second start on (0.1.40) |
+
+- **The driver.** Only `xe` was tested. On a kernel that binds the iGPU to `i915`, `i915.force_probe=!7d51 xe.force_probe=7d51`
+  on the kernel command line moves it to `xe`.
+- **Build.** Install the oneAPI Base Toolkit (2026.0 here, Intel's installer, into `/opt/intel/oneapi`) and the GPU compute runtime of the
+  distribution (Fedora 44: `intel-compute-runtime`, `intel-level-zero`, `oneapi-level-zero`, and `cmake`, `ninja-build`). Then, in the checkout,
+  `BUILD_DIR=build-sycl bash sycl/tools/build.sh` (it sources `setvars.sh` itself). The build ends with `BUILD EXIT 0`.
+- **Free memory.** The 140T has no `ext_intel_free_memory`, also with `ZES_ENABLE_SYSMAN=1`, so the engine got 0 and the
+  expert cache refused to start. On a device with `host_unified_memory` it now reads `MemAvailable`. The `xe` driver keeps the
+  memory a GPU program freed in its own pool, which `MemAvailable` does not count until a reboot: on the first start after a
+  boot all 12,288 experts were cached, on later starts 10,496 to 10,870 (the rest mirrored). `STRATA_SYCL_FREE_MIB` sets the
+  figure by hand.
+- **No prompt-slot borrowing.** With it, the answer after a prompt that borrowed the cache's slots was token 0 (every expert
+  activation NaN from the second prompt chunk; 0.1.40, any context). The prompt now gets its own buffers on a device with
+  `host_unified_memory`. Borrowing saved about 7% of prompt time in a test without the bug (112 vs 105 tok/s, 0.1.40).
+- **The first decode window stalled** on every request until `STRATA_WINDOW_SYNC=1` (#2110): 10 of 10 in 0.1.43,
+  6 of 6 in 0.1.47.
+- **What fits.** The experts' file (shard 1) has to fit in the RAM beside everything else. The Coder IQ1_M and the IQ2_XS
+  (shard 1 36.5 GiB) ran with 10 to 13 GiB of RAM left; the IQ3_XXS (43.8 GiB) left 3 to 4 GiB and did not run well (0.1.40).
+  Programs that use the GPU's memory (another model server) take from the same RAM: stop them first.
+- **The launcher.** `sycl/serve/strata-sycl-native.sh` is the config's `exe`. It sources oneAPI, sets the port's defaults
+  (`STRATA_VERIFY_DEVICE_PLAN=1`, `STRATA_VERIFY_NO_HOST=1`, `STRATA_STAGER_THREADS=12`, `STRATA_NO_MULTI_GR=1`), each one
+  overridden by the config's `"env"` (`0` turns one off), and gives the engine an OOM score of 1000, so that a PC out of
+  memory loses the engine and not the desktop. `STRATA_SYCL_BIN` names another binary (relative to the checkout or absolute).
+
+**Running it by hand.** A config like this, started with
+`.venv/bin/python sycl/serve/server_intel.py --engine strata --config strata-coder-iq1_m.json --port 8080`:
+
+    {
+     "exe": "<checkout>/sycl/serve/strata-sycl-native.sh",
+     "args": ["--pack", "<data>/packs/coder-iq1_m", "--native", "<data>/models/coder-IQ1_M/<shard 1>.gguf",
+              "--ple-gguf", "<data>/models/coder-IQ1_M/<shard 2>.gguf", "--expert-profile", "<checkout>/data/expert-profile-coder.bin",
+              "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "<data>/mtp/rt",
+              "--max-context", "98304", "--kv", "int8", "--stream-experts", "--vram-reserve-mib", "2048"],
+     "cwd": "<checkout>", "tokenizer": "<data>/packs/coder-iq1_m/tokenizer", "model_name": "qwen3.8-flash-next-coder-iq1_m",
+     "log": "<checkout>/strata-coder-iq1_m.log", "port": 8080, "backend": "sycl", "draft_vocab": "en", "fit_max_tokens": true,
+     "env": {"SYCL_CACHE_PERSISTENT": "1"}
+    }
+
+**Speed** (through the server, greedy, thinking off, with #2110):
+
+| | |
+|---|---|
+| decode, 100-token answers to short questions, 0.1.43 | 12.0 to 17.4 tok/s all experts cached, 11.5 to 17.2 with 1,792 of them mirrored |
+| the same, 0.1.47 (four runs of 10, 1,915 to 2,660 experts mirrored) | 8.4 to 15.2 tok/s; two runs of the same config gave 8.5-13.3 and 10.6-15.2 |
+| a 72,648-token prompt, 0.1.43 | read at 156.5 tok/s (7 min 44 s), the fact at its start recalled |
+| a 74,939-token prompt, 0.1.47 | read at 149.9 tok/s (8 min 20 s), the fact at its start recalled |
+| a 24-token prompt | 1.2 s (0.1.43), 2.3 s (0.1.47) |
+
+The 140T reads 90.5 GB/s from device memory and 76.1 GB/s from host memory (a read probe, 2026-10-05). Where a decode round's
+time goes is not profiled yet.
+
 ## Not done
 
 - Images on the llama.cpp config: not wired. On the SYCL port they are wired, see "Pictures on an Arc" below. Open there: a
@@ -1385,3 +1451,105 @@ Both are FP32 in another summation order, not bitwise. First-token logits agains
 |---|---|---|---|
 | Coder IQ1_M, 256K config | 1,329 -> 1,468 (+10%) | 1,562 -> 1,885 (+21%) | 1,336 -> 1,798 (+35%) |
 | Flash-Next IQ2_XS, 128K config | | 1,373 -> 1,613 (+18%) | |
+
+## Two cards computing each layer's experts together: `--expert-parallel-device` (2026-10-08)
+
+Measured on 2x Arc Pro B70 (32 GB each, `xe`), Flash-Next IQ3_XXS, Ryzen 9 9950X3D, 60 GB RAM, through the server
+(`sycl/serve/server_intel.py`, 131,072 context, INT8 KV with `--kv-resident 32768`, `--vram-reserve-mib 2048`, the
+default drafting), greedy, thinking off, the same request 3 times (the table: the 2nd and 3rd, the 1st reads the prompt):
+
+| | `--layer-split auto` | `--expert-parallel-device 1` |
+|---|---|---|
+| where the experts live | layers 0-28 on card 0, 29-47 on card 1, every expert in VRAM | card 0: 283 per layer, card 1: the other 229, every expert in VRAM |
+| decode, a BST class (600 tokens) | 94.3 tok/s | **107.9 tok/s** (+14.4%) |
+| decode, a 300-word explanation (384 tokens) | 64.2 tok/s | **72.6 tok/s** (+13.1%) |
+| output | | byte-identical to the layer split, all 6 requests of each |
+
+`--expert-parallel-device N` uses two cards, card 0 and card N (N is a card number, not a count). Card 0 runs every
+layer and card N holds the experts card 0 does not; for each layer the two cards compute their own experts at the same
+time, card N writes its rows into card 0's memory, and card 0 combines them as on one card. Only the experts run on
+both cards; the rest of each layer runs on card 0 alone. Each layer's experts are dealt to the two cards hottest
+first, in pairs alternating 0,1 / 1,0, so both serve about the same share of the routing (in a unitrace of 96 decoded
+tokens each card's expert kernels take 160-170 ms of the trace's 1.1 s). The sets are fixed at the start (no prompt
+loans, no adaptive swaps).
+
+- Needs `--stream-experts` and every expert in one of the two cards' VRAM; not with `--layer-split`, `--peer-device`
+  or `--pipeline-windows`.
+- In a server config: `"gpu": [0, 1]`, `"--expert-parallel-device", "1"` in `"args"` and
+  `"ONEAPI_DEVICE_SELECTOR": "level_zero:*"` in `"env"` (setup writes the last for a list of cards). The server adds
+  no `--layer-split` beside the option. With every expert in VRAM nothing is mirrored in RAM.
+- `--batch N` works with it: 4 requests at once give the same outputs as one at a time.
+- The prompt path computes card N's experts on card N, with card 0's FP16 expert path (byte-identical rows).
+  `STRATA_EP_PREFILL=0` reads them from the GGUF on card 0 instead; `STRATA_EP_MIRROR=1` then mirrors them in pinned
+  RAM (18 GB for IQ3_XXS).
+- Checks: `STRATA_EP_VERIFY=1` (with `STRATA_EP_MIRROR=1`) has card 0 compute every row itself and compare card N's
+  rows with them word for word: no row differed in the 448 windows the three runs reported. `STRATA_EP_SELF=1` runs
+  the window on card 0's own rows only; its output is byte-identical to the expert-parallel one.
+- Through `--tokens` (no server, 32K context), 512 tokens of the BST prompt: 107.3 tok/s; one card with the other
+  experts in the RAM mirror: 50.8 (1,024 tokens).
+
+## Integrated Arc: the Arc 140T (`xe`, 2026-10-12, re-run 2026-10-22)
+
+Measured on the Arc 140T (PCI id 7d51, Xe-LPG+) of a Core Ultra 9 285H with 62 GiB of RAM, Fedora 44 (kernel 7.2.9,
+`xe` driver), oneAPI 2026.0 installed on the PC, with the Coder IQ1_M, engine 0.1.43 and again with engine 0.1.47
+(Strata 0.2.2) on 2026-10-22. The GPU's memory is the system
+RAM: it reports 58 GiB of global memory and no free-memory query.
+
+| | Arc Pro B70 (`xe`, 32 GB) | Arc 140T (`xe`, integrated) |
+|---|---|---|
+| where the engine runs | in the `strata-sycl-dev` image (`sycl/serve/strata-sycl.sh`) | on the PC's own oneAPI (`sycl/serve/strata-sycl-native.sh`), no Docker |
+| build | AOT `bmg-g31` | JIT (`BUILD_DIR=build-sycl bash sycl/tools/build.sh`) |
+| experts | `--stream-experts`: from the GGUF into VRAM, the rest in a pinned RAM mirror | the same flags; the cache and the mirror are both in the RAM |
+| how big the cache is | the card's free VRAM | `MemAvailable` from `/proc/meminfo` (`STRATA_SYCL_FREE_MIB` overrides it) |
+| prompt-slot borrowing | from 32K up | off |
+| `SYCL_CACHE_PERSISTENT` | 0 (it crashed on Xe2) | 1 works: the start takes 7 s instead of 79 s from the second start on (0.1.40) |
+
+- **The driver.** Only `xe` was tested. On a kernel that binds the iGPU to `i915`, `i915.force_probe=!7d51 xe.force_probe=7d51`
+  on the kernel command line moves it to `xe`.
+- **Build.** Install the oneAPI Base Toolkit (2026.0 here, Intel's installer, into `/opt/intel/oneapi`) and the GPU compute runtime of the
+  distribution (Fedora 44: `intel-compute-runtime`, `intel-level-zero`, `oneapi-level-zero`, and `cmake`, `ninja-build`). Then, in the checkout,
+  `BUILD_DIR=build-sycl bash sycl/tools/build.sh` (it sources `setvars.sh` itself). The build ends with `BUILD EXIT 0`.
+- **Free memory.** The 140T has no `ext_intel_free_memory`, also with `ZES_ENABLE_SYSMAN=1`, so the engine got 0 and the
+  expert cache refused to start. On a device with `host_unified_memory` it now reads `MemAvailable`. The `xe` driver keeps the
+  memory a GPU program freed in its own pool, which `MemAvailable` does not count until a reboot: on the first start after a
+  boot all 12,288 experts were cached, on later starts 10,496 to 10,870 (the rest mirrored). `STRATA_SYCL_FREE_MIB` sets the
+  figure by hand.
+- **No prompt-slot borrowing.** With it, the answer after a prompt that borrowed the cache's slots was token 0 (every expert
+  activation NaN from the second prompt chunk; 0.1.40, any context). The prompt now gets its own buffers on a device with
+  `host_unified_memory`. Borrowing saved about 7% of prompt time in a test without the bug (112 vs 105 tok/s, 0.1.40).
+- **The first decode window stalled** on every request until `STRATA_WINDOW_SYNC=1` (#2110): 10 of 10 in 0.1.43,
+  6 of 6 in 0.1.47.
+- **What fits.** The experts' file (shard 1) has to fit in the RAM beside everything else. The Coder IQ1_M and the IQ2_XS
+  (shard 1 36.5 GiB) ran with 10 to 13 GiB of RAM left; the IQ3_XXS (43.8 GiB) left 3 to 4 GiB and did not run well (0.1.40).
+  Programs that use the GPU's memory (another model server) take from the same RAM: stop them first.
+- **The launcher.** `sycl/serve/strata-sycl-native.sh` is the config's `exe`. It sources oneAPI, sets the port's defaults
+  (`STRATA_VERIFY_DEVICE_PLAN=1`, `STRATA_VERIFY_NO_HOST=1`, `STRATA_STAGER_THREADS=12`, `STRATA_NO_MULTI_GR=1`), each one
+  overridden by the config's `"env"` (`0` turns one off), and gives the engine an OOM score of 1000, so that a PC out of
+  memory loses the engine and not the desktop. `STRATA_SYCL_BIN` names another binary (relative to the checkout or absolute).
+
+**Running it by hand.** A config like this, started with
+`.venv/bin/python sycl/serve/server_intel.py --engine strata --config strata-coder-iq1_m.json --port 8080`:
+
+    {
+     "exe": "<checkout>/sycl/serve/strata-sycl-native.sh",
+     "args": ["--pack", "<data>/packs/coder-iq1_m", "--native", "<data>/models/coder-IQ1_M/<shard 1>.gguf",
+              "--ple-gguf", "<data>/models/coder-IQ1_M/<shard 2>.gguf", "--expert-profile", "<checkout>/data/expert-profile-coder.bin",
+              "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", "<data>/mtp/rt",
+              "--max-context", "98304", "--kv", "int8", "--stream-experts", "--vram-reserve-mib", "2048"],
+     "cwd": "<checkout>", "tokenizer": "<data>/packs/coder-iq1_m/tokenizer", "model_name": "qwen3.8-flash-next-coder-iq1_m",
+     "log": "<checkout>/strata-coder-iq1_m.log", "port": 8080, "backend": "sycl", "draft_vocab": "en", "fit_max_tokens": true,
+     "env": {"SYCL_CACHE_PERSISTENT": "1"}
+    }
+
+**Speed** (through the server, greedy, thinking off, with #2110):
+
+| | |
+|---|---|
+| decode, 100-token answers to short questions, 0.1.43 | 12.0 to 17.4 tok/s all experts cached, 11.5 to 17.2 with 1,792 of them mirrored |
+| the same, 0.1.47 (four runs of 10, 1,915 to 2,660 experts mirrored) | 8.4 to 15.2 tok/s; two runs of the same config gave 8.5-13.3 and 10.6-15.2 |
+| a 72,648-token prompt, 0.1.43 | read at 156.5 tok/s (7 min 44 s), the fact at its start recalled |
+| a 74,939-token prompt, 0.1.47 | read at 149.9 tok/s (8 min 20 s), the fact at its start recalled |
+| a 24-token prompt | 1.2 s (0.1.43), 2.3 s (0.1.47) |
+
+The 140T reads 90.5 GB/s from device memory and 76.1 GB/s from host memory (a read probe, 2026-10-05). Where a decode round's
+time goes is not profiled yet.

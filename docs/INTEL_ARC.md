@@ -57,8 +57,7 @@ Full flags, per-request timings and engine logs are in the report linked in the 
 - **Unchanged:** the CUDA engine's greedy output, checked byte-identical against the gated 0.1.39 build (Q2_0 and Coder).
   The HIP build is not affected (the option is off by default).
 
-**Not covered by those 0.1.39 checks:** native Windows (tested later; see below), Arc on WSL2 for the 0.1.39 port, integrated Arc
-GPUs (the B390 / Panther Lake in #515; the shared-memory planning does not exist yet), and pictures on a Battlemage card
+**Not covered by those 0.1.39 checks:** native Windows (tested later; see below), Arc on WSL2 for the 0.1.39 port, integrated Arc GPUs other than the Arc 140T on Linux (the B390 / Panther Lake in #515; the shared-memory planning does not exist yet; the 140T: [INTEL.md](INTEL.md), "Integrated Arc"), and pictures on a Battlemage card
 (the first picture on the Arc Pro B70 reset the GPU; they are off by default there, [INTEL.md](INTEL.md#pictures-on-an-arc-2026-10-19-branch-f-021-arcvis)).
 Pictures work on the A750 (on by default, read on the CPU). The Alchemist A-series was tested later, on an A750 (rows above and
 [INTEL.md](INTEL.md), "Arc A750 and the other Alchemist cards").
@@ -281,3 +280,5 @@ setup cannot detect the card there, because it reads `/sys/class/drm`, which WSL
 
 Open an issue with: the card, the driver version, `sycl-ls` output, the oneAPI version, the model and flags, and the
 engine's stderr. Results from real cards are what move this from experimental to supported.
+
+**Not covered by those 0.1.39 checks:** native Windows (tested later; see below), Arc on WSL2 for the 0.1.39 port, integrated Arc GPUs other than the Arc 140T on Linux (the B390 / Panther Lake in #515; the shared-memory planning does not exist yet; the 140T: [INTEL.md](INTEL.md), "Integrated Arc"), and pictures on a Battlemage card
