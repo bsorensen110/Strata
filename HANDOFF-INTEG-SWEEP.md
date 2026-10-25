@@ -222,3 +222,12 @@ Not run in this session (owed):
    copies `build-verify/strata` + the python layer and rolls back on health failure.
 4. Wave 24's parked **#2240** (Remote stage worker, 211 conflicts) and the 0.2.4 follow-ups
    above (Metal `--dflash` side, dead fork dflash sources, dead `if (has_dflash)` blocks).
+
+### Post-merge test pass (2026-10-25, on 2a9befe8)
+- `serve/test_frontend.py` 26 passed + 58 subtests — the frontend union (`require_messages`,
+  `assistant_prefix_kw`, `_order_chat_tool_results`).
+- `serve/test_mcp.py` 29 passed + 8 subtests — imports `serve.server`, so it exercises the
+  import union (`tls.install()`, `MAX_RESULT_IMAGES`, `serve.tracing`).
+- `tests/terminal/test_runtime.py` + `test_runtime_idle.py` 59 passed, 4 skipped — the
+  `restart()` signature union (`refuse_busy` + `MAX_START_WAIT`).
+Still owed: the rest of `serve/`, `ctest`, and the 5K recall probe before promotion.
