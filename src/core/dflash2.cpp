@@ -712,4 +712,48 @@ bool Dflash2Drafter::restore_state(const std::vector<uint8_t>& in, int64_t prefi
     return true;
 }
 
+void Dflash2Drafter::reset() {
+    have_ctx_ = 0;
+    for (int32_t& p : ring_pos_) p = -1;
+    if (device_ >= 0 && kring_[0] != nullptr) {
+        const OnDevice on_device(device_);
+        const size_t bytes = (size_t) ring_slots_ * NKV_ * HD_ * 4;
+        for (int l = 0; l < L_; ++l) {
+            cudaMemsetAsync(kring_[l], 0, bytes, cs_);
+            cudaMemsetAsync(vring_[l], 0, bytes, cs_);
+        }
+        if (cs_) cudaStreamSynchronize(cs_);
+    }
+}
+
+void Dflash2Drafter::rewind(int64_t prefix_len) {
+    if (prefix_len <= 0) { reset(); return; }
+    if (device_ >= 0 && kring_[0] != nullptr) {
+        const OnDevice on_device(device_);
+        bool any = false;
+        for (int s0 = 0; s0 < ring_slots_;) {
+            if (ring_pos_[(size_t) s0] < prefix_len) { ++s0; continue; }
+            int s1 = s0;
+            while (s1 < ring_slots_ && ring_pos_[(size_t) s1] >= prefix_len) {
+                ring_pos_[(size_t) s1] = -1;
+                ++s1;
+            }
+            const size_t span_bytes = (size_t) (s1 - s0) * (size_t) HD_ * 4;
+            for (int l = 0; l < L_; ++l)
+                for (int hk = 0; hk < NKV_; ++hk) {
+                    const size_t off = ((size_t) hk * ring_slots_ + s0) * (size_t) HD_;
+                    cudaMemsetAsync(kring_[l] + off, 0, span_bytes, cs_);
+                    cudaMemsetAsync(vring_[l] + off, 0, span_bytes, cs_);
+                }
+            any = true;
+            s0 = s1;
+        }
+        if (any && cs_) cudaStreamSynchronize(cs_);
+    } else {
+        for (int32_t& p : ring_pos_)
+            if (p >= prefix_len) p = -1;
+    }
+    if (have_ctx_ > prefix_len) have_ctx_ = prefix_len;
+}
+
 }  // namespace strata::core

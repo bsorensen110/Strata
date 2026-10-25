@@ -55,7 +55,9 @@ public:
     bool bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err);
 
     /// A new request: no row in the old request's ring is a valid context cell.
-    void reset() { have_ctx_ = 0; for (int32_t& p : ring_pos_) p = -1; }
+    void reset();
+    /// Rewinds the live ring in place to `prefix_len`, zeroing any slots written at positions >= prefix_len.
+    void rewind(int64_t prefix_len);
     /// Context rows without a draft: `n` rows of taps (device, [n][5 * n_embd]) for positions pos0 ... pos0 + n - 1.
     bool context(const float* taps_dev, int64_t n, int64_t pos0, std::string& err);
     /// One round: the new context rows (n_new in 1..8: the committed window rows, taps device [n_new][5 * n_embd], positions pos0 ...),

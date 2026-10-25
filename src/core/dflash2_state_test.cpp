@@ -81,6 +81,20 @@ int main(int argc, char** argv) {
         cudaFree(taps);
         return 1;
     }
+    // Live in-place rewind (continuing a conversation from an earlier checkpoint without parking):
+    // must produce the exact same ring state as restore_state(..., 1).
+    if (!df.restore_state(state, 2, err)) {
+        std::fprintf(stderr, "restore before live rewind: %s\n", err.c_str());
+        cudaFree(taps);
+        return 1;
+    }
+    df.rewind(1);
+    std::vector<uint8_t> rewound_live;
+    if (!df.save_state(rewound_live, err, 1) || rewound_live != rewound) {
+        std::fprintf(stderr, "live rewind(1) did not match restore_state(..., 1): %s\n", err.c_str());
+        cudaFree(taps);
+        return 1;
+    }
     std::vector<uint8_t> corrupt = state;
     const int32_t wrong_position = 1; // slot 0 must contain position 0 (or -1), never position 1
     std::memcpy(corrupt.data() + 128, &wrong_position, sizeof(wrong_position));
