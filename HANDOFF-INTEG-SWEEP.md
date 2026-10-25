@@ -231,3 +231,37 @@ Not run in this session (owed):
 - `tests/terminal/test_runtime.py` + `test_runtime_idle.py` 59 passed, 4 skipped — the
   `restart()` signature union (`refuse_busy` + `MAX_START_WAIT`).
 Still owed: the rest of `serve/`, `ctest`, and the 5K recall probe before promotion.
+
+### Defect fixes + production promotion (2026-10-25)
+
+Fixed and committed as **`9d4d0a59`** (`fix two real defects that came in with upstream 0.2.6`):
+- `strata_cli/launch/screens.py`: removed one unreachable duplicate `return out`.
+- `src/program/generate.cpp`: added the missing `\\n` escapes to three `--adapt-async` help
+  string literals. Verified the built binary prints the paragraph across separate lines.
+- The apparent duplicate in `tests/terminal/test_flow2_022.py` is intentional: the test emits
+  30s/60s/60s and asserts two visible heartbeat lines (deduplication of the repeated 60s event).
+  Left unchanged; `pytest tests/terminal/test_flow2_022.py -q` = 30 passed.
+
+Rebuilt after both fixes: HIP gfx1201 `strata` green, md5
+`21739e622be44f82651855bf62e7053b`.
+
+Before promotion, the deployed release binary (`49ec4c9f`) passed the 5K needle probe **8/8**
+(depths 5/15/25/35/50/65/80/95); raw output `recall-baseline-49ec4c9f.json`.
+Then ran `~/promote-integ.sh` with the repaired v0.2.6 candidate. It created rollback artifacts:
+`/home/soren/Strata/engine/strata.pre-integ-0.2.4-20261025-154155.bak` and
+`/home/soren/Strata-backup-python-20261025-154155.tgz`; synced the Python layer and started the
+service. Post-promotion verification:
+- `strata.service`: active/running, NRestarts=0.
+- live `/home/soren/Strata/engine/strata` md5 matches candidate `21739e622be44f82651855bf62e7053b`.
+- authenticated `/v1/models`: HTTP 200; `swift-1.5-iq3_s` loaded at context 262144.
+- real arithmetic inference: 19 x 23 -> `437`, finish_reason=stop, 36 completion tokens.
+- **Post-promotion 5K needle probe: 8/8** at the same eight depths; raw JSON and stdout in
+  `recall-prod-v0.2.6-21739e62.json` / `.log`.
+- promotion script's initial health and model-list checks passed. Its exact `ready` smoke request
+  ended `finish_reason=length` after 16 reasoning tokens and the engine correctly reported no
+  final answer; the explicit arithmetic request above subsequently completed normally.
+
+Current prod = v0.2.6 + two defect fixes, build hash above. Rollback artifacts retained; the
+service has not restarted unexpectedly. Remaining QA not done: full serve/ pytest suite and
+ctest (`STRATA_BUILD_TESTS=OFF` in the build); these were not required for the focused fix/build/
+recall/deploy gate.
