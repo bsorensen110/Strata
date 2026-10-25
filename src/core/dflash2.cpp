@@ -614,11 +614,10 @@ bool Dflash2Drafter::save_state(std::vector<uint8_t>& out, std::string& err, int
     h.L = L_; h.NKV = NKV_; h.HD = HD_; h.ring = kRing; h.window = window_; h.N = N_; h.NH = NH_;
     h.have = have_ctx_;
     h.prefix = conversation_len < 0 ? have_ctx_ : conversation_len;
-    if (h.prefix < h.have || h.prefix > h.have + 1) {
-        err = "dflash2: save_state context does not match the parked conversation length";
-        out.clear();
-        return false;
-    }
+    // No equality check against have_ctx_: in serve mode the drafter's context is rebuilt per request
+    // from the cache-NEW rows only (the ring holds the window around the tail at absolute positions),
+    // so the conversation is always longer than the rows this drafter has seen. restore_state() zeroes
+    // slots at positions >= the resumed checkpoint, which is what makes a rewound branch correct.
     std::memcpy(&h.theta_bits, &theta_, 4);
     std::memcpy(&h.eps_bits, &eps_, 4);
     h.pack_size = pack_size_; h.pack_mtime = pack_mtime_; h.pack_path_hash = df2_path_hash(pack_path_);
@@ -668,14 +667,14 @@ bool Dflash2Drafter::restore_state(const std::vector<uint8_t>& in, int64_t prefi
     const size_t rings = (size_t) L_ * 2 * slice;
     if (h.ring_bytes != rings) return refuse("the blob's ring size disagrees with the header");
     if (in.size() != 128 + (size_t) kRing * 4 + rings) return refuse("the blob's size disagrees with the header");
-    if (h.have < 0 || h.have > INT32_MAX || h.prefix < h.have || h.prefix > h.have + 1 ||
-        prefix_len < 0 || prefix_len > h.prefix || prefix_len > h.have + 1)
+    if (h.have < 0 || h.prefix < h.have || prefix_len < 0 || prefix_len > h.prefix)
         return refuse("the saved/resumed positions are out of range");
-    // A live park is one row shy: the anchor's taps enter the ring with the NEXT round's context, so
-    // prefix_len == have + 1 is exactly the state a turn's first draft sees.
+    // Serve parks stamp h.prefix with the CONVERSATION length while the drafter has seen only the
+    // cache-new rows of the request that parked it (have << prefix), and the ring slots hold
+    // absolute conversation positions. Every range check therefore goes against h.prefix.
     const int32_t* table = reinterpret_cast<const int32_t*>(in.data() + 128);
     for (int s = 0; s < kRing; ++s)
-        if (table[s] < -1 || table[s] >= h.have || (table[s] >= 0 && table[s] % kRing != s))
+        if (table[s] < -1 || table[s] >= h.prefix || (table[s] >= 0 && table[s] % kRing != s))
             return refuse("the ring slot table is invalid");
     // Rewind: cells this park committed past the resumed checkpoint go; the drafter must not draft
     // from tokens of a branch the conversation did not take.
