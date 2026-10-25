@@ -77,8 +77,10 @@ public:
     static constexpr uint32_t kStateMagic = 0x53324644;   // "DF2S"
     static constexpr uint32_t kStateVersion = 1;
     /// Host bytes one save_state() produces (header + slot table + L layers of planar K/V).
+    size_t ring_elem_bytes() const { return fp16_ring_ ? 2 : 4; }
+    void set_fp16_ring(bool on) { fp16_ring_ = on; }
     size_t state_bytes() const {
-        return 128 + (size_t) ring_slots_ * 4 + (size_t) L_ * 2 * ((size_t) ring_slots_ * NKV_ * HD_ * 4);
+        return 128 + (size_t) ring_slots_ * 4 + (size_t) L_ * 2 * ((size_t) ring_slots_ * NKV_ * HD_ * ring_elem_bytes());
     }
     int attention_window() const { return window_; }
     int ring_slots() const { return ring_slots_; }
@@ -171,6 +173,7 @@ private:
     int64_t pack_mtime_ = 0;
     cudaEvent_t ev_a_ = nullptr, ev_b_ = nullptr;
     bool timing_ = false;
+    bool fp16_ring_ = true;
 };
 
 }  // namespace strata::core
