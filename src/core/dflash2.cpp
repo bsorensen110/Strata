@@ -22,6 +22,7 @@
 #include <stdexcept>
 
 namespace strata::core {
+static_assert(Dflash2Drafter::kMaxWindow == kernels::kDf2MaxWindow, "DFlash2 pack and kernel window limits must match");
 namespace {
 
 using Clock = std::chrono::steady_clock;
@@ -165,10 +166,16 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
             total = std::max(total, t.off + t.bytes);
         }
     }
-    if (tensors_.empty() || NH_ != 32 || NKV_ != 8 || HD_ != 128 || rank_ != 256 || N_ != 2560 || L_ > 8 || window_ + 16 > kRing) {
+    if (tensors_.empty() || NH_ != 32 || NKV_ != 8 || HD_ != 128 || rank_ != 256 || N_ != 2560 || L_ < 1 || L_ > 8) {
         err = "dflash2: the pack's shape is not the Flash-Next drafter this engine was written for";
         return false;
     }
+    if (window_ < 1 || window_ > kMaxWindow) {
+        err = "dflash2: pack attention window " + std::to_string(window_) + " is outside the supported 1.." + std::to_string(kMaxWindow) + " range";
+        return false;
+    }
+    ring_slots_ = window_ + kRingSlack;
+    ring_pos_.assign((size_t) ring_slots_, -1);
     // The pack's identity for save_state/restore_state: a parked conversation's blob is only
     // restorable into a drafter built from this same pack (path hash, size, mtime).
     pack_path_ = path;
@@ -180,7 +187,7 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
         const auto wt = std::filesystem::last_write_time(p, ec);
         pack_mtime_ = ec ? 0 : (int64_t) wt.time_since_epoch().count();
     }
-    ring_pos_.fill(-1);
+    for (int32_t& p : ring_pos_) p = -1;
     have_ctx_ = 0;
     if (cudaMalloc((void**) &blob_, total) != cudaSuccess) { err = "dflash2: the pack does not fit in VRAM (" + std::to_string(total >> 20) + " MiB)"; return false; }
     vram_ += total;
@@ -250,9 +257,9 @@ bool Dflash2Drafter::alloc(std::string& err) {
               dev(&fcy_, B * N_) && dev(&hctx_, B * N_) && dev(&kc_, B * NKV_ * HD_) && dev(&vc_, B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
               dev(&xc_, B * N_) && dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
-              dev(&part_, (size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) && dev(&fn_, B * N_) && dev(&topval_, kDrafts * 16) && dev(&toptok_, kDrafts * 16) &&
+              dev(&part_, (size_t) kernels::df2_attention_chunks(window_) * 8 * 32 * 130) && dev(&fn_, B * N_) && dev(&topval_, kDrafts * 16) && dev(&toptok_, kDrafts * 16) &&
               dev(&hsel_, kDrafts * rank_) && dev(&topscratch_, (size_t) kDrafts * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
-    for (int l = 0; ok && l < L_; ++l) ok = dev(&kring_[l], (size_t) kRing * NKV_ * HD_) && dev(&vring_[l], (size_t) kRing * NKV_ * HD_);
+    for (int l = 0; ok && l < L_; ++l) ok = dev(&kring_[l], (size_t) ring_slots_ * NKV_ * HD_) && dev(&vring_[l], (size_t) ring_slots_ * NKV_ * HD_);
     if (!ok) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
     void* hd = nullptr;
     void* dd = nullptr;
@@ -268,7 +275,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
     cudaMemset(xdp_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
     cudaMemset(xqc_, 0, (size_t) 5 * N_ * 8 + 4096);
     cudaMemset(xdc_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
-    for (int l = 0; l < L_; ++l) { cudaMemset(kring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); cudaMemset(vring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); }
+    for (int l = 0; l < L_; ++l) { cudaMemset(kring_[l], 0, (size_t) ring_slots_ * NKV_ * HD_ * 4); cudaMemset(vring_[l], 0, (size_t) ring_slots_ * NKV_ * HD_ * 4); }
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
@@ -375,7 +382,7 @@ bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, s
             const std::string kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
             gemm({kp.c_str(), vp.c_str()}, {kc_, vc_}, n, cs, xqc_, xdc_);
             stamp("gemm:kp");
-            df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), d_meta_ + 0, rt_ctx_, kring_[l], vring_[l], kRing, n, NKV_, eps_, cs);
+            df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), d_meta_ + 0, rt_ctx_, kring_[l], vring_[l], ring_slots_, n, NKV_, eps_, cs);
             stamp("df2_kv_ring");
             if (fork_) cudaEventRecord(ev_ctx_[l], cs);   // layer l's keys and values are in the ring
         }
@@ -412,7 +419,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             if (!skip_part("small")) df2_norm_rope_qk(q_, k_, f32(p + "self_attn.q_norm.weight"), f32(p + "self_attn.k_norm.weight"), rt_blk_, qn_, kblk_, B, NH_, NKV_, eps_, cs);
             stamp("df2_norm_rope_qk");
             if (fork_) cudaStreamWaitEvent(cs, ev_ctx_[l], 0);   // the context update has written this layer's ring
-            if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs);
+            if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, ring_slots_, window_, part_, xqp_, xdp_, cs);
             stamp("df2_attention");
             if (!skip_part("qkvo")) gemm({(p + "self_attn.o_proj.weight").c_str()}, {o_}, B, cs, xqp_, xdp_);
             stamp("gemm:o_proj");
@@ -506,7 +513,7 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
     for (int64_t r0 = 0; r0 < n; r0 += kRows) {
         const int m = (int) std::min<int64_t>(kRows, n - r0);
         for (int i = 0; i < m; ++i) h_meta_[i] = (int32_t) (pos0 + r0 + i);
-        for (int i = 0; i < m; ++i) ring_pos_[(size_t) ((pos0 + r0 + i) % kRing)] = (int32_t) (pos0 + r0 + i);
+        for (int i = 0; i < m; ++i) ring_pos_[(size_t) ((pos0 + r0 + i) % ring_slots_)] = (int32_t) (pos0 + r0 + i);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
         if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, cs_, err)) return false;
@@ -530,7 +537,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     }
     const int64_t s = pos0 + n_new;
     for (int i = 0; i < 8; ++i) { h_meta_[i] = (int32_t) (pos0 + std::min(i, n_new - 1)); h_meta_[8 + i] = (int32_t) (s + i); }
-    for (int i = 0; i < n_new; ++i) ring_pos_[(size_t) ((pos0 + i) % kRing)] = (int32_t) (pos0 + i);
+    for (int i = 0; i < n_new; ++i) ring_pos_[(size_t) ((pos0 + i) % ring_slots_)] = (int32_t) (pos0 + i);
     h_meta_[16] = anchor;
     h_meta_[17] = (int32_t) s;
     h_meta_[24] = anchor;
@@ -604,14 +611,14 @@ uint64_t df2_path_hash(const std::string& s) {   // FNV-1a-64
 bool Dflash2Drafter::save_state(std::vector<uint8_t>& out, std::string& err, int64_t conversation_len) {
     if (blob_ == nullptr || kring_[0] == nullptr) { err = "dflash2: save_state on an un-loaded drafter"; return false; }
     const OnDevice on_device(device_);
-    const size_t slice = (size_t) kRing * NKV_ * HD_ * 4;
+    const size_t slice = (size_t) ring_slots_ * NKV_ * HD_ * 4;
     const size_t rings = (size_t) L_ * 2 * slice;
     out.clear();
-    try { out.resize(128 + (size_t) kRing * 4 + rings); }
+    try { out.resize(128 + (size_t) ring_slots_ * 4 + rings); }
     catch (const std::bad_alloc&) { err = "dflash2: save_state out of host memory"; return false; }
     Df2StateHeader h{};
     h.magic = kStateMagic; h.version = kStateVersion;
-    h.L = L_; h.NKV = NKV_; h.HD = HD_; h.ring = kRing; h.window = window_; h.N = N_; h.NH = NH_;
+    h.L = L_; h.NKV = NKV_; h.HD = HD_; h.ring = ring_slots_; h.window = window_; h.N = N_; h.NH = NH_;
     h.have = have_ctx_;
     h.prefix = conversation_len < 0 ? have_ctx_ : conversation_len;
     // No equality check against have_ctx_: in serve mode the drafter's context is rebuilt per request
@@ -623,8 +630,8 @@ bool Dflash2Drafter::save_state(std::vector<uint8_t>& out, std::string& err, int
     h.pack_size = pack_size_; h.pack_mtime = pack_mtime_; h.pack_path_hash = df2_path_hash(pack_path_);
     h.ring_bytes = rings;
     std::memcpy(out.data(), &h, 128);
-    std::memcpy(out.data() + 128, ring_pos_.data(), (size_t) kRing * 4);
-    uint8_t* p = out.data() + 128 + (size_t) kRing * 4;
+    std::memcpy(out.data() + 128, ring_pos_.data(), (size_t) ring_slots_ * 4);
+    uint8_t* p = out.data() + 128 + (size_t) ring_slots_ * 4;
     if (cs_ != nullptr && cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = std::string("dflash2: save_state stream: ") + cudaGetErrorString(cudaGetLastError());
         out.clear();
@@ -646,12 +653,12 @@ bool Dflash2Drafter::save_state(std::vector<uint8_t>& out, std::string& err, int
 bool Dflash2Drafter::restore_state(const std::vector<uint8_t>& in, int64_t prefix_len, std::string& err) {
     const auto refuse = [&](const char* why) { err = std::string("dflash2: restore_state: ") + why; return false; };
     if (blob_ == nullptr || kring_[0] == nullptr) return refuse("the drafter is not loaded");
-    if (in.size() < 128 + (size_t) kRing * 4) return refuse("the blob is short");
+    if (in.size() < 128 + (size_t) ring_slots_ * 4) return refuse("the blob is short");
     Df2StateHeader h;
     std::memcpy(&h, in.data(), 128);
     if (h.magic != kStateMagic) return refuse("not a DFlash2 context blob");
     if (h.version != kStateVersion) return refuse("blob version is not this engine's");
-    if (h.L != L_ || h.NKV != NKV_ || h.HD != HD_ || h.ring != kRing || h.window != window_ ||
+    if (h.L != L_ || h.NKV != NKV_ || h.HD != HD_ || h.ring != ring_slots_ || h.window != window_ ||
         h.N != N_ || h.NH != NH_) return refuse("the drafter's geometry changed");
     float ts = 0, es = 0;
     std::memcpy(&ts, &h.theta_bits, 4); std::memcpy(&es, &h.eps_bits, 4);
@@ -663,22 +670,22 @@ bool Dflash2Drafter::restore_state(const std::vector<uint8_t>& in, int64_t prefi
     const auto wt = std::filesystem::last_write_time(p, ec);
     if (ec || (int64_t) wt.time_since_epoch().count() != h.pack_mtime) return refuse("the drafter pack changed");
     if (h.pack_path_hash != df2_path_hash(pack_path_)) return refuse("the drafter pack moved");
-    const size_t slice = (size_t) kRing * NKV_ * HD_ * 4;
+    const size_t slice = (size_t) ring_slots_ * NKV_ * HD_ * 4;
     const size_t rings = (size_t) L_ * 2 * slice;
     if (h.ring_bytes != rings) return refuse("the blob's ring size disagrees with the header");
-    if (in.size() != 128 + (size_t) kRing * 4 + rings) return refuse("the blob's size disagrees with the header");
+    if (in.size() != 128 + (size_t) ring_slots_ * 4 + rings) return refuse("the blob's size disagrees with the header");
     if (h.have < 0 || h.prefix < h.have || prefix_len < 0 || prefix_len > h.prefix)
         return refuse("the saved/resumed positions are out of range");
     // Serve parks stamp h.prefix with the CONVERSATION length while the drafter has seen only the
     // cache-new rows of the request that parked it (have << prefix), and the ring slots hold
     // absolute conversation positions. Every range check therefore goes against h.prefix.
     const int32_t* table = reinterpret_cast<const int32_t*>(in.data() + 128);
-    for (int s = 0; s < kRing; ++s)
-        if (table[s] < -1 || table[s] >= h.prefix || (table[s] >= 0 && table[s] % kRing != s))
+    for (int s = 0; s < ring_slots_; ++s)
+        if (table[s] < -1 || table[s] >= h.prefix || (table[s] >= 0 && table[s] % ring_slots_ != s))
             return refuse("the ring slot table is invalid");
     // Rewind: cells this park committed past the resumed checkpoint go; the drafter must not draft
     // from tokens of a branch the conversation did not take.
-    const uint8_t* src = in.data() + 128 + (size_t) kRing * 4;
+    const uint8_t* src = in.data() + 128 + (size_t) ring_slots_ * 4;
     std::vector<uint8_t> staging;
     try { staging.resize(slice); }
     catch (const std::bad_alloc&) { return refuse("out of host memory"); }
@@ -689,17 +696,17 @@ bool Dflash2Drafter::restore_state(const std::vector<uint8_t>& in, int64_t prefi
             std::memcpy(staging.data(), slab, slice);
             // The ring is head-major ([NKV][kRing][HD], see kv_ring_kernel): zero every head's cell for
             // slots that were never written or were written at positions >= prefix_len.
-            for (int s = 0; s < kRing; ++s)
+            for (int s = 0; s < ring_slots_; ++s)
                 if (table[s] < 0 || table[s] >= prefix_len)
                     for (int hk = 0; hk < NKV_; ++hk)
-                        std::memset(staging.data() + ((size_t) hk * kRing + s) * (size_t) HD_ * 4, 0, (size_t) HD_ * 4);
+                        std::memset(staging.data() + ((size_t) hk * ring_slots_ + s) * (size_t) HD_ * 4, 0, (size_t) HD_ * 4);
             float* dst = kv ? vring_[l] : kring_[l];
             if (cudaMemcpy(dst, staging.data(), slice, cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = std::string("dflash2: restore_state ring copy: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
         }
-    for (int s = 0; s < kRing; ++s) ring_pos_[(size_t) s] = (table[s] >= 0 && table[s] < prefix_len) ? table[s] : -1;
+    for (int s = 0; s < ring_slots_; ++s) ring_pos_[(size_t) s] = (table[s] >= 0 && table[s] < prefix_len) ? table[s] : -1;
     have_ctx_ = prefix_len;
     err.clear();
     return true;

@@ -35,7 +35,11 @@ class Dflash2Drafter {
 public:
     static constexpr int kRows = 8;           ///< block rows: the anchor + 7 masks
     static constexpr int kDrafts = kRows - 1;
-    static constexpr int kRing = 2064;        ///< K/V slots per layer: the 2048 window + slack for rows written ahead of a rejection
+    static constexpr int kDefaultWindow = 2048;
+    static constexpr int kMaxWindow = 8192;   ///< opt-in pack metadata limit; longer windows need larger ring/kernel buffers
+    static constexpr int kRingSlack = 16;     ///< rows written ahead of a rejection
+    static constexpr int kRing = kDefaultWindow + kRingSlack;  ///< default pack ring size, kept for existing bench callers
+    static constexpr int kMaxRing = kMaxWindow + kRingSlack;
 
     Dflash2Drafter() = default;
     ~Dflash2Drafter();
@@ -51,7 +55,7 @@ public:
     bool bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err);
 
     /// A new request: no row in the old request's ring is a valid context cell.
-    void reset() { have_ctx_ = 0; ring_pos_.fill(-1); }
+    void reset() { have_ctx_ = 0; for (int32_t& p : ring_pos_) p = -1; }
     /// Context rows without a draft: `n` rows of taps (device, [n][5 * n_embd]) for positions pos0 ... pos0 + n - 1.
     bool context(const float* taps_dev, int64_t n, int64_t pos0, std::string& err);
     /// One round: the new context rows (n_new in 1..8: the committed window rows, taps device [n_new][5 * n_embd], positions pos0 ...),
@@ -72,8 +76,10 @@ public:
     static constexpr uint32_t kStateVersion = 1;
     /// Host bytes one save_state() produces (header + slot table + L layers of planar K/V).
     size_t state_bytes() const {
-        return 128 + (size_t) kRing * 4 + (size_t) L_ * 2 * ((size_t) kRing * NKV_ * HD_ * 4);
+        return 128 + (size_t) ring_slots_ * 4 + (size_t) L_ * 2 * ((size_t) ring_slots_ * NKV_ * HD_ * 4);
     }
+    int attention_window() const { return window_; }
+    int ring_slots() const { return ring_slots_; }
     /// Dumps the ring (device quiesced: draft() synchronized before returning) into `out`.
     bool save_state(std::vector<uint8_t>& out, std::string& err, int64_t conversation_len = -1);
     /// Reinstalls a saved ring as the context of a conversation of `prefix_len` tokens: slots written at
@@ -116,7 +122,7 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* blob_ = nullptr;
     uint64_t vram_ = 0;
-    int N_ = 2560, L_ = 5, NH_ = 32, NKV_ = 8, HD_ = 128, I_ = 7680, window_ = 2048, group_ = 16, rank_ = 256, mask_token_ = 0;
+    int N_ = 2560, L_ = 5, NH_ = 32, NKV_ = 8, HD_ = 128, I_ = 7680, window_ = kDefaultWindow, ring_slots_ = kRing, group_ = 16, rank_ = 256, mask_token_ = 0;
     float theta_ = 10000.0f, eps_ = 1e-6f;
     std::vector<int> taps_;
     int64_t vocab_ = 0;
@@ -157,7 +163,7 @@ private:
     int64_t have_ctx_ = 0;
     /// The absolute position every ring slot was last written at (-1: never). Host-side mirror of the
     /// device writes; maintained by context()/draft(), saved/restored with the ring (see save_state).
-    std::array<int32_t, kRing> ring_pos_{};
+    std::vector<int32_t> ring_pos_ = std::vector<int32_t>(kRing, -1);
     std::string pack_path_;          ///< the pack's path at load (restore refuses a moved pack)
     uint64_t pack_size_ = 0;         ///< the pack's size and mtime at load: a swapped pack is a foreign blob
     int64_t pack_mtime_ = 0;

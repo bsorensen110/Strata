@@ -94,7 +94,7 @@ __global__ void copy_rows_kernel(const float* __restrict__ in, float* __restrict
     out[slot_mod > 0 ? ((size_t) (c / HD) * slot_mod + slot) * HD + c % HD : (size_t) slot * cols + c] = in[i];
 }
 
-// ---- attention.  grid (8 K/V heads, kDf2MaxChunks), 128 threads.  The 32 queries (4 heads x 8 rows) of a K/V head share each key tile;
+// ---- attention.  grid (8 K/V heads, active chunks for the selected window), 128 threads.  The 32 queries (4 heads x 8 rows) of a K/V head share each key tile;
 // S = Q K^T in 4 x 4 register tiles (64 threads), the online softmax per query, O += P V in 4 x 8 register tiles (128 threads).
 constexpr int AS = 132;   // smem row stride of the Q / K / V tiles (float4 aligned, conflict-free for the 4 x 4 tiles)
 constexpr int PS = 36;    // stride of the transposed probabilities P[key][query]
@@ -249,13 +249,13 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
 
 __device__ __forceinline__ void quant_block(float v, int blk, int col, int K, int8_t* __restrict__ xq, float* __restrict__ xd);
 
-__global__ void attn_merge_kernel(const float* __restrict__ part, int8_t* __restrict__ xq, float* __restrict__ xd) {
+__global__ void attn_merge_kernel(const float* __restrict__ part, int n_chunks, int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int a = blockIdx.x;                      // kvh * 32 + qi
     const int kvh = a >> 5, qi = a & 31, d = threadIdx.x;
     float M = -INFINITY;
-    for (int c = 0; c < kDf2MaxChunks; ++c) M = fmaxf(M, part[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130]);
+    for (int c = 0; c < n_chunks; ++c) M = fmaxf(M, part[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130]);
     float L = 0.0f, o = 0.0f;
-    for (int c = 0; c < kDf2MaxChunks; ++c) {
+    for (int c = 0; c < n_chunks; ++c) {
         const float* p = part + (((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130;
         const float mc = p[0];
         const float w = (mc == -INFINITY) ? 0.0f : __expf(mc - M);
@@ -687,9 +687,12 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
                    int ring_slots, int window, float* part, void* xq, float* xd, void* stream) {
-    attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant);
+    if (window < 1 || window > kDf2MaxWindow || ring_slots < window + 8)
+        throw std::invalid_argument("df2_attention: unsupported sliding-window/ring geometry");
+    const int n_chunks = df2_attention_chunks(window);
+    attn_part_kernel<<<dim3(kDf2Kv, n_chunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant);
     check("attn_part");
-    attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
+    attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, n_chunks, static_cast<int8_t*>(xq), xd);
     check("attn_merge");
 }
 

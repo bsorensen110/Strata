@@ -5,19 +5,28 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
 int main(int argc, char** argv) {
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: dflash2_state_test PACK\n");
+    if (argc != 2 && argc != 3) {
+        std::fprintf(stderr, "usage: dflash2_state_test PACK [expected-window]\n");
         return 2;
     }
+    const int expected_window = argc == 3 ? std::atoi(argv[2]) : 2048;
     strata::core::Dflash2Drafter df;
     std::string err;
     if (!df.load(argv[1], 0, err)) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
+        return 1;
+    }
+    const size_t expected_ring = (size_t) expected_window + 16;
+    const size_t expected_state = 128 + expected_ring * 4 + df.tap_layers().size() * 2 * expected_ring * 8 * 128 * 4;
+    if (df.attention_window() != expected_window || df.ring_slots() != (int) expected_ring || df.state_bytes() != expected_state) {
+        std::fprintf(stderr, "window %d: loaded window=%d ring=%d state=%zu, expected ring=%zu state=%zu\n",
+                     expected_window, df.attention_window(), df.ring_slots(), df.state_bytes(), expected_ring, expected_state);
         return 1;
     }
     const size_t n = (size_t) df.tap_layers().size() * (size_t) df.n_embd() * 2;
