@@ -1220,7 +1220,12 @@ int main() {
         std::vector<ConversationCheckpoint> held_by_new_chain;
         ConversationCheckpoint cp; cp.ids = {4, 5};
         held_by_new_chain.push_back(cp);
-        check(c.drop_superseded({9}, {}, held_by_new_chain, true) == 1, "the superseded entry drops");
+        // take_superseded_reuse must leave disk entries untouched for drop_superseded to unlink and debit disk_bytes.
+        auto disk_harvest = c.take_superseded_reuse({9}, {}, held_by_new_chain, true);
+        check(disk_harvest.dropped == 0 && c.size() == 3 && c.bytes() == 700 && fs::exists(pe),
+              "take_superseded_reuse does not steal disk entries without unlinking them");
+        check(c.drop_superseded({9}, {}, held_by_new_chain, true) == 1 && c.bytes() == 600,
+              "the superseded entry drops and debits disk_bytes");
         check(!fs::exists(pe) && fs::exists(pb) && fs::exists(pd), "drop_superseded unlinks the dropped entry's file");
         c.clear();
         check(c.size() == 0 && !fs::exists(pb) && !fs::exists(pd), "clear unlinks every parked file");

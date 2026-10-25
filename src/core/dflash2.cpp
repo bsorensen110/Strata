@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <atomic>
 #include <initializer_list>
 #include <stdexcept>
@@ -168,6 +169,19 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
         err = "dflash2: the pack's shape is not the Flash-Next drafter this engine was written for";
         return false;
     }
+    // The pack's identity for save_state/restore_state: a parked conversation's blob is only
+    // restorable into a drafter built from this same pack (path hash, size, mtime).
+    pack_path_ = path;
+    {
+        std::error_code ec;
+        const std::filesystem::path p(path);
+        pack_size_ = (uint64_t) std::filesystem::file_size(p, ec);
+        if (ec) pack_size_ = 0;
+        const auto wt = std::filesystem::last_write_time(p, ec);
+        pack_mtime_ = ec ? 0 : (int64_t) wt.time_since_epoch().count();
+    }
+    ring_pos_.fill(-1);
+    have_ctx_ = 0;
     if (cudaMalloc((void**) &blob_, total) != cudaSuccess) { err = "dflash2: the pack does not fit in VRAM (" + std::to_string(total >> 20) + " MiB)"; return false; }
     vram_ += total;
     uint64_t max_bytes = 0;
@@ -492,6 +506,7 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
     for (int64_t r0 = 0; r0 < n; r0 += kRows) {
         const int m = (int) std::min<int64_t>(kRows, n - r0);
         for (int i = 0; i < m; ++i) h_meta_[i] = (int32_t) (pos0 + r0 + i);
+        for (int i = 0; i < m; ++i) ring_pos_[(size_t) ((pos0 + r0 + i) % kRing)] = (int32_t) (pos0 + r0 + i);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
         if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, cs_, err)) return false;
@@ -515,6 +530,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     }
     const int64_t s = pos0 + n_new;
     for (int i = 0; i < 8; ++i) { h_meta_[i] = (int32_t) (pos0 + std::min(i, n_new - 1)); h_meta_[8 + i] = (int32_t) (s + i); }
+    for (int i = 0; i < n_new; ++i) ring_pos_[(size_t) ((pos0 + i) % kRing)] = (int32_t) (pos0 + i);
     h_meta_[16] = anchor;
     h_meta_[17] = (int32_t) s;
     h_meta_[24] = anchor;
@@ -553,6 +569,140 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
 bool Dflash2Drafter::debug_rows(std::vector<float>& rows, std::string& err) {
     rows.resize((size_t) kRows * (size_t) N_);
     if (cudaMemcpy(rows.data(), fn_, rows.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) { err = "dflash2: debug copy"; return false; }
+    return true;
+}
+
+// ---- the drafter's context: park/restore ----------------------------------------------------------
+// The blob: a 128-byte self-describing header, the kRing slot positions, then L layers of planar K/V
+// in the device's own layout. Everything a restore needs to refuse a foreign drafter: geometry ints,
+// the pack's path hash / size / mtime, and the slot table that makes a resumed checkpoint's rewind
+// safe (cells written past the resumed prefix are zeroed, the drafter keeps the cells below it).
+namespace {
+#pragma pack(push, 1)
+struct Df2StateHeader {
+    uint32_t magic, version;
+    int64_t L, NKV, HD, ring, window, N, NH;
+    int64_t have;             // last committed position (exclusive) at save time
+    int64_t prefix;           // conversation length the blob was parked at
+    uint32_t theta_bits, eps_bits;
+    uint64_t pack_size;
+    int64_t pack_mtime;
+    uint64_t pack_path_hash;
+    uint64_t ring_bytes;      // L * 2 * ring * NKV * HD * 4
+    uint8_t reserved[8];
+};
+#pragma pack(pop)
+static_assert(sizeof(Df2StateHeader) == 128, "df2 state header is the blob's fixed contract");
+
+uint64_t df2_path_hash(const std::string& s) {   // FNV-1a-64
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+}  // namespace
+
+bool Dflash2Drafter::save_state(std::vector<uint8_t>& out, std::string& err, int64_t conversation_len) {
+    if (blob_ == nullptr || kring_[0] == nullptr) { err = "dflash2: save_state on an un-loaded drafter"; return false; }
+    const OnDevice on_device(device_);
+    const size_t slice = (size_t) kRing * NKV_ * HD_ * 4;
+    const size_t rings = (size_t) L_ * 2 * slice;
+    out.clear();
+    try { out.resize(128 + (size_t) kRing * 4 + rings); }
+    catch (const std::bad_alloc&) { err = "dflash2: save_state out of host memory"; return false; }
+    Df2StateHeader h{};
+    h.magic = kStateMagic; h.version = kStateVersion;
+    h.L = L_; h.NKV = NKV_; h.HD = HD_; h.ring = kRing; h.window = window_; h.N = N_; h.NH = NH_;
+    h.have = have_ctx_;
+    h.prefix = conversation_len < 0 ? have_ctx_ : conversation_len;
+    if (h.prefix < h.have || h.prefix > h.have + 1) {
+        err = "dflash2: save_state context does not match the parked conversation length";
+        out.clear();
+        return false;
+    }
+    std::memcpy(&h.theta_bits, &theta_, 4);
+    std::memcpy(&h.eps_bits, &eps_, 4);
+    h.pack_size = pack_size_; h.pack_mtime = pack_mtime_; h.pack_path_hash = df2_path_hash(pack_path_);
+    h.ring_bytes = rings;
+    std::memcpy(out.data(), &h, 128);
+    std::memcpy(out.data() + 128, ring_pos_.data(), (size_t) kRing * 4);
+    uint8_t* p = out.data() + 128 + (size_t) kRing * 4;
+    if (cs_ != nullptr && cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("dflash2: save_state stream: ") + cudaGetErrorString(cudaGetLastError());
+        out.clear();
+        return false;
+    }
+    for (int l = 0; l < L_; ++l)
+        for (int kv = 0; kv < 2; ++kv) {
+            const float* src = kv ? vring_[l] : kring_[l];
+            if (cudaMemcpy(p, src, slice, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                err = std::string("dflash2: save_state ring copy: ") + cudaGetErrorString(cudaGetLastError());
+                out.clear();
+                return false;
+            }
+            p += slice;
+        }
+    return true;
+}
+
+bool Dflash2Drafter::restore_state(const std::vector<uint8_t>& in, int64_t prefix_len, std::string& err) {
+    const auto refuse = [&](const char* why) { err = std::string("dflash2: restore_state: ") + why; return false; };
+    if (blob_ == nullptr || kring_[0] == nullptr) return refuse("the drafter is not loaded");
+    if (in.size() < 128 + (size_t) kRing * 4) return refuse("the blob is short");
+    Df2StateHeader h;
+    std::memcpy(&h, in.data(), 128);
+    if (h.magic != kStateMagic) return refuse("not a DFlash2 context blob");
+    if (h.version != kStateVersion) return refuse("blob version is not this engine's");
+    if (h.L != L_ || h.NKV != NKV_ || h.HD != HD_ || h.ring != kRing || h.window != window_ ||
+        h.N != N_ || h.NH != NH_) return refuse("the drafter's geometry changed");
+    float ts = 0, es = 0;
+    std::memcpy(&ts, &h.theta_bits, 4); std::memcpy(&es, &h.eps_bits, 4);
+    if (ts != theta_ || es != eps_) return refuse("the drafter's RoPE/eps changed");
+    std::error_code ec;
+    const std::filesystem::path p(pack_path_);
+    const uint64_t size_now = (uint64_t) std::filesystem::file_size(p, ec);
+    if (ec || size_now != h.pack_size) return refuse("the drafter pack changed size");
+    const auto wt = std::filesystem::last_write_time(p, ec);
+    if (ec || (int64_t) wt.time_since_epoch().count() != h.pack_mtime) return refuse("the drafter pack changed");
+    if (h.pack_path_hash != df2_path_hash(pack_path_)) return refuse("the drafter pack moved");
+    const size_t slice = (size_t) kRing * NKV_ * HD_ * 4;
+    const size_t rings = (size_t) L_ * 2 * slice;
+    if (h.ring_bytes != rings) return refuse("the blob's ring size disagrees with the header");
+    if (in.size() != 128 + (size_t) kRing * 4 + rings) return refuse("the blob's size disagrees with the header");
+    if (h.have < 0 || h.have > INT32_MAX || h.prefix < h.have || h.prefix > h.have + 1 ||
+        prefix_len < 0 || prefix_len > h.prefix || prefix_len > h.have + 1)
+        return refuse("the saved/resumed positions are out of range");
+    // A live park is one row shy: the anchor's taps enter the ring with the NEXT round's context, so
+    // prefix_len == have + 1 is exactly the state a turn's first draft sees.
+    const int32_t* table = reinterpret_cast<const int32_t*>(in.data() + 128);
+    for (int s = 0; s < kRing; ++s)
+        if (table[s] < -1 || table[s] >= h.have || (table[s] >= 0 && table[s] % kRing != s))
+            return refuse("the ring slot table is invalid");
+    // Rewind: cells this park committed past the resumed checkpoint go; the drafter must not draft
+    // from tokens of a branch the conversation did not take.
+    const uint8_t* src = in.data() + 128 + (size_t) kRing * 4;
+    std::vector<uint8_t> staging;
+    try { staging.resize(slice); }
+    catch (const std::bad_alloc&) { return refuse("out of host memory"); }
+    const OnDevice on_device(device_);
+    for (int l = 0; l < L_; ++l)
+        for (int kv = 0; kv < 2; ++kv) {
+            const uint8_t* slab = src + ((size_t) l * 2 + kv) * slice;
+            std::memcpy(staging.data(), slab, slice);
+            // The ring is head-major ([NKV][kRing][HD], see kv_ring_kernel): zero every head's cell for
+            // slots that were never written or were written at positions >= prefix_len.
+            for (int s = 0; s < kRing; ++s)
+                if (table[s] < 0 || table[s] >= prefix_len)
+                    for (int hk = 0; hk < NKV_; ++hk)
+                        std::memset(staging.data() + ((size_t) hk * kRing + s) * (size_t) HD_ * 4, 0, (size_t) HD_ * 4);
+            float* dst = kv ? vring_[l] : kring_[l];
+            if (cudaMemcpy(dst, staging.data(), slice, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = std::string("dflash2: restore_state ring copy: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        }
+    for (int s = 0; s < kRing; ++s) ring_pos_[(size_t) s] = (table[s] >= 0 && table[s] < prefix_len) ? table[s] : -1;
+    have_ctx_ = prefix_len;
+    err.clear();
     return true;
 }
 

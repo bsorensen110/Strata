@@ -220,6 +220,52 @@ int main() {
     }
     check(written == fs::file_size(good), "write reports the file size");
     check(no_temp(dir), "no temporary left behind");
+    // v4: the DFlash2 context blob rides at the payload's end. The v1 golden above proves the no-blob layout is
+    // byte-frozen; these cover the blob round trip, the v4 version stamp, tamper rejection and the read limit.
+    {
+        SavedConversation with_df2 = sample();
+        with_df2.df2_state.resize(300000);
+        for (size_t i = 0; i < with_df2.df2_state.size(); ++i) with_df2.df2_state[i] = uint8_t(i * 7 + 3);
+        const fs::path dp = dir / "df2.bin";
+        size_t w = 0;
+        std::string e;
+        check(session_file_write(dp.string(), with_df2, id, w, e), "df2: write");
+        {
+            const std::vector<char> g = slurp(dp);
+            uint32_t ver = 0;
+            for (int i = 3; i >= 0; --i) ver = ver << 8 | uint8_t(g[8 + i]);
+            check(ver == 4, "df2: version 4 header");
+            SavedConversation back;
+            size_t r = 0;
+            check(session_file_read(dp.string(), id, back, r, e), "df2: read");
+            check(back.df2_state == with_df2.df2_state, "df2: the blob round trips");
+            check(same(with_df2, back), "df2: the image round trips beside the blob");
+            auto tampered = g;
+            tampered[g.size() - 16 - 1000] ^= 1;   // payload trailer is 16 bytes: this lands inside the blob
+            spit(dp, tampered);
+            SavedConversation bad;
+            check(!session_file_read(dp.string(), id, bad, r, e) && e.find("checksum") != std::string::npos,
+                  "df2: a tampered blob fails the payload checksum");
+            spit(dp, g);
+            SessionReadLimits lim;
+            lim.max_df2_bytes = 1024;
+            check(!session_file_read(dp.string(), id, bad, r, e, lim) && !e.empty(),
+                  "df2: a blob past max_df2_bytes is refused");
+            // the streaming passes: the read pass hashes the tail, the apply pass hands the blob out
+            std::vector<std::array<uint64_t, 5>> parts;
+            SavedConversation meta;
+            size_t sb = 0;
+            const bool stream_ok = session_file_read_streamed(dp.string(), id, meta, sb, e, SessionReadLimits{}, &parts);
+            if (!stream_ok) std::fprintf(stderr, "df2: streamed read: %s\n", e.c_str());
+            check(stream_ok, "df2: streamed read accepts the tail");
+            check(meta.df2_state == with_df2.df2_state, "df2: the streamed read materialized the blob");
+            std::vector<uint8_t> blob;
+            check(session_file_apply_streamed_df2(dp.string(), id, [](size_t, size_t, uint64_t, const void*, size_t) { return true; },
+                                                  parts, e, &blob),
+                  "df2: the apply pass runs with the tail");
+            check(blob == with_df2.df2_state, "df2: the apply pass hands the blob out");
+        }
+    }
     {
         SavedConversation back;
         size_t read = 0;
@@ -279,21 +325,21 @@ int main() {
     check(rejects(good, {id.model ^ 1, id.config}, "model"), "different model fingerprint rejected");
     check(rejects(good, {id.model, id.config ^ 1}, "config"), "different configuration rejected");
     // wrong version: header field patched and header hash recomputed so only the version differs.
-    // v1 and v3 are accepted; v2 (reserved for #2247's state codec) and v4+ are rejected.
+    // v2 requires the migration marker; v3 is the stage format; v4 adds DFlash2, and v5+ are unknown.
     {
         auto d = image;
-        uint32_t v = 4; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 5; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
-        check(rejects(p, id, "version"), "unknown version (4) rejected");
+        check(rejects(p, id, "version"), "unknown version (5) rejected");
     }
-    // v2 is reserved for #2247's state codec; this build rejects it explicitly (not a silent v1 misparse).
+    // v2 is the approximate RoPE migration format and must carry a valid migration marker.
     {
         auto d = image;
-        uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver2.bin"; spit(p, d);
-        check(rejects(p, id, "version"), "version 2 (state codec) rejected by this build");
+        check(rejects(p, id, "migration"), "version 2 without migration provenance is rejected");
     }
     // a corrupted element count with a recomputed payload hash must fail on bounds, not allocate
     {

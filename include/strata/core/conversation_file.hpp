@@ -108,6 +108,7 @@ bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint6
 struct SessionInputs {
     std::vector<std::string> native_shards, native_dense, native_head;
     std::string embedding, ple, pack, mtp;
+    std::string dflash2;   // the DFlash2 pack (--draft dflash2 --draft-model): a swapped pack must invalidate session files
     std::vector<std::pair<std::string, std::string>> experts;
 };
 // The fingerprint's list: every role with its file, none merged (a path in two roles is two entries).
@@ -254,6 +255,8 @@ struct SessionReadLimits {
     // per K/V layer (the QSA layers, then the draft): the most bytes of each part (k, v, k_scale, v_scale, pooled).
     // A layer past the end of the list is bounded by the payload only.
     std::vector<std::array<uint64_t, 5>> max_kv_bytes;
+    // the v4 DFlash2 context blob: L layers of planar FP32 K/V rings (about 85 MiB for the shipped geometry)
+    uint64_t max_df2_bytes = 1ull << 29;
     // per later stage (0-based): its layer range, running-state bounds and per-K/V-layer bounds.  A stage past the
     // end of the list is bounded by the payload only.
     std::vector<SessionStageLimits> stage_limits;
@@ -298,9 +301,14 @@ bool session_file_read_streamed(const std::string& path, const SessionFileIdenti
 bool session_file_apply_streamed(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
                                  const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
                                  SessionStatus* status = nullptr);
+// `df2_state` (v4 files): the blob's bytes, read by the apply pass and moved out (the DFlash2 drafter's
+// context); null: read and hashed but dropped.
+bool session_file_apply_streamed_df2(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
+                                     const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
+                                     std::vector<uint8_t>* df2_state, SessionStatus* status = nullptr);
 // The RAM preflight of the streaming read of a `file_bytes` file: the two block buffers, the small vectors and the
 // running-state metadata the limits admit; the K/V itself stays on disk.
-uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits);
+uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits, bool has_df2 = false);
 
 // ---- Cache parking: the cheap scan read used to index parked conversations on disk (PR #3341).
 struct SessionFileMeta {

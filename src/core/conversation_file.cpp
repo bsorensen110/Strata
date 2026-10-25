@@ -47,6 +47,7 @@ constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 constexpr uint32_t kVersion = 1;
 constexpr uint32_t kVersionStages = 3;   // a file that carries stage_images (a multi-GPU split); v2 is reserved for #2247's state codec
+constexpr uint32_t kVersionDf2 = 4;      // a file whose payload ends with the DFlash2 drafter's context blob
 constexpr size_t kHeader = 64, kTrailer = 16;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
@@ -740,12 +741,19 @@ void put_stage(Out& o, const SavedConversation& s, const std::vector<SessionKvSo
 // `kv_stages` (optional) supplies the K/V per stage: kv_stages[0] for stage 0, kv_stages[k+1] for stage_images[k].
 // With no stage_images this is byte-for-byte the format-v1 payload.
 void put_payload(Out& o, const SavedConversation& s,
-                 const std::vector<std::vector<SessionKvSource>>* kv_stages = nullptr) {
+                 const std::vector<std::vector<SessionKvSource>>* kv_stages = nullptr,
+                 uint32_t version = kVersion) {
     put_stage(o, s, kv_stages ? &(*kv_stages)[0] : nullptr);
-    if (s.stage_images.empty()) return;
-    o.u64(s.stage_images.size());
-    for (size_t k = 0; k < s.stage_images.size(); ++k)
-        put_stage(o, s.stage_images[k], kv_stages ? &(*kv_stages)[k + 1] : nullptr);
+    if (version >= kVersionStages) {
+        o.u64(s.stage_images.size());
+        for (size_t k = 0; k < s.stage_images.size(); ++k)
+            put_stage(o, s.stage_images[k], kv_stages ? &(*kv_stages)[k + 1] : nullptr);
+    }
+    // the v4 tail: the DFlash2 drafter's context blob (see Dflash2Drafter::save_state). v1..v3 files
+    // keep their exact old byte layout: the writer picks v4 only for a non-empty blob.
+    if (version < kVersionDf2) return;
+    o.u64(s.df2_state.size());
+    if (!s.df2_state.empty()) o.raw(s.df2_state.data(), s.df2_state.size());
 }
 
 // ---- parsing: every count is checked against the bytes left and the caller's limits before anything is allocated
@@ -854,14 +862,47 @@ bool get_stage(In& in, SavedConversation& s, const std::pair<int64_t, int64_t>* 
     return true;
 }
 
-// The streaming read: the same walk, but every K/V part's bytes are read through one 16 MiB block and hashed, never
-// kept; a `sink` (the apply pass) gets each block as it is read.  When `in.record_kv` is set the part sizes are
-// recorded for the caller; when `in.verify_kv` is set (the apply pass) the file must have exactly the layer count
-// and part sizes the read pass saw, checked before that layer or part is applied.
-bool get_payload_streamed(In& in, SavedConversation& s, const SessionKvBlock& sink) {
+// The v4 payload tail: the DFlash2 drafter's context blob. v1..v3 files end before it.
+bool get_df2_tail(In& in, SavedConversation& s, uint32_t version) {
+    if (version < kVersionDf2) return true;
+    uint64_t n = 0;
+    if (!in.count(n, 1, in.limits.max_df2_bytes)) return false;
+    s.df2_state.clear();
+    s.df2_state.resize((size_t) n);
+    return n == 0 || in.raw(s.df2_state.data(), (size_t) n);
+}
+
+// The streamed restore parses stage 0's metadata/checkpoints normally, then streams K/V instead of materializing them.
+bool get_stage_prefix(In& in, SavedConversation& s, const std::pair<int64_t, int64_t>* want_range) {
+    for (auto& g : s.geometry) if (!in.i64(g)) return false;
+    if (in.limits.geometry && *in.limits.geometry != s.geometry)
+        return in.fail("saved with another model geometry than this runtime's");
+    uint64_t cvec = 0;
+    if (!in.i64(s.layer_lo) || !in.i64(s.layer_hi) || !in.u64(cvec)) return false;
+    if (want_range && (want_range->first != s.layer_lo || want_range->second != s.layer_hi))
+        return in.fail("saved with another layer range than this runtime's");
+    if (cvec > 7) return in.fail("invalid cvec/LoRA/migration flag");
+    s.cvec = (cvec & 1) != 0;
+    s.lora = (cvec & 2) == 0;
+    if (cvec & 4) {
+        for (auto& value : s.rope_migration) if (!in.u64(value)) return false;
+        if (s.rope_migration[0] != 1 || !s.rope_migration[1] || !s.rope_migration[2] || !s.rope_migration[3])
+            return in.fail("invalid approximate RoPE migration provenance");
+    }
+    if (!get_checkpoint(in, s.live)) return false;
+    uint64_t n = 0;
+    if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
+    s.checkpoints.resize((size_t) n);
+    for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
+    return true;
+}
+
+// The streaming read: every K/V part is read through one 16 MiB block and hashed, never kept; a `sink` (the apply
+// pass) gets each block as it is read. The read/apply passes also verify the number and size of every K/V part.
+bool get_payload_streamed(In& in, SavedConversation& s, const SessionKvBlock& sink, uint32_t version = kVersionStages) {
     // the streaming passes walk a single stage (the session restore path refuses --layer-split files)
     const auto* want0 = in.limits.layer_range ? &*in.limits.layer_range : nullptr;
-    if (!get_stage(in, s, want0, in.limits.max_kv_layers)) return false;
+    if (!get_stage_prefix(in, s, want0)) return false;
     uint64_t n = 0;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
     if (in.verify_kv && in.verify_kv->size() != (size_t) n)
@@ -898,7 +939,12 @@ bool get_payload_streamed(In& in, SavedConversation& s, const SessionKvBlock& si
                 }
             }
         }    }
-    return true;
+    if (version >= kVersionDf2) {
+        uint64_t stages = 0;
+        if (!in.count(stages, 256, in.limits.max_stages) || stages != 0)
+            return in.fail("streaming restore does not support layer-split files");
+    }
+    return get_df2_tail(in, s, version);
 }
 
 bool get_payload(In& in, SavedConversation& s, uint32_t version) {
@@ -919,7 +965,7 @@ bool get_payload(In& in, SavedConversation& s, uint32_t version) {
         const uint64_t kv_layers = sl ? sl->max_kv_bytes.size() : UINT64_MAX;
         if (!get_stage(in, s.stage_images[k], sl ? &sl->layer_range : nullptr, kv_layers)) return false;
     }
-    return true;
+    return get_df2_tail(in, s, version);
 }
 
 // skip `n` payload bytes without reading them (the running state and K/V of a meta read): the file
@@ -1111,6 +1157,7 @@ std::vector<SessionModelFile> session_model_inputs(const SessionInputs& in) {
     if (!in.embedding.empty()) f.push_back({"embedding", in.embedding});
     if (!in.ple.empty()) f.push_back({"ple", in.ple});
     if (!in.mtp.empty()) f.push_back({"mtp", in.mtp});
+    if (!in.dflash2.empty()) f.push_back({"dflash2", in.dflash2});
     if (!in.pack.empty()) f.push_back({"pack native_experts.txt", in.pack + "/native_experts.txt", true});
     for (const auto& [role, path] : in.experts) f.push_back({role, path});
     return f;
@@ -1236,6 +1283,9 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
             }
         }
     }
+    // the v4 tail (the DFlash2 drafter's context blob): counted when the caller bounds it; an open limit
+    // is bounded by the payload, as the parser's count check is
+    if (l.max_df2_bytes != open) n = sat_add(n, sat_add(8, l.max_df2_bytes));
     return std::min(n, l.max_file_bytes);
 }
 
@@ -1245,7 +1295,7 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes) {
     return sat_add(sat_add(sat_add(file_bytes, kBlock), sat_mul(segments, 4096)), uint64_t(1) << 20);
 }
 
-uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits) {
+uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLimits& limits, bool has_df2) {
     // the reader's block and the block a K/V part is moved through, plus the small vectors
     uint64_t n = sat_add(sat_mul(2, kBlock), uint64_t(1) << 20);
     // the parsed running-state metadata: the live checkpoint and every checkpoint the limits accept, each bounded
@@ -1257,6 +1307,8 @@ uint64_t session_read_stream_peak_bytes(uint64_t file_bytes, const SessionReadLi
     n = sat_add(n, std::min(sat_add(cp, checkpoints), file_bytes));
     // one hash per <= 16 MiB block moved, and the per-layer directories (a tiny term, bounded by the file)
     n = sat_add(n, sat_mul(file_bytes / kBlock + 1, 6 * sizeof(uint64_t)));
+    // the v4 DFlash2 context blob is materialized (it is not streamed to a sink): count it only for v4 files.
+    if (has_df2) n = sat_add(n, std::min(sat_add(8, limits.max_df2_bytes), file_bytes));
     return n;
 }
 
@@ -1288,9 +1340,15 @@ bool write_impl(const std::string& path, const SavedConversation& image,
         st.error = SessionError::invalid;
         return false;
     }
-    const uint32_t version = image.stage_images.empty() ? (migrated ? 2u : (uint32_t) kVersion) : kVersionStages;
+    if (!image.df2_state.empty() && !image.stage_images.empty()) {
+        error = "session file: the DFlash2 context blob is written for single-stage files only";
+        st.error = SessionError::invalid;
+        return false;
+    }
+    const uint32_t version = !image.df2_state.empty() ? kVersionDf2
+        : image.stage_images.empty() ? (migrated ? 2u : (uint32_t) kVersion) : kVersionStages;
     Out sizing;
-    put_payload(sizing, image, kv_stages);
+    put_payload(sizing, image, kv_stages, version);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
@@ -1333,7 +1391,7 @@ bool write_impl(const std::string& path, const SavedConversation& image,
     Out out;
     out.f = &f;
     out.hash = &hash;
-    if (ok) put_payload(out, image, kv_stages);
+    if (ok) put_payload(out, image, kv_stages, version);
     ok = ok && out.ok && out.n == payload;
     if (ok) {
         const uint64_t ph = hash.digest();
@@ -1449,9 +1507,10 @@ bool header_ok(const uint8_t* h, uint64_t size, const SessionFileIdentity& id, u
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
     if (version_out) *version_out = version;
-    if (version != kVersion && version != 2 && version != kVersionStages) {
+    if (version != kVersion && version != 2 && version != kVersionStages && version != kVersionDf2) {
         // v2 is this build's approximate RoPE migration marker (#2967: the header carries no other v2 format; the
-        // state codec #2247 reserves upstream is not implemented here), v3 carries a layer split's stage blocks.
+        // state codec #2247 reserves upstream is not implemented here), v3 carries a layer split's stage blocks,
+        // v4 appends the DFlash2 drafter's context blob after the stage section.
         error = "session file: unsupported version " + std::to_string(version); return false;
     }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
@@ -1556,7 +1615,7 @@ bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, Sa
     if (!rf.open(path, id, limits, payload, error, st)) return false;
     if (limits.admit) {
         std::string why;
-        if (!limits.admit(session_read_stream_peak_bytes(rf.size, limits), why)) {
+        if (!limits.admit(session_read_stream_peak_bytes(rf.size, limits, rf.version >= kVersionDf2), why)) {
             st.error = SessionError::memory;
             error = "session file: " + why;
             return false;
@@ -1568,7 +1627,7 @@ bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, Sa
     SavedConversation parsed;
     In in{&rf.source, SessionHasher(0), payload, error, limits};
     in.record_kv = kv_part_bytes;
-    if (!get_payload_streamed(in, parsed, {})) { st.error = in.kind; return false; }
+    if (!get_payload_streamed(in, parsed, {}, rf.version)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
     if (!rf.source.read(t, kTrailer)) { st.error = rf.source.kind(); error = "session file: trailer read error: " + rf.source.error(); return false; }
@@ -1589,7 +1648,7 @@ bool read_stream_impl(const std::string& path, const SessionFileIdentity& id, Sa
 // the first sink call leaves the caller's state partly written - the caller must fail-stop.
 bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
                        const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
-                       SessionStatus& st) {
+                       SessionStatus& st, std::vector<uint8_t>* df2_out = nullptr) {
     error.clear();
     st = {};
     st.error = SessionError::invalid;
@@ -1600,7 +1659,7 @@ bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, c
     SavedConversation parsed;   // re-parsed, then discarded
     In in{&rf.source, SessionHasher(0), payload, error, open};
     in.verify_kv = &kv_part_bytes;
-    if (!get_payload_streamed(in, parsed, sink)) { st.error = in.kind; return false; }
+    if (!get_payload_streamed(in, parsed, sink, rf.version)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
     if (!rf.source.read(t, kTrailer)) { st.error = rf.source.kind(); error = "session file: trailer read error: " + rf.source.error(); return false; }
@@ -1608,6 +1667,7 @@ bool apply_stream_impl(const std::string& path, const SessionFileIdentity& id, c
     std::memcpy(&ph, t, 8);
     if (ph != in.hash.digest()) { error = "session file: the file changed since the read pass (payload checksum)"; return false; }
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
+    if (df2_out) *df2_out = std::move(parsed.df2_state);   // the DFlash2 drafter's context (v4 tail)
     st.error = SessionError::none;
     return true;
 }
@@ -1647,10 +1707,16 @@ bool session_file_read_streamed(const std::string& path, const SessionFileIdenti
 bool session_file_apply_streamed(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
                                  const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
                                  SessionStatus* status) {
+    return session_file_apply_streamed_df2(path, id, sink, kv_part_bytes, error, nullptr, status);
+}
+
+bool session_file_apply_streamed_df2(const std::string& path, const SessionFileIdentity& id, const SessionKvBlock& sink,
+                                     const std::vector<std::array<uint64_t, 5>>& kv_part_bytes, std::string& error,
+                                     std::vector<uint8_t>* df2_state, SessionStatus* status) {
     SessionStatus st;
     bool ok = false;
     try {
-        ok = apply_stream_impl(path, id, sink, kv_part_bytes, error, st);
+        ok = apply_stream_impl(path, id, sink, kv_part_bytes, error, st, df2_state);
     } catch (const std::bad_alloc&) {
         error = "session file: out of memory while reading " + path;
         st.error = SessionError::memory;

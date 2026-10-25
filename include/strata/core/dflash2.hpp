@@ -20,6 +20,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
@@ -49,8 +50,8 @@ public:
     using EmbedFn = std::function<void(const int32_t* tokens_dev, int n, float* out, cudaStream_t)>;
     bool bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err);
 
-    /// A new request: the ring is empty again.
-    void reset() { have_ctx_ = 0; }
+    /// A new request: no row in the old request's ring is a valid context cell.
+    void reset() { have_ctx_ = 0; ring_pos_.fill(-1); }
     /// Context rows without a draft: `n` rows of taps (device, [n][5 * n_embd]) for positions pos0 ... pos0 + n - 1.
     bool context(const float* taps_dev, int64_t n, int64_t pos0, std::string& err);
     /// One round: the new context rows (n_new in 1..8: the committed window rows, taps device [n_new][5 * n_embd], positions pos0 ...),
@@ -60,6 +61,26 @@ public:
 
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
+
+    // ---- the drafter's context: save at park, restore at restore ----------------------------------
+    // The ring's K/V cells, the absolute position every slot was written at, and the last committed
+    // position: everything a parked conversation needs so its next turn starts with the drafter warm
+    // instead of proposing from a cold (or, worse, another conversation's) ring. The blob self-describes:
+    // magic, version, the geometry ints, the pack's path/size/mtime, `have`, and the kRing slot table;
+    // restore_state() refuses a blob from another geometry or pack (the conversation starts cold).
+    static constexpr uint32_t kStateMagic = 0x53324644;   // "DF2S"
+    static constexpr uint32_t kStateVersion = 1;
+    /// Host bytes one save_state() produces (header + slot table + L layers of planar K/V).
+    size_t state_bytes() const {
+        return 128 + (size_t) kRing * 4 + (size_t) L_ * 2 * ((size_t) kRing * NKV_ * HD_ * 4);
+    }
+    /// Dumps the ring (device quiesced: draft() synchronized before returning) into `out`.
+    bool save_state(std::vector<uint8_t>& out, std::string& err, int64_t conversation_len = -1);
+    /// Reinstalls a saved ring as the context of a conversation of `prefix_len` tokens: slots written at
+    /// positions >= prefix_len (a branch this park took past the resumed checkpoint) are zeroed, every
+    /// slot keeps the absolute position it was written at, `have_ctx_` becomes prefix_len.
+    bool restore_state(const std::vector<uint8_t>& in, int64_t prefix_len, std::string& err);
+    int64_t have_ctx() const { return have_ctx_; }
 
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
@@ -134,6 +155,12 @@ private:
     cudaGraphExec_t exec_[kRows + 1] = {};
     const float* graph_taps_ = nullptr;
     int64_t have_ctx_ = 0;
+    /// The absolute position every ring slot was last written at (-1: never). Host-side mirror of the
+    /// device writes; maintained by context()/draft(), saved/restored with the ring (see save_state).
+    std::array<int32_t, kRing> ring_pos_{};
+    std::string pack_path_;          ///< the pack's path at load (restore refuses a moved pack)
+    uint64_t pack_size_ = 0;         ///< the pack's size and mtime at load: a swapped pack is a foreign blob
+    int64_t pack_mtime_ = 0;
     cudaEvent_t ev_a_ = nullptr, ev_b_ = nullptr;
     bool timing_ = false;
 };

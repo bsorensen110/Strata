@@ -205,6 +205,9 @@ struct SavedConversation {
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
     // In-memory DFlash context, separate from the target/MTP disk-session schema.
     std::vector<ConversationKv> dflash_kv;
+    // DFlash2's drafter context (see Dflash2Drafter::save_state): saved at park, reinstalled at
+    // restore. RAM parks hold the blob; disk parks write it into the session file (payload v4).
+    std::vector<uint8_t> df2_state;
     bool cvec = true;
     bool lora = true;   // the LoRA adapter's setting (--lora; true when none is loaded)
     // with a layer split, the later stages' own images, one per stage, in stage order
@@ -223,7 +226,8 @@ struct SavedConversation {
 
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
-                   kv.capacity() * sizeof(ConversationKv) + dflash_kv.capacity() * sizeof(ConversationKv);
+                   kv.capacity() * sizeof(ConversationKv) + dflash_kv.capacity() * sizeof(ConversationKv) +
+                   df2_state.capacity();
         for (const auto& k : dflash_kv) n += k.bytes();
         for (const auto& s : stage_images) n += s.bytes();
         for (const auto& c : checkpoints) n += c.bytes();
@@ -800,10 +804,12 @@ public:
                                            const std::vector<ConversationImageKey>& images,
                                            const std::vector<ConversationCheckpoint>& checkpoints, bool cvec, bool lora = true) {
         SupersededReuse out;
+        if (disk_) return out;   // disk entries hold no host K/V segments to reuse; drop_superseded() unlinks them
         std::vector<size_t> hit;
         size_t best = SIZE_MAX, best_kv = 0;
         hit.reserve(entries_.size());
         for (size_t i = 0; i < entries_.size(); ++i) {
+            if (!entries_[i].disk_path.empty()) continue;
             if (!superseded_entry(i, ids, images, checkpoints, cvec, lora)) continue;
             hit.push_back(i);
             size_t kvb = 0;
@@ -813,7 +819,7 @@ public:
             if (best == SIZE_MAX || kvb > best_kv) { best = i; best_kv = kvb; }
         }
         std::vector<size_t> was(hit.size());
-        for (size_t n = 0; n < hit.size(); ++n) was[n] = entries_[hit[n]].bytes();
+        for (size_t n = 0; n < hit.size(); ++n) was[n] = entry_bytes(entries_[hit[n]]);
         if (best != SIZE_MAX && best_kv > 0) {
             auto& e = entries_[best];
             out.reuse.captured_tokens = (int64_t) e.live.ids.size();

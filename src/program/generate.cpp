@@ -10618,6 +10618,7 @@ int main(int argc, char** argv) {
         if (share_pool && stages.empty() && !multi_gpu && share_has_work && !share_default_ok()) share_has_work = false;   // H11
         strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu && share_has_work);
         bool has_dflash = use_df2;   // serve-mode DFlash2 (upstream --draft dflash2); cleared if the bind fails below
+        bool df2_park_ok = false;    // set with the drafter below: park its context with each conversation (STRATA_DF2_CTX=0 disables)
         bool df_request = false;   // set before prefill; for both greedy and sampled requests
 
 
@@ -11679,6 +11680,13 @@ int main(int argc, char** argv) {
         if (has_dflash)
             std::fprintf(stderr, "strata serve: DFlash2 drafter on (%s, graphs captured in %.0f ms), the MTP stays as the fallback\n",
                          o.draft_model.c_str(), df2.ms_capture);
+        {   // the drafter's context joins conversation parking (park/restore below); STRATA_DF2_CTX=0 turns it off
+            static const bool df2_ctx_env = [] { const char* e = std::getenv("STRATA_DF2_CTX"); return !(e && e[0] == '0'); }();
+            df2_park_ok = has_dflash && df2_ctx_env && stages.empty();   // the ring is one card's drafter: never a layer split
+            if (has_dflash && df2_park_ok)
+                std::fprintf(stderr, "strata serve: DFlash2 context parks with each conversation (%.1f MiB each)\n",
+                             (double) df2.state_bytes() / (1024.0 * 1024.0));
+        }
 #endif
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (native_head_deferred)
@@ -11963,6 +11971,7 @@ int main(int argc, char** argv) {
 #else
                 in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
 #endif
+                in.dflash2 = use_df2 ? o.draft_model : std::string();   // session files belong to the drafter pack that parked them
                 if (srcp != nullptr) in.experts = srcp->model_inputs();
                 std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
@@ -12126,8 +12135,8 @@ int main(int argc, char** argv) {
             // #3321: retain() is empty after a prompt-cache restore, so keep the largest superseded copy's K/V pages
             // and recopy into them.  checks is still whole here; the split below moves it.
             strata::core::ConversationCache::SupersededReuse harvested;
-            if (conversations.retained_bytes() == 0)
-                harvested = conversations.take_superseded_reuse(src.ids, src.imgs, src.checks, src.cvec);
+            if (!conv_disk && conversations.retained_bytes() == 0)
+                harvested = conversations.take_superseded_reuse(src.ids, src.imgs, src.checks, src.cvec, lora_cached);
             if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec, lora_cached))
                 std::fprintf(stderr, "strata serve: conversation cache: dropped %zu superseded cop%s of this "
                              "conversation; parked=%zu\n", dropped, dropped == 1 ? "y" : "ies", conversations.size());
@@ -12150,6 +12159,9 @@ int main(int argc, char** argv) {
                     err.clear();   // recoverable: do not poison the batched draft prefill's error channel
                     return true;
                 }
+#if defined(STRATA_HAVE_DFLASH2)
+                if (df2_park_ok) estimate += df2.state_bytes();   // the context blob is written into the session file
+#endif
                 // the RAM path's make_room analogue, before any capture or write: a snapshot bigger than the
                 // whole disk budget could never be indexed - skip it instead of writing gigabytes put_disk then
                 // deletes.  The post-write refusal stays for the rest (a budget only pinned entries hold full).
@@ -12180,8 +12192,11 @@ int main(int argc, char** argv) {
                 {   // admit gate; refuse-and-skip when it says no (nothing parked lives in RAM to evict for it)
                     const auto mem = strata::core::sample_host_memory();
                     const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
-                    const uint64_t need = strata::core::session_save_peak_bytes(
+                    uint64_t need = strata::core::session_save_peak_bytes(
                         strata::core::session_deepest_checkpoint(deep), sl);
+#if defined(STRATA_HAVE_DFLASH2)
+                    if (df2_park_ok) need += df2.state_bytes();   // the host blob held while the file is written
+#endif
                     if (!strata::core::conversation_memory_admit(avail, need, floor)) {
                         std::fprintf(stderr, "strata serve: conversation cache: skip disk parking (RAM admission: %zu MiB "
                                      "plus a floor of %lld MiB, %s)\n", (size_t)(need >> 20),
@@ -12197,6 +12212,15 @@ int main(int argc, char** argv) {
                     err.clear();
                     return true;
                 }
+#if defined(STRATA_HAVE_DFLASH2)
+                if (df2_park_ok) {
+                    std::string de;
+                    if (!df2.save_state(meta.df2_state, de, (int64_t) live.size())) {
+                        std::fprintf(stderr, "strata serve: conversation cache: DFlash2 context not saved (%s)\n", de.c_str());
+                        meta.df2_state.clear();
+                    }
+                }
+#endif
                 strata::core::SessionFileIdentity sid;
                 if (!session_identity(sid, err, {})) {   // memoized since the startup scan
                     std::fprintf(stderr, "strata serve: conversation cache: skip disk parking (%s)\n", err.c_str());
@@ -12312,6 +12336,9 @@ int main(int argc, char** argv) {
                 err.clear();
             }
             estimate += stage_estimate;
+#if defined(STRATA_HAVE_DFLASH2)
+            if (df2_park_ok && n_st == 0) estimate += df2.state_bytes();   // the drafter's context rides with the image
+#endif
             // A park carrying its own retained K/V replaces memory the cache
             // already held, so capacity is make_room's call - it runs next either
             // way, and put()'s accounting still bounds the budget. The with-reuse
@@ -12376,6 +12403,15 @@ int main(int argc, char** argv) {
                     image.stage_images.push_back(std::move(part));
                 }
                 park_canary("after stage images");
+#if defined(STRATA_HAVE_DFLASH2)
+                if (df2_park_ok && n_st == 0) {
+                    std::string de;
+                    if (!df2.save_state(image.df2_state, de, (int64_t) src.ids.size())) {
+                        std::fprintf(stderr, "strata serve: conversation cache: DFlash2 context not saved (%s)\n", de.c_str());
+                        image.df2_state.clear();
+                    }
+                }
+#endif
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
@@ -14173,7 +14209,9 @@ int main(int argc, char** argv) {
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(), lora_summary.c_str(),
                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
-                        o.spec_min_p, dflash_k, 0, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                        o.spec_min_p, dflash_k, 0,
+                        (long long) (conv_disk ? o.conversation_cache_disk_mib : o.conversation_cache_mib),
+                        o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                         min_read.c_str(),
                         (long long) o.tail_role_token,
@@ -18193,6 +18231,9 @@ int main(int argc, char** argv) {
                         limits_ok = strata::core::conversation_session_read_limits(
                             limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
                             (uint64_t) std::max(o.prompt_cache, 1), err);
+#if defined(STRATA_HAVE_DFLASH2)
+                    if (limits_ok && df2_park_ok) limits.max_df2_bytes = df2.state_bytes();
+#endif
                     if (!limits_ok) { std::fprintf(stderr, "strata serve: conversation cache: %s\n", err.c_str()); err.clear(); }
                     strata::core::SavedConversation image;
                     size_t ibytes = 0;
@@ -18572,6 +18613,22 @@ int main(int argc, char** argv) {
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv),
                                          live, live_imgs);   // these bytes belong to THIS conversation
                 }
+#if defined(STRATA_HAVE_DFLASH2)
+                // the drafter's context: reinstall this conversation's ring (the RAM image carries the blob,
+                // the disk file's v4 tail was read into it whole). `resume`: the checkpoint this request
+                // resumed at - cells the park committed past it are zeroed by restore_state.
+                if (df2_park_ok && !incoming->df2_state.empty()) {
+                    std::string de;
+                    const size_t df2_mb = incoming->df2_state.size() >> 20;
+                    if (!df2.restore_state(incoming->df2_state, resume, de))
+                        std::fprintf(stderr, "strata serve: conversation cache: DFlash2 context NOT restored (%s); "
+                                             "the drafter starts cold\n", de.c_str());
+                    else
+                        std::fprintf(stderr, "strata serve: conversation cache: DFlash2 context restored "
+                                             "(%.1f MiB, %lld tokens)\n", (double) df2_mb / 1024.0, (long long) resume);
+                    incoming->df2_state.clear();
+                }
+#endif
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 lent_slot = -1;   // (the main session holds the parked conversation now)
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
