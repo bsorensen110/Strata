@@ -158,3 +158,67 @@ Still owed:
    `kernels/dflash_taps_test.cpp`) appear dead; delete in the same quiet pass.
 3. `serve/` + `tools/` pytest not yet run against the merged tree (system python lacks pytest;
    use `/home/soren/Strata/.venv/bin/python -m pytest serve/ -q`, excluding the `sys.argv[1]` scripts).
+
+## Upstream main merged (4b9e05a2, v0.2.6) — 2026-10-25
+
+Merge of `origin/main` **4b9e05a2** (tag v0.2.6; v0.2.4.2 → v0.2.5 → v0.2.6 = 186 commits,
+249 files) into `integ/community-2026-10`. Parents: `cf70f46a` (ours) + `4b9e05a2`.
+**Rollback ref: branch `integ/pre-upstream-0.2.6` = `cf70f46a`** (branch, not tag — a plain tag
+on the live branch poisons `git describe`, see the 0.2.4 notes).
+
+25 conflicted files, 74 markers: 5 code + 20 docs. HIP build of `strata` was **GREEN on the
+first pass** (`build-verify`, gfx1201, md5 `98535f90dda80ef3bf0cf2b1b0d22b51`, `strata --version`
+= engine 0.1.51).
+
+Code resolutions — all unions; policy = upstream wins its own refactors, fork keeps live grafts:
+- `generate.cpp`: took upstream's `--adapt-async` help text **and** its `adapt_async_given`
+  setter (the arena auto-trial; read at the `adapt_async_default` gate, ~line 10214); kept the
+  fork's `--numa-hot-node` help entry (live, 16 refs) and `spec_min_p_set`. Upstream's new help
+  literal lines carry **no trailing `\n`**, so that paragraph prints as one long `--help` line —
+  upstream's own text, kept verbatim, don't "fix" it.
+- `serve/server.py`: the conflict is ONLY the `serve.frontend`/`serve.mcp` import lines —
+  upstream's moved import block (runconfig, engine_component, `tls.install()`, hipblaslt_tuning,
+  vision_reader, draft_layer, drafting, user_args, gpu_roles, ready, owner_guard,
+  launch_identity) **auto-merged below the block**. A context-printing script that shows lines
+  after `>>>>>>>` makes that block look like part of "theirs" and invites a duplicate import.
+  Union: `assistant_prefix_kw`, `require_messages`, `videos_of`, `MAX_RESULT_IMAGES`, plus the
+  fork's `serve.tracing` import.
+- `serve/frontend.py`: fork's `assistant_prefix_kw` + `_order_chat_tool_results`, then upstream's
+  `require_messages`, ahead of the shared `openai_to_messages`.
+- `strata_control/runtime.py`: one `restart()` signature carrying upstream's `MAX_START_WAIT`
+  bound AND the fork's `refuse_busy` (live: `restart_if_idle` passes it; the RPC name switches
+  to `restart_if_idle`). Taking either side alone breaks the other's caller.
+- `apps/host/src/components/SettingsUpdates.tsx`: single `native-job-diagnostics` import
+  (`jobErrorText` + `nativeJobDiagnostics`), fork's `RecoveredUpdateHistory`, upstream's
+  `shownEngineVersion`. Pre-existing fork litter: `RecoveredUpdateHistory` is imported and never
+  rendered, and `diagnostics` is a dead local — on BOTH sides, so not a merge seam; apps/host is
+  not built on Linux. Clean on a quiet pass.
+
+Docs — **policy chosen by Brooks: hybrid.** Upstream's rewritten prose taken wholesale in all 20
+doc/README/packaging files. The fork's displaced passages from `AMD_HIP.md` (215 lines),
+`DETAILS.md` (2,167) and `INTEL.md` (928) are extracted verbatim into
+`docs/FORK-AMD_HIP.md`, `docs/FORK-DETAILS.md`, `docs/FORK-INTEL.md` (archival addenda, each
+linked from a pointer line under its page's H1). Fork doc content dropped and NOT extracted,
+recoverable with `git show cf70f46a:<file>` (ours-only lines inside the conflict blocks):
+`MULTI_GPU.md` 377, `README.md` 272, `README.fr.md` 258, `TROUBLESHOOTING.md` 158, `MAC.md` 152,
+`INTEL_ARC.md` 143, `AI_SETUP.md` 82, `SECOND_GPU.md` 43, `OLDER_GPUS.md` 39, the five other
+README translations 28 each, `UNSLOTH_Q4.md` 16, `packaging/README.md` 11, `STRIX_HALO.md` 9.
+
+Verified after resolving: 0 conflict markers in the tree; `py_compile` clean over all 71 changed
+`.py`; `import serve.server`, `serve.frontend`, `serve.tracing`, `serve.runconfig`, `serve.mcp`,
+`strata_control.runtime` clean under `/home/soren/Strata/.venv/bin/python`; `dup_audit.py` over
+the hand-resolved files reports NEAR noise only, nothing at a seam. Two `ADJ` hits in the wide
+audit (`strata_cli/launch/screens.py:1037` duplicated `return out`,
+`tests/terminal/test_flow2_022.py:311`) are byte-identical to `origin/main` — upstream's own,
+worth a PR upstream. Fork work confirmed at the tip: the staged tree vs `origin/main` shows the
+fork residual in all 16 files the DFlash2 serve-mode / park-restore / FP16-ring / 4k-window
+commits touch.
+
+Not run in this session (owed):
+1. `serve/` + `tools/` pytest clusters and `ctest` (`build-verify` is `STRATA_BUILD_TESTS=OFF`).
+2. The 5K recall probe before shipping a perf wave (release baseline 8/8) — the merge moved
+   `dsv41`, `iq_avx512` and CPU kernels, so run it before promotion.
+3. Promotion. **Prod is untouched**, still the 0.2.4-era engine md5 `49ec4c9f`; `~/promote-integ.sh`
+   copies `build-verify/strata` + the python layer and rolls back on health failure.
+4. Wave 24's parked **#2240** (Remote stage worker, 211 conflicts) and the 0.2.4 follow-ups
+   above (Metal `--dflash` side, dead fork dflash sources, dead `if (has_dflash)` blocks).
