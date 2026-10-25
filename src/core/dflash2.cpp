@@ -5,6 +5,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/dflash2.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -233,6 +234,7 @@ bool Dflash2Drafter::make_streams(std::string& err) {
     }
     for (int l = 0; l < 8; ++l)
         if (cudaEventCreateWithFlags(&ev_ctx_[l], cudaEventDisableTiming) != cudaSuccess) { err = "dflash2: events"; return false; }
+    if (const char* e = std::getenv("STRATA_DF2_FP16_RING"); e && e[0]) fp16_ring_ = e[0] != '0';
     if (const char* e = std::getenv("STRATA_DF2_PROFILE"); e && e[0] == '1') prof_ = new Prof();
     if (const char* e = std::getenv("STRATA_DF2_TIMING"); e && e[0] == '1') {
         timing_ = true;
@@ -257,7 +259,15 @@ bool Dflash2Drafter::alloc(std::string& err) {
               dev(&part_, (size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) && dev(&fn_, B * N_) && dev(&topval_, kDrafts * 16) && dev(&toptok_, kDrafts * 16) &&
               dev(&hsel_, kDrafts * rank_) && dev(&topscratch_, (size_t) kDrafts * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
     ok = ok && dev(&landing_, (size_t) kRows * std::max<size_t>(taps_.size(), 1) * (size_t) N_);
-    for (int l = 0; ok && l < L_; ++l) ok = dev(&kring_[l], (size_t) kRing * NKV_ * HD_) && dev(&vring_[l], (size_t) kRing * NKV_ * HD_);
+    const size_t ring_bytes = (size_t) kRing * NKV_ * HD_ * ring_elem_bytes();
+    for (int l = 0; ok && l < L_; ++l) {
+        if (cudaMalloc((void**) &kring_[l], ring_bytes) != cudaSuccess ||
+            cudaMalloc((void**) &vring_[l], ring_bytes) != cudaSuccess) {
+            ok = false;
+            break;
+        }
+        vram_ += 2 * ring_bytes;
+    }
     if (!ok) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
     void* hd = nullptr;
     void* dd = nullptr;
@@ -280,7 +290,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
     cudaMemset(xdp_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
     cudaMemset(xqc_, 0, (size_t) 5 * N_ * 8 + 4096);
     cudaMemset(xdc_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
-    for (int l = 0; l < L_; ++l) { cudaMemset(kring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); cudaMemset(vring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); }
+    for (int l = 0; l < L_; ++l) { cudaMemset(kring_[l], 0, ring_bytes); cudaMemset(vring_[l], 0, ring_bytes); }
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
@@ -424,7 +434,10 @@ bool Dflash2Drafter::record_kv(int n, cudaStream_t cs, const uint8_t* xq, const 
             const std::string kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
             gemm({kp.c_str(), vp.c_str()}, {kc_, vc_}, n, cs, xq, xd);
             stamp("gemm:kp");
-            df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), pos, rt_ctx_, kring_[l], vring_[l], kRing, n, NKV_, eps_, cs, tag_, d_meta_ + 18);
+            if (fp16_ring_)
+                df2_kv_ring_f16(kc_, vc_, f32(p + "self_attn.k_norm.weight"), pos, rt_ctx_, kring_[l], vring_[l], kRing, n, NKV_, eps_, cs, tag_, d_meta_ + 18);
+            else
+                df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), pos, rt_ctx_, kring_[l], vring_[l], kRing, n, NKV_, eps_, cs, tag_, d_meta_ + 18);
             stamp("df2_kv_ring");
             if (fork_) cudaEventRecord(ev_ctx_[l], cs);   // layer l's keys and values are in the ring
         }
@@ -487,7 +500,12 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
             if (!skip_part("small")) df2_norm_rope_qk(q_, k_, f32(p + "self_attn.q_norm.weight"), f32(p + "self_attn.k_norm.weight"), rt_blk_, qn_, kblk_, B, NH_, NKV_, eps_, cs);
             stamp("df2_norm_rope_qk");
             if (fork_) cudaStreamWaitEvent(cs, ev_ctx_[l], 0);   // the context update has written this layer's ring
-            if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs, tag_, d_meta_ + 18);
+            if (!skip_part("attn")) {
+                if (fp16_ring_)
+                    df2_attention_f16(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs, tag_, d_meta_ + 18);
+                else
+                    df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs, tag_, d_meta_ + 18);
+            }
             stamp("df2_attention");
             if (!skip_part("qkvo")) gemm({op.c_str()}, {o_}, B, cs, xqp_, xdp_);
             stamp("gemm:o_proj");
@@ -603,11 +621,11 @@ bool Dflash2Drafter::clone_bind(const Dflash2Drafter& parent, std::string& err) 
 }
 
 bool Dflash2Drafter::copy_state_from(Dflash2Drafter& src, std::string& err) {
-    if (src.device_ != device_ || src.L_ != L_ || src.NKV_ != NKV_) { err = "dflash2: the two drafters are not alike"; return false; }
+    if (src.device_ != device_ || src.L_ != L_ || src.NKV_ != NKV_ || src.fp16_ring_ != fp16_ring_) { err = "dflash2: the two drafters are not alike"; return false; }
     if (!src.context_wait(err) || !context_wait(err)) return false;
     const OnDevice on_device(device_);
     if (cudaStreamSynchronize(src.cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) { err = "dflash2: sync before a state copy"; return false; }
-    const size_t ring_bytes = (size_t) kRing * NKV_ * HD_ * 4;
+    const size_t ring_bytes = (size_t) kRing * NKV_ * HD_ * ring_elem_bytes();
     for (int l = 0; l < L_; ++l)
         if (cudaMemcpyAsync(kring_[l], src.kring_[l], ring_bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
             cudaMemcpyAsync(vring_[l], src.vring_[l], ring_bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) { err = "dflash2: ring copy"; return false; }
@@ -1090,9 +1108,21 @@ bool Dflash2Drafter::debug_ring(std::vector<float>& kv, std::vector<int64_t>& ta
     kv.resize((size_t) L_ * 2 * per);
     tags.resize((size_t) kRing);
     if (cudaDeviceSynchronize() != cudaSuccess) { err = "dflash2: debug ring sync"; return false; }
+    std::vector<uint16_t> raw;
+    const size_t elem = ring_elem_bytes();
+    if (elem == 2) raw.resize(per);
     for (int l = 0; l < L_; ++l) {
-        if (cudaMemcpy(kv.data() + ((size_t) l * 2) * per, kring_[l], per * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
-            cudaMemcpy(kv.data() + ((size_t) l * 2 + 1) * per, vring_[l], per * 4, cudaMemcpyDeviceToHost) != cudaSuccess) { err = "dflash2: debug ring copy"; return false; }
+        if (elem == 2) {
+            for (int kvh = 0; kvh < 2; ++kvh) {
+                void* rng = kvh ? vring_[l] : kring_[l];
+                if (cudaMemcpy(raw.data(), rng, per * 2, cudaMemcpyDeviceToHost) != cudaSuccess) { err = "dflash2: debug ring copy"; return false; }
+                float* d = kv.data() + ((size_t) l * 2 + kvh) * per;
+                for (size_t i = 0; i < per; ++i) d[i] = strata::kernels::f32_from_f16(raw[i]);
+            }
+        } else {
+            if (cudaMemcpy(kv.data() + ((size_t) l * 2) * per, kring_[l], per * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
+                cudaMemcpy(kv.data() + ((size_t) l * 2 + 1) * per, vring_[l], per * 4, cudaMemcpyDeviceToHost) != cudaSuccess) { err = "dflash2: debug ring copy"; return false; }
+        }
     }
     if (cudaMemcpy(tags.data(), tag_, (size_t) kRing * 8, cudaMemcpyDeviceToHost) != cudaSuccess) { err = "dflash2: debug tag copy"; return false; }
     return true;

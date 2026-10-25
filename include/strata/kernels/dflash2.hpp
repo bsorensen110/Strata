@@ -46,6 +46,12 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
                    int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag = nullptr, const int32_t* epoch = nullptr);
 
+/// The same attention with the K/V ring stored in fp16 (kring, vring: uint16_t head-major [8][ring_slots][128], written by df2_kv_ring_f16).
+/// Ring rows load as packed halfs (uint2 register loads) and expand to float in registers, so df2_attention_f16 on an fp16 ring is bitwise
+/// equal to df2_attention on the fp32 ring holding f32_from_f16 of those same rows (dflash2_attn_bench checks it).
+void df2_attention_f16(const float* q, const void* kring, const void* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
+                       int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag = nullptr, const int32_t* epoch = nullptr);
+
 /// The Q8 GEMM the drafter's matrices run on.  A weight matrix is TILED (see the layout note in dflash2.cu; df2_q8_tile makes it from GGUF Q8_0 blocks):
 /// the int8 plane at `w` (n_out * n_in bytes) then the fp16 scale plane.  Activations are planar (df2_quant_rows and the fused quantizers below):
 /// xq is int8 [col][n_in] (8 columns of n_in bytes), xd float [col][n_in / 32].  Up to 3 matrices that share the input run in one launch; y (matrix i)

@@ -121,6 +121,8 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
                                                        const float* __restrict__ kblk, const float* __restrict__ vblk,
                                                        const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
                                                        const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
+    using Traits = RegTraits<RingT>;
+    using Reg = typename Traits::Reg;
     __shared__ __align__(16) float Qs[32 * AS];
     __shared__ __align__(16) float Ks[32 * AS];   // the K tile, then the V tile
     __shared__ __align__(16) float Ps[32 * PS];
@@ -156,24 +158,32 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
     const int qg_pv = tid >> 4, dg_pv = tid & 15;   // PV: queries qg*4 .. +3, dims dg*8 .. +7
     const int k_end = min(k_begin + kDf2Chunk, nkeys);
     // a tile is 32 keys x 128 dims = 1024 float4: eight per thread, loaded into registers ahead of their use
-    auto fetch = [&](int k0, float4 (&reg)[8], const float* ring, const float* blk) {
+    auto fetch = [&](int k0, Reg (&reg)[8], const RingT* ring, const float* blk) {
+        if (k0 + 32 <= nctx) {
 #pragma unroll
-        for (int u = 0; u < 8; ++u) {
-            const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4), k = k0 + t;
-            float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
-            if (k < nctx) v = *reinterpret_cast<const float4*>(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
-            else if (k < nkeys) v = *reinterpret_cast<const float4*>(blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d4 * 4);
-            reg[u] = v;
+            for (int u = 0; u < 8; ++u) {
+                const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4), k = k0 + t;
+                reg[u] = Traits::load_ring(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
+            }
+        } else {
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4), k = k0 + t;
+                Reg v = Traits::zero();
+                if (k < nctx) v = Traits::load_ring(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d4 * 4);
+                else if (k < nkeys) v = Traits::load_blk(blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d4 * 4);
+                reg[u] = v;
+            }
         }
     };
-    auto put = [&](const float4 (&reg)[8]) {
+    auto put = [&](const Reg (&reg)[8]) {
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
-            *reinterpret_cast<float4*>(&Ks[t * AS + d4 * 4]) = reg[u];
+            *reinterpret_cast<float4*>(&Ks[t * AS + d4 * 4]) = Traits::unpack(reg[u]);
         }
     };
-    float4 kreg[8], vreg[8];
+    Reg kreg[8], vreg[8];
     fetch(k_begin, kreg, kring, kblk);
     for (int k0 = k_begin; k0 < k_end; k0 += 32) {
         __syncthreads();   // Ks free (the last tile's V reads done); Qs / m_s written on the first pass
@@ -687,8 +697,9 @@ __global__ void norm_rope_qk_kernel(const float* __restrict__ q, const float* __
 }
 
 // the context update's ring write: K norm + rope of (row, head) and the V copy, both into the head-major ring slot pos % slots
+template <typename RingT>
 __global__ void kv_ring_kernel(const float* __restrict__ kin, const float* __restrict__ vin, const float* __restrict__ gk, const int32_t* __restrict__ pos,
-                               const float* __restrict__ table, float* __restrict__ kring, float* __restrict__ vring, int slots, int heads, float eps,
+                               const float* __restrict__ table, RingT* __restrict__ kring, RingT* __restrict__ vring, int slots, int heads, float eps,
                                int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
     const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
     __shared__ float red[4];
@@ -705,8 +716,8 @@ __global__ void kv_ring_kernel(const float* __restrict__ kin, const float* __res
     const float c = table[(r * 2 + 0) * 64 + i], sn = table[(r * 2 + 1) * 64 + i];
     const int slot = (int) (pos[r] % slots);
     const size_t at = ((size_t) h * slots + slot) * HD + d;
-    kring[at] = d < 64 ? v * c - y[d + 64] * sn : v * c + y[d - 64] * sn;
-    vring[at] = vin[((size_t) r * heads + h) * HD + d];
+    store_ring_elem(kring, at, d < 64 ? v * c - y[d + 64] * sn : v * c + y[d - 64] * sn);
+    store_ring_elem(vring, at, vin[((size_t) r * heads + h) * HD + d]);
     if (tag != nullptr && h == 0 && d == 0) tag[slot] = ((int64_t) *epoch_ptr << 32) | (int64_t) pos[r];
 }
 
@@ -957,8 +968,18 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
                    int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
-    attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+    attn_part_kernel<float><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
     check("attn_part");
+    attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
+    check("attn_merge");
+}
+
+void df2_attention_f16(const float* q, const void* kring, const void* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
+                       int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
+    attn_part_kernel<uint16_t><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, static_cast<const uint16_t*>(kring),
+                                                                                               static_cast<const uint16_t*>(vring),
+                                                                                               kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+    check("attn_part_f16");
     attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
     check("attn_merge");
 }
@@ -978,8 +999,15 @@ void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const flo
 
 void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, float* kring, float* vring, int slots, int rows,
                  int heads, float eps, void* stream, int64_t* tag, const int32_t* epoch) {
-    kv_ring_kernel<<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, kring, vring, slots, heads, eps, tag, epoch);
+    kv_ring_kernel<float><<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin谗, kin, vin, gk, pos, table, kring, vring, slots, heads, eps, tag, epoch);
     check("kv_ring");
+}
+
+void df2_kv_ring_f16(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, void* kring, void* vring, int slots, int rows,
+                     int heads, float eps, void* stream, int64_t* tag, const int32_t* epoch) {
+    kv_ring_kernel<uint16_t><<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, static_cast<uint16_t*>(kring),
+                                                                                  static_cast<uint16_t*>(vring), slots, heads, eps, tag, epoch);
+    check("kv_ring_f16");
 }
 
 void df2_rope_inv(float theta, double* inv, void* stream) {

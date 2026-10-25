@@ -150,6 +150,11 @@ public:
     /// draft() returns token 0 with probability 0 for the rest.  Before prepare() / the first draft(); a later change drops the captured graphs.
     void set_max_drafts(int n);
 
+    /// The drafter's context K/V ring is fp16 (2 bytes per element) by default; off with set_fp16_ring(false) / STRATA_DF2_FP16_RING=0.
+    /// Set before alloc(); the slot drafters refuse a state copy whose ring dtype differs.
+    void set_fp16_ring(bool on) { fp16_ring_ = on; }
+    std::size_t ring_elem_bytes() const { return fp16_ring_ ? 2 : 4; }
+
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
     int n_embd() const { return N_; }
@@ -278,6 +283,7 @@ private:
     int launch_n_ = 0;
     int64_t launch_pos0_ = 0;
     std::chrono::steady_clock::time_point launch_t0_{};
+    bool fp16_ring_ = true;
 };
 
 }  // namespace strata::core
