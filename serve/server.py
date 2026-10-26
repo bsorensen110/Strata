@@ -162,6 +162,47 @@ def listen_problem(host: str, port: int, e: OSError) -> str:
     return f"cannot listen on {host}:{port}: {what} [{code}]. {hint}"
 
 
+# The boot race (measured on the R9700 box, 2026-10-25): a user-scope systemd unit has no
+# network-online.target ordering, so the server started before DHCP handed this PC its configured
+# address.  The preflight listen raised EADDRNOTAVAIL and `ap.error(listen_problem(...))` ended the
+# start: 11 failed starts after one reboot (the unit's Restart=on-failure eventually won, each
+# failure costing a whole start).  An address that is not there YET is worth waiting for; a port
+# that is TAKEN is a real conflict and stays a loud, immediate failure.
+# STRATA_BIND_WAIT_SECONDS / STRATA_BIND_STEP_SECONDS override the window.
+def bind_is_transient(e: OSError) -> bool:
+    """True when a bind failure can disappear by itself: an address this PC has not been given yet
+    (Linux EADDRNOTAVAIL, Windows 10049).  A taken port or a permission refusal is not transient."""
+    import errno
+    return (getattr(e, "winerror", None) or e.errno) in (errno.EADDRNOTAVAIL, 10049)
+
+
+def preflight_bind(host: str, port: int, seconds: float | None = None, step: float | None = None,
+                   factory=None) -> float:
+    """#769 continued: attempt the preflight listen - is this address there, is this port free -
+    and return the seconds it took.  Only a not-yet-existing address is retried; anything else
+    raises at once.  The last OSError is re-raised unchanged, so the caller's `listen_problem`
+    message stays the same text."""
+    env = os.environ.get
+    if seconds is None:
+        seconds = float(env("STRATA_BIND_WAIT_SECONDS") or 60.0)
+    if step is None:
+        step = float(env("STRATA_BIND_STEP_SECONDS") or 2.0)
+    make = factory or (lambda: Server((host, port), BaseHTTPRequestHandler))
+    t0 = time.monotonic()
+    while True:
+        try:
+            httpd = make()
+        except OSError as e:
+            if not bind_is_transient(e) or time.monotonic() - t0 + step > seconds:
+                raise
+            print(f"[strata] {host}:{port} is not bindable yet ({e.strerror or e}): waiting up to "
+                  f"{seconds:.0f} s for the address", flush=True)
+            time.sleep(step)
+            continue
+        httpd.server_close()
+        return round(time.monotonic() - t0, 1)
+
+
 def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
     """#874: where one request's combined image-embeddings file goes.  Every request with images rewrites it (it is
     deleted after the request), which on a disk is steady heavy writing: on Linux it goes to /dev/shm when that has
@@ -8828,7 +8869,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         return 2
     # A key is recommended on a network, never required (owner decision 2026-10-20): the banner below warns once.
     try:                                                # before the minutes of loading: is the port free?
-        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
+        waited = preflight_bind(a.host, a.port)
+        if waited >= 2.0:
+            print(f"[strata] {a.host}:{a.port} became bindable after {waited:.0f} s", flush=True)
     except OSError as e:
         ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):
