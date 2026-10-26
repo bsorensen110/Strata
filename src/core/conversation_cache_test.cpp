@@ -529,7 +529,9 @@ int main() {
             return std::pair<int64_t, int64_t>(a_found, b_found);
         };
         const auto baseline = replay(false, false);
-        check(baseline.first == 14 && baseline.second == 0, "baseline: A returns to its prompt-read state, B to nothing (as measured)");
+        check(baseline.first == 14 && baseline.second == 0,
+              ("baseline: A returns to its prompt-read state (14) and B to nothing, measured "
+               + std::to_string(baseline.first) + " and " + std::to_string(baseline.second)).c_str());
         const auto parks_only = replay(true, false);
         check(parks_only.first == 17 && parks_only.second == 0, "slot parks alone: A whole, B's copy evicted by a stale initial image");
         const auto both = replay(true, true);
