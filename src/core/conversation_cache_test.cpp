@@ -528,12 +528,15 @@ int main() {
             const int64_t b_found = restore(cache, B, 21);
             return std::pair<int64_t, int64_t>(a_found, b_found);
         };
+        // This replay predates the branch's newer drop_superseded policy. That policy replaces stale short copies,
+        // so B's current 15-token image now survives even when slot parking/checkpoint carry are disabled.
         const auto baseline = replay(false, false);
-        check(baseline.first == 14 && baseline.second == 0,
-              ("baseline: A returns to its prompt-read state (14) and B to nothing, measured "
+        check(baseline.first == 14 && baseline.second == 15,
+              ("baseline with superseded-copy pruning: A=14 and B=15, measured "
                + std::to_string(baseline.first) + " and " + std::to_string(baseline.second)).c_str());
         const auto parks_only = replay(true, false);
-        check(parks_only.first == 17 && parks_only.second == 0, "slot parks alone: A whole, B's copy evicted by a stale initial image");
+        check(parks_only.first == 17 && parks_only.second == 17,
+              "slot parks alone: both conversations retain their current full copies");
         const auto both = replay(true, true);
         check(both.first == 17 && both.second == 17, "slot parks + checkpoints back: both return whole");
     }
