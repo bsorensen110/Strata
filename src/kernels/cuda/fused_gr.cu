@@ -2068,7 +2068,7 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q8_q32_kernel(GrMulti m, co
             for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
 #pragma unroll
             for (int o = 16; o > 0; o >>= 1) qsum += __shfl_xor_sync(0xffffffffu, qsum, o);
-            const float d = q8_1_finite(amax / 127.0f);
+            const float d = q8_1_finite(q81_div(amax, 127.0f));
             const int8_t q = q8_1_quant(xi, d, amax);
             GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + d0 / 32;
             y->qs[lane] = q;
