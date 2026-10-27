@@ -173,6 +173,12 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
                               const std::atomic<int>* ready, const PadMap* pad, uint64_t dst_bias);
+/// The padded-layout read with no `dst_bias` (the 0.2.7 call shape; the arena's own blocks pass one).
+inline LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
+                                     const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
+                                     const std::atomic<int>* ready, const PadMap* pad) {
+    return load_experts_ranges(path, dst, layer_off, layer_bytes, threads, chunk, ready, pad, 0);
+}
 
 /// The same ranges read UNBUFFERED straight into `dst` (Windows): no staging buffer and no file-cache copy - the
 /// drive's DMA lands where the experts live. Every range, `dst` and `chunk` must be 4 KiB aligned; returns ok =
