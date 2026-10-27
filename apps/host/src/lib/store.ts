@@ -5,6 +5,7 @@ import { updateAgent } from './agents';
 import { LOOP_USAGE, parseLoop, type LoopCommand } from './loop';
 import { LoopScheduler } from './loop-runner';
 import { applyStatusFrame, clearStatus } from './live-status';
+import { approvalNeeded, workFinished } from './attention';
 import { applyGoalFrame } from './goal';
 import { tidyAnswer } from './answer-text';
 import { appendText, mergeDeliverable, readDeliverable, readGroup, readSkills, upsertGroup } from './deliverables';
@@ -82,12 +83,19 @@ export interface AppState {
   transparency: 'translucent' | 'opaque';
   /** Chrome scale, independent of the conversation's reading size. */
   uiScale: number;
+  /** Price of one kWh for the Monitor's cost line (0 = not set) and the currency the person picked instead of the detected one ('' = automatic) (#3628). */
+  electricityPrice: number;
+  electricityCurrency: string;
+  /** Opt-in: a short sound when a task finishes (#3586). */
+  doneSound: boolean;
+  /** Opt-in: a desktop notification when Manual mode waits for an approval (#3477). */
+  approvalNotify: boolean;
   /** Governs anonymous usage reporting. Nothing is sent in this build; the
    *  choice is recorded so a version that does offer it starts from it. */
   shareTelemetry: boolean;
   paletteOpen: boolean;
   shortcutsOpen: boolean;
-  settingsSection: 'Appearance' | 'Models' | 'Tools' | 'iPhone' | 'Storage' | 'Engine' | 'About';
+  settingsSection: 'Appearance' | 'Models' | 'Tools' | 'Storage' | 'Engine' | 'About';
   hardware: Hardware | null;
   library: ModelLibrary | null;
   imageModels: ImageModelLibrary | null;
@@ -143,6 +151,10 @@ export interface Prefs {
   motion: 'system' | 'full' | 'reduced';
   transparency: 'translucent' | 'opaque';
   uiScale: number;
+  electricityPrice: number;
+  electricityCurrency: string;
+  doneSound: boolean;
+  approvalNotify: boolean;
   /** Governs anonymous usage reporting. Nothing is sent in this build; the
    *  choice is recorded so a version that does offer it starts from it. */
   shareTelemetry: boolean;
@@ -160,6 +172,10 @@ const PREFS_DEFAULTS: Prefs = {
   motion: 'system',
   transparency: 'translucent',
   uiScale: 1,
+  electricityPrice: 0,
+  electricityCurrency: '',
+  doneSound: false,
+  approvalNotify: false,
   shareTelemetry: false,
 };
 
@@ -203,6 +219,11 @@ function loadPrefs(): Prefs {
         language: validLanguage(parsed.language) ? parsed.language : 'en',
         fontFamily: typeof parsed.fontFamily === 'string' ? parsed.fontFamily.slice(0,128).replace(/[\x00-\x1f]/g,'') : '',
         contentFontSize: Math.min(CONTENT_FS_MAX, Math.max(CONTENT_FS_MIN, Number(parsed.contentFontSize) || 14)),
+        uiScale: [0.9, 1, 1.1, 1.25, 1.5, 1.75, 2].includes(Number(parsed.uiScale)) ? Number(parsed.uiScale) : 1,
+        electricityPrice: Number.isFinite(Number(parsed.electricityPrice)) && Number(parsed.electricityPrice) > 0 && Number(parsed.electricityPrice) < 1000 ? Number(parsed.electricityPrice) : 0,
+        electricityCurrency: typeof parsed.electricityCurrency === 'string' && /^[A-Za-z]{3}$/.test(parsed.electricityCurrency) ? parsed.electricityCurrency.toUpperCase() : '',
+        doneSound: parsed.doneSound === true,
+        approvalNotify: parsed.approvalNotify === true,
       };
     } catch {
       /* fall through to the next key */
@@ -214,6 +235,9 @@ function loadPrefs(): Prefs {
 const prefs = loadPrefs();
 // Use the saved language for the very first render, before host bootstrap.
 setTranslationLanguage(prefs.language);
+
+/** The last approval question a notification was shown for, so one question is announced once. */
+let lastApprovalNotice = '';
 
 let state: AppState = {
   language: prefs.language,
@@ -232,6 +256,10 @@ let state: AppState = {
   motion: prefs.motion,
   transparency: prefs.transparency,
   uiScale: prefs.uiScale,
+  electricityPrice: prefs.electricityPrice,
+  electricityCurrency: prefs.electricityCurrency,
+  doneSound: prefs.doneSound,
+  approvalNotify: prefs.approvalNotify,
   paletteOpen: false,
   shortcutsOpen: false,
   settingsSection: 'Appearance',
@@ -280,7 +308,7 @@ function set(patch: Partial<AppState> | ((s: AppState) => Partial<AppState>)) {
   // Opening another chat shows that chat's model choice and whether that chat is mid-turn.
   if (state.activeSession !== before) {
     const chosen = state.sessions.find(s => s.id === state.activeSession)?.preferences?.remoteModel ?? null;
-    state = { ...state, remoteModel: 'remoteModel' in next ? state.remoteModel : chosen, streaming: !!state.activeSession && (liveTurns.has(state.activeSession) || sharedActive.has(state.activeSession)) };
+    state = { ...state, remoteModel: 'remoteModel' in next ? state.remoteModel : chosen, streaming: !!state.activeSession && liveTurns.has(state.activeSession) };
   }
   for (const l of listeners) l();
 }
@@ -422,9 +450,11 @@ function applyPrefs() {
   root.dataset.contrast = state.contrast;
   root.dataset.density = state.density;
   root.style.setProperty('--st-content-fs', `${state.contentFontSize}px`);
-  // The chrome scale. The reading size is deliberately separate: someone who
-  // needs larger prose does not necessarily want larger buttons.
-  root.style.setProperty('--st-ui-scale', String(state.uiScale));
+  // The interface size (#3970): the whole page is scaled, so every text, button, menu and dialog follows, not only the parts that were
+  // written with the scale token. The token stays at 1 so nothing is scaled twice. The reading size stays separate: someone who needs
+  // larger prose does not necessarily want larger buttons.
+  root.style.setProperty('--st-ui-scale', '1');
+  root.style.setProperty('zoom', state.uiScale === 1 ? '' : String(state.uiScale));
 
   // "system" means the OS decides, so the attribute is absent rather than set
   // to a third value the stylesheet would have to special-case.
@@ -452,6 +482,10 @@ function savePrefs() {
     motion: state.motion,
     transparency: state.transparency,
     uiScale: state.uiScale,
+    electricityPrice: state.electricityPrice,
+    electricityCurrency: state.electricityCurrency,
+    doneSound: state.doneSound,
+    approvalNotify: state.approvalNotify,
     shareTelemetry: state.shareTelemetry,
   };
   try {
@@ -471,7 +505,17 @@ export function toggleRail() {
   set({ rail: !state.rail });
   savePrefs();
 }
-export function setLanguage(language:Language){if(!validLanguage(language))return;setTranslationLanguage(language);set({language});savePrefs();}
+export function setLanguage(language:Language){if(!validLanguage(language))return;setTranslationLanguage(language);set({language});savePrefs();rememberShellLanguage(language);}
+let shellAnnounced = false;
+/** The desktop shell's tray menu follows the app's language; it reads it from a small file the host keeps (no effect in a browser). */
+function rememberShellLanguage(language:Language){api.post('/api/shell/prefs',{language}).catch(()=>undefined);}
+/** The shell started on another port than it wanted: the chats and settings saved on that port are not here, so say so once (#3402). */
+async function announcePortNotice(){
+  try{
+    const shell=await api.get<{portNotice:{wanted:number;used:number}|null}>('/api/shell');
+    if(shell.portNotice)pushToast('warn',tr('Strata could not use its port'),tr('Port {0} is used by another program, so Strata started on port {1}. Chats and settings saved on port {0} are not shown until Strata can use it again. Close the other program and restart Strata.',[shell.portNotice.wanted,shell.portNotice.used]));
+  }catch{/* a browser or an older host has no shell */}
+}
 export function setFontFamily(fontFamily:string){set({fontFamily:fontFamily.trim().slice(0,128).replace(/[\x00-\x1f]/g,'')});savePrefs();}
 
 export function setFocus(focus: boolean) {
@@ -544,7 +588,24 @@ export function setTransparency(transparency: 'translucent' | 'opaque') {
   savePrefs();
 }
 
-export const UI_SCALES = [0.9, 1, 1.1, 1.25] as const;
+/** The electricity price for the Monitor's cost line: a positive price per kWh; 0 turns the line off. The currency is the detected one unless a three-letter code is given (#3628). */
+export function setElectricity(price: number, currency: string) {
+  const ok = Number.isFinite(price) && price > 0 && price < 1000;
+  set({ electricityPrice: ok ? Math.round(price * 10000) / 10000 : 0, electricityCurrency: /^[A-Za-z]{3}$/.test(currency) ? currency.toUpperCase() : '' });
+  savePrefs();
+}
+
+export function setDoneSound(doneSound: boolean) {
+  set({ doneSound });
+  savePrefs();
+}
+
+export function setApprovalNotify(approvalNotify: boolean) {
+  set({ approvalNotify });
+  savePrefs();
+}
+
+export const UI_SCALES = [0.9, 1, 1.1, 1.25, 1.5, 1.75, 2] as const;
 
 export function setUiScale(uiScale: number) {
   set({ uiScale });
@@ -680,16 +741,10 @@ function applyEvent(e: StreamEvent) {
       // A task finished on its own (the host ran it on schedule): say so, and say when it needs a person's yes or failed.
       const t = data as unknown as { title?: string; status?: string; attention?: string | null; error?: string | null };
       if (t.status === 'error') pushToast('error', 'Task failed', String(t.title ?? ''));
-      else if (t.attention) pushToast('warn', 'Task needs your yes', String(t.title ?? ''));
-      else if (t.status === 'done') pushToast('success', 'Task finished', String(t.title ?? ''));
+      else if (t.attention) { pushToast('warn', 'Task needs your yes', String(t.title ?? '')); void approvalNeeded(state.approvalNotify, String(t.title ?? '')); }
+      else if (t.status === 'done') { pushToast('success', 'Task finished', String(t.title ?? '')); workFinished(state.doneSound, Infinity); }
       break;
     }
-    case 'companion':
-      if (data.available === true && !sharedReady) void initializeSharedConversations().catch(() => undefined);
-      break;
-    case 'conversation':
-      applySharedConversation(data as { conversation?: Session; deleted?: string });
-      break;
     case 'agent':
       if (typeof data.sessionId === 'string') patchSession(data.sessionId, s => ({ ...s, agents: updateAgent(s.agents ?? [], data.agent) }));
       break;
@@ -732,8 +787,7 @@ export async function bootstrap() {
       connection: 'live',
     });
     applyProviders(providers);
-    // A source UI proxy or older host can keep using its local cache until shared routes are available.
-    await initializeSharedConversations().catch(() => { sharedReady = false; });
+    if (!shellAnnounced) { shellAnnounced = true; void announcePortNotice(); rememberShellLanguage(state.language); }
     closeEvents?.();
     let reconnect = false;
     closeEvents = onEvent(applyEvent, (status) => {
@@ -953,7 +1007,7 @@ export async function setLocalSharing(enabled: boolean) {
   set({ serving: newestServingState(state.serving, result) });
 }
 
-export async function setServingAccess(patch: { otherDevices?: boolean; apiKey?: string | null; remoteModelManagement?: boolean }) {
+export async function setServingAccess(patch: { otherDevices?: boolean; apiKey?: string | null }) {
   const result = await api.patch<ServingState>('/api/serving', patch);
   set({ serving: newestServingState(state.serving, result) });
 }
@@ -1045,72 +1099,6 @@ export function flushSessions() {
 if (typeof window !== 'undefined' && typeof document !== 'undefined' && window.addEventListener) {
   window.addEventListener('pagehide', flushSessions);
   document.addEventListener?.('visibilitychange', () => { if (document.visibilityState === 'hidden') flushSessions(); });
-const sharedRevisions = new Map<string, number>();
-const sharedSnapshots = new Map<string, string>();
-const sharedActive = new Set<string>();
-let sharedReady = false;
-let sharedSyncTimer: ReturnType<typeof setTimeout> | null = null;
-let sharedSyncPending = Promise.resolve();
-const sessionSnapshot = (session: Session) => { const { revision, active, status, ...snapshot } = session; return snapshot; };
-function cacheSessions(sessions: Session[]) {
-  try { localStorage.setItem(SESSION_KEY, JSON.stringify(sessions)); } catch { /* Offline cache may be full; the host retains history. */ }
-}
-function applySharedConversation(data: { conversation?: Session; deleted?: string }) {
-  if (data.deleted) {
-    sharedActive.delete(data.deleted); sharedRevisions.delete(data.deleted); sharedSnapshots.delete(data.deleted);
-    const sessions = state.sessions.filter(s => s.id !== data.deleted);
-    cacheSessions(sessions); set({ sessions, activeSession: state.activeSession === data.deleted ? null : state.activeSession }); return;
-  }
-  const session = data.conversation;
-  if (!session || !Array.isArray(session.messages) || !session.id) return;
-  if (typeof session.revision === 'number' && session.revision < (sharedRevisions.get(session.id) ?? 0)) return;
-  sharedRevisions.set(session.id, session.revision ?? 0);
-  if (session.active) sharedActive.add(session.id); else sharedActive.delete(session.id);
-  // This renderer already projects its own stream; applying the same deltas twice would duplicate text.
-  if (liveTurns.has(session.id)) return;
-  sharedSnapshots.set(session.id, JSON.stringify(sessionSnapshot(session)));
-  const sessions = state.sessions.some(s => s.id === session.id) ? state.sessions.map(s => s.id === session.id ? session : s) : [session, ...state.sessions];
-  cacheSessions(sessions);
-  set({ sessions, streaming: !!state.activeSession && (liveTurns.has(state.activeSession) || sharedActive.has(state.activeSession)), liveChats: new Set([...liveTurns.keys(), ...sharedActive]).size });
-  document.documentElement.dataset.streaming = state.liveChats ? 'true' : 'false';
-}
-async function initializeSharedConversations() {
-  const availability = await api.get<{ available?: boolean }>('/api/companion/conversations');
-  if (availability.available === false) { sharedReady = false; return; }
-  // First import is insert-only; reconnecting with an old browser cache never replaces newer phone work.
-  const result = await api.post<{ results: { conversation?: Session; deleted?: string; id?: string }[] }>('/api/companion/conversations/sync', { sessions: state.sessions.filter(session => !liveTurns.has(session.id)).map(session => ({ session: sessionSnapshot(session) })) });
-  for (const item of result.results) applySharedConversation(item.deleted ? { deleted: item.id } : item);
-  const remote = await api.get<{ conversations: Session[] }>('/api/companion/conversations');
-  for (const conversation of remote.conversations) applySharedConversation({ conversation });
-  sharedReady = true;
-  scheduleSharedSync();
-}
-async function syncSharedSession(session: Session) {
-  const snapshot = sessionSnapshot(session);
-  const result = await api.post<{ results: { conversation?: Session; deleted?: boolean; id?: string }[] }>('/api/companion/conversations/sync', { sessions: [{ session: snapshot, baseRevision: session.revision }] });
-  for (const item of result.results) applySharedConversation(item.deleted ? { deleted: item.id } : { conversation: item.conversation });
-}
-function scheduleSharedSync() {
-  if (!sharedReady || sharedSyncTimer) return;
-  sharedSyncTimer = setTimeout(() => {
-    sharedSyncTimer = null;
-    sharedSyncPending = sharedSyncPending.then(async () => {
-      for (const session of state.sessions) {
-        if (liveTurns.has(session.id) || sharedActive.has(session.id)) continue;
-        if (sharedSnapshots.get(session.id) === JSON.stringify(sessionSnapshot(session))) continue;
-        await syncSharedSession(session);
-      }
-    }).catch(() => { /* Preserve local edits while offline; bootstrap retries after reconnect. */ });
-  }, 300);
-}
-
-function persistSessions(sessions: Session[]) {
-  try {
-    localStorage.setItem(SESSION_KEY, JSON.stringify(sessions));
-  } catch {
-    /* quota — sessions are a cache, not the source of truth */
-  }
-  scheduleSharedSync();
 }
 
 export function newSession(): Session {
@@ -1136,8 +1124,7 @@ export function setChatPreferences(id: string | undefined, preferences: NonNulla
   const sessionId = id ?? newSession().id;
   patchSession(sessionId, s => ({ ...s, preferences: { ...s.preferences, ...preferences } }));
   // A mode change applies to the very next tool call of a turn that is already running (a goal and its helpers included).
-  if (sharedReady) void api.patch<{ conversation: Session }>(`/api/companion/conversations/${encodeURIComponent(sessionId)}/preferences`, preferences).then(applySharedConversation).catch(() => undefined);
-  if (preferences.mode && (liveTurns.get(sessionId)?.agent || sharedActive.has(sessionId))) void api.post('/api/chat/mode', { sessionId, mode: preferences.mode }).catch(() => undefined);
+  if (preferences.mode && liveTurns.get(sessionId)?.agent) void api.post('/api/chat/mode', { sessionId, mode: preferences.mode }).catch(() => undefined);
 }
 export function setPreviewTabClosed(sessionId:string|undefined, artifactId:string, closed:boolean, selected:string|null) {
   if(!sessionId)return;
@@ -1209,8 +1196,6 @@ export function isUnread(s: Session, activeSession: string | null): boolean {
 }
 
 export function deleteSession(id: string) {
-  if (sharedActive.has(id) || liveTurns.has(id)) { pushToast('info', 'Stop this conversation first', 'Its work is still running on the Mac.'); return; }
-  if (sharedReady) void api.del(`/api/companion/conversations/${encodeURIComponent(id)}`).catch(() => void initializeSharedConversations());
   const sessions = state.sessions.filter((s) => s.id !== id);
   persistSessions(sessions);
   set({ sessions, activeSession: state.activeSession === id ? (sessions[0]?.id ?? null) : state.activeSession });
@@ -1425,8 +1410,8 @@ function startTimeSkipDemo(prompt: string) {
 
 function markTurn(sessionId: string, turn: { abort: AbortController; agent: boolean } | null) {
   if (turn) liveTurns.set(sessionId, turn); else liveTurns.delete(sessionId);
-  set({ streaming: !!state.activeSession && (liveTurns.has(state.activeSession) || sharedActive.has(state.activeSession)), liveChats: new Set([...liveTurns.keys(), ...sharedActive]).size });
-  document.documentElement.dataset.streaming = state.liveChats ? 'true' : 'false';
+  set({ streaming: !!state.activeSession && liveTurns.has(state.activeSession), liveChats: liveTurns.size });
+  document.documentElement.dataset.streaming = liveTurns.size ? 'true' : 'false';
 }
 
 /**
@@ -1437,7 +1422,6 @@ function markTurn(sessionId: string, turn: { abort: AbortController; agent: bool
 export function stopStreaming() {
   const id = state.activeSession;
   const turn = id ? liveTurns.get(id) : undefined;
-  if (id && !turn && sharedActive.has(id)) { void api.post(`/api/companion/conversations/${encodeURIComponent(id)}/stop`).then(result => applySharedConversation(result as { conversation?: Session })).catch(e => pushToast('error', 'Could not stop the conversation', e.message)); return; }
   if (!id || !turn) return;
   const abort = () => { turn.abort.abort(); };
   void api.post<{ stopped: boolean }>('/api/chat/stop', { sessionId: id }).then(
@@ -1637,13 +1621,12 @@ export function loopIsRunning(sessionId: string | null): boolean { return loopSc
 /* ------------------------------------------------------------- task board */
 
 /** The chats with a turn going, and the chats with a loop going: what the board needs besides the sessions themselves. */
-export function liveChatIds(): string[] { return [...new Set([...liveTurns.keys(), ...sharedActive])]; }
+export function liveChatIds(): string[] { return [...liveTurns.keys()]; }
 export function loopChatIds(): string[] { return loopScheduler.ids(); }
 
 /** Stop any chat's turn, not only the open one (the board's Stop). Same two-step as stopStreaming. */
 export function stopChat(id: string) {
   const turn = liveTurns.get(id);
-  if (!turn && sharedActive.has(id)) { void api.post(`/api/companion/conversations/${encodeURIComponent(id)}/stop`).then(result => applySharedConversation(result as { conversation?: Session })).catch(e => pushToast('error', 'Could not stop the conversation', e.message)); return; }
   if (!turn) return;
   const abort = () => { turn.abort.abort(); };
   void api.post<{ stopped: boolean }>('/api/chat/stop', { sessionId: id }).then(
@@ -1790,17 +1773,13 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
     }));
 
   const started = performance.now();
-  const sharedAtStart = sharedReady;
 
   const imageSlots=photoHistorySlots(prior,pictures.length);
   try {
-    // Persist the complete transcript before the host begins capturing this exact turn.
-    if (sharedReady) { const snapshot = state.sessions.find(s => s.id === sessionId); if (snapshot) await syncSharedSession(snapshot); }
     await streamPost(
       planStart ? '/api/plan/start-goal' : '/api/chat/stream',
       {
         sessionId,
-        userMessageId: userMsg.id, assistantMessageId: assistantId,
         ...(planStart ? { planId: planStart } : {}),
         ...(resume ? { goalAction: 'resume' } : planStart ? {} : { message: options.shown ? body : body }),
         history:await Promise.all(prior.map(async(m,index)=>{const included=pictureCheck.ok?(m.photos??[]).filter((_,p)=>imageSlots.has(`${index}:${p}`)):[];const omitted=(m.photos??[]).filter(p=>!included.includes(p));const text=m.content+(omitted.length?`\n[Earlier pictures: ${omitted.map(p=>p.name).join(', ')}. Their pixels are outside this model's image context; ask to reattach them if needed.]`:'');return {role:m.role,content:included.length?[{type:'text',text},...await Promise.all(included.map(async photo=>({type:'image_url',image_url:{url:(await photoData(photo)).url}})))]:text};})),
@@ -1829,6 +1808,12 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
           patchAssistant((m) => ({ ...m, demo: frame.demo === true, remoteModel: frame.remoteModel === true, requestId: typeof frame.requestId === 'string' ? frame.requestId : m.requestId, model: String(frame.model), contextMax: Number(frame.contextMax), skillsUsed: Array.isArray(frame.skills) ? frame.skills.map(String) : [] }));
         } else if (type === 'status') {
           applyStatusFrame(sessionId, frame as Record<string, unknown>);
+          // Manual mode waits for the person: a notification when they have opted in and Strata is in the background (#3477), once per question.
+          if (frame.code === 'waiting-approval' && lastApprovalNotice !== `${sessionId}:${String(frame.seq)}`) {
+            lastApprovalNotice = `${sessionId}:${String(frame.seq)}`;
+            const tool = (frame.args as { tool?: unknown } | undefined)?.tool;
+            void approvalNeeded(state.approvalNotify, typeof tool === 'string' ? tool : '');
+          }
         } else if (type === 'goal') {
           applyGoalFrame(sessionId, frame.goal);
         } else if (type === 'plan') {
@@ -1903,6 +1888,7 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
           patchAssistant((m) => ({ ...m, error: said, streaming: false, ...(typeof frame.code === 'string' ? { errorCode: frame.code } : {}), ...(typeof frame.details === 'string' && frame.details ? { errorDetail: frame.details } : {}) }));
         } else if (type === 'done') {
           clearStatus(sessionId);
+          workFinished(state.doneSound, Number(frame.durationMs ?? performance.now() - started));
           patchSession(sessionId, (sess) => ({
             ...sess,
             tokensIn: sess.tokensIn + Number(frame.tokensIn ?? 0),
@@ -1943,14 +1929,6 @@ export async function sendMessage(text: string, options: { fromLoop?: boolean; g
     flushSessions();
     clearStatus(sessionId);
     markTurn(sessionId, null);
-    if (sharedReady) {
-      try {
-        // First enable may happen during this previously unshared stream. Import only its complete result.
-        if (!sharedAtStart) { const complete = state.sessions.find(s => s.id === sessionId); if (complete) await syncSharedSession(complete); }
-        applySharedConversation(await api.get<{ conversation: Session }>(`/api/companion/conversations/${encodeURIComponent(sessionId)}`));
-      } catch {}
-    }
-    scheduleSharedSync();
     const next = releasedMessages.get(sessionId)?.shift();
     if (next !== undefined) { if (!releasedMessages.get(sessionId)?.length) releasedMessages.delete(sessionId); setTimeout(() => void sendMessage(next), 0); }
   }

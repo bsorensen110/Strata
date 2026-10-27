@@ -3,7 +3,6 @@
 #include "strata/kernels/kv_q4.hpp"
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
@@ -13,11 +12,26 @@
 #include <string>
 #include <cstdlib>
 #include <limits>
-#include <memory>
+#include <utility>
 #include <vector>
 
 using namespace strata::core;
 using namespace strata::kernels;
+
+namespace {
+// STRATA_CKPT_ASYNC=1 (the ctest entries conversation_snapshot_test_ckpt_async / _vram_slots): the checkpoint's GDN bytes land in
+// the background; the test reads them at once, so it joins after each save (the engine's readers join before they read)
+template <class... A> bool ckpt_save(A&&... a) {
+    const bool ok = conversation_checkpoint_save(std::forward<A>(a)...);
+    conversation_checkpoint_join(nullptr);
+    return ok;
+}
+template <class... A> bool snap_save(A&&... a) {
+    const bool ok = conversation_snapshot_save(std::forward<A>(a)...);
+    conversation_checkpoint_join(nullptr);
+    return ok;
+}
+}  // namespace
 
 namespace {
 int checks = 0;
@@ -91,48 +105,11 @@ struct Fixture {
             kv_ring_table(st.page_table,st.n_pages,st.n_slots,nullptr);
         }
     }
-    // --kv-pool-tokens: the host copy of a streamed state lives in chunks of a pool shared with other states: block b of
-    // this state is block (table[b >> 2] << 2 | b & 3) of the arrays (KvHostPools::chunk_host)
-    static constexpr int kLanes = 3, kShift = 2;
-    std::vector<int32_t> table;
-    void make_pooled(Fixture* owner, int lane) {
-        auto& h = state.host;
-        if (owner == nullptr) {   // the pool: kLanes states' worth of blocks, in every host array
-            const size_t n = size_t(kLanes);
-            if (h.k_pool) { alloc(h.k_pool, sizes[0]*n, true); alloc(h.v_pool, sizes[1]*n, true); }
-            if (h.k_q4) { alloc(h.k_q4, sizes[0]*n, true); alloc(h.v_q4, sizes[1]*n, true); }
-            if (h.k_q) {
-                alloc(h.k_q, sizes[0]*n, true); alloc(h.v_q, sizes[1]*n, true);
-                alloc(h.k_scale, sizes[2]*n, true); alloc(h.v_scale, sizes[3]*n, true);
-            }
-        } else {
-            h = owner->state.host;
-        }
-        if (h.k_pool) { sources[0] = h.k_pool; sources[1] = h.v_pool; }
-        if (h.k_q4) { sources[0] = h.k_q4; sources[1] = h.v_q4; }
-        if (h.k_q) { sources[0] = h.k_q; sources[1] = h.v_q; sources[2] = h.k_scale; sources[3] = h.v_scale; }
-        table.resize(size_t(state.n_pages) >> kShift);
-        for (size_t c = 0; c < table.size(); ++c) table[c] = int32_t(c * kLanes + size_t(lane));   // interleaved: no two chunks adjacent
-        h.chunk_host = table.data();
-        h.chunk_shift = kShift;
-    }
-    // bytes [off, off + n) of array i of THIS state, written where its chunk table puts them
-    void put(size_t i, size_t off, const uint8_t* p, size_t n) {
-        if (table.empty() || i >= 4) { cuda_check(cudaMemcpy(static_cast<uint8_t*>(sources[i])+off,p,n,cudaMemcpyDefault)); return; }
-        const size_t block = sizes[i] / size_t(state.n_pages);
-        for (size_t done = 0; done < n;) {
-            const size_t pos = off + done, b = pos / block, in = pos % block;
-            const size_t len = std::min(block - in, n - done);
-            const size_t phys = (size_t(table[b >> kShift]) << kShift | (b & ((1u << kShift) - 1))) * block + in;
-            cuda_check(cudaMemcpy(static_cast<uint8_t*>(sources[i])+phys,p+done,len,cudaMemcpyDefault));
-            done += len;
-        }
-    }
     void fill(uint8_t salt) {
         for (size_t i=0;i<sources.size();++i) {
             std::vector<uint8_t> data(sizes[i]);
             for (size_t j=0;j<data.size();++j) data[j]=(uint8_t)(salt+i*31+j*7+j/257);
-            if (!data.empty()) put(i,0,data.data(),data.size());
+            if (!data.empty()) cuda_check(cudaMemcpy(sources[i],data.data(),data.size(),cudaMemcpyDefault));
         }
     }
     void fill_after(uint8_t salt, int64_t first_dirty) {
@@ -154,6 +131,7 @@ void full_session(int fmt, int mode, int experts) {
     auto& g=main.g;
     g.n_layers=4; g.n_expert=experts;
     g.ssm_state_size=2; g.ssm_v_heads=2; g.ssm_conv_channels=8;
+    if (std::getenv("STRATA_TEST_BIG_GDN")) { g.ssm_state_size=64; g.ssm_v_heads=64; }   // a GDN state over 1 MiB: the async checkpoint path
     SessionState ss;
     ss.max_cells=96; ss.qsa_states=&main.state;
     ss.layer_hi=g.n_layers; ss.gdn_alloc=g.n_gdn_layers(); ss.qsa_alloc=g.n_qsa_layers();   // the whole-model carve
@@ -181,15 +159,15 @@ void full_session(int fmt, int mode, int experts) {
     fill(13);
     ConversationCheckpoint checkpoint;
     checkpoint.ids.assign(ids.begin(),ids.begin()+3);
-    check(conversation_checkpoint_save(checkpoint,ss,g,err),"save complete running checkpoint");
+    check(ckpt_save(checkpoint,ss,g,err),"save complete running checkpoint");
     checkpoint.used = 17;
     checkpoints.push_back(std::move(checkpoint));
     const ConversationView view{ids,images,checkpoints,true};
     SavedConversation a,b,restored;
-    check(conversation_snapshot_save(a,view,ss,g,draft.state,err),"capture complete A");
+    check(snap_save(a,view,ss,g,draft.state,err),"capture complete A");
     check(a.checkpoints[0].used == 17,"upstream checkpoint LRU stamp survives capture");
     fill(177);
-    check(conversation_snapshot_save(b,view,ss,g,draft.state,err),"capture complete B");
+    check(snap_save(b,view,ss,g,draft.state,err),"capture complete B");
     {
         // disk save path: metadata + streamed K/V give the same file as the captured image
         SavedConversation meta;
@@ -213,23 +191,6 @@ void full_session(int fmt, int mode, int experts) {
               x.checkpoints.size()==y.checkpoints.size() && equal(x.kv[0],y.kv[0]) && equal(x.kv.back(),y.kv.back()),
               "streamed file equals captured file");
         check(slurp(p1)==slurp(p2),"streamed file is byte-identical to the captured file");
-        SavedConversation no_draft, meta_no_draft, loaded;
-        std::vector<SessionKvSource> no_draft_sources;
-        check(conversation_snapshot_save(no_draft,view,ss,g,nullptr,err),"capture without MTP");
-        check(conversation_snapshot_sources(meta_no_draft,no_draft_sources,view,ss,g,nullptr,err),"disk sources without MTP");
-        check(no_draft_sources.size()==no_draft.kv.size() && no_draft_sources.size()+1==b.kv.size(),"no phantom draft source");
-        check(session_file_write(p1,meta_no_draft,no_draft_sources,id,n1,err) && session_file_write(p2,no_draft,id,n2,err),"write no-MTP sessions");
-        check(slurp(p1)==slurp(p2),"streamed no-MTP file equals captured file");
-        SessionReadLimits limits;
-        check(conversation_session_read_limits(limits,ss,g,nullptr,96,1,err),"no-MTP runtime read bounds");
-        check(session_file_read(p1,id,loaded,n1,err,limits),"read no-MTP file under runtime bounds");
-        check(!conversation_snapshot_validate(loaded,ss,g,draft.state,err),"no-MTP file refused by MTP session");
-        fill(91);
-        check(conversation_snapshot_restore(loaded,ss,g,nullptr,err)==ConversationRestore::restored,"restore no-MTP disk file");
-        SavedConversation checked;
-        check(conversation_snapshot_save(checked,view,ss,g,nullptr,err) && checked.live.gdn==no_draft.live.gdn &&
-              checked.live.dead==no_draft.live.dead && equal(checked.kv[0],no_draft.kv[0]),"no-MTP disk round trip exact");
-        check(conversation_snapshot_restore(b,ss,g,draft.state,err)==ConversationRestore::restored,"restore original fixture after no-MTP disk check");
         std::error_code ec;
         fs::remove_all(dir,ec);
         auto empty_ids=std::vector<int32_t>{};
@@ -240,15 +201,30 @@ void full_session(int fmt, int mode, int experts) {
     auto bad=a; bad.kv.back().k.pop_back();
     check(conversation_snapshot_restore(bad,ss,g,draft.state,err)==ConversationRestore::invalid,
           "reject invalid late draft before any main-layer write");
-    check(conversation_snapshot_save(restored,view,ss,g,draft.state,err),"capture B after refused restore");
+    check(snap_save(restored,view,ss,g,draft.state,err),"capture B after refused restore");
     check(restored.live.gdn==b.live.gdn && restored.live.dead==b.live.dead &&
           equal(restored.kv[0],b.kv[0]) && equal(restored.kv[1],b.kv[1]),"refusal preserves all tested state");
     check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore complete A");
-    check(conversation_snapshot_save(restored,view,ss,g,draft.state,err),"capture restored A");
+    check(snap_save(restored,view,ss,g,draft.state,err),"capture restored A");
     check(restored.live.gdn==a.live.gdn && restored.live.ple==a.live.ple && restored.live.tails==a.live.tails &&
           restored.live.dead==a.live.dead && restored.live.block_pos==a.live.block_pos &&
           equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
+    {
+        // #2409: a restore writes into the session's own buffers. After the copy stream exists (the restores above made
+        // it) a restore of either image allocates nothing on the card: free memory does not move (2 MiB allocation
+        // granules; 4 MiB of slack for a desktop card's other programs).
+        check(conversation_copy_stream_ready(0),"this thread has its copy stream after the first restore");
+        cudaDeviceSynchronize();
+        size_t before=0,after=0,total=0;
+        check(cudaMemGetInfo(&before,&total)==cudaSuccess,"free memory before the repeated restores");
+        for(int i=0;i<6;++i)
+            check(conversation_snapshot_restore(i%2?b:a,ss,g,draft.state,err)==ConversationRestore::restored,"repeated restore");
+        cudaDeviceSynchronize();
+        check(cudaMemGetInfo(&after,&total)==cudaSuccess,"free memory after the repeated restores");
+        check((long long)after+(4ll<<20)>=(long long)before,"six more restores allocate nothing on the card");
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"A is back");
+    }
     {
         // a borrowed prefix (ConversationCache::borrows): the K/V of A's first tokens and A's checkpoint there, A
         // untouched - the same bytes as restoring A whole and rewinding to that checkpoint
@@ -260,7 +236,7 @@ void full_session(int fmt, int mode, int experts) {
         want_state.ids=got_state.ids=a.checkpoints[0].ids;
         check(conversation_kv_save(want_main,main.state,g,at,true,err) &&
               conversation_kv_save(want_draft,draft.state,g,at,false,err) &&
-              conversation_checkpoint_save(want_state,ss,g,err),"capture the rewound prefix");
+              ckpt_save(want_state,ss,g,err),"capture the rewound prefix");
         fill(201);   // another conversation in the session
         const SavedConversation untouched=a;
         check(conversation_snapshot_restore_prefix(a,(int64_t)a.live.ids.size()+1,ss,g,draft.state,err)==
@@ -272,7 +248,7 @@ void full_session(int fmt, int mode, int experts) {
         check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"mount the checkpoint over it");
         check(conversation_kv_save(got_main,main.state,g,at,true,err) &&
               conversation_kv_save(got_draft,draft.state,g,at,false,err) &&
-              conversation_checkpoint_save(got_state,ss,g,err),"capture the borrowed prefix");
+              ckpt_save(got_state,ss,g,err),"capture the borrowed prefix");
         check(equal(got_main,want_main) && equal(got_draft,want_draft),
               "borrowed K/V equals the whole restore's prefix");
         check(got_state.gdn==want_state.gdn && got_state.ple==want_state.ple && got_state.tails==want_state.tails &&
@@ -292,10 +268,10 @@ void full_session(int fmt, int mode, int experts) {
         cuda_check(cudaMemcpy(main.state.idx_pooled+(ids.size()/4)*g.idx_key_dim,
                               main.state.idx_dead,sizes.dead,cudaMemcpyDeviceToDevice));
         SavedConversation fresh,incremental;
-        check(conversation_snapshot_save(fresh,view,ss,g,draft.state,err),"full capture reference after growth or rewind");
+        check(snap_save(fresh,view,ss,g,draft.state,err),"full capture reference after growth or rewind");
         size_t peak=0,reused=0;
         check(conversation_snapshot_capture_bytes(reuse,view,ss,g,draft.state,peak,err),"admit incremental capture peak");
-        check(conversation_snapshot_save(incremental,view,ss,g,draft.state,err,std::move(reuse),&reused),"capture with retained pages");
+        check(snap_save(incremental,view,ss,g,draft.state,err,std::move(reuse),&reused),"capture with retained pages");
         check(incremental.bytes() <= peak,"incremental allocation stays within admitted bound");
         check(incremental.live.gdn==fresh.live.gdn && incremental.live.ple==fresh.live.ple &&
               incremental.live.dead==fresh.live.dead && equal(incremental.kv[0],fresh.kv[0]) &&
@@ -317,7 +293,7 @@ void full_session(int fmt, int mode, int experts) {
               conversation_snapshot_bytes(view,ss,g,nullptr,without,err) && without<with_draft,
               "a stage image's estimate leaves the draft out");
         SavedConversation stage,stage_b,stage_back;
-        check(conversation_snapshot_save(stage,view,ss,g,nullptr,err),"capture a stage image");
+        check(snap_save(stage,view,ss,g,nullptr,err),"capture a stage image");
         check(stage.kv.size()==a.kv.size()-1 && equal(stage.kv[0],a.kv[0]) && stage.live.gdn==a.live.gdn,
               "a stage image holds the session's own layers, no draft");
         check(stage.bytes()<a.bytes(),"a stage image is smaller by the draft ring");
@@ -325,21 +301,21 @@ void full_session(int fmt, int mode, int experts) {
         check(!conversation_snapshot_validate(stage,ss,g,draft.state,err),"a stage image is refused where a draft is expected");
         check(!conversation_snapshot_validate(a,ss,g,nullptr,err),"an image with a draft is refused where none is expected");
         fill(201);
-        check(conversation_snapshot_save(stage_b,view,ss,g,nullptr,err),"capture another stage state");
+        check(snap_save(stage_b,view,ss,g,nullptr,err),"capture another stage state");
         check(conversation_snapshot_restore(a,ss,g,nullptr,err)==ConversationRestore::invalid,
               "restoring a draft image as a stage image is refused before any write");
-        check(conversation_snapshot_save(stage_back,view,ss,g,nullptr,err) && stage_back.live.gdn==stage_b.live.gdn &&
+        check(snap_save(stage_back,view,ss,g,nullptr,err) && stage_back.live.gdn==stage_b.live.gdn &&
               equal(stage_back.kv[0],stage_b.kv[0]),"the refusal left the stage untouched");
         check(conversation_snapshot_restore(stage,ss,g,nullptr,err)==ConversationRestore::restored,"restore a stage image");
-        check(conversation_snapshot_save(stage_back,view,ss,g,nullptr,err) && stage_back.live.gdn==stage.live.gdn &&
+        check(snap_save(stage_back,view,ss,g,nullptr,err) && stage_back.live.gdn==stage.live.gdn &&
               stage_back.live.dead==stage.live.dead && equal(stage_back.kv[0],stage.kv[0]),"stage A/B/A exactness");
         // its retained K/V: the next park copies only what changed, and equals a full capture
         ConversationKvReuse reuse{stage.kv,65,65,{}};
         SavedConversation fresh,incremental;
         size_t peak=0,reused=0;
-        check(conversation_snapshot_save(fresh,view,ss,g,nullptr,err),"full stage capture reference");
+        check(snap_save(fresh,view,ss,g,nullptr,err),"full stage capture reference");
         check(conversation_snapshot_capture_bytes(reuse,view,ss,g,nullptr,peak,err),"admit an incremental stage capture");
-        check(conversation_snapshot_save(incremental,view,ss,g,nullptr,err,std::move(reuse),&reused),"incremental stage capture");
+        check(snap_save(incremental,view,ss,g,nullptr,err,std::move(reuse),&reused),"incremental stage capture");
         check(reused>0 && incremental.bytes()<=peak && equal(incremental.kv[0],fresh.kv[0]) &&
               incremental.live.gdn==fresh.live.gdn,"an incremental stage capture reuses pages and equals a full one");
         SavedConversation split_image=stage;
@@ -348,25 +324,6 @@ void full_session(int fmt, int mode, int experts) {
               "a layer split's image is refused by the whole-session form");
         ConversationKvReuse wrong{a.kv,65,65,{}};
         check(!conversation_snapshot_capture_bytes(wrong,view,ss,g,nullptr,peak,err),"a draft image's K/V is not a stage's reuse");
-        // the QsaState* overload of conversation_snapshot_sources: a later stage's sources, no draft ring
-        SavedConversation meta_s; std::vector<SessionKvSource> srcs_stage, srcs_full;
-        check(conversation_snapshot_sources(meta_s, srcs_stage, view, ss, g, nullptr, err),
-              "stage sources captured with a null draft");
-        check(srcs_stage.size() == stage.kv.size(), "a later stage's sources are its own layers only, no draft");
-        check(conversation_snapshot_sources(meta_s, srcs_full, view, ss, g, &draft.state, err),
-              "whole-session sources captured with a draft");
-        check(srcs_full.size() == srcs_stage.size() + 1, "the whole-session form adds the draft source");
-        // the per-stage limits helper reproduces the whole-session limits for stage 0, and drops the draft for a later stage
-        SessionReadLimits whole;
-        check(conversation_session_read_limits(whole, ss, g, draft.state, 100000, 8, err), "whole-session read limits");
-        SessionReadLimits::SessionStageLimits sl_full, sl_stage;
-        check(conversation_stage_read_limits(sl_full, ss, g, &draft.state, 100000, err), "stage 0 limits with a draft");
-        check(sl_full.layer_range == whole.layer_range && sl_full.max_state_bytes == whole.max_state_bytes &&
-              sl_full.max_kv_bytes == whole.max_kv_bytes, "the per-stage helper matches the whole-session limits");
-        check(conversation_stage_read_limits(sl_stage, ss, g, nullptr, 100000, err), "later-stage limits with a null draft");
-        const std::vector<std::array<uint64_t, 5>> drop_draft(whole.max_kv_bytes.begin(), whole.max_kv_bytes.end() - 1);
-        check(sl_stage.layer_range == whole.layer_range && sl_stage.max_state_bytes == whole.max_state_bytes &&
-              sl_stage.max_kv_bytes == drop_draft, "a later stage's limits drop the draft layer");
     }
     check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"restore A after stage images");
     check(conversation_checkpoint_restore(a.checkpoints[0],ss,g,err),"restore early running checkpoint");
@@ -380,18 +337,9 @@ void full_session(int fmt, int mode, int experts) {
 int main() {
     int devices=0;
     if (cudaGetDeviceCount(&devices)!=cudaSuccess || !devices) return 77;
-    for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode_id : {0,1,2,3}) {
-        // mode_id 3: a streamed state whose host copy is a chunk of a pool shared with `other` (--kv-pool-tokens)
-        const bool pooled = mode_id == 3;
-        const int mode = pooled ? 1 : mode_id;
-        if (fmt==3 && mode_id!=0) continue;
+    for (int fmt : std::array<int,4>{kKvF16,kKvInt8,kKvQ4,3}) for (int mode : {0,1,2}) {
+        if (fmt==3 && mode!=0) continue;
         Fixture f(fmt,mode);
-        std::unique_ptr<Fixture> other;
-        if (pooled) {
-            f.make_pooled(nullptr,0);
-            other = std::make_unique<Fixture>(fmt,mode);
-            other->make_pooled(&f,1);
-        }
         if (fmt==3) {
             std::string err;
             ConversationKv invalid;
@@ -428,26 +376,6 @@ int main() {
             check(equal(a,restored),"A/B/A byte-exact K/V and indexer state");
             uint64_t fingerprint = 0;
             check(conversation_kv_verify(a,f.state,f.g,upto,index,fingerprint,err),"verify restored authoritative and resident bytes without rewriting them");
-            if (pooled) {
-                // a second state in the same pool, its chunks interleaved with f's (--kv-pool-tokens): the direct copy
-                // between two chunk tables, a neighbour's writes, and a prefix restore all go through the tables
-                ConversationKv theirs, after, want, got;
-                other->fill(99);
-                check(conversation_kv_copy(f.state,other->state,f.g,upto,index,err,false),"direct copy between two pooled states");
-                cuda_check(cudaDeviceSynchronize());
-                check(conversation_kv_save(theirs,other->state,f.g,upto,index,err) && equal(a,theirs),
-                      "the direct copy between two pooled states is byte-exact");
-                other->fill(55);
-                check(conversation_kv_save(after,f.state,f.g,upto,index,err) && equal(a,after),
-                      "a neighbour's writes do not reach this state's chunks");
-                const int64_t part = upto / 2;
-                if (part > 0) {
-                    check(conversation_kv_restore_prefix(a,other->state,f.g,upto,part,index,err),"prefix restore into a pooled state");
-                    cuda_check(cudaDeviceSynchronize());
-                    check(conversation_kv_save(want,f.state,f.g,part,index,err) && conversation_kv_save(got,other->state,f.g,part,index,err) &&
-                          equal(want,got),"the prefix restored through the chunk table equals the source's prefix");
-                }
-            }
             {
                 // disk save streams the same bytes as a captured image, without the host copy
                 SessionKvSource src;

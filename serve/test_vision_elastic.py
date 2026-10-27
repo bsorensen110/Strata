@@ -129,6 +129,27 @@ class Elastic(unittest.TestCase):
         self.assertIn("the image encoder stopped after 60 s without a picture", out.getvalue())
         self.assertNotIn("expert cache", out.getvalue())
 
+    def test_an_encoder_that_fails_to_start_is_a_503_not_a_dropped_connection(self):
+        def fail():
+            raise RuntimeError("the vision encoder did not start: cudaMalloc failed: out of memory")
+        self.vision.restart = fail
+        with self.assertRaises(EngineDied) as e:            # the handlers answer EngineDied with a 503
+            self.picture()
+        self.assertIn("the image encoder failed to start", str(e.exception))
+        self.svc.last_image_at = 0
+        self.assertEqual(self.svc._vision_idle_down(), "down")
+        self.assertEqual(self.engine.calls, [2048, 0])      # the share made for it goes back
+
+    def test_the_stop_is_logged_when_the_cache_never_made_room(self):
+        self.engine.elastic = False                         # a layer split: the engine refuses --vram-elastic
+        self.picture()
+        self.svc.last_image_at = 0
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.svc._vision_idle_down(), "down")
+        self.assertIn("the image encoder stopped after 60 s without a picture", out.getvalue())
+        self.assertNotIn("expert cache", out.getvalue())
+
     def test_the_load_never_starts_an_elastic_encoder(self):
         self.assertFalse(self.svc._vision_down())
         self.svc.vision = ElasticVision(tempfile.mkdtemp(), elastic=False)

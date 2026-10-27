@@ -1,313 +1,222 @@
-// CPU-only behavior tests: execute the real Chat code and attachment serialization in a Node VM.
-// The DOM is deliberately small. Layout, focus, keyboard and real DOM wiring need browser tests too.
+// The chat history's logic (serve/web/history.js) and the browser store behind the saved-chats list (serve/web/chatstore.js),
+// run in Node. The store runs against a small stub of IndexedDB that is faithful where the code depends on it: a read's result
+// is on the request and not on the store; a write the browser refuses fires abort on the transaction; a blocked open never
+// resolves by itself; a database already at version 1 does not run onupgradeneeded; requests answer on a later tick.
+// (The stub and its cases are from PR #1787 by Scotty-Hudson, rebuilt for the split modules.)
+//   node serve/test_web_history.js      (serve/test_web_history.py runs it too and skips when node is missing)
 "use strict";
 const assert = require("node:assert/strict");
-const fs = require("node:fs");
 const path = require("node:path");
-const vm = require("node:vm");
-
-class Element {
-  constructor(tag = "div") {
-    this.tagName = tag.toUpperCase(); this.children = []; this.dataset = {}; this.style = {};
-    this.attrs = {}; this.listeners = {}; this.value = ""; this.hidden = false; this.disabled = false;
-    this.scrollHeight = 100; this.clientHeight = 100; this.scrollTop = 0; this._html = "";
-    this.textContent = ""; this.selectors = new Map();
-    this.classList = {
-      add: (...names) => { this.className = [...new Set([...(this.className || "").split(/\s+/), ...names])].join(" "); },
-      remove: (...names) => { this.className = (this.className || "").split(/\s+/).filter(n => !names.includes(n)).join(" "); },
-      contains: name => (this.className || "").split(/\s+/).includes(name),
-      toggle: (name, on) => { if (on === undefined) on = !this.classList.contains(name); this.classList[on ? "add" : "remove"](name); return on; },
-    };
-  }
-  set innerHTML(html) { this._html = String(html); this.children = []; this.selectors.clear(); }
-  get innerHTML() { return this._html; }
-  appendChild(el) { this.children.push(el); el.parentElement = this; return el; }
-  append(...els) { for (const el of els) this.appendChild(typeof el === "string" ? Object.assign(new Element(), {textContent: el}) : el); }
-  prepend(el) { this.children.unshift(el); el.parentElement = this; }
-  remove() { this.removed = true; if (this.parentElement) this.parentElement.children = this.parentElement.children.filter(e => e !== this); }
-  setAttribute(k, v) { this.attrs[k] = String(v); }
-  getAttribute(k) { return this.attrs[k] ?? null; }
-  addEventListener(k, fn) { (this.listeners[k] ||= []).push(fn); }
-  querySelector(selector) {
-    const index = selector.match(/^\[data-i="(\d+)"\]$/);
-    if (index) return this.children.find(e => String(e.dataset.i) === index[1]) || null;
-    if (selector.startsWith(".")) {
-      const found = this.children.find(e => (e.className || "").split(/\s+/).includes(selector.slice(1)));
-      if (found) return found;
-    }
-    if (!this.selectors.has(selector)) {
-      const el = new Element(selector.startsWith("details") ? "details" : "div");
-      el.parentElement = this; this.selectors.set(selector, el);
-    }
-    return this.selectors.get(selector);
-  }
-  querySelectorAll(selector) {
-    if (selector === ".st-msg") return this.children.filter(e => (e.className || "").split(/\s+/).includes("st-msg"));
-    return [];
-  }
-  insertAdjacentHTML(position, html) { this._html += html; }
-  get firstChild() { return this.children[0] || this.querySelector("first-child"); }
-  get lastElementChild() { return this.children.at(-1); }
-  focus() {} select() {} scrollIntoView() {} click() { if (this.onclick) this.onclick(); }
-}
-
-function flatten(el) {
-  return `${el.innerHTML} ${el.textContent} ${el.className || ""} ${Object.keys(el.attrs).join(" ")} ` + el.children.map(flatten).join(" ");
-}
-
-const source = fs.readFileSync(path.join(__dirname, "web", "app.js"), "utf8");
-const start = source.indexOf("// ------------------------------------------------------------------ Chat\n");
-const end = source.indexOf("// ------------------------------------------------------------------ the sampling drawer\n", start);
-assert(start >= 0 && end > start, "the actual Chat section must be loaded");
-const chatSource = source.slice(start, end);
-
-function setup({enabled = true, history = [], sampling} = {}) {
-  const elements = new Map(), saved = new Map([["chat", JSON.parse(JSON.stringify(history))]]);
-  if (enabled) saved.set("editHistory", true);
-  if (sampling) saved.set("sampling", sampling);
-  const requests = [], toasts = [], blobs = [], pending = [];
-  let hold = false, nextFrame = 1, failure = null;
-  const get = id => {
-    if (id === "history-undo") return elements.has(id) && !elements.get(id).removed ? elements.get(id) : null;
-    if (!elements.has(id)) {
-      const el = new Element();
-      el.before = sibling => elements.set(sibling.id, sibling);
-      elements.set(id, el);
-    }
-    return elements.get(id);
-  };
-  const context = vm.createContext({
-    console, AbortController, TextDecoder, TextEncoder, Blob, Date, JSON, performance,
-    window: {addEventListener: () => {}},   // #2473's pagehide hook: the VM never navigates away
-    paintLive: () => {},   // integ's Monitor repaint: no Monitor machinery runs in the VM
-    ws: {on: false}, searchPhase: null, liveQueued: 0, modelOp: null,   // integ globals the Chat slice borrows from the Monitor section
-    setSearchPhase: () => {}, endSearchPhase: () => {},                 // integ's websearch hooks: first token calls
-    setSearchBubble: () => {}, clearSearchBubble: () => {},             // clearSearchBubble inside the stream loop
-
-
-    $: get, document: {createElement: tag => new Element(tag), querySelectorAll: () => []},
-    store: {get: (k, fallback) => saved.has(k) ? saved.get(k) : fallback, set: (k, v) => saved.set(k, JSON.parse(JSON.stringify(v)))},
-    icon: name => `<svg data-icon="${name}"></svg>`,
-    esc: s => String(s).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c])),
-    fmt: n => String(n), markdown: s => String(s),
-    health: {model: "mock-model", images: true}, mcpInfo: {tools: 0},
-    headers: () => ({"Content-Type": "application/json"}), projectionLoaded: () => false,
-    toast: (...args) => toasts.push(args), copyText: () => {}, innerHeight: 800,
-    requestAnimationFrame: () => nextFrame++, cancelAnimationFrame: () => {},
-    setTimeout: () => 1, clearTimeout: () => {},
-    URL: {createObjectURL: b => { blobs.push(b); return "blob:mock"; }, revokeObjectURL: () => {}},
-    fetch: async (url, options) => {
-      assert.equal(url, "v1/chat/completions", "the test must never contact a real endpoint");
-      requests.push(JSON.parse(options.body));
-      if (failure) { const error = failure; failure = null; throw error; }
-      let emitted = false;
-      return {ok: true, body: {getReader: () => ({read: () => {
-        if (hold) return new Promise((resolve, reject) => {
-          const abort = () => reject(Object.assign(new Error("stopped"), {name: "AbortError"}));
-          if (options.signal.aborted) abort(); else options.signal.addEventListener("abort", abort, {once: true});
-          pending.push({resolve, reject});
-        });
-        if (emitted) return Promise.resolve({done: true});
-        emitted = true;
-        return Promise.resolve({done: false, value: new TextEncoder().encode('data: {"choices":[{"delta":{"content":"fresh answer"}}]}\n\ndata: [DONE]\n\n')});
-      }})}};
-    },
-  });
-  vm.runInContext(chatSource, context, {filename: "web/app.js (Chat section)"});
-  vm.runInContext("renderChat()", context);
-  const run = code => vm.runInContext(code, context);
-  const value = code => JSON.parse(JSON.stringify(run(code)));
-  const settle = async () => {
-    for (let i = 0; i < 50; i++) { await new Promise(resolve => setImmediate(resolve)); if (!run("busy")) return; }
-    throw new Error("mock generation did not settle");
-  };
-  return {run, value, settle, requests, toasts, blobs, saved, get, setHold: value => { hold = value; },
-          failNext: () => { failure = new Error("mock network failure"); }, pending};
-}
+const H = require(path.join(__dirname, "web", "history.js"));
+const {createChatStore} = require(path.join(__dirname, "web", "chatstore.js"));
 
 const user = (text, extra = {}) => ({role: "user", text, time: 1, ...extra});
-const assistant = (text, extra = {}) => ({role: "assistant", text, time: 2, ...extra});
-const tool = {id: "old-call", name: "old_tool", tool: "old_tool", arguments: {old: true}, round: 0,
-              result: "old secret result", state: "done", at: 0, rat: 0, ok: true};
-const attached = user("original question", {
-  images: [{kind: "image", name: "pic.png", url: "data:image/png;base64,AAA"}],
-  files: [{kind: "file", name: "notes.md", text: "attached evidence"}],
-});
-const history = () => [attached, assistant("old answer", {reasoning: "old thoughts", tools: [tool]}), user("later question"), assistant("later answer")];
+const bot = (text, extra = {}) => ({role: "assistant", text, time: 2, ...extra});
+const tool = {id: "t1", name: "fs__read", result: "secret result", state: "done", round: 0, at: 0};
+const convo = () => [user("q1", {images: [{kind: "image", name: "a.png", url: "data:image/png;base64,AAA"}], files: [{kind: "file", name: "n.txt", text: "notes"}]}),
+                     bot("a1", {reasoning: "thoughts", tools: [tool], meta: "12 tokens", stopped: true, error: "x"}), user("q2"), bot("a2")];
 
 const cases = {
-  async default_off() {
-    const a = setup({enabled: false, history: [user("first"), assistant("answer")]});
-    a.run("renderChat()");
-    assert.equal(a.run("historyEditing"), false);
-    assert.doesNotMatch(flatten(a.get("chat")), /history-actions|data-msg-(edit|remove|delete|retry|regenerate)/);
-    const before = a.value("messages");
-    a.run('editMessage(0); removeHistoryFrom(0); retryMessage(1);');
-    assert.deepEqual(a.value("messages"), before);
-    assert.equal(a.requests.length, 0);
-    a.get("input").value = "next"; await a.run("send()");
-    assert.deepEqual(a.requests[0], {model: "mock-model", messages: [
-      {role: "user", content: "first"}, {role: "assistant", content: "answer"}, {role: "user", content: "next"}],
-      stream: true, reasoning_effort: "high"});
+  titles_and_groups() {
+    assert.equal(H.chatTitle({title: "Mine", messages: []}), "Mine");
+    assert.equal(H.chatTitle({title: "", messages: [user("  first line\nsecond")]}), "first line");
+    assert.equal(H.chatTitle({title: "", messages: [user("x".repeat(100))]}).length, H.TITLE_MAX);
+    assert.equal(H.chatTitle({title: "", messages: []}), "New chat");
+    assert.equal(H.chatTitle({title: "", messages: []}, "Neuer Chat"), "Neuer Chat", "the caller's word for an unnamed chat");
+    const now = Date.UTC(2026, 9, 26, 12), day = 86400000;
+    const keys = [0, 0.4, 1.5, 5, 20, 40].map((d) => H.groupKey(now - d * day, now));
+    assert.deepEqual(keys, ["today", "today", "yesterday", "week", "month", "older"]);
+    const a = H.newChat(1, 0.5), b = H.newChat(2, 0.5);
+    assert.notEqual(a.id, b.id); assert.deepEqual(a.messages, []);
   },
-  async history_sampling() {
-    // Editing and retrying must use main's model-card defaults, including migrated old settings,
-    // while retaining an explicit override or greedy mode. Exercise the real generation path.
-    const modes = [
-      {sampling: undefined, expected: {}, thinking: "high"},
-      {sampling: {temperature: 0.6, top_p: 0.95, top_k: 20, thinking: "none"}, expected: {}, thinking: "none"},
-      {sampling: {temperature: 0.3, top_p: 0.9, top_k: 40}, expected: {temperature: 0.3, top_p: 0.9, top_k: 40}, thinking: "high"},
-      {sampling: {temperature: 0}, expected: {temperature: 0}, thinking: "high"},
-    ];
-    for (const {sampling, expected, thinking} of modes) {
-      const a = setup({history: history(), sampling});
-      a.run('editMessage(0); saveMessageEdit(0, "edited question")'); await a.settle();
-      a.run('retryMessage(1)'); await a.settle();
-      assert.equal(a.requests.length, 2);
-      for (const request of a.requests) {
-        const actual = Object.fromEntries(["temperature", "top_p", "top_k"]
-          .filter(key => key in request).map(key => [key, request[key]]));
-        assert.deepEqual(actual, expected);
-        assert.equal(request.reasoning_effort, thinking);
-        assert.equal(request.messages.length, 1);
-      }
-    }
+  filter_searches_titles_and_text() {
+    const chats = [{id: "a", title: "the garden", time: 3, messages: [user("watering the tomatoes")]},
+                   {id: "b", title: "a chat about code", time: 2, messages: [user("nothing here")]},
+                   {id: "c", title: "tomatoes again", time: 1, messages: [user("a different question")]}];
+    assert.deepEqual(H.filterChats(chats, "").map((c) => c.id), ["a", "b", "c"], "newest first");
+    assert.deepEqual(H.filterChats(chats, " TOMATOES ").map((c) => c.id), ["a", "c"], "title or text, any case");
+    assert.deepEqual(H.filterChats(chats, "nothing here").map((c) => c.id), ["b"]);
+    assert.deepEqual(H.filterChats(chats, "zzz"), []);
+    assert.deepEqual(chats.map((c) => c.id), ["a", "b", "c"], "the caller's list is not reordered");
   },
-  async user_edit() {
-    const a = setup({history: history()});
-    a.run('editMessage(0); saveMessageEdit(0, "changed question")'); await a.settle();
-    assert.equal(a.requests.length, 1);
-    const request = a.requests[0].messages;
-    assert.equal(request.length, 1);
-    assert.deepEqual(request[0], {role: "user", content: [
-      {type: "text", text: "changed question\n\nFile: notes.md\n```\nattached evidence\n```"},
-      {type: "image_url", image_url: {url: "data:image/png;base64,AAA"}}]});
-    const messages = a.value("messages");
-    assert.equal(messages.length, 2); assert.equal(messages[1].text, "fresh answer");
-    assert.deepEqual(messages[0].images, attached.images); assert.deepEqual(messages[0].files, attached.files);
-    assert.doesNotMatch(JSON.stringify(request), /old answer|old-call|old secret|later question/);
+  clean_keeps_names_only() {
+    const clean = H.cleanMessages(convo());
+    assert.deepEqual(clean[0].images, [{name: "a.png"}]);
+    assert.deepEqual(clean[0].files, [{name: "n.txt"}]);
+    assert.ok(!JSON.stringify(clean).includes("data:image") && !JSON.stringify(clean).includes("notes"), "no contents in the browser's store");
+    assert.equal(clean[1].text, "a1", "the text stays");
+    assert.deepEqual(convo()[0].files, [{kind: "file", name: "n.txt", text: "notes"}], "a copy: the screen keeps its contents");
   },
-  async assistant_edit() {
-    const old = assistant("wrong", {reasoning: "private", tools: [tool], error: "failure", meta: "old tokens", stopped: true, thinkSecs: 12, limit: 3});
-    const a = setup({history: [user("question"), old, user("descendant"), assistant("descendant answer")]});
-    a.run('editMessage(1); saveMessageEdit(1, "corrected answer")'); await a.settle();
-    assert.equal(a.requests.length, 0);
-    const messages = a.value("messages"); assert.equal(messages.length, 2);
-    assert.equal(messages[1].text, "corrected answer");
-    for (const key of ["reasoning", "tools", "error", "stopped", "thinkSecs", "limit"]) assert(!messages[1][key], `old ${key} survived`);
-    assert.notEqual(messages[1].meta, "old tokens");
-    assert.deepEqual(a.value("apiMessages()"), [{role: "user", content: "question"}, {role: "assistant", content: "corrected answer"}]);
+  rewind_a_question() {
+    const m = convo();
+    const plan = H.rewind(m, 2);
+    assert.deepEqual(plan.keep.map((x) => x.text), ["q1", "a1"]);
+    assert.equal(plan.hidden, 2, "the question and its answer");
+    assert.equal(plan.draft.text, "q2"); assert.equal(plan.draft.lost, 0);
+    const first = H.rewind(m, 0);
+    assert.deepEqual(first.keep, [], "the first question: nothing stays, the question goes to the box");
+    assert.equal(first.draft.text, "q1"); assert.equal(first.hidden, 4);
+    assert.deepEqual(first.draft.images, [{kind: "image", name: "a.png", url: "data:image/png;base64,AAA"}], "attachments with contents come back");
+    assert.deepEqual(first.draft.files, [{kind: "file", name: "n.txt", text: "notes"}]);
+    assert.equal(m.length, 4, "the list itself is not changed");
   },
-  async truncate() {
-    const a = setup({history: history()}); a.run("removeHistoryFrom(1)");
-    assert.deepEqual(a.value("messages"), [attached]);
-    assert.equal(a.requests.length, 0);
-    a.run("removeHistoryFrom(0)"); assert.deepEqual(a.value("messages"), []);
+  rewind_an_answer() {
+    const plan = H.rewind(convo(), 1);
+    assert.deepEqual(plan.keep.map((x) => x.text), ["q1", "a1"], "the answer stays and the list ends with it");
+    assert.equal(plan.draft, null); assert.equal(plan.hidden, 2);
+    assert.equal(H.rewind(convo(), 3).hidden, 0, "the last answer: nothing to hide");
+    assert.equal(H.rewind(convo(), 9), null);
   },
-  async retry() {
-    const a = setup({history: history()}); a.run("retryMessage(1)"); await a.settle();
-    assert.equal(a.requests.length, 1);
-    const request = a.requests[0].messages; assert.equal(request.length, 1); assert.equal(request[0].role, "user");
-    assert.match(request[0].content[0].text, /original question/);
-    assert.doesNotMatch(JSON.stringify(request), /old answer|old-call|old secret|later question/);
-    assert.equal(a.value("messages").length, 2);
+  lost_attachments_are_counted() {
+    const reloaded = H.cleanMessages(convo());
+    assert.equal(H.lostAttachments(reloaded[0]), 2);
+    assert.equal(H.lostAttachments(convo()[0]), 0);
+    const plan = H.rewind(reloaded, 0);
+    assert.equal(plan.draft.lost, 2); assert.deepEqual(plan.draft.images, []); assert.deepEqual(plan.draft.files, []);
+    assert.equal(plan.draft.text, "q1", "the text still comes back");
   },
-  async stop_then_edit() {
-    const a = setup({history: [user("before"), assistant("before answer")]});
-    a.setHold(true); a.get("input").value = "running";
-    const sending = a.run("send()"); await new Promise(resolve => setImmediate(resolve));
-    const before = a.value("messages");
-    a.run('editMessage(0); saveMessageEdit(0, "blocked"); removeHistoryFrom(0); retryMessage(1); undoHistory();');
-    assert.deepEqual(a.value("messages"), before); assert.equal(a.requests.length, 1);
-    a.get("stop-btn").onclick();
-    a.run("removeHistoryFrom(0)"); assert.deepEqual(a.value("messages"), before, "abort must finalize before editing");
-    await sending; assert.equal(a.run("busy"), null);
-    assert.equal(a.value("messages").at(-1).stopped, true);
-    a.setHold(false); a.run('editMessage(0); saveMessageEdit(0, "after stop")'); await a.settle();
-    assert.equal(a.requests.length, 2); assert.equal(a.requests[1].messages[0].content, "after stop");
-    assert.equal(a.value("messages").at(-1).text, "fresh answer");
+  regenerate_from_the_question() {
+    const m = convo();
+    assert.deepEqual(H.regenerate(m, 1).keep.map((x) => x.text), ["q1"]);
+    assert.equal(H.regenerate(m, 1).hidden, 3);
+    assert.deepEqual(H.regenerate(m, 3).keep.map((x) => x.text), ["q1", "a1", "q2"]);
+    assert.deepEqual(H.regenerate(m, 2).keep.map((x) => x.text), ["q1", "a1", "q2"], "on the last question itself");
+    assert.equal(H.regenerate([bot("orphan")], 0), null, "no question before it");
   },
-  async undo() {
-    const a = setup({history: history()}); const before = a.value("messages");
-    a.run("removeHistoryFrom(1); undoHistory()");
-    assert.deepEqual(a.value("messages"), before);
-    assert.match(JSON.stringify(a.value("apiMessages()")), /old-call/);
-    assert.equal(a.run("historyUndo"), null);
+  edit_an_answer() {
+    const plan = H.editAnswer(convo(), 1, "corrected", "Edited");
+    assert.equal(plan.keep.length, 2); assert.equal(plan.hidden, 2);
+    const a = plan.keep[1];
+    assert.deepEqual(a, {role: "assistant", text: "corrected", time: 2, meta: "Edited"}, "no thinking, tools, error, stop mark or stats");
+    assert.equal(H.editAnswer(convo(), 0, "x"), null, "only an answer can be edited");
   },
-  async feature_generation_undo() {
-    const a = setup({history: history()}); const before = a.value("messages");
-    a.run('editMessage(0); saveMessageEdit(0, "replacement")'); await a.settle();
-    assert(a.run("historyUndo")); a.run("undoHistory()");
-    assert.deepEqual(a.value("messages"), before, "feature-generated answer must not alter the Undo snapshot");
-  },
-  async new_send_invalidates_undo() {
-    const a = setup({history: history()}); a.run("removeHistoryFrom(1)");
-    const undoActions = a.toasts.map(t => t[4]).filter(x => x && x.label === "Undo");
-    a.get("input").value = "new branch"; await a.run("send()");
-    const after = a.value("messages"); assert.equal(a.run("historyUndo"), null);
-    a.run("undoHistory()"); for (const action of undoActions) action.run();
-    assert.deepEqual(a.value("messages"), after);
-  },
-  async new_chat_invalidates_undo() {
-    const a = setup({history: history()}); a.run("removeHistoryFrom(1)");
-    const oldActions = a.toasts.map(t => t[4]).filter(x => x && x.label === "Undo");
-    a.get("new-btn").onclick(); assert.equal(a.run("historyUndo"), null);
-    a.run("undoHistory()"); for (const action of oldActions) action.run();
-    assert.deepEqual(a.value("messages"), []);
-  },
-  async empty_new_chat_invalidates_undo() {
-    const a = setup({history: history()}); a.run("removeHistoryFrom(0)");
-    assert.equal(a.value("messages").length, 0);
-    assert(a.run("historyUndo"));
-    a.get("new-btn").onclick();
-    assert.equal(a.run("historyUndo"), null);
-    assert.equal(a.run("undoHistory()"), false);
-    assert.deepEqual(a.value("messages"), []);
-  },
-  async composer_during_edit() {
-    const a = setup({history: history()}); a.run("editMessage(0)");
-    a.get("input").value = "must not send"; await a.run("send()");
-    a.get("composer").onsubmit({preventDefault() {}}); await a.settle();
-    assert.equal(a.requests.length, 0); assert.equal(a.value("messages").length, 4);
-  },
-  async reasoning_only() {
-    const a = setup({enabled: false, history: [user("first"), assistant("", {reasoning: "only thoughts", stopped: true})]});
-    a.get("input").value = "next"; await a.run("send()");
-    assert.deepEqual(a.requests[0].messages[1], {role: "assistant", content: "", reasoning_content: "only thoughts"});
-  },
-  async export() {
-    const a = setup({history: [user("question"), assistant("old", {reasoning: "old reasoning", tools: [tool]})]});
-    a.run('editMessage(1); saveMessageEdit(1, "corrected")'); a.get("export-btn").onclick();
-    assert.equal(a.blobs.length, 1); const md = await a.blobs[0].text();
-    assert.match(md, /question/); assert.match(md, /corrected/); assert.doesNotMatch(md, /old reasoning|old secret result|old_tool/);
-  },
-  async legacy_undo_after_enabling() {
-    const a = setup({enabled: false, history: [user("old chat"), assistant("old answer")]});
-    a.get("new-btn").onclick();
-    const oldUndo = a.toasts.at(-1)[4]; assert.equal(oldUndo.label, "Undo");
-    a.run("historyEditing = true; renderChat()");
-    a.get("input").value = "new chat"; await a.run("send()");
-    const after = a.value("messages"); oldUndo.run();
-    assert.deepEqual(a.value("messages"), after, "a toast from feature-off must not overwrite a new request after enabling");
-  },
-  async reloaded_attachments() {
-    const original = setup({history: history()}); original.run("saveChat()");
-    const a = setup({history: original.saved.get("chat")});
-    a.run("retryMessage(1)"); await a.settle();
-    assert.equal(a.requests.length, 0, "regenerate must not silently omit attachment contents lost on reload");
-    assert.equal(a.value("messages").length, 4);
-  },
-  async network_failure() {
-    const a = setup({history: history()}); const before = a.value("messages");
-    a.failNext(); await a.run('editMessage(0); saveMessageEdit(0, "replacement")');
-    assert.equal(a.run("busy"), null); assert(a.run("historyUndo"));
-    assert.equal(a.value("messages").at(-1).error, "mock network failure");
-    a.run("undoHistory()"); assert.deepEqual(a.value("messages"), before);
+  branch_is_a_copy_with_a_title_that_stays() {
+    const original = {id: "c1", title: "", time: 1, messages: convo()};
+    const plan = H.rewind(original.messages, 2);
+    const b = H.branch(original, plan.keep, plan.keep.length, "Branch of q1", 5, 0.25);
+    assert.deepEqual(b.messages.map((x) => x.text), ["q1", "a1"]);
+    assert.equal(b.title, "Branch of q1"); assert.deepEqual(b.parent, {id: "c1", title: "q1"});
+    assert.notEqual(b.id, "c1");
+    b.messages[0].text = "changed"; b.messages[1].tools[0].result = "changed";
+    assert.equal(original.messages[0].text, "q1", "the original is untouched");
+    assert.equal(original.messages[1].tools[0].result, "secret result");
+    assert.equal(H.chatTitle(H.branch(original, [], 0, "Branch of q1"), "x"), "Branch of q1", "a branch at the first message keeps its title");
   },
 };
 
+// ---------------------------------------------------------------- the stub IndexedDB
+function makeIdb(hooks = {}, seed = {}) {
+  const data = Object.assign({}, seed), stores = {}, calls = {upgradeneeded: 0, createObjectStore: 0};
+  let current = null;
+  const request = () => ({result: null, error: null, transaction: current, onsuccess: null, onerror: null});
+  const store = {
+    put(value) {
+      const req = request();
+      queueMicrotask(() => {
+        if (hooks.quota) { req.error = {name: "QuotaExceededError"}; req.onerror && req.onerror(); return; }
+        if (hooks.abort) return;
+        data[value.id] = value; req.result = value; req.onsuccess && req.onsuccess();
+      });
+      return req;
+    },
+    delete(key) {
+      const req = request();
+      queueMicrotask(() => { if (hooks.quota || hooks.abort) return; delete data[key]; req.result = true; req.onsuccess && req.onsuccess(); });
+      return req;
+    },
+    getAll() {
+      const req = request();
+      queueMicrotask(() => { if (hooks.abort) return; req.result = Object.values(data); req.onsuccess && req.onsuccess(); });
+      return req;
+    },
+  };
+  const transaction = () => {
+    const t = {error: null, oncomplete: null, onerror: null, onabort: null, objectStore: () => store};
+    current = t;
+    queueMicrotask(() => {
+      if (hooks.quota || hooks.abort) { t.error = {name: hooks.quota ? "QuotaExceededError" : hooks.abort}; t.onabort && t.onabort(); }
+      else if (t.oncomplete) t.oncomplete();
+    });
+    return t;
+  };
+  const db = {objectStoreNames: {contains: (n) => n in stores}, createObjectStore: (n) => { calls.createObjectStore++; stores[n] = store; }, transaction};
+  return {open: () => {
+    if (hooks.throws) throw new Error("private mode");
+    const r = {result: db, error: null, onupgradeneeded: null, onsuccess: null, onerror: null, onblocked: null};
+    queueMicrotask(() => {
+      if (hooks.blocked) { r.onblocked && r.onblocked(); return; }
+      if (hooks.newDatabase !== false) { calls.upgradeneeded++; r.onupgradeneeded && r.onupgradeneeded(); }
+      r.result = db; r.onsuccess && r.onsuccess();
+    });
+    return r;
+  }, records: data, calls};
+}
+const wait = () => new Promise((r) => setTimeout(r, 10));
+const mk = (hooks, seed) => {
+  const idb = makeIdb(hooks, seed), problems = [];
+  return {idb, problems, store: createChatStore({indexedDB: idb, onProblem: (k) => problems.push(k)})};
+};
+const chat = (id, extra = {}) => ({id, title: id, time: 1, messages: [user("hi " + id)], ...extra});
+
+Object.assign(cases, {
+  async store_fresh_database_creates_the_store_and_reads() {
+    const a = mk({}, {c0: chat("c0"), c1: chat("c1")});
+    assert.equal(await a.store.start(), true);
+    assert.equal(a.idb.calls.upgradeneeded, 1); assert.equal(a.idb.calls.createObjectStore, 1);
+    assert.deepEqual((await a.store.all()).map((c) => c.id).sort(), ["c0", "c1"], "the result is read from the request");
+    assert.deepEqual(a.problems, []);
+  },
+  async store_put_and_remove_touch_one_record() {
+    const a = mk({}, {c0: chat("c0")});
+    await a.store.start();
+    a.store.put(chat("c1", {title: "renamed"})); await wait();
+    assert.equal(a.idb.records.c1.title, "renamed"); assert.ok(a.idb.records.c0, "the other record is not rewritten");
+    a.store.remove("c0"); await wait();
+    assert.ok(!("c0" in a.idb.records));
+  },
+  async store_private_mode_is_memory_only_and_says_so_once() {
+    const a = mk({throws: true});
+    assert.equal(await a.store.start(), false);
+    assert.deepEqual(a.problems, ["memory"]);
+    assert.deepEqual(await a.store.all(), []);
+    a.store.put(chat("x")); a.store.remove("x");          // no store: nothing to do, nothing thrown
+    await a.store.start();
+    assert.deepEqual(a.problems, ["memory"], "told once, not on every try");
+  },
+  async store_missing_object_store_is_memory_only() {
+    const a = mk({newDatabase: false});                  // a database already at version 1: no upgrade, no store
+    assert.equal(await a.store.start(), false);
+    assert.equal(a.idb.calls.createObjectStore, 0);
+    assert.deepEqual(a.problems, ["memory"]);
+  },
+  async store_blocked_open_does_not_hang() {
+    const a = mk({blocked: true});
+    assert.equal(await a.store.start(), false);
+    assert.deepEqual(a.problems, ["memory"]);
+  },
+  async store_full_storage_warns_once_with_its_own_message() {
+    const a = mk({quota: true});
+    await a.store.start();
+    a.store.put(chat("big")); await wait();
+    a.store.put(chat("big2")); await wait();
+    assert.deepEqual(a.problems, ["quota"], "one warning, the quota one");
+  },
+  async store_another_failure_is_not_called_quota() {
+    const a = mk({abort: "DataError"});
+    await a.store.start();
+    a.store.put(chat("bad")); await wait();
+    assert.deepEqual(a.problems, ["failed"]);
+  },
+  async store_a_read_that_aborts_answers_empty() {
+    const a = mk({abort: "DataError"}, {c0: chat("c0")});
+    await a.store.start();
+    assert.deepEqual(await a.store.all(), [], "no hang, no records");
+  },
+});
+
 (async () => {
   const name = process.argv[2];
-  if (name) { assert(cases[name], `unknown test ${name}`); await cases[name](); console.log(`ok ${name}`); }
-  else for (const [name, test] of Object.entries(cases)) { await test(); console.log(`ok ${name}`); }
-})().catch(err => { console.error(err.stack || err); process.exitCode = 1; });
+  const run = name ? [[name, cases[name]]] : Object.entries(cases);
+  if (name && !cases[name]) throw new Error("unknown test " + name);
+  for (const [n, fn] of run) { await fn(); console.log("ok " + n); }
+})().catch((e) => { console.error(e); process.exitCode = 1; });

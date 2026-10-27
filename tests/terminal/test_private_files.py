@@ -10,7 +10,6 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
@@ -19,7 +18,7 @@ from strata_control import private_files as pf  # noqa: E402
 
 def resolved(sddl: str) -> str:
     """``sddl`` with every trustee alias (``LA`` is the built-in Administrator) written as its string SID."""
-    return re.sub(r";;;([^)]*)\)", lambda match: f";;;{pf._as_sid(match.group(1))})", sddl)
+    return re.sub(r";;;([^)]*)\)", lambda match: f";;;{pf._string_sid(match.group(1))})", sddl)
 
 
 class PrivateFileTests(unittest.TestCase):
@@ -78,11 +77,18 @@ class PrivateFileTests(unittest.TestCase):
     def test_a_file_made_in_the_profile_is_unshared_but_not_strictly_private(self):
         path = self.root / "inherited.json"
         path.write_text("{}")
+        if not pf.WINDOWS:
+            # POSIX files have mode bits rather than an inherited profile ACL.
+            # Specify the private mode instead of depending on the process umask.
+            path.chmod(0o600)
+        self.assertTrue(pf.is_unshared(path))
         if pf.WINDOWS:
-            self.assertTrue(pf.is_unshared(path))
             self.assertFalse(pf.is_private(path))   # SYSTEM and Administrators still inherit
         else:
-            self.assertEqual(pf.is_unshared(path), pf.is_private(path))   # POSIX: the same check; a fresh file's bits follow the umask
+            self.assertTrue(pf.is_private(path))
+            path.chmod(0o644)
+            self.assertFalse(pf.is_unshared(path))
+            self.assertFalse(pf.is_private(path))
 
     @unittest.skipUnless(pf.WINDOWS, "NTFS ACLs")
     def test_everyone_is_noticed_by_the_relaxed_check_too(self):
@@ -100,29 +106,6 @@ class PrivateFileTests(unittest.TestCase):
         import subprocess
         subprocess.run(["icacls", str(path), "/grant", "*S-1-1-0:R"], check=True, capture_output=True)
         self.assertFalse(pf.is_private(path))
-
-
-    @unittest.skipUnless(pf.WINDOWS, "NTFS ACLs")
-    def test_the_builtin_administrator_is_recognised_through_its_sddl_alias(self):
-        # The account with RID 500 is written back as "LA", not as the SID that was set
-        with mock.patch.object(pf, "dacl_sddl", return_value="D:PAI(A;;FA;;;LA)"), \
-                mock.patch.object(pf, "current_user_sid", return_value=pf._as_sid("LA")):
-            self.assertNotEqual(pf._as_sid("LA"), "LA")
-            self.assertTrue(pf.is_private(self.root))
-            self.assertTrue(pf.is_unshared(self.root))
-
-    @unittest.skipUnless(pf.WINDOWS, "NTFS ACLs")
-    def test_the_alias_is_not_accepted_for_another_account(self):
-        with mock.patch.object(pf, "dacl_sddl", return_value="D:PAI(A;;FA;;;LA)"), \
-                mock.patch.object(pf, "current_user_sid", return_value="S-1-5-21-1-2-3-1001"):
-            self.assertFalse(pf.is_private(self.root))
-            # is_unshared is the relaxed check for "this user, SYSTEM and the administrators": the built-in
-            # Administrator is an administrator, so #3406's stricter expectation is not our baseline design
-            # (main c316a7c2: unshared_offenders treats LA / RID-500 as privileged).
-            self.assertTrue(pf.is_unshared(self.root))
-
-    def test_an_unparsable_entry_is_compared_as_written(self):
-        self.assertEqual(pf._as_sid("not-a-sid"), "not-a-sid")
 
 
 if __name__ == "__main__":

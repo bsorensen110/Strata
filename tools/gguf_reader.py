@@ -28,6 +28,8 @@ GGML_TYPES: dict[int, str] = {
     39: "MXFP4", 40: "NVFP4", 41: "Q4_0_8_8", 42: "Q2_0",
     # Agention's llama.cpp fork (agentionai/llama.cpp): the APR trellis expert types (128-value blocks)
     143: "PTQ1_0", 144: "TQ2_T", 145: "TQK6", 146: "TQK7",
+    # pair-trellis family added for Gyro-L (agentionai llama.cpp release/gyro-l)
+    147: "TQP5", 148: "TQP6", 149: "TQP7",
 }
 
 # GGUF metadata value type ids
@@ -41,8 +43,6 @@ GGUF_META = {
 # This is what makes a per-tensor byte count checkable, and it is the contract the kernels share.
 BLOCK_GEOMETRY: dict[str, tuple[int, int]] = {
     "F32": (1, 4), "F16": (1, 2), "BF16": (1, 2), "F64": (1, 8),
-    "I8": (1, 1), "I16": (1, 2), "I32": (1, 4), "I64": (1, 8),
-    "TQ1_0": (256, 54), "TQ2_0": (256, 66),
     "Q4_0": (32, 18), "Q4_1": (32, 20), "Q5_0": (32, 22), "Q5_1": (32, 24),
     "Q8_0": (32, 34), "Q8_1": (32, 36),
     "Q2_K": (256, 84), "Q3_K": (256, 110), "Q4_K": (256, 144), "Q5_K": (256, 176),
@@ -52,6 +52,8 @@ BLOCK_GEOMETRY: dict[str, tuple[int, int]] = {
     "IQ1_M": (256, 56), "Q2_0": (64, 18), "MXFP4": (32, 17), "NVFP4": (64, 36),
     # fp16 scale + trellis stream (32 steps x 8 / 6 / 7 bits); PTQ1_0: 26 B of trits + fp16 scale
     "TQ2_T": (128, 34), "TQK6": (128, 26), "TQK7": (128, 30), "PTQ1_0": (128, 28),
+    # TQP5/6/7: fp16 scale + 8*K bytes of a 64-step x K-bit circular stream (K = 5/6/7)
+    "TQP5": (128, 42), "TQP6": (128, 50), "TQP7": (128, 58),
 }
 
 
@@ -80,10 +82,6 @@ class TensorInfo:
         return self.elements // block_elems * block_bytes
 
 
-class UnsupportedTensorSize(ValueError):
-    """A readable tensor directory whose complete payload size is not known to this reader."""
-
-
 _META_FMT = {"u8": "B", "i8": "b", "u16": "H", "i16": "h", "u32": "I", "i32": "i",
              "f32": "f", "bool": "?", "u64": "Q", "i64": "q", "f64": "d"}
 
@@ -103,26 +101,6 @@ class GGUFFile:
             except ValueError as e:
                 raise ValueError(f"{self.path.name}: {e}") from None
         self.data_start = self._data_start
-
-    def data_end(self) -> int:
-        """Return the required file extent; unknown tensor sizes cannot establish completeness."""
-        # Alignment locates tensor data. A metadata-only file ends at its parsed header.
-        end = self._pos
-        unknown = []
-        for tensor in self.tensors:
-            size = tensor.expected_bytes()
-            if tensor.type_name in BLOCK_GEOMETRY and size is None:
-                raise ValueError(f"tensor {tensor.name} has an invalid element count for {tensor.type_name}")
-            if size is None:
-                unknown.append(tensor)
-            end = max(end, self.data_start + tensor.offset + (size or 0))
-        # Known extents remain binding even if another tensor has an unknown type.
-        if unknown:
-            if end > self._size:
-                raise ValueError(f"tensor directory requires at least {end:,} bytes, file has {self._size:,}")
-            tensor = unknown[0]
-            raise UnsupportedTensorSize(f"cannot verify tensor {tensor.name}: unsupported type {tensor.type_name}")
-        return end
 
     # ------------------------------------------------------------------ internals
     def _read(self, fh, n: int) -> bytes:
@@ -162,8 +140,8 @@ class GGUFFile:
                                            GGML_TYPES.get(type_id, f"type{type_id}"), offset))
         align = self.metadata.get("general.alignment")
         if align is not None:
-            if type(align) is not int or align <= 0 or align & (align - 1):
-                raise ValueError("general.alignment must be a positive power of two")
+            if type(align) is not int or align <= 0 or align % 8:
+                raise ValueError("general.alignment must be a positive multiple of 8")
             self.alignment = align
         pos = self._pos
         self._data_start = (pos + self.alignment - 1) // self.alignment * self.alignment
