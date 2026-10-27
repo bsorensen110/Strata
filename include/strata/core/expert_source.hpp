@@ -36,7 +36,6 @@
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -96,7 +95,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
                            const std::string& cgroup_root = "/sys/fs/cgroup");
 
 /// Bound a resident budget by RAM and commit capacity after headroom; leave 256 MiB more when clamping.
-/// Pass UINT64_MAX for the initial RAM-only attempt or when the platform does not report commit capacity.
+/// Pass UINT64_MAX for commit when the platform does not report it.
 uint64_t clamp_resident_budget(uint64_t requested, uint64_t physical, uint64_t commit, uint64_t headroom);
 
 /// #1250: one cudaHostAlloc of the whole page-locked complement has no way back when the kernel does not give the
@@ -126,36 +125,9 @@ uint64_t numa_pin_free(uint64_t global_free, const std::vector<uint64_t>& node_f
 /// caller coalesces them).
 std::array<std::pair<uint64_t, uint64_t>, 3> numa_slice_ranges(uint64_t slot_off, const uint64_t role_bytes[3],
                                                                int slice, uint64_t page = 4096);
-/// S1 (`--numa-hot-node`): this host's NUMA nodes, counted under /sys/devices/system/node (numa_node_ids().size()).
-/// 0 when the host cannot be asked at all (a platform without sysfs), and the caller then skips its range check.
-int numa_node_count();
-/// S1: the node NUMBERS themselves, the sysfs entries in ascending order.  The entries are what the host HAS, not
-/// 0..count-1: firmware PXM ids can leave holes (a hot-removed or offline node), so an id is a member of this list
-/// or the host does not have that node.  Empty when the host cannot be asked at all.
-std::vector<int> numa_node_ids();
-/// S1: one node's OWN free memory - the MemFree line of /sys/devices/system/node/node<N>/meminfo (the line reads
-/// "Node N MemFree: <kB> kB") - false when that file cannot be read or has no MemFree line (a memoryless or
-/// offline node: nothing there to place pages on).
-bool numa_node_memfree_bytes(int node, uint64_t& bytes);
-/// S1: the parse above, over the text of such a file (the tests feed it a string).
-bool numa_node_memfree_from_text(const std::string& meminfo_text, uint64_t& bytes);
-/// S1: whether a claim of `bytes` fits what a node really has free: the claim PLUS `reserve`, which must stay free
-/// on the node besides it.  A strict fit: MemFree is a point-in-time reading.
-bool node_claim_fits(uint64_t node_free, uint64_t bytes, uint64_t reserve);
 /// The sentence appended to a "not enough RAM" start failure: how much of the RAM is file cache (Cached + Buffers of
 /// `meminfo_text`, mapped pages included) and what to do about it; "" when under 1 GiB of cache (nothing to say).
 std::string page_cache_hint(const std::string& meminfo_text);
-
-struct ResidentRetry {
-    HostMemory memory;
-    uint64_t limit = 0;
-};
-
-/// The first attempt uses RAM alone. Only a host allocation failure (failed_bytes > 0) permits one smaller retry.
-/// An empty memory probe disables retries. Callbacks allow failure and page-file growth tests without large allocations.
-using ResidentAttempt = std::function<bool(const ResidentRetry*, uint64_t& failed_bytes, std::string& err)>;
-bool try_resident_allocation(const ResidentAttempt& attempt, const std::function<bool(HostMemory&)>& read_memory,
-                             uint64_t headroom, std::string& err);
 
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
 /// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
@@ -233,9 +205,6 @@ public:
     /// Plan v0.3 P5: whether `blob(layer, expert)` lies in page-locked, CUDA-registered memory, so an
     /// asynchronous host-to-device copy can DMA it directly (no staging copy on the CPU).
     virtual bool pinned(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
-    /// Bytes already in a host copy (a resident complement, or an arena that is not a demand-paged
-    /// file mapping). A file or mmap miss is false. The tail skip asks only while a helper is attached.
-    virtual bool host_copy(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
 
     /// Called once before the first expert of a layer.  A source that reads from disk wants to start the read
     /// here so it overlaps the quantisation, and a prefetching source in Phase 3 wants the ids.
@@ -372,8 +341,7 @@ private:
     std::condition_variable cv_;
     bool quit_ = false, pending_ = false, busy_ = false;
     int64_t layer_ = -1, n_tok_ = 0;
-    std::vector<int32_t> res_;   ///< the residency rows of the layers predicted, copied at submit (admissions write the table)
-    bool has_res_ = false;
+    const int32_t* host_res_ = nullptr;
     uint64_t sub_gen_ = 0;
     ForesightSwap* fs_ = nullptr;                   ///< (under mu_)
     std::vector<float> x_;
@@ -407,9 +375,6 @@ struct GpuPlanSink {
     /// copy engine.  counts[0] = VRAM groups, counts[1] = all entries, counts[2] = PCIe groups.
     unsigned long long* ptr2 = nullptr;
     int32_t* start2 = nullptr;
-    /// STRATA_ADAPT_FETCH (pcie_mode 2): per PCIe group, the VRAM cache slot its blob is copied into instead of
-    /// staging (0: staging).  staging_cap entries.
-    unsigned long long* dst2 = nullptr;
     unsigned long long staging = 0;
     int64_t staging_cap = 0;
     int64_t cap = 0;
@@ -421,12 +386,6 @@ struct GpuPlanSink {
     /// kernel reads the mapped arena directly; 2 = a copy kernel stages it inside the graph.  For 1 and 2 `ptr2`
     /// holds the arena's device alias.
     int pcie_mode = 0;
-    /// STRATA_VERIFY_DEFER_CPU_BELOW (verify.cpp): the group's routing weights as the doorbell published them (entry
-    /// token * k + j).  With `partial` set and heavy > 0 the pool computes the experts of the CPU entries whose weight is
-    /// >= heavy first and calls partial(ctx) before the others.  Null / 0: one pass, as always.
-    const float* weights = nullptr;
-    float heavy = 0.0f;
-    void (*partial)(void* ctx) = nullptr;
     int32_t cpu_jobs = 0;   ///< host only: the distinct experts the pool computes for the layer just published
 };
 
@@ -681,30 +640,11 @@ struct ExpertDispatch {
     /// whose routed ids all look resident there publishes no activation (doorbell_publish_res) - counted
     const int32_t* dres_check = nullptr;
     int64_t stale_x = 0;
-    /// Opt-in (STRATA_ADAPT_FETCH): the PCIe share admits into the VRAM tier.  Its blobs cross into VRAM anyway, so the
-    /// layer's most-routed misses (`usage`) take the share, and one routed at least `fetch_min` and `fetch_margin` more
-    /// than its layer's least-routed resident expert not routed in the window is copied into that one's slot instead
-    /// of staging - a swap with no RAM read of its own.  `res_mut` is `host_res`, written here (and listed in
-    /// `res_dirty_idx`); `in_flight`: experts the adaptive tier is copying in.
-    int fetch_admit = 0;
-    float fetch_min = 1.0f, fetch_margin = 0.5f;
-    int32_t* res_mut = nullptr;
-    std::vector<uint8_t> in_flight;
-    std::vector<uint8_t> fetch_mark;   ///< per expert of the layer: routed in the window
-    /// STRATA_ADAPT_FETCH: whether the pool can admit into `layer` now (a window still needs a PCIe share there)
-    bool fetch_can(int64_t layer) const;
-    /// per layer: the PCIe share fetched there since the tier's last round (the tier leaves those layers' fetchable
-    /// candidates to the admission under STRATA_ADAPT_FETCH=2, and swaps the rest itself)
-    std::vector<uint8_t> fetch_avail;
-    int64_t fetch_admitted = 0;
-    bool fetch_log_on = false;          ///< STRATA_ADAPT_FETCH_VERIFY: keep the admissions for a read-back
-    std::vector<std::pair<int64_t, int32_t>> fetch_log;   ///< (layer * n_expert + expert, slot)
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).
     PeerExperts* peer = nullptr;
     int64_t peer_entries = 0;      ///< routed entries the peer served in verify windows
-    double ms_cpu = 0;             ///< the CPU pool's own time in verify windows (inside ms_run, without the peer's wait)
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
     /// where a source failure surfaces: the driver checks it after `session_loop` returns rather than the
     /// engine computing from a half-filled `parts`.
@@ -786,12 +726,9 @@ public:
     ///
     /// The resident RAM mode (`--resident-experts`, `--resident-cpu-experts`):
     ///   - `pin`: page-locked and mapped (`cudaHostAlloc`), so the prompt path copies it by DMA and the verify
-    ///     window may read a share of the misses over PCIe; when the driver refuses the one allocation, ordinary
-    ///     memory registered slice by slice (about one layer each, as the arena) up to the GPU's shared-memory budget
-    ///     on Windows, and only what no slice holds is locked in the working set instead (STRATA_COMPLEMENT_PIN_GIB:
-    ///     "all" until the driver refuses a slice, N caps the slices at N GiB, 0 skips them).
-    ///     `pin = false` is ordinary pageable memory (the ROCm arm: large pinned allocations can fail there, and it is
-    ///     what the HIP measurements used).
+    ///     window may read a share of the misses over PCIe; when the driver refuses, ordinary memory locked in the
+    ///     working set instead.  `pin = false` is ordinary pageable memory (the ROCm arm: large pinned allocations
+    ///     can fail there, and it is what the HIP measurements used).
     ///   - `lend_from_slot` >= 0: the GPU-cache slots from there to the end are the prompt path's lend region; their
     ///     experts are kept in RAM too, from the last slot down, as far as available memory minus headroom allows
     ///     (a lent slot's expert is streamed during the prompt and copied back after it).
@@ -800,8 +737,7 @@ public:
     /// CS-T, `budget_bytes` > 0 (`--resident-budget-gib`): only as many of those experts as fit `budget_bytes`, taken
     /// in `rank` order (the expert profile: the hottest after the GPU cache's), are copied; the rest stay on the
     /// mapped files (the SSD tier).  No lend region then (a lent slot's expert is read from the files).
-    /// The first attempt uses available RAM. After host allocation failure, Windows retries once with a smaller
-    /// budget limited by a fresh RAM/commit snapshot. A strict whole complement must still fit; only lending shrinks.
+    /// Available memory is limited by both RAM and commit capacity on Windows.
     /// #467: `budget_bytes` = `kResidentWhatFits` sizes that path from available memory minus headroom and the #403
     /// margin - the soft --resident-experts mode's second try when the whole complement does not fit;
     /// false when not even one expert fits.  On Windows the mapped experts leave the working set before any reading.
@@ -811,24 +747,6 @@ public:
         const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs = {}, int64_t lend_from_slot = -1,
         uint64_t headroom_bytes = 8ull << 30, uint64_t budget_bytes = 0,
         const std::vector<std::pair<int32_t, int32_t>>* rank = nullptr);
-    /// S1 (`--numa-hot-node N`): claim the resident complement's pages on NUMA node `N` BEFORE the startup reads.
-    /// The driver's own allocation cannot do it: `cudaHostAlloc` allocates AND page-locks at call time and `mbind`
-    /// cannot move page-locked pages, so where `pin_cache_complement` runs today - after the expert cache's ~24 GiB
-    /// fill has filled the node's page cache - is already too late.  This takes the arena first, on the fallback
-    /// path (mmap -> mbind(MPOL_BIND, N) -> pre-touch), and `pin_cache_complement` then registers and locks the
-    /// claimed arena instead of allocating one.
-    ///
-    /// `requested_bytes` is `--resident-budget-gib`; it is clamped by RAM and commit exactly as the complement's
-    /// own budget is, so the result is the UPPER BOUND of the bytes the complement will copy (the tail it does not
-    /// use is given back when the complement's size is known).  False, with `err`, when this build or this host has
-    /// no mbind, the bind is refused, or the memory cannot be had: the caller warns and starts as it always did -
-    /// the flag is opt-in and the default path is untouched.
-    bool reserve_resident_arena(uint64_t requested_bytes, uint64_t headroom_bytes, int node, std::string& err);
-    /// The bytes `reserve_resident_arena` claimed (0 when none), for the caller's log line.
-    uint64_t reserved_arena_bytes() const { return arena_preclaim_bytes_; }
-    /// The claimed arena itself (null when none), for the caller's own checks; `pin_cache_complement` takes it
-    /// over, so it must not be kept past that call.
-    void* reserved_arena() const { return arena_preclaim_; }
     /// A layer split: the prompt path borrows the TAIL SLOTS of every stage's cache - CUDA0's own part
     /// first, then every stage in order.  Set these BEFORE `pin_cache_complement` to keep those slots' experts
     /// in the RAM copy too: each region lists its stage's (layer, expert) pairs, the highest cache slot first,
@@ -846,16 +764,6 @@ public:
     uint64_t resident_bytes() const { return complement_bytes_; }
     bool complement_pinned() const { return complement_pinned_; }
     bool complement_ready() const { return complement_ready_; }
-#if defined(STRATA_HYBRID)
-    static constexpr int kHybridHip = 8;
-    /// Device pointer for HIP device `hip_index`, or null when that device cannot see the row.
-    const uint8_t* apu_blob(int hip_index, int64_t layer, int64_t expert) const;
-    bool apu_ready() const {
-        for (const uint8_t* p : complement_apu_)
-            if (p != nullptr) return true;
-        return false;
-    }
-#endif
     uint64_t locked_bytes() const { return complement_locked_; }
     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
     int64_t resident_lent_slots() const { return complement_lent_slots_; }
@@ -997,7 +905,6 @@ public:
     /// VRAM. Never touches the resident complement or staging buffers. Disabled by default.
     uint64_t release(int64_t layer, int64_t expert) override;
     bool pinned(int64_t layer, int64_t expert) const override;
-    bool host_copy(int64_t layer, int64_t expert) const override { return has_resident(layer, expert); }
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     bool pcie_layer(int64_t layer) const override;
     bool transient(int64_t layer, int64_t expert) const override;
@@ -1030,9 +937,6 @@ public:
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }
     /// #286: blobs an unbuffered read could not deliver, read through the mapping instead (0 when all went direct).
     int64_t direct_fallbacks() const { return direct_fallbacks_.load(std::memory_order_relaxed); }
-    /// #1237: refills that had to wait for a copy queued out of the stage buffer (STRATA_STAGE_PIN).  Nonzero says the
-    /// streams ran more than a buffer pool behind; tests/hip/stage_fence.cpp asserts it moves.
-    int64_t stage_fence_waits() const { return (int64_t) stage_fence_waits_.load(std::memory_order_relaxed); }
 
     /// Blobs touched, for the driver to report.  With `h = 0` this is `48 * k` per token and the number is only
     /// interesting once Phase 3 makes it not so.
@@ -1075,12 +979,6 @@ public:
     IoCounters io_counters() const;
 
 private:
-    friend struct FileExpertSourceTestAccess;
-    bool pin_cache_complement_attempt(
-        const ExpertCache& cache, std::string& err, bool pin,
-        const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
-        uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
-        const detail::ResidentRetry* retry, uint64_t& failed_bytes);
     const uint8_t* resident_blob(size_t index) const;
     const uint8_t* mapped_blob(int64_t layer, int64_t expert) const;
     /// The blob's bytes from the mapped file(s) - experts.bin, or the three GGUF role slices - into `dst`.
@@ -1230,19 +1128,10 @@ private:
     int64_t last_layer_ = -1;
     bool stage_grew_ = false;
     bool stage_pin_said_ = false, stage_pin_failed_said_ = false;   ///< the one-time notes in claim_stage
-    // #1237: per stage buffer, one fence entry per stream a copy out of it was queued on (note_async_read); the
-    // buffer is refilled only once EVERY such copy has completed.  One entry per stream, not one event per buffer:
-    // the hit path, a peer GPU's refill and the startup's stream-0 refills can all read the same blob, and a single
-    // event would keep only the last one recorded - the refill would then overwrite the buffer under the others.
-    // cudaEvent_t and cudaStream_t are stored untyped (no cuda_runtime.h here).  A full table waits for its oldest
-    // entry and reuses it, so a fence is never dropped.
-    struct StageFence {
-        void* stream = nullptr;
-        void* event = nullptr;
-        bool live = false;          ///< a copy was queued and not yet waited for
-    };
-    static constexpr size_t kStageFences = 4;
-    std::vector<std::array<StageFence, kStageFences>> stage_fence_;
+    // #1237: per stage buffer, the event recorded after the last asynchronous copy out of it (note_async_read); a
+    // buffer is refilled only once that event has completed.  cudaEvent_t, stored untyped (no cuda_runtime.h here).
+    std::vector<void*> stage_ev_;
+    std::vector<char> stage_ev_live_;                 ///< a copy was queued since the buffer was last waited for
     std::unordered_map<const uint8_t*, size_t> stage_idx_;   ///< buffer address -> index (the buffers never move)
     void stage_free_events();
     std::atomic<uint64_t> stage_fence_waits_{0};      ///< refills that had to wait for a queued copy
@@ -1305,10 +1194,6 @@ private:
     void* complement_arena_ = nullptr;
     const uint8_t* complement_host_ = nullptr;
     const uint8_t* complement_device_ = nullptr;
-#if defined(STRATA_HYBRID)
-    /// One hipHostGetDevicePointer per HIP device. A null slot keeps those rows off that device.
-    const uint8_t* complement_apu_[kHybridHip] = {};
-#endif
     uint64_t complement_bytes_ = 0;
     std::vector<uint64_t> complement_offsets_;
     detail::ExchangeStorage exchange_storage_; // authoritative when active; original arenas still own memory
@@ -1320,22 +1205,6 @@ private:
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
-    // ---- S1 (--numa-hot-node): the arena claimed before the startup reads, until pin_cache_complement takes it
-    void* arena_preclaim_ = nullptr;          ///< an mmap of arena_preclaim_bytes_, bound to arena_preclaim_node_
-    uint64_t arena_preclaim_bytes_ = 0;
-    int arena_preclaim_node_ = -1;
-    uint64_t complement_arena_mmap_bytes_ = 0;   ///< complement_arena_ came from mmap: give it back with munmap
-    /// The claimed arena for a complement of `bytes`, its unused tail given back; null (and the claim released)
-    /// when nothing is claimed, or the claim is smaller than `bytes` (the complement was sized after it).
-    void* take_reserved_arena(uint64_t bytes, uint64_t& mmap_bytes);
-    void release_reserved_arena();
-
-    /// The one page-locked allocation refused: the copy registered slice by slice, each with its own device alias
-    /// (sorted by `start`, page-aligned; empty otherwise).  A blob is pinned only when one slice holds all of it.
-    struct ComplementSlice { uint64_t start, end; const uint8_t* device; };
-    std::vector<ComplementSlice> complement_slices_;
-    bool complement_vmem_ = false;            ///< Windows: the sliced copy is VirtualAlloc'd (page-aligned), not malloc'd
-    const ComplementSlice* complement_slice(uint64_t offset, uint64_t bytes) const;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
@@ -1387,20 +1256,11 @@ public:
 
     /// Allocates and loads `<pack_dir>/experts.bin`.  Prints nothing; the caller reports `note()` and the load
     /// rate, because those are the two numbers that say whether the arena is the one that was asked for.
-    /// arena-skip: call BEFORE open().  `l` > 0 loads the packed layout into TWO PinnedArenas, [0, l) and [l, n_layers).
-    /// A large-page allocation cannot be freed in part, so a whole block can be handed back with one MEM_RELEASE once
-    /// the GPU caches are known to hold every pair of its layers (release_tail()).  -1: one block, as before.
-    void set_split_layer(int64_t l) { split_hint_ = l; }
     bool open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads, std::string& err,
               uint64_t max_pinned_bytes = 0, const std::string& shared_arena_file = {});
     /// Plan v0.3 P6: a native pack without experts.bin takes its experts from the model's GGUF: `native` is the
     /// --native shard, and native_experts.txt names the other shards beside it (per layer, or per role in v4).
     void set_gguf(const std::string& native) { gguf_ = native; }
-    /// REMOTE STAGE: hold only layers [lo, hi) (-1: to the last) - a process that runs only
-    /// those layers.  The other layers' experts are absent: blob() and blob_at() are null for them.  Set before
-    /// `open`; a native pack read from its GGUF only (no experts.bin, no STRATA_ARENA_MMAP, no shared arena, no pin
-    /// by need).
-    void set_layer_range(int64_t lo, int64_t hi) { lo_ = lo; hi_ = hi; }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -1411,22 +1271,11 @@ public:
     const uint8_t* blob_at(int64_t layer, int64_t expert) const;
     int64_t reads() const { return reads_.load(std::memory_order_relaxed); }
     bool pinned(int64_t layer, int64_t expert) const override;
-    bool host_copy(int64_t layer, int64_t expert) const override;
     const uint8_t* device_alias(int64_t layer, int64_t expert) const override;
     /// Prefix pinning: the old rule (device_alias(layer, 0)); pin by need: at least one pinned range in the layer.
     bool pcie_layer(int64_t layer) const override;
     void prefetch(int64_t layer, int64_t expert) override;
     uint64_t release(int64_t layer, int64_t expert) override;
-
-    /// arena-skip: the first layer of the tail block (-1 when open() got no split, or when the layout/backing
-    /// forces one block).  Layers >= it live in `arena1_`; blob_at() answers nullptr once that block is gone.
-    int64_t split_layer() const { return split_layer_; }
-    /// arena-skip: hand the tail block back to the OS, whole (MEM_RELEASE of a large-page allocation).  Only sound
-    /// when EVERY pair of those layers sits in a GPU cache: then the pool never reads them, and the adaptive tier
-    /// has no spare slot in those layers to evict one into a read.  Returns the bytes released (0 when there is
-    /// nothing to release or the block is already gone).
-    uint64_t release_tail();
-    bool tail_released() const { return split_layer_ >= 0 && base1_ == nullptr; }
 
     /// Pin by need (STRATA_PIN_BY_NEED=1): BEFORE open(), the (layer, expert) pairs worth pinning, by decreasing
     /// priority - the profile's ranked pairs the GPU cache will NOT hold, then the unranked ones.  open() merges
@@ -1458,11 +1307,6 @@ public:
 
 private:
     void* arena_ = nullptr;          ///< the PinnedArena, owned
-    void* arena1_ = nullptr;         ///< arena-skip: the tail block's PinnedArena, owned (nullptr = one block / released)
-    const uint8_t* base1_ = nullptr; ///< arena-skip: data() of the tail block
-    int64_t split_layer_ = -1;       ///< arena-skip: first layer of the tail block (-1 = one block)
-    int64_t split_hint_ = -1;        ///< arena-skip: set_split_layer()'s request, honoured only on the packed layout
-    uint64_t boundary_off_ = 0;      ///< arena-skip: arena_off(split_layer_, 0) - the tail block's dst_bias
     void* map_ = nullptr;            ///< STRATA_ARENA_MMAP: the arena file, mapped read-only (not the PinnedArena)
     uint64_t map_bytes_ = 0;
     std::vector<const uint8_t*> dev_slice_;   ///< device alias of each registered slice (or of the whole range)
@@ -1494,9 +1338,6 @@ private:
     std::vector<uint8_t> layer_pcie_;
     /// index of the registered range holding [off, off + len), or -1
     int64_t pin_range_of(uint64_t off, uint64_t len) const;
-    int64_t lo_ = 0, hi_ = -1;       ///< set_layer_range
-    uint64_t lo_off_ = 0;            ///< the arena's first byte is layer lo_'s (base_ is shifted back by it)
-    bool in_range(int64_t layer) const { return layer >= lo_ && (hi_ < 0 || layer < hi_); }
     std::string gguf_;
 };
 
@@ -1508,12 +1349,8 @@ bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::E
 /// `unbuffered`: each chunk read past the file cache (Windows); `ready`: layer l is written only once
 /// *ready > l + 1 (an arena that is still being registered).
 /// `pad` (optional): the destination is the page-aligned padded layout (pin by need), see PadMap.
-/// `dst_bias` / `[l0, l1)`: the destination offset that maps to the file's layer 0, and the layer range to load.
-/// Both exist so that one pack can be spread over several allocations (the arena's blocks): a block's first layer
-/// lands at dst[0].  Defaults (0, all layers) are the old single-destination behaviour.  remote-stage's layer
-/// range ([layer_lo, layer_hi) written at dst + blob_offset - dst_off) uses the same parameters (l0, l1, dst_bias).
 LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
                             int threads, bool unbuffered = false, const std::atomic<int>* ready = nullptr,
-                            const PadMap* pad = nullptr, uint64_t dst_bias = 0, int64_t l0 = 0, int64_t l1 = -1);
+                            const PadMap* pad = nullptr);
 
 }  // namespace strata::core
