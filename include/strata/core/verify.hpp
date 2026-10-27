@@ -730,7 +730,7 @@ private:
     int nf_row_ = -1;                     ///< nonfinite_row()
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
     uint32_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
-    void note_nonfinite(int T, const int64_t* pos_b, const int32_t* picks);   ///< the window's flags, + the picks
+    void note_nonfinite(int T, const int64_t* pos_b, const int32_t* picks = nullptr);   ///< the window's flags, + the picks
     /// read beside it (a sentinel INT32_MAX marks its row: the host-side arm of the guard, covering ports whose
     /// graphs carry no logits_nonfinite_rows), + STRATA_NAN_INJECT -> nf_row_
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
