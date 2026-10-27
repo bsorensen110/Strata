@@ -28,14 +28,8 @@ def sh_path(p) -> str:
 class Scripts(unittest.TestCase):
     @unittest.skipIf(SH is None, "needs sh")
     def test_shell_scripts_parse(self):
-        for name in ("entrypoint.sh", "strata-wrapper.sh", "healthcheck.sh", "build.sh", "publish.sh",
-                     "smoke-test.sh"):
-            shell = SH
-            if (DOCKER / name).read_text().startswith("#!/bin/bash"):      # smoke-test.sh: bash on the host, not the image's sh
-                shell = BASH                                      # our full path: a bare "bash" on Windows can start the WSL launcher
-                if shell is None:
-                    continue
-            r = subprocess.run([shell, "-n", sh_path(DOCKER / name)], capture_output=True, text=True)
+        for name in ("entrypoint.sh", "strata-wrapper.sh", "healthcheck.sh", "build.sh", "publish.sh"):
+            r = subprocess.run([SH, "-n", sh_path(DOCKER / name)], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, f"{name}: {r.stderr}")
 
     @unittest.skipIf(BASH is None, "needs bash")

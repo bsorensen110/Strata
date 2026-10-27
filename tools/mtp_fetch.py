@@ -223,60 +223,14 @@ def exit_with_parent():
     if parent <= 1:
         return
     if os.name == "nt":
-        # Watch every ancestor, not only the direct parent: a venv's python.exe is a trampoline that starts the real
-        # interpreter as its own child and waits for it, so the direct parent lives exactly as long as this download
-        # and can never notice that setup (its parent) was killed - exactly the grandchild #3257 is about.  A handle
-        # is kept for each: a reused process id is never mistaken for the one we watched.
         import ctypes
-        from ctypes import wintypes
         k32 = ctypes.windll.kernel32
-        SYNCHRONIZE, SNAPSHOT = 0x00100000, 0x00000002
-        k32.OpenProcess.restype = k32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
-        k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        k32.CreateToolhelp32Snapshot.argtypes = (wintypes.DWORD, wintypes.DWORD)
+        k32.OpenProcess.restype = ctypes.c_void_p
         k32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_ulong)
-        k32.CloseHandle.argtypes = (ctypes.c_void_p,)
-
-        class Entry(ctypes.Structure):
-            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
-                        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
-                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
-                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
-                        ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_char * 260)]
-
-        k32.Process32First.argtypes = (ctypes.c_void_p, ctypes.POINTER(Entry))
-        k32.Process32Next.argtypes = (ctypes.c_void_p, ctypes.POINTER(Entry))
-
-        def parent_of(pid):
-            """The process that started `pid`, from the kernel's snapshot; None when it is not in there."""
-            snap = k32.CreateToolhelp32Snapshot(SNAPSHOT, 0)
-            if not snap or snap == ctypes.c_void_p(-1).value:
-                return None
-            e = Entry()
-            e.dwSize = ctypes.sizeof(Entry)
-            try:
-                ok = k32.Process32First(snap, ctypes.byref(e))
-                while ok:
-                    if e.th32ProcessID == pid:
-                        return e.th32ParentProcessID or None
-                    ok = k32.Process32Next(snap, ctypes.byref(e))
-            finally:
-                k32.CloseHandle(snap)
-            return None
-
-        handles, seen, pid, direct = [], set(), parent, True
-        while pid and pid not in seen and len(handles) < 8:
-            seen.add(pid)
-            h = k32.OpenProcess(SYNCHRONIZE, False, pid)
-            if not h:
-                if direct:
-                    return                             # no access to the parent (or it is gone): as before, no watch
-                break                                  # a higher ancestor we cannot see: watch the ones we can
-            handles.append(h)
-            pid, direct = parent_of(pid), False
-        if not handles:
-            return                                       # nothing to watch
-        gone = lambda: any(k32.WaitForSingleObject(h, 0) == 0 for h in handles)
+        h = k32.OpenProcess(0x00100000, False, parent)       # SYNCHRONIZE: a handle keeps the answer true if the id is reused
+        if not h:
+            return                                           # no access (or already gone): nothing to watch
+        gone = lambda: k32.WaitForSingleObject(h, 0) == 0
     else:
         gone = lambda: os.getppid() != parent
 

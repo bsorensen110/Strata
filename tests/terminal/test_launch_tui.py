@@ -697,7 +697,7 @@ class AccessStep(Base):
         async def case(app, pilot, ctx):
             with mock.patch.object(access, "find_cloudflared", return_value=None):
                 await press(pilot, *self.reach(), "down", "down")
-                t = " ".join(text_of(app).split())          # the hint wraps; the Linux one is long enough to split "quick tunnel"
+                t = text_of(app)
                 self.assertIn("cloudflared is not installed on this computer", t)
                 self.assertIn("quick tunnel", flat(app))
                 await press(pilot, "enter")

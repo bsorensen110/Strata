@@ -29,7 +29,6 @@ td.log
 /.venv/
 /build/
 /third_party/llama.cpp
-/third_party/metal-cpp/
 /models/
 /packs/
 /mtp/
@@ -60,12 +59,6 @@ build-vision-cuda12.bat
 .vscode/
 .idea/
 .cursor/
-# Local History extension snapshots (per-file editor history, incl. copies of
-# *.local.md notes) -- local session state, never project source
-.history/
-# Personal Copilot/agent sidecar files (per-machine agent personas) -- local
-# session state, not project source
-.github/agents/
 
 /.ccache/
 /.rocm-win/
@@ -76,13 +69,6 @@ build-vision-cuda12.bat
 
 # local Windows HIP packaging output
 dist-hip/
-gap/.server
-
-# local notes written by scheduled scans (kept out of version control)
-security-findings.local.md
-bug-hunter-state.local.md
-proposed-fixes.local.md
-change-digest-state.local.md
 
 # Terminal / Desktop split: local venvs, build output and archives never enter git
 .terminal-venv/
@@ -91,10 +77,6 @@ node_modules/
 *.dmg
 /release/artifacts/
 /apps/host/dist/
-/apps/host/python/remote-lifecycle-source.json.gz
-/apps/desktop/build/
-/apps/desktop/src-tauri/resources/companion-bridge/*
-!/apps/desktop/src-tauri/resources/companion-bridge/.gitignore
 /apps/desktop/src-tauri/target/
 /apps/desktop/src-tauri/resources/node/*
 !/apps/desktop/src-tauri/resources/node/.gitignore

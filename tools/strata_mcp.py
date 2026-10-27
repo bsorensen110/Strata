@@ -22,7 +22,6 @@ This file is an MCP *server* for the AI assistant you already use.
 from __future__ import annotations
 
 import argparse
-import http.client
 import importlib.util
 import json
 import os
@@ -400,10 +399,7 @@ def http_json(url: str, method="GET", body=None, api_key=None, timeout=3.0):
             status = r.status
     except urllib.error.HTTPError as e:
         raw, status = e.read(), e.code
-    # `HTTPException` (#probe): a port that answers with something that is not HTTP - on Windows a loopback
-    # self-connect (the client's own ephemeral port is the port being probed) hands the request straight back, so
-    # `http.client` reads it as a status line.  Probing must not throw: 0, nothing answers.
-    except (OSError, ValueError, http.client.HTTPException):
+    except (OSError, ValueError):
         return 0, None
     try:
         return status, json.loads(raw or b"null")
@@ -2577,14 +2573,9 @@ class Tools:
 # ------------------------------------------------------------------------------------------------ MCP over stdio
 INSTRUCTIONS = ("Strata runs a large AI model (Qwen3.8-Flash-Next, a mixture of experts) locally on this PC's GPU and "
                 "RAM, with an OpenAI- and Anthropic-compatible server on http://127.0.0.1:8080. Call strata_status "
-                "first: it says what is running, what is installed, and which model size fits this PC. To install, "
-                "choose a size with strata_models, then strata_install - the first call only returns the plan, so "
-                "show it to the user and get their OK for the 58-111 GB download before calling again with "
-                "confirm=true; it runs in the background, call it again for progress. Start the model with "
-                "strata_start (loading takes 1-3 minutes; 'loading' means check strata_status again), check the "
-                "speed with strata_benchmark, and point other apps at it with strata_connect_info. strata_logs shows "
-                "what went wrong and strata_stop ends the model. The server answers on this PC only, unless the user "
-                "runs it with --host 0.0.0.0 and an API key.")
+                "first. To install: strata_install (it returns a plan; get the user's OK for the 58-111 GB download, "
+                "then call it with confirm=true; it runs in the background - call it again for progress). Then "
+                "strata_start, strata_stop, strata_logs for problems, strata_connect_info to point other apps at it.")
 
 
 class McpServer:

@@ -90,11 +90,9 @@ uint64_t free_huge_bytes() {
 // are the resident arena.  This shared-file layout is intended for tmpfs (/dev/shm); hugetlbfs would need
 // hugepage-aligned file size and arena offset rather than the 4 KiB header layout used here.
 void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::string& shared_file,
-              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes,
-              bool& shared_existing, bool& shared_complete) {
+              uint64_t shared_pack_hash, void*& mapping_base, uint64_t& mapping_bytes) {
     mapping_base = nullptr;
     mapping_bytes = 0;
-    shared_existing = shared_complete = false;
 
 #ifdef _WIN32
     if (!shared_file.empty()) {
@@ -194,7 +192,6 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
                 return nullptr;
             }
         } else {
-            shared_existing = true;
             if (st.st_size < 0 || (uint64_t) st.st_size != file_bytes) {
                 close(fd);
                 note = "shared arena " + shared_file + " is " +
@@ -221,7 +218,6 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
                 note = b;
                 return nullptr;
             }
-            shared_complete = hdr.reserved[0] == 1;   // STRATA_ARENA_REUSE: a previous start finished this arena
         }
 
         void* map = mmap(nullptr, (size_t) file_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -358,57 +354,39 @@ int arena_pin_cap_gib() {
     if (e == nullptr || *e == '\0') return -1;
     if (std::string(e) == "none") return -1;   // 153-igpu: handled by arena_no_register(); no cap otherwise
     if (std::string(e) == "auto") return -2;   // #243: the Windows shared-memory budget sets the sliced pin's cap
-    if (std::string(e) == "none") return -3;   // nothing pinned (`0` stays the whole arena, as documented)
     const int v = std::atoi(e);
     return v < 0 ? -1 : v;
 }
 
-// #243: how much a sliced registration that CUDA device `dev` reads may pin on Windows.  Page-locked memory a GPU
-// maps is charged to its adapter's shared (non-local) WDDM segment; pinned slice by slice until the driver refused one
-// (28 GiB of a 63 GB PC), that segment was left full and every later cudaMalloc failed "out of memory".  A margin of
-// the budget (STRATA_PIN_MARGIN_GIB, default 4 GiB) stays free for what the engine allocates after the registration;
-// without the DXGI numbers, RAM/2 - 8 GiB (the budget is about half the RAM).  False: no limit could be worked out.
-bool shared_pin_limit_for(int dev, uint64_t& limit, std::string& why) {
+namespace {
 #ifdef _WIN32
+// #243: how much of the arena the sliced registration may pin on Windows when the whole arena was refused.
+// Page-locked memory the GPU maps is charged to its shared (non-local) WDDM segment; pinned slice by slice until
+// the driver refused one (28 GiB of a 63 GB PC), that segment was left full and every later cudaMalloc failed
+// "out of memory".  4 GiB of the budget stay free for what the engine allocates after the arena; without the DXGI
+// numbers, RAM/2 - 8 GiB (the budget is about half the RAM).  False: no limit could be worked out.
+bool sliced_pin_limit(uint64_t& limit, std::string& why) {
     constexpr uint64_t GiB = 1ull << 30;
-    static const uint64_t margin = [] {
-        const char* e = std::getenv("STRATA_PIN_MARGIN_GIB");
-        return e != nullptr && *e != '\0' && std::atof(e) >= 0.0 ? (uint64_t) (std::atof(e) * 1073741824.0) : 4 * GiB;
-    }();
     char buf[256];
+    int dev = 0;
     cudaDeviceProp p{};
     uint64_t budget = 0, usage = 0;
     std::string err = "no CUDA device properties";
-    if (cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+    if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
         strata::platform::gpu_shared_memory_budget(p.luid, budget, usage, err)) {
-        limit = budget > usage + margin ? budget - usage - margin : 0;
-        std::snprintf(buf, sizeof buf, "the shared-memory budget of CUDA%d's adapter %.1f GiB - %.1f GiB in use - %.1f GiB",
-                      dev, (double) budget / GiB, (double) usage / GiB, (double) margin / GiB);
+        limit = budget > usage + 4 * GiB ? budget - usage - 4 * GiB : 0;
+        std::snprintf(buf, sizeof buf, "the GPU's shared-memory budget %.1f GiB - %.1f GiB in use - 4 GiB",
+                      (double) budget / GiB, (double) usage / GiB);
         why = buf;
         return true;
     }
     (void) cudaGetLastError();
     const uint64_t ram = strata::platform::total_physical_memory();
-    if (ram == 0) { why = err; return false; }
+    if (ram == 0) return false;
     limit = ram / 2 > 8 * GiB ? ram / 2 - 8 * GiB : 0;
     std::snprintf(buf, sizeof buf, "%s: RAM/2 - 8 GiB of %.1f GiB", err.c_str(), (double) ram / GiB);
     why = buf;
     return true;
-#else
-    (void) dev;
-    limit = 0;
-    why = "no shared-memory budget outside Windows";
-    return false;
-#endif
-}
-
-namespace {
-#ifdef _WIN32
-// the arena's sliced registration (#243, STRATA_ARENA_PIN_GIB=auto): the current device's adapter
-bool sliced_pin_limit(uint64_t& limit, std::string& why) {
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); dev = 0; }
-    return shared_pin_limit_for(dev, limit, why);
 }
 #endif
 }  // namespace
@@ -423,12 +401,6 @@ std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
 }
 }  // namespace
 
-void PinnedArena::mark_shared_complete() {
-    // only a shared-FILE backing has base above its header; an anonymous arena sets mapping_base == base
-    if (mapping_base == nullptr || (uint8_t*) mapping_base == (uint8_t*) base) return;
-    ((SharedArenaHeader*) mapping_base)->reserved[0] = 1;   // MAP_SHARED: the flag lands in the file
-}
-
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
     if (slice_bytes) slice_bytes = slice;   // sliced registration: record the uniform size
 }
@@ -437,8 +409,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
                          uint64_t max_pinned_bytes, const std::string& shared_file,
                          uint64_t shared_pack_hash) : capacity(bytes) {
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes,
-                   shared_existing, shared_complete);
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
@@ -470,10 +441,6 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         if (cap == 0 && env_gib > 0) {
             cap = (uint64_t) env_gib << 30;
             cap_why = "by STRATA_ARENA_PIN_GIB";
-        }
-        if (env_gib == -3 && cap <= 1) {   // STRATA_ARENA_PIN_GIB=none: no slice fits one byte
-            cap = 1;
-            cap_why = "by STRATA_ARENA_PIN_GIB=none (nothing pinned)";
         }
         const bool capped = cap > 0 && cap < bytes && bounds.size() >= 2;
         const cudaError_t e = capped ? cudaSuccess :
@@ -561,8 +528,7 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
                          uint64_t shared_pack_hash) : capacity(bytes) {
     by_need = true;
     if (bytes == 0) return;
-    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes,
-                   shared_existing, shared_complete);
+    base = reserve(bytes, backing, note, shared_file, shared_pack_hash, mapping_base, mapping_bytes);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
@@ -649,8 +615,7 @@ PinnedArena::PinnedArena(uint64_t bytes, ByNeed, const std::vector<std::pair<uin
 PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, Deferred)
     : capacity(bytes), bounds_(bounds) {
     if (bytes == 0 || bounds.size() < 2) return;
-    base = reserve(bytes, backing, note, std::string{}, 0, mapping_base, mapping_bytes,
-                   shared_existing, shared_complete);
+    base = reserve(bytes, backing, note, std::string{}, 0, mapping_base, mapping_bytes);
     if (base != nullptr && mapping_base == nullptr) {
         mapping_base = base;
         mapping_bytes = bytes;
@@ -866,13 +831,13 @@ bool experts_unbuffered(const std::vector<std::string>& files, uint64_t arena_by
 
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
-                              const std::atomic<int>* ready, uint64_t dst_bias) {
-    return load_experts_ranges(path, dst, layer_off, layer_bytes, threads, chunk, ready, nullptr, dst_bias);
+                              const std::atomic<int>* ready) {
+    return load_experts_ranges(path, dst, layer_off, layer_bytes, threads, chunk, ready, nullptr);
 }
 
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
-                              const std::atomic<int>* ready, const PadMap* pad, uint64_t dst_bias) {
+                              const std::atomic<int>* ready, const PadMap* pad) {
     LoadStats st;
     const uint64_t layers = (uint64_t) layer_off.size();
     st.layers = layers;
@@ -942,9 +907,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
                 }
                 const auto t_copy = std::chrono::steady_clock::now();
                 if (pad == nullptr) {
-                    // dst_bias maps the file offset to the destination: 0 for the whole arena, the block's first
-                    // layer offset when the file is split across several allocations (see ArenaExpertSource).
-                    std::memcpy(dst + off - dst_bias + pos, buf.data(), (size_t) n);
+                    std::memcpy(dst + off + pos, buf.data(), (size_t) n);
                 } else {   // the padded layout: a chunk may span blobs, each lands at its own page-aligned start
                     const uint64_t B = pad->blob[(size_t) L], S = pad->stride[(size_t) L];
                     for (uint64_t q = 0; q < n;) {

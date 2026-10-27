@@ -65,26 +65,15 @@ int qk_of(int t) { return t == 20 ? 32 : t == 42 ? 64 : 256; }
 struct Choice {
     std::string name;
     bool dec = false;
-    K::NativeExpertExpdecParams p;   // only explicitly specified fields set; unspecified fields keep their sentinels
+    K::NativeExpertExpdecParams p;   // every field set: the engine's startup values, then the choice's fields
 };
-
-K::NativeExpertExpdecParams resolve_choice_params(const K::NativeExpertExpdecParams& base, const Choice& c) {
-    K::NativeExpertExpdecParams p = base;
-    if (c.p.gu_rows_per_lane > 0) p.gu_rows_per_lane = c.p.gu_rows_per_lane;
-    if (c.p.down_rows_per_lane > 0) p.down_rows_per_lane = c.p.down_rows_per_lane;
-    if (c.p.gu_min_blocks_per_sm > 0) p.gu_min_blocks_per_sm = c.p.gu_min_blocks_per_sm;
-    if (c.p.down_iq4_nl >= 0) p.down_iq4_nl = c.p.down_iq4_nl;
-    if (c.p.down >= 0) p.down = c.p.down;
-    if (c.p.gu_rows_per_block >= 0) p.gu_rows_per_block = c.p.gu_rows_per_block;
-    if (c.p.down_rows_per_block >= 0) p.down_rows_per_block = c.p.down_rows_per_block;
-    if (c.p.min_blocks > 0) p.min_blocks = c.p.min_blocks;
-    return p;
-}
+K::NativeExpertExpdecParams g_engine_params;   // the engine's values at startup (environment or defaults)
 
 // "def" | "dec[:r<n>][:d<n>][:b<n>][:x<n>][:g<n>][:h<n>][:m<n>]"; false on anything else
 bool parse_choice(const std::string& s, Choice& c) {
     c = Choice{};
     c.name = s;
+    c.p = g_engine_params;
     if (s == "def") return true;
     if (s.rfind("dec", 0) != 0) return false;
     c.dec = true;
@@ -101,7 +90,7 @@ bool parse_choice(const std::string& s, Choice& c) {
             case 'd': if (v != 1 && v != 2 && v != 4) return false; c.p.down_rows_per_lane = v; break;
             case 'b': if (v != 2 && v != 4) return false; c.p.gu_min_blocks_per_sm = v; break;
             case 'x': if (v != 0 && v != 1) return false; c.p.down_iq4_nl = v; break;
-            case 'w': if (v != 0 && v != 1) return false; c.p.down = v; break;   // EXPDEC for the down (device default when omitted)
+            case 'w': if (v != 0 && v != 1) return false; c.p.down = v; break;   // EXPDEC for the down (engine default 0)
             case 'g': if (v < 0) return false; c.p.gu_rows_per_block = v; break;
             case 'h': if (v < 0) return false; c.p.down_rows_per_block = v; break;
             case 'm': if (v <= 0) return false; c.p.min_blocks = v; break;
@@ -112,9 +101,9 @@ bool parse_choice(const std::string& s, Choice& c) {
     return true;
 }
 
-void apply_choice(const K::NativeExpertExpdecParams& base, const Choice& c) {
+void apply_choice(const Choice& c) {
     K::native_expert_set_expdec(c.dec ? 1 : 0);
-    K::native_expert_set_expdec_params(resolve_choice_params(base, c));
+    K::native_expert_set_expdec_params(c.p);
 }
 
 bool g_cuda_error = false;
@@ -226,10 +215,9 @@ struct StreamEvents {
 using Key = std::tuple<int, int, int, int, std::string, std::string>;
 std::map<Key, std::array<double, 3>> g_times;
 
-bool run_device(int dev, const K::NativeExpertExpdecParams& dev_params, int reps, int groups_req,
-                const std::vector<uint8_t>& pool, size_t P, size_t stride, const std::vector<float>& xh,
-                const K::NativeExpertLayout& L, const Pair& pair, const std::vector<Choice>& choices,
-                const std::vector<std::string>& shapes, long long& bad) {
+bool run_device(int dev, int reps, int groups_req, const std::vector<uint8_t>& pool, size_t P, size_t stride,
+                const std::vector<float>& xh, const K::NativeExpertLayout& L, const Pair& pair,
+                const std::vector<Choice>& choices, const std::vector<std::string>& shapes, long long& bad) {
     if (!ck(cudaSetDevice(dev), "set device")) return false;
     cudaDeviceProp pr{};
     cudaGetDeviceProperties(&pr, dev);
@@ -308,7 +296,7 @@ bool run_device(int dev, const K::NativeExpertExpdecParams& dev_params, int reps
             std::vector<float> ref, res((size_t) NE * kEmbd);
             for (size_t vi = 0; vi < choices.size() && ok; ++vi) {
                 const Choice& c = choices[vi];
-                apply_choice(dev_params, c);
+                apply_choice(c);
                 K::native_expert_set_mode(-1, 0);
                 ok = ck(cudaMemset(dout, 0, (size_t) NE * kEmbd * sizeof(float)), "memset out");
                 call(0);
@@ -338,7 +326,8 @@ bool run_device(int dev, const K::NativeExpertExpdecParams& dev_params, int reps
         }
     }
     Choice off;
-    apply_choice(dev_params, off);
+    off.p = g_engine_params;
+    apply_choice(off);
     K::native_expert_set_mode(-1, 0);
     return ok;
 }
@@ -391,6 +380,7 @@ int main(int argc, char** argv) {
     } else {
         pairs.assign(std::begin(kModelPairs), std::end(kModelPairs));
     }
+    g_engine_params = K::native_expert_expdec_params();
     std::vector<Choice> choices;
     for (const std::string& s : split_commas(argc > 5 ? argv[5] : "def,dec,dec:r2,dec:b4,dec:r2:b4")) {
         Choice c;
@@ -421,14 +411,6 @@ int main(int argc, char** argv) {
         std::printf("expdec_bench: device %d, only %d present\n", only, n_dev);
         return 1;
     }
-    // Snapshot each device's startup defaults before any choice overrides the process-wide EXPDEC parameters.
-    std::vector<K::NativeExpertExpdecParams> dev_params((size_t) n_dev);
-    for (int d = 0; d < n_dev; ++d) {
-        if (only >= 0 && d != only) continue;
-        if (!ck(cudaSetDevice(d), "set device")) return 1;
-        dev_params[(size_t) d] = K::native_expert_expdec_params();
-    }
-    const K::NativeExpertExpdecParams banner_params = dev_params[(size_t) (only >= 0 ? only : 0)];
     for (const Pair& p : pairs) {
         if (!K::native_expert_supported(p.gu, p.d, kEmbd, kFf)) {
             std::printf("expdec_bench: native_expert_supported(%d, %d, %d, %d) is false\n", p.gu, p.d, kEmbd, kFf);
@@ -447,14 +429,10 @@ int main(int argc, char** argv) {
     K::iq_set_old_kernels(false);
     std::printf("# n_embd %d, n_ff %d, %d pair(s), choices:", kEmbd, kFf, (int) pairs.size());
     for (const Choice& c : choices) {
-        if (c.dec) {
-            const K::NativeExpertExpdecParams cp = resolve_choice_params(banner_params, c);
-            std::printf(" %s(gu R %d minb %d, down %d R %d iq4_nl %d, rb %d drb %d, min blocks %d)", c.name.c_str(),
-                        cp.gu_rows_per_lane, cp.gu_min_blocks_per_sm, cp.down, cp.down_rows_per_lane, cp.down_iq4_nl,
-                        cp.gu_rows_per_block, cp.down_rows_per_block, cp.min_blocks);
-        } else {
-            std::printf(" %s", c.name.c_str());
-        }
+        if (c.dec) std::printf(" %s(gu R %d minb %d, down R %d iq4_nl %d, rb %d drb %d, min blocks %d)", c.name.c_str(),
+                               c.p.gu_rows_per_lane, c.p.gu_min_blocks_per_sm, c.p.down_rows_per_lane, c.p.down_iq4_nl,
+                               c.p.gu_rows_per_block, c.p.down_rows_per_block, c.p.min_blocks);
+        else std::printf(" %s", c.name.c_str());
     }
     std::printf("\n# dev T shape gu/d choice all_us gu_us down_us GB/s pct identical|DIFFERENT\n");
     long long bad = 0;
@@ -475,7 +453,7 @@ int main(int argc, char** argv) {
         for (float& v : xh) v = nd(rng);
         for (int dev = 0; dev < n_dev; ++dev) {
             if (only >= 0 && dev != only) continue;
-            ok = run_device(dev, dev_params[(size_t) dev], reps, groups_req, pool, P, stride, xh, L, p, choices, shapes, bad) && ok;
+            ok = run_device(dev, reps, groups_req, pool, P, stride, xh, L, p, choices, shapes, bad) && ok;
         }
     }
     if (shapes.size() == 2 && groups_req == 20) {

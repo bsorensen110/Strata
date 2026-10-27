@@ -1,5 +1,4 @@
 #include "strata/core/expert_source.hpp"
-#include "strata/core/numa_policy.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -40,41 +39,15 @@
 #define PSAPI_VERSION 2
 #include <windows.h>
 #include <psapi.h>
-#elif defined(__linux__)
-#include <sys/syscall.h>
-#include <unistd.h>
 #endif
 
 namespace fs = std::filesystem;
-
-namespace strata::core {
-
-// Exercise the production retry attempt with controlled memory limits, without exhausting host RAM.
-struct FileExpertSourceTestAccess {
-    static bool retry(FileExpertSource& source, const ExpertCache& cache, std::string& err,
-                      const std::vector<std::pair<int32_t, int32_t>>& additional, uint64_t budget,
-                      const detail::ResidentRetry* retry, uint64_t& failed_bytes) {
-        return source.pin_cache_complement_attempt(cache, err, false, additional, -1, 0, budget, nullptr,
-                                                    retry, failed_bytes);
-    }
-};
-
-}  // namespace strata::core
 
 namespace {
 
 void require(bool ok, const std::string& message) {
     if (!ok) throw std::runtime_error(message);
 }
-
-#if defined(__linux__) && defined(SYS_get_mempolicy)
-/// The NUMA node the page at `p` is allocated on (get_mempolicy, MPOL_F_NODE|MPOL_F_ADDR); -1 when unanswerable.
-int page_node_of(const void* p) {
-    int node = -1;
-    if (syscall(SYS_get_mempolicy, &node, nullptr, 0, p, 1 | 2 /*MPOL_F_NODE|MPOL_F_ADDR*/) != 0) return -1;
-    return node;
-}
-#endif
 
 struct TempDirectory {
     fs::path path;
@@ -471,136 +444,10 @@ void test_numa_slice_ranges() {
     require(!(b[0].first <= 870400 && 870400 < b[0].second), "the gate/up boundary page was in slice 1's gate range");
 }
 
-// S2/S3: the two node accessors every placement site tests BEFORE it does anything.  They are process-wide and -1
-// is "off" - the state a run that never passed --numa-hot-node leaves them in, and the reason such a run takes no
-// placement branch and issues not one syscall.
-void test_numa_node_accessors() {
-    using namespace strata::core::detail;
-    require(numa_hot_node() == -1 && numa_cold_node() == -1, "-1 (off) is the default of both node accessors");
-    set_numa_hot_node(1);
-    set_numa_cold_node(0);
-    require(numa_hot_node() == 1 && numa_cold_node() == 0, "a node set is read back from the same accessor");
-    set_numa_hot_node(-1);
-    set_numa_cold_node(-1);
-    require(numa_hot_node() == -1 && numa_cold_node() == -1, "off can be set back");
-    std::cout << "numa node accessors: off by default, round-trip: PASS\n";
-}
-
-// S1: the claim is judged against the target node's OWN free memory before a page is mapped.  These are the three
-// pieces that judgment is made of - the node meminfo parse, the fit arithmetic, and the node id enumeration (the
-// entries are a set, not the 0..count-1 range their count would suggest) - and all three are GPU-free and allocate
-// nothing.
-void test_numa_node_guard() {
-    using namespace strata::core::detail;
-    constexpr uint64_t GiB = 1ull << 30;
-    uint64_t bytes = 0;
-    require(numa_node_memfree_from_text("Node 1 MemFree:         52428800 kB\n", bytes) && bytes == 52428800ull * 1024,
-            "a node's MemFree line was misread");
-    require(numa_node_memfree_from_text("Node 0 MemTotal: 59000000 kB\nNode 0 MemFree: 4096 kB\n", bytes) &&
-                bytes == 4096ull * 1024, "a MemFree line after other lines was misread");
-    require(!numa_node_memfree_from_text("MemFree: 1284096 kB\n", bytes),
-            "a /proc/meminfo line was read as a node's own MemFree");
-    require(!numa_node_memfree_from_text("Node 1 MemUsed: 7 kB\n", bytes), "a text with no MemFree line was read");
-    // the scaling bound: the largest reading that fits is taken, one past it is refused rather than wrapped
-    require(numa_node_memfree_from_text("Node 1 MemFree:         18014398509481983 kB\n", bytes) &&
-                bytes == 18014398509481983ull * 1024, "the largest MemFree reading that fits was refused");
-    require(!numa_node_memfree_from_text("Node 1 MemFree:         18446744073709551615 kB\n", bytes),
-            "a MemFree reading too large to scale was accepted");
-    require(node_claim_fits(10 * GiB, 6 * GiB, 4 * GiB), "a claim that fits with the reserve was refused");
-    require(!node_claim_fits(10 * GiB, 6 * GiB, 4 * GiB + 1), "a claim eating into the reserve was accepted");
-    require(node_claim_fits(GiB, GiB, 0), "a claim equal to the free memory and no reserve was refused");
-    require(!node_claim_fits(10 * GiB, 11 * GiB, 0), "a claim past the node's free memory was accepted");
-    require(!node_claim_fits(0, 1, 0) && !node_claim_fits(2 * GiB, 2 * GiB, 1), "an empty node took a claim");
-    require(!node_claim_fits(std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max() - 1, 2),
-            "a claim that would overflow was accepted");
-    // the enumeration: the ids ARE the sysfs entries, ascending and distinct, and readable one by one
-    const std::vector<int> ids = numa_node_ids();
-    require((int) ids.size() == numa_node_count(), "the node count disagrees with the node ids");
-    require(std::is_sorted(ids.begin(), ids.end()) && std::adjacent_find(ids.begin(), ids.end()) == ids.end(),
-            "the node ids are not strictly ascending");
-    for (int id : ids)
-        require(fs::is_directory("/sys/devices/system/node/node" + std::to_string(id)),
-                "an enumerated node has no sysfs entry");
-    if (!ids.empty()) {
-        require(numa_node_memfree_bytes(ids.front(), bytes), "the first node's own MemFree could not be read");
-        require(!numa_node_memfree_bytes(ids.back() + 1, bytes), "a node that does not exist answered");
-    } else {
-        require(!numa_node_memfree_bytes(0, bytes), "a host with no node sysfs answered for node 0");
-    }
-    std::cout << "numa node guard: meminfo parse, fit arithmetic and node ids: PASS\n";
-}
-
-// S1 (--numa-hot-node): the resident complement's pages are claimed on one node BEFORE the startup reads - mmap,
-// mbind(MPOL_BIND) and the pages faulted in while the node is still empty - and `pin_cache_complement` registers
-// and locks that arena instead of allocating one.  Only the claim itself is testable without a GPU (the
-// complement's use of it needs a real ExpertCache: the --rotation-gpu path).
-void test_numa_hot_node() {
-    using namespace strata::core;
-    using namespace strata::kernels::cpu;
-#if defined(__linux__) && defined(SYS_mbind) && defined(SYS_get_mempolicy)
-    const std::vector<int> node_ids = strata::core::detail::numa_node_ids();
-    require(!node_ids.empty(), "a host with /sys/devices/system/node/node* has at least one node");
-    TempDirectory dir;
-    std::string err;
-    require(expert_layout_load(dir.path.string(), 1, 2, err), err);
-    create_pack(dir.path, 2 * BLOB);
-    FileExpertSource source;
-    require(!source.reserve_resident_arena(32ull << 20, 0, node_ids.front(), err) && !err.empty(),
-            "a claim before the mapped experts were opened was accepted");
-    require(source.open(dir.path.string(), 1, 2, err), err);
-    require(!source.reserve_resident_arena(0, 0, node_ids.front(), err),
-            "a claim with no resident budget was accepted");
-    if (node_ids.size() < 2) {
-        std::cout << "file_expert_source_test: --numa-hot-node placement skipped (one NUMA node here)\n";
-        source.close();
-        return;
-    }
-    const uint64_t want = 32ull << 20;
-    const int hot = node_ids[1], first = node_ids.front();
-    require(source.reserve_resident_arena(want, 0, hot, err), err);
-    require(source.reserved_arena_bytes() == want, "the claim was not sized by the requested budget");
-    uint8_t* arena = (uint8_t*) source.reserved_arena();
-    require(arena != nullptr, "a successful claim has no arena");
-    for (uint64_t at = 0; at < want; at += 1ull << 20) {
-        require(page_node_of(arena + at) == hot, "a page claimed for a node is not on it");
-        arena[at] = (uint8_t) (at >> 20);
-        require(arena[at] == (uint8_t) (at >> 20), "the claimed arena is not writable memory");
-    }
-    // one claim per source, and close() gives it back
-    require(!source.reserve_resident_arena(want, 0, first, err), "a second claim on one source was accepted");
-    require(source.reserved_arena_bytes() == want && source.reserved_arena() == arena,
-            "the refused second claim touched the first");
-    source.close();
-    require(source.reserved_arena_bytes() == 0 && source.reserved_arena() == nullptr, "close() kept the claim");
-    // the first node id is a node number, not "off" (node 0 on every host that has a node 0)
-    require(source.open(dir.path.string(), 1, 2, err), err);
-    require(source.reserve_resident_arena(want, 0, first, err), err);
-    uint8_t* zero = (uint8_t*) source.reserved_arena();
-    require(zero != nullptr, "a node-0 claim has no arena");
-    zero[0] = 1;
-    zero[want - 4096] = 1;
-    require(page_node_of(zero) == first && page_node_of(zero + want - 4096) == first,
-            "node 0 is a node number: its claim must be placed on node 0");
-    source.close();
-    // a node this host does not have is refused - its own meminfo is not even there - not silently placed elsewhere
-    require(source.open(dir.path.string(), 1, 2, err), err);
-    require(!source.reserve_resident_arena(want, 0, node_ids.back() + 1, err) && !err.empty(),
-            "a claim on a node this host does not have was accepted");
-    require(source.reserved_arena() == nullptr, "a refused claim left an arena behind");
-    source.close();
-    std::cout << "numa hot node: " << node_ids.size() << " nodes, claims on " << hot << " and " << first
-              << " placed there: PASS\n";
-#else
-    std::cout << "file_expert_source_test: --numa-hot-node test skipped (not a Linux host with mbind)\n";
-#endif
-}
-
 void test_resident_memory_budget() {
     using strata::core::detail::clamp_resident_budget;
     constexpr uint64_t GiB = 1ull << 30, margin = 256ull << 20, headroom = 4 * GiB;
     constexpr uint64_t unlimited = std::numeric_limits<uint64_t>::max();
-    require(clamp_resident_budget(66 * GiB, 69 * GiB, unlimited, headroom) == 65 * GiB - margin,
-            "the initial allocation did not retain the RAM-only budget");
     // #730: RAM can hold the requested cache, but Windows cannot commit it.
     require(clamp_resident_budget(66 * GiB, 69 * GiB, 47 * GiB, headroom) == 43 * GiB - margin,
             "a RAM budget exceeded available commit capacity");
@@ -624,162 +471,6 @@ void test_resident_memory_budget() {
     require(clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin - 1, headroom) == 0 &&
                 clamp_resident_budget(66 * GiB, 69 * GiB, headroom + margin, headroom) == 0,
             "subtracting the clamping margin underflowed");
-}
-
-void test_resident_allocation_retry() {
-    using namespace strata::core::detail;
-    constexpr uint64_t GiB = 1ull << 30, headroom = 4 * GiB, margin = 256ull << 20;
-    int attempts = 0, probes = 0;
-    std::string err = "stale error";
-    HostMemory current;
-    current.available = 69 * GiB;
-    current.commit = 20 * GiB;
-    const auto probe = [&](HostMemory& m) { ++probes; m = current; return true; };
-
-    // A successful initial allocation may have grown the page file: do not cap or retry it.
-    require(try_resident_allocation([&](const ResidentRetry* retry, uint64_t&, std::string& reason) {
-        ++attempts;
-        require(retry == nullptr && reason.empty(), "initial attempt was constrained by a retry or stale error");
-        return true;
-    }, probe, headroom, err), "successful initial allocation was refused");
-    require(attempts == 1 && probes == 0 && err.empty(), "success read commit capacity or retried");
-
-    attempts = probes = 0;
-    require(try_resident_allocation([&](const ResidentRetry* retry, uint64_t& failed_bytes, std::string& reason) {
-        ++attempts;
-        if (retry == nullptr) {
-            require(probes == 0, "commit was read before the allocation failed");
-            current.commit = 47 * GiB;   // changed during the unsuccessful allocation
-            failed_bytes = 65 * GiB;
-            reason = "initial allocation failed";
-            return false;
-        }
-        require(failed_bytes == 0 && reason.empty(), "retry inherited failure state");
-        require(retry->memory.available == 69 * GiB && retry->memory.commit == 47 * GiB &&
-                    retry->limit == 43 * GiB - margin, "retry did not use the fresh snapshot and headroom");
-        return true;
-    }, probe, headroom, err), "smaller allocation was not retried");
-    require(attempts == 2 && probes == 1 && err.empty(), "successful retry left stale errors or read memory twice");
-
-    const auto fail_allocation = [&](const ResidentRetry* retry, uint64_t& failed_bytes, std::string& reason) {
-        ++attempts;
-        failed_bytes = retry ? retry->limit : 65 * GiB;
-        reason = retry ? "retry allocation failed" : "initial allocation failed";
-        return false;
-    };
-    attempts = probes = 0;
-    require(!try_resident_allocation(fail_allocation, probe, headroom, err), "two failed allocations succeeded");
-    require(attempts == 2 && probes == 1 && err.find("initial allocation failed") != std::string::npos &&
-                err.find("retry allocation failed") != std::string::npos, "retry was unbounded or lost an error");
-
-    attempts = probes = 0;
-    require(!try_resident_allocation([&](const ResidentRetry*, uint64_t&, std::string& reason) {
-        ++attempts;
-        reason = "file read failed";
-        return false;
-    }, probe, headroom, err), "a file-read error succeeded");
-    require(attempts == 1 && probes == 0 && err == "file read failed", "a non-allocation error triggered a retry");
-
-    attempts = probes = 0;
-    require(!try_resident_allocation(fail_allocation, [&](HostMemory&) { ++probes; return false; }, headroom, err),
-            "a failed memory probe succeeded");
-    require(attempts == 1 && probes == 1 && err == "initial allocation failed", "failed probe retried or lost the error");
-
-    // No room, only headroom/margin, or enough commit already: do not retry zero or the same size.
-    current.available = 80 * GiB;
-    for (uint64_t commit : {uint64_t{0}, headroom, headroom + margin, 70 * GiB}) {
-        current.commit = commit;
-        attempts = probes = 0;
-        require(!try_resident_allocation(fail_allocation, probe, headroom, err), "an unusable retry succeeded");
-        require(attempts == 1 && probes == 1 && err == "initial allocation failed", "zero or unchanged size was retried");
-    }
-    attempts = probes = 0;
-    require(!try_resident_allocation(fail_allocation, {}, headroom, err) && attempts == 1 && probes == 0,
-            "a platform without a commit retry attempted one");
-
-    current.commit = 47 * GiB;
-    attempts = probes = 0;
-    require(!try_resident_allocation([&](const ResidentRetry* retry, uint64_t& failed_bytes, std::string& reason) {
-        ++attempts;
-        if (retry == nullptr) {
-            failed_bytes = 65 * GiB;
-            reason = "initial allocation failed";
-        } else {
-            require(retry->limit < 45 * GiB, "retry unexpectedly fit the mandatory complement");
-            reason = "mandatory complement does not fit";
-        }
-        return false;
-    }, probe, headroom, err), "a strict complement silently became partial");
-    require(attempts == 2 && probes == 1 && err.find("mandatory complement does not fit") != std::string::npos,
-            "strict retry did not preserve its failure");
-}
-
-void test_stage_only_allocation_retry(uint64_t requested_budget, bool fits, bool regions = true) {
-    using namespace strata::core;
-    using namespace strata::core::detail;
-    using namespace strata::kernels::cpu;
-    constexpr uint64_t GiB = 1ull << 30;
-    TempDirectory dir;
-    std::string err;
-    require(expert_layout_load(dir.path.string(), 2, 2, err), err);
-    const uint64_t blob = (uint64_t) BLOB;
-    create_pack(dir.path, 4 * blob, {{0, 'a'}, {blob, 'b'}, {2 * blob, 'c'}, {3 * blob, 'd'}});
-
-    FileExpertSource source;
-    ExpertCache cache;
-    require(source.open(dir.path.string(), 2, 2, err), err);
-    require(cache.open(2, 2, 2, blob, err), err);
-    std::vector<uint8_t> expected((size_t) blob, 0), actual((size_t) blob);
-    for (int32_t e = 0; e < 2; ++e) {
-        expected[0] = (uint8_t) ('a' + e);
-        const int32_t slot = cache.admit(0, e);
-        require(slot >= 0 && cache.fill_slot_blocking(slot, expected.data(), err), err);
-    }
-    // The later stage holds layer 1; every expert is on a GPU, so only lend regions can enter RAM.
-    const std::vector<std::pair<int32_t, int32_t>> additional{{1, 0}, {1, 1}};
-    if (regions) source.stage_lend_regions({{{0, 1}, {0, 0}}, {{1, 1}, {1, 0}}});
-    const uint64_t retry_bytes = fits ? 2 * blob : blob - 1;
-    int attempts = 0, probes = 0;
-    const bool ok = try_resident_allocation([&](const ResidentRetry* retry, uint64_t& failed_bytes, std::string& reason) {
-        ++attempts;
-        if (retry == nullptr) {
-            // Simulate an 8 GiB allocation failure; the actual retry fixture uses only a few small blobs.
-            failed_bytes = 8 * GiB;
-            reason = "injected allocation failure";
-            return false;
-        }
-        require(retry->limit == retry_bytes, "retry did not use the injected commit limit");
-        return FileExpertSourceTestAccess::retry(source, cache, reason, additional, requested_budget, retry, failed_bytes);
-    }, [&](HostMemory& memory) {
-        ++probes;
-        memory.available = 16 * GiB;
-        memory.commit = retry_bytes + (256ull << 20);
-        return true;
-    }, 0, err);
-    require(attempts == 2 && probes == 1, "stage-only allocation did not make exactly one smaller retry");
-    if (!fits || !regions) {
-        require(!ok && !source.complement_ready() && source.resident_bytes() == 0,
-                "an empty retry succeeded or retained a partial allocation");
-        require(err.find("injected allocation failure") != std::string::npos &&
-                    err.find("available memory cannot hold any expert") != std::string::npos,
-                "empty retry lost the initial failure or its final reason");
-        return;
-    }
-    require(ok, "stage-only retry failed: " + err);
-    require(err.empty() && source.complement_ready(), "successful retry retained failure state");
-    require(source.resident_bytes() == retry_bytes && source.resident_lent_slots() == 2,
-            "retry did not keep the lend region that fits its budget");
-    require(source.has_resident(0, 0) && source.has_resident(0, 1) &&
-                !source.has_resident(1, 0) && !source.has_resident(1, 1),
-            "retry kept the wrong stage's lend region or exceeded the budget");
-    const uint64_t file_bytes = source.file_read_bytes();
-    for (int32_t e = 0; e < 2; ++e) {
-        expected[0] = (uint8_t) ('a' + e);
-        require(source.copy_blob(0, e, actual.data()) && actual == expected, "lent expert bytes changed on retry");
-    }
-    require(source.file_read_bytes() == file_bytes, "retained lend regions were read from the file");
-    expected[0] = 'c';
-    require(source.copy_blob(1, 0, actual.data()) && actual == expected, "the unretained stage lost its file fallback");
 }
 
 void test_cgroup_memory_budget() {
@@ -963,48 +654,6 @@ void test_host_memory() {
     require(probe("4:memory:/docker/abc\n") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v1 unlimited");
     // a v1 group not visible here (another namespace): MemAvailable alone
     require(probe("4:memory:/elsewhere\n") && m.available == 100 * GiB, "v1 group not mounted");
-    // a v2 line whose group the mount does not show as such; each layout has its own mount
-    auto probe_at = [&](const std::string& self, const std::string& at) {
-        put("cgroup", self);
-        m.commit = 0;
-        const bool ok = host_available_memory(m, mi, cg, (t.path / at).string());
-        require(m.commit == ~0ull, "Linux memory probe retained a commit limit");
-        return ok;
-    };
-    // the host's own root group, "0::/" (WSL without systemd, #1856): no memory.max there, MemAvailable alone
-    put("host/cgroup.controllers", "memory\n");
-    require(probe_at("0::/\n", "host") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "v2 root group");
-    // a container with an 8 GiB limit, 2 GiB charged: with its own cgroup namespace ("0::/"), or without one, where
-    // the line names its host path and the mount shows only the container's own subtree
-    put("ns/cgroup.controllers", "memory\n");
-    put("ns/memory.max", std::to_string(8 * GiB) + "\n");
-    put("ns/memory.current", std::to_string(2 * GiB) + "\n");
-    put("ns/memory.stat", "inactive_file 0\nfile_dirty 0\nfile_writeback 0\n");
-    require(probe_at("0::/\n", "ns") && m.available == 6 * GiB && m.cgroup_limit == 8 * GiB,
-            "v2 container, own namespace");
-    require(probe_at("0::/system.slice/docker-abc.scope\n", "ns") && m.available == 6 * GiB &&
-                m.cgroup_limit == 8 * GiB, "v2 container without a cgroup namespace");
-    // a hybrid host (systemd-hybrid, WSL2 with systemd): a v1 tmpfs at the mount and the v2 tree, without
-    // controllers, at unified/; every process lists a 0:: line, and the memory controller's v1 group decides
-    put("hy/unified/cgroup.controllers", "\n");
-    put("hy/memory/docker/abc/memory.limit_in_bytes", std::to_string(32 * GiB) + "\n");
-    put("hy/memory/docker/abc/memory.usage_in_bytes", std::to_string(10 * GiB) + "\n");
-    require(probe_at("4:memory:/docker/abc\n0::/system.slice/containerd.service\n", "hy") &&
-                m.available == 22 * GiB && m.cgroup_limit == 32 * GiB, "hybrid host, a v1 limit");
-    require(probe_at("5:memory:/init.scope\n0::/init.scope\n", "hy") && m.available == 100 * GiB &&
-                m.cgroup_limit == ~0ull, "hybrid host, no limit");
-    // a path the mount shows in part: its deepest part shown, a 4 GiB group with 1 GiB charged
-    put("walk/cgroup.controllers", "memory\n");
-    put("walk/a/memory.max", std::to_string(4 * GiB) + "\n");
-    put("walk/a/memory.current", std::to_string(1 * GiB) + "\n");
-    put("walk/a/memory.stat", "inactive_file 0\nfile_dirty 0\nfile_writeback 0\n");
-    require(probe_at("0::/a/gone\n", "walk") && m.available == 3 * GiB && m.cgroup_limit == 4 * GiB,
-            "v2 path shown in part");
-    // no cgroup mount at all: MemAvailable alone, as for a v1 group that is not visible
-    require(probe_at("0::/x\n", "none") && m.available == 100 * GiB && m.cgroup_limit == ~0ull, "no cgroup mount");
-    // a group path that leaves the mount, here into the limited group just above it
-    put("ns/sub/cgroup.controllers", "memory\n");
-    require(!probe_at("0::/../etc\n", "ns/sub"), "a v2 group outside the mount accepted");
 #else
     require(host_available_memory(m) && m.available > 0 && m.cgroup_limit == ~0ull, "this PC's RAM");
 #if defined(_WIN32)
@@ -1359,20 +1008,6 @@ void test_replace_resident(bool pin) {
 
 int main(int argc, char** argv) {
     try {
-        if (argc == 2 && std::string(argv[1]) == "--resident-retry-gpu") {
-            int devices = 0;
-            if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) {
-                std::cout << "no GPU: resident retry integration skipped\n";
-                return 77;
-            }
-            for (uint64_t budget : {8ull << 30, 0ull}) {
-                test_stage_only_allocation_retry(budget, true);
-                test_stage_only_allocation_retry(budget, false);
-                test_stage_only_allocation_retry(budget, true, false);
-            }
-            std::cout << "resident retry integration: PASS\n";
-            return 0;
-        }
         test_complement_plan();
         test_resident_lend_region();
         test_split_lend_regions();
@@ -1380,10 +1015,6 @@ int main(int argc, char** argv) {
         test_resident_memory_budget();
         test_pin_pacing();
         test_numa_slice_ranges();
-        test_numa_node_accessors();
-        test_numa_node_guard();
-        test_numa_hot_node();
-        test_resident_allocation_retry();
         test_cgroup_memory_budget();
         test_host_memory();
         test_canonical_layout();

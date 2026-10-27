@@ -60,9 +60,9 @@ export async function which(binary, { env = process.env, platform = process.plat
 
 /** Minimal SSE hub. */
 export class EventHub {
-  #clients = new Map();
+  #clients = new Set();
 
-  add(res, { allowEvent = () => true } = {}) {
+  add(res) {
     res.writeHead(200, {
       'content-type': 'text/event-stream; charset=utf-8',
       'cache-control': 'no-cache, no-transform',
@@ -70,7 +70,7 @@ export class EventHub {
       'x-accel-buffering': 'no',
     });
     res.write(': connected\n\n');
-    this.#clients.set(res, allowEvent);
+    this.#clients.add(res);
     const ping = setInterval(() => res.write(': ping\n\n'), 15000);
     res.on('close', () => {
       clearInterval(ping);
@@ -80,9 +80,8 @@ export class EventHub {
 
   send(event, payload) {
     const frame = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
-    for (const [res, allowEvent] of this.#clients) {
+    for (const res of this.#clients) {
       try {
-        if (!allowEvent(event, payload)) continue;
         res.write(frame);
       } catch {
         this.#clients.delete(res);

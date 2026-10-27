@@ -47,10 +47,6 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 
 /// Plan v0.3 P5: `n_q` queries at once, each with its own selection: q [n_q, n_head, 256], ids [n_q, cap], steps
 /// [n_q, kStepCount], attn [n_q, n_head, 256]; scratch is `n_q` times the single-query size.
-/// STRATA_PROMPT_ATTN_RDNA2=1 (HIP gfx103x, INT8 K/V): the prompt's n_q queries without the split and merge
-/// (one block per query and KV head, online softmax); false when it does not apply (the caller keeps its path).
-bool qsa_prompt_attn_rdna2(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* attn, int64_t n_q, void* stream);
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
@@ -83,13 +79,5 @@ void qsa_decode_attn_merge_only(const int32_t* steps, int64_t cap, const QsaShap
 /// over rows.p[z] - one launch instead of one per query, the same per-query arithmetic (bit-identical outputs).
 void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
                                 int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
-/// The DFlash drafter's slice of the batch attention: the cells are the identity [0, active_cells)
-/// (no selection table, `ids` is not read) and only their chunks launch - `cap` stays the stride
-/// the caller allocated the scratch (and would have allocated a selection table) with.  The grid
-/// is (ceil(active_cells / CHUNK), n_head_kv, n_q); every score is the same expression the
-/// selection kernel computes for the same cell.  `qsa_decode_attn_batch` is the TARGET's path
-/// and is unchanged.
-void dflash_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t active_cells,
-                       int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
 }  // namespace strata::kernels

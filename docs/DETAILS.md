@@ -1,7 +1,5 @@
 # Strata engine and server reference
 
-> **Fork addendum:** passages this page's 0.2.6 doc rewrite displaced — the fork's design notes on suffix reuse, batching, JEV, DFlash2 and serve behaviour — are kept verbatim in [FORK-DETAILS.md](FORK-DETAILS.md). Archival, not maintained.
-
 This page is the technical reference for the Qwen engine and its server: measured speed, the HTTP API, the settings in
 `strata-<model>.json`, memory modes and the speed switches. It is for people who run Strata from a source checkout, tune
 an installation or connect their own software. It describes the current release. Dated measurements are in

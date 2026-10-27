@@ -97,16 +97,6 @@ class Units(unittest.TestCase):
         self.assertEqual(got[("strata:ram_total_bytes", lab)], 64 << 30)
 
 
-    def test_the_literal_think_total_is_absent_until_the_guard_reports(self):
-        """#1814: the series is absent while the flag is off (the total is never set) and present once the guard counts."""
-        m = {"engine": {"model": "m", "max_context": 1000}, "live": {}, "totals": {}}
-        lab = 'model_name="m"'
-        self.assertNotIn(("strata:totals_ended_inside_thinking_total", lab),
-                         parse(render(m, Latencies().snapshot())))
-        m["totals"]["ended_inside_thinking"] = 2
-        self.assertEqual(parse(render(m, Latencies().snapshot()))[("strata:totals_ended_inside_thinking_total", lab)], 2)
-
-
 class Endpoint(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -143,20 +133,6 @@ class Endpoint(unittest.TestCase):
         self.assertGreaterEqual(json.loads(text)["totals"]["requests"], 1)
         ctype, _ = self.get("/metrics?format=prometheus", "*/*")
         self.assertTrue(ctype.startswith("text/plain"))
-
-    def test_the_literal_think_total_is_on_the_llamacpp_names_too(self):
-        """#1814: /metrics/prometheus is the llama.cpp-named renderer (Service.prometheus); the guard's total is there
-        too, and absent while the guard has not counted (a default server's /metrics carries no such series)."""
-        ctype, text = self.get("/metrics/prometheus", "*/*")
-        self.assertTrue(ctype.startswith("text/plain"))
-        self.assertNotIn("ended_inside_thinking", text)
-        self.svc.totals["ended_inside_thinking"] = 3
-        try:
-            _, text = self.get("/metrics/prometheus", "*/*")
-            self.assertIn("# TYPE strata:totals_ended_inside_thinking_total counter", text)
-            self.assertIn("strata:totals_ended_inside_thinking_total 3", text)
-        finally:
-            del self.svc.totals["ended_inside_thinking"]
 
 
 class BatchEngine(MockEngine):
@@ -199,40 +175,6 @@ class Batched(unittest.TestCase):
         self.assertEqual(after["vllm:e2e_request_latency_seconds_count"], 3)
         self.assertEqual(after["vllm:time_to_first_token_seconds_count"], 3)
         self.assertEqual(svc.metrics()["totals"]["requests"], 3)          # the JSON agrees
-
-
-
-class RoutingCounts(unittest.TestCase):
-    """--routing-counts: the engine's counts file -> a per-layer summary in the JSON and per-layer gauges."""
-    def test_summary_and_gauges(self):
-        import json as _json, os as _os, tempfile
-        from serve import server as srv
-        with tempfile.TemporaryDirectory() as d:
-            path = _os.path.join(d, "counts.json")
-            rows = [[0] * 8 for _ in range(3)]
-            rows[0][1], rows[0][5] = 30, 10            # layer 0: two experts, 75 % / 25 %
-            rows[2] = [5] * 8                          # layer 2: spread evenly, 3 bits
-            with open(path, "w") as f:
-                _json.dump({"layers": 3, "experts": 8, "counts": rows}, f)
-            s = srv.routing_summary(path)
-            self.assertEqual(s["routed_total"], 80)
-            l0, l1, l2 = s["layers"]
-            self.assertEqual((l0["experts_seen"], l0["top"][0]), (2, [1, 30]))
-            self.assertEqual((l1["routed"], l1["experts_seen"], l1["entropy_bits"]), (0, 0, 0.0))
-            self.assertAlmostEqual(l2["entropy_bits"], 3.0, places=3)
-            text = render({"experts": s}, Latencies().snapshot())
-            self.assertIn("strata:expert_routed_total{", text)
-            self.assertIn('layer="2"} 3.0', text)
-            self.assertEqual(text.count("# TYPE strata:expert_entropy_bits gauge"), 1)
-            self.assertIn('strata:expert_routed_by_expert_total{model_name="strata",layer="0",expert="1"} 30', text)
-            self.assertEqual(text.count("strata:expert_routed_by_expert_total{"), 2 + 0 + 8)   # top 8 at most
-            self.assertIsNone(srv.routing_summary(_os.path.join(d, "missing.json")))
-
-    def test_config_key_adds_the_engine_flag(self):
-        from serve import server as srv
-        args = srv.routing_counts_args({"routing_counts": "/data/routing/counts.json", "routing_counts_every": 2}, ["x"])
-        self.assertEqual(args, ["x", "--routing-counts", "/data/routing/counts.json", "--routing-counts-every", "2"])
-        self.assertEqual(srv.routing_counts_args({}, ["x"]), ["x"])
 
 
 if __name__ == "__main__":

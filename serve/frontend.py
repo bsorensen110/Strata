@@ -65,18 +65,6 @@ class ChatTemplate:
         return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
 
-    def gen_prompt_tail(self, enable_thinking: bool) -> str:
-        """What add_generation_prompt adds to this template: the generation prompt's tail.
-
-        The raw /v1/completions prompt is passed through untouched; this is what a chat render would have
-        appended when the client asks thinking off. The probe message keeps the render the template needs;
-        both renders get the same kwargs, so the difference is the generation prompt alone.
-        """
-        probe = [{"role": "user", "content": "x"}]
-        base = self.render(probe, add_generation_prompt=False, enable_thinking=enable_thinking)
-        full = self.render(probe, add_generation_prompt=True, enable_thinking=enable_thinking)
-        return full[len(base):]
-
     def _detect_caps(self) -> dict[str, bool]:
         """llama.cpp's capability names, checked at load time against this template and Strata's tool-call format.
         These are rendering hints, not a guarantee that the model will follow a request."""
@@ -140,8 +128,6 @@ def _text_of(content) -> str:
 
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
-VIDEO_PARTS = ("video_url", "input_video", "video")
-VIDEO_OPTIONS = ("fps", "max_frames", "max_side", "tokens", "total_tokens")
 
 # Thinking levels.  The model's template knows low, medium and xhigh (its default; "high" means xhigh), and
 # enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
@@ -193,8 +179,7 @@ def budget_effort(tokens) -> dict:
 
 
 def _has_image(content) -> bool:
-    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS + VIDEO_PARTS
-                                             for p in content)
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
 
 
 def _image_source(part: dict) -> str:
@@ -213,24 +198,6 @@ def _image_source(part: dict) -> str:
     return url or ""
 
 
-def _video_source(part: dict) -> tuple[str, dict]:
-    """A video part's source (a data: URL, an http(s) URL or a local file path) and its sampling options.
-    OpenAI-style {"type": "video_url", "video_url": {"url": ..., "fps": 1}} (or "video_url": "..."), Responses-style
-    {"type": "input_video", "video_url": ...}, and {"type": "video", "source": {"type": "base64" | "url" | "path",
-    ...}} or {"type": "video", "video": "..."}.  Options (VIDEO_OPTIONS) may sit on the part or beside the url; unset
-    ones take the server's defaults."""
-    src = part.get("video_url")
-    if part.get("type") == "video":
-        src = part.get("source") or part.get("video") or {}
-        if isinstance(src, dict) and src.get("type") == "base64":
-            src = f"data:{src.get('media_type', 'video/mp4')};base64,{src.get('data', '')}"
-    opts = {k: part[k] for k in VIDEO_OPTIONS if part.get(k) is not None}
-    if isinstance(src, dict):
-        opts.update({k: src[k] for k in VIDEO_OPTIONS if src.get(k) is not None})
-        src = src.get("url") or src.get("path") or ""
-    return src or "", opts
-
-
 def _parts_of(content):
     """Message content for the template: a string when there is no image (unchanged behaviour), otherwise the
     template's list form - text items and image items, in order - whose image items carry their source."""
@@ -242,9 +209,6 @@ def _parts_of(content):
             continue
         if part.get("type") in IMAGE_PARTS:
             items.append({"type": "image", "source": _image_source(part)})
-        elif part.get("type") in VIDEO_PARTS:
-            src, opts = _video_source(part)
-            items.append({"type": "video", "source": src, "options": opts})
         elif part.get("type") in TEXT_PARTS and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -287,13 +251,6 @@ def images_of(messages: list[dict]) -> list[str]:
     <|vision_start|><|image_pad|><|vision_end|> per image item, message by message)."""
     return [item["source"] for m in messages if isinstance(m.get("content"), list)
             for item in m["content"] if item.get("type") == "image"]
-
-
-def videos_of(messages: list[dict]) -> list[tuple[str, dict]]:
-    """The videos of the rendered conversation, (source, options) in prompt order (the template renders one
-    <|vision_start|><|video_pad|><|vision_end|> per video item)."""
-    return [(item["source"], item.get("options") or {}) for m in messages if isinstance(m.get("content"), list)
-            for item in m["content"] if item.get("type") == "video"]
 
 
 # #537: a literal <think> / </think> inside a message's text is plain text, not the model's reasoning markers.  The
@@ -582,46 +539,6 @@ def tool_arguments(raw) -> dict:
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
 
 
-def assistant_prefix_kw(req: dict, kwargs: dict) -> dict:
-    """A request's "assistant_prefix" - text the assistant has already said, so the model continues its turn from
-    it instead of starting one - as a template kwarg (Service.render_prompt renders it as an unfinished final
-    assistant turn).  Absent, None or "" is no prefix (kwargs back unchanged); anything else that is not a string
-    is a ValueError, which the server answers with a 400 naming the field."""
-    prefix = req.get("assistant_prefix")
-    if prefix is None or prefix == "":
-        return kwargs
-    if not isinstance(prefix, str):
-        raise ValueError("assistant_prefix must be a string")
-    return {**kwargs, "assistant_prefix": prefix}
-
-def _order_chat_tool_results(messages: list[dict]) -> None:
-    """The template pairs results by position, so restore call order while IDs are still available.
-
-    Only a complete, unambiguous run of results is reordered. Legacy or incomplete histories keep their
-    received order. IDs are private to this conversion and never reach the template.
-    """
-    i = 0
-    while i < len(messages):
-        if messages[i]["role"] != "tool":
-            i += 1
-            continue
-        j = i + 1
-        while j < len(messages) and messages[j]["role"] == "tool":
-            j += 1
-        prev = messages[i - 1] if i else {}
-        calls = [c.get("_call_id") for c in prev.get("tool_calls") or []] if prev.get("role") == "assistant" else []
-        results = [m.get("_call_id") for m in messages[i:j]]
-        if len(calls) == len(results) and all(isinstance(cid, str) and cid for cid in calls + results):
-            if len(set(calls)) == len(calls) and len(set(results)) == len(results) and set(calls) == set(results):
-                rank = {cid: n for n, cid in enumerate(calls)}
-                messages[i:j] = sorted(messages[i:j], key=lambda m: rank[m["_call_id"]])
-        i = j
-    for message in messages:
-        message.pop("_call_id", None)
-        for call in message.get("tool_calls") or []:
-            call.pop("_call_id", None)
-
-
 def require_messages(messages: list) -> None:
     """A chat request with no message at all is a 400 (OpenAI: "empty array. Expected an array with minimum length 1"); the
     template would otherwise render just the assistant turn and the model would answer nothing."""
@@ -698,7 +615,7 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
-    return _env_to_user(_late_system_to_user(messages)), tools, assistant_prefix_kw(req, kwargs)
+    return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
 BILLING_HEADER = "x-anthropic-billing-header:"
@@ -799,7 +716,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
-    return _env_to_user(_late_system_to_user(messages)), tools, assistant_prefix_kw(req, kwargs)
+    return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
 # ------------------------------------------------------------------------------------------------ output parser
@@ -1032,6 +949,11 @@ class OutputParser:
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
+        # #804/#3075: in the answer too, a call counts only for a tool the request declared.  With tools declared a
+        # call for another name stays text (the Responses spelling `namespace__tool` of a `namespace.tool` counts as
+        # that tool); `declared_only` extends the rule to a request that declared none (Chat Completions, Anthropic:
+        # the client has no tool to run).  The Responses route leaves it off: a Codex compaction request keeps its
+        # conversation's tools in the prompt only, and its calls come back as before.
         self.declared_only = declared_only
         # A declared namespace.member tool is also accepted as namespace__member (PR #3556),
         # namespace=member (Qwen writes the <function= tag's equals sign into the name),

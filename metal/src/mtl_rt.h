@@ -22,8 +22,6 @@ struct Buffer {
     // a buffer longer than maxBufferLength: overlapping chunks every `stride` bytes (see Context::wrap)
     std::shared_ptr<std::vector<void*>> chunks;
     size_t stride = 0;
-    // or disjoint regions (Context::wrap_ranges): chunk k holds the bytes from starts[k]; the gaps are not wrapped
-    std::shared_ptr<std::vector<size_t>> starts;
     template <class T> T* as() const { return static_cast<T*>(ptr); }
 };
 
@@ -84,7 +82,6 @@ public:
     bool supports_metal4() const;
     uint64_t recommended_working_set() const;
     uint64_t max_buffer_length() const;
-    uint64_t max_threadgroup_memory() const;
     uint64_t allocated() const { return allocated_; }   // bytes of alloc() + wrap() buffers so far
 
     // Compiles a library from MSL source files (paths), prepended by `prelude` (defines) and, if include_ggml,
@@ -93,16 +90,12 @@ public:
     // Safe math unless STRATA_METAL_MATH=fast (the argument is ignored; kept for callers).
     int compile(const std::vector<std::string>& files, const std::string& prelude = "", bool fast_math = false);
     Pipeline pipeline(int lib, const std::string& fn, const Constants& c = {});
-    bool has_function(int lib, const std::string& fn) const;
 
     Buffer alloc(size_t bytes);                  // shared storage, zeroed
     Buffer wrap(void* page_aligned, size_t bytes);  // no-copy wrap (page-aligned, size multiple of page)
     // the same, also when bytes > maxBufferLength: then overlapping chunks, each holding any range of up to
     // max_span bytes that starts in it (max_span = the largest tensor bound at one offset)
     Buffer wrap(void* page_aligned, size_t bytes, size_t max_span);
-    // only the given [begin, end) byte ranges (page-aligned, ascending, each up to maxBufferLength), bound by their
-    // offsets from the start of p: what lies between them is never wrapped, so it stays out of the GPU's working set
-    Buffer wrap_ranges(void* page_aligned, const std::vector<std::pair<size_t, size_t>>& ranges);
     void free(Buffer& b);
 
     // Encodes `ds` into ONE compute encoder (serial or concurrent dispatch type) and ONE command buffer, `reps`
@@ -117,13 +110,6 @@ public:
     // missing experts are put in place).  Returns the GPU time in seconds.
     double run_graph_seg(const std::vector<Dispatch>& ds, const std::vector<int>& cuts, void (*at_cut)(void*, int),
                          void* user);
-    // run_graph_seg without stopping the queue: ONE concurrent encoder; seq_d is injected after every cut
-    // (it bumps a device counter the host reads through the shared buffer), spin_d before every segment after
-    // the first (it waits for a plain host store to `rel`).  The host spins on seq, runs at_cut(s), stores
-    // rel = s + 1.  Bench: metal/tests/dispatch_lat times it against the event handshake (230-400 us/cut on
-    // the M1 Max).  seq/rel are the host addresses of those counters.
-    double run_graph_flag(const std::vector<Dispatch>& ds, const std::vector<int>& cuts, const Dispatch& seq_d,
-                          const Dispatch& spin_d, const int* seq, int* rel, void (*at_cut)(void*, int), void* user);
     // One command buffer per `run_cb` call, empty or not: measures commit+wait round trips.
     double run_wall(const std::vector<Dispatch>& ds, int reps, double* gpu_seconds = nullptr);
 

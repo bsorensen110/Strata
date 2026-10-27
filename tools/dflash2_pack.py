@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Pack the incoai DFlash2 drafter for Qwen3.8-Flash-Next (safetensors) into the engine's runtime file.
 
-python tools/dflash2_pack.py model.safetensors config.json out.pack [--window N]
-
-`--window` is an experimental runtime attention-radius override, not a trained-weight change.
+    python tools/dflash2_pack.py model.safetensors config.json out.pack [--bf16]
 
 Format (little endian): "DF2P", u32 version (1), u32 index_len, a text index (padded with spaces so the data starts on a 4096 multiple), then
 the tensors, each 256-byte aligned at its offset (from the end of the index).  Index lines: "cfg <key> <value>", "t <name> <dtype> <rows>
@@ -82,14 +80,11 @@ def quant_q8_0(w):
     return out.tobytes()
 
 
-def pack(st_path, cfg_path, out_path, say=print, window=None):
-    """Write the runtime file from `st_path` and `config.json`; `window` overrides only its attention-radius metadata."""
+def pack(st_path, cfg_path, out_path, say=print):
+    """Write the engine's runtime file for the drafter in `st_path` (+ its config.json). Returns the number of bytes written."""
     with open(cfg_path, encoding="utf-8") as fh:
         cfg = json.load(fh)
     dc = cfg["dflash_config"]
-    attention_window = int(cfg["sliding_window"] if window is None else window)
-    if attention_window < 1 or attention_window > 8192:
-        raise ValueError("window must be in 1..8192 (runtime ring limit)")
     f = SafeTensors(st_path)
     tensors = []
     blobs = []
@@ -127,7 +122,7 @@ def pack(st_path, cfg_path, out_path, say=print, window=None):
 
     meta = {
         "hidden": cfg["hidden_size"], "layers": L, "heads": cfg["num_attention_heads"], "kv_heads": cfg["num_key_value_heads"],
-        "head_dim": cfg["head_dim"], "inter": cfg["intermediate_size"], "window": attention_window, "rope_theta": cfg["rope_parameters"]["rope_theta"],
+        "head_dim": cfg["head_dim"], "inter": cfg["intermediate_size"], "window": cfg["sliding_window"], "rope_theta": cfg["rope_parameters"]["rope_theta"],
         "eps": cfg["rms_norm_eps"], "block": dc["block_size"], "conv_group": dc["conv_group_size"], "conv_kernel": dc["conv_kernel_size"],
         "mask_token": dc["mask_token_id"], "rank": dc["selector_rank"], "top_k": dc["selector_top_k"], "taps": dc["target_layer_ids"],
         "vocab": cfg["vocab_size"], "source": "incoai/Qwen3.8-Flash-Next-DFlash2 a22a1744",
@@ -162,14 +157,7 @@ def pack(st_path, cfg_path, out_path, say=print, window=None):
 def main():
     if len(sys.argv) < 4:
         sys.exit(__doc__)
-    st_path, cfg_path, out_path = sys.argv[1:4]
-    window = None
-    extra = sys.argv[4:]
-    if extra:
-        if len(extra) != 2 or extra[0] != "--window":
-            raise SystemExit("usage: dflash2_pack.py model.safetensors config.json out.pack [--window N]")
-        window = int(extra[1])
-    pack(st_path, cfg_path, out_path, window=window)
+    pack(*sys.argv[1:4])
 
 
 if __name__ == "__main__":

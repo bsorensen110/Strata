@@ -35,8 +35,6 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         // and does nothing (measured: with and without it identical, 0.0 to +0.1%).
         // STRATA_GDN_CONVL2 is AMD-only on purpose: it is not bitwise on CUDA 13.3 sm_120 (#1522), and this table is never
         // consulted by a CUDA build.
-        // STRATA_HIP_WMMA is NOT in this process-wide environment table: hip_wmma_usable() resolves the Linux gfx12 default
-        // per device (kGfx12PromptDefaultsOn) so Windows gfx12 and mixed-GPU gfx11 stages stay opt-in.
         const char* off12 = std::getenv("STRATA_GFX12_DEFAULTS");
         if (off12 != nullptr && off12[0] == '0') return t;
         t = {
@@ -74,7 +72,6 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         {"STRATA_MMVF_ROWS", "1"},       // bf16 multi-row GEMV, 4 rows per block (S25)
         {"STRATA_ATTN_LANECELL", "1"},   // decode attention scores, one cell per thread (S25)
         {"STRATA_EXPERT_V2", "1"},       // the grouped decode experts, IQ3_S gate/up + IQ4_NL down (S26)
-        {"STRATA_EXPERT_V2K", "1"},      // the grouped decode experts, Q4_K/Q5_K gate/up + Q5_1/Q8_0 down (UD-Q4_K_XL)
         {"STRATA_TSUM", "1"},            // several warp sums as one transposed butterfly (S26)
         {"STRATA_LFUSE", "1"},           // fewer launches around the shared expert and the KV append (S26)
         {"STRATA_GDN_SPLIT", "1"},       // the GDN step over 4 blocks per head (S25/S26)

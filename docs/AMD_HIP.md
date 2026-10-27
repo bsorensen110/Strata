@@ -1,7 +1,5 @@
 # AMD Radeon: the HIP backend
 
-> **Fork addendum:** passages this page's 0.2.6 doc rewrite displaced — measured R9700/gfx1201 and gfx1030 results, community-validated card notes, hipBLASLt table details — are kept verbatim in [FORK-AMD_HIP.md](FORK-AMD_HIP.md). Archival, not maintained.
-
 Strata runs on AMD Radeon cards through its HIP backend, the same engine as on NVIDIA compiled for AMD. This page is for
 people with an RX 6000, 7000 or 9000 card or a Radeon AI PRO R9700, and for anyone building the engine from source.
 The Ryzen AI Max "Strix Halo" APU has its own page: [STRIX_HALO.md](STRIX_HALO.md). Integrated Radeon chips in mini PCs are

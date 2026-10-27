@@ -369,8 +369,7 @@ def footprint(cfg: dict, config: Path | None = None) -> Footprint:
 
 
 def data_dir_of(fp: Footprint) -> Path | None:
-    """The data folder an installed model lives in: the parent of its ``packs`` folder, else the one holding ``models``.
-    Repeated ``models`` dirs (a nest left by earlier runs) count as one: the outermost one's parent is the data folder."""
+    """The data folder an installed model lives in: the parent of its ``packs`` folder, else the one holding ``models``."""
     if fp.pack is not None:
         return fp.pack.parent.parent
     if fp.mtp is not None and fp.mtp.name.lower() == "rt":
@@ -378,10 +377,7 @@ def data_dir_of(fp: Footprint) -> Path | None:
     for w in fp.weights:
         for parent in w.parents:
             if parent.name.lower() == "models":
-                data = parent.parent
-                while data.name.lower() == "models":
-                    data = data.parent
-                return data
+                return parent.parent
     return None
 
 
@@ -393,18 +389,14 @@ def prepared_beside(gguf: Path) -> dict:
     out: dict = {"data_dir": None, "pack": None, "mtp": None, "mmproj": None}
     for parent in folder.parents:
         if parent.name.lower() == "models":
-            models_dir = parent
             data = parent.parent
-            while data.name.lower() == "models":
-                models_dir = data
-                data = data.parent
             out["data_dir"] = data
-            tag = folder.name.lower() if folder != models_dir else ""
+            tag = folder.name.lower() if folder != parent else ""
             if tag and (data / "packs" / tag).is_dir():
                 out["pack"] = data / "packs" / tag
             if (data / "mtp" / "rt" / "experts.bin").is_file():
                 out["mtp"] = data / "mtp" / "rt"
-            for cand in sorted(models_dir.glob("mmproj*.gguf")) + sorted(parent.glob("mmproj*.gguf")) + sorted(folder.glob("mmproj*.gguf")):
+            for cand in sorted(parent.glob("mmproj*.gguf")) + sorted(folder.glob("mmproj*.gguf")):
                 out["mmproj"] = cand
                 break
             break

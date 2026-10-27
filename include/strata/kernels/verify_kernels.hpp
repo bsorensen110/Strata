@@ -108,10 +108,6 @@ void copy_rows_strided(float* dst, const float* src, int64_t rows, int64_t w, in
 void resident_plan(const int32_t* ids, int n_entries, int k, const int32_t* res_layer, int n_expert,
                    const uint8_t* cache_base, const unsigned long long* slot_off, long long blob, int32_t* plan,
                    long long capx, uint32_t* skip, uint32_t ring, void* stream, uint32_t* plan_err = nullptr);
-/// STRATA_VERIFY_ECAP (relaxed MTP): cap the verify window's expert set in place - token 0 keeps all k picks,
-/// the speculative tail (tokens 1..n-1) keeps the top (cap - k) entries by routing weight; dropped entries join
-/// entry 0's group with weight 0 (no extra expert read, zero contribution).  No-op when n <= k or cap <= k.
-void verify_ecap(int32_t* ids, float* w, int n, int k, int cap, void* stream);
 /// wait_flag_ge that also returns when *skip == value (device memory).
 void wait_flag_ge_or(const uint32_t* flag, uint32_t value, const uint32_t* skip, void* stream);
 /// copy_i32_from_mapped unless *skip == value.
@@ -120,20 +116,6 @@ void copy_i32_from_mapped_unless(int32_t* dst, const int32_t* src, long long n, 
 /// copy_from_mapped, or zeros when *skip == value (n a multiple of 4, 16-byte aligned).
 void copy_or_zero_from_mapped(float* dst, const float* src, long long n, const uint32_t* skip, uint32_t value,
                               void* stream);
-/// STRATA_VERIFY_DEFER_CPU: a layer's CPU expert rows added to the residual late.  For token t < n_tok, column d:
-/// s = sum_j w[t*k + j] * parts[(t*k + j)*n_embd + d] (the combine's order), then for every stream c < hc
-/// R[(t*hc + c)*n_embd + d] += 2*sigmoid(inject[t*hc + c] / hc) * s (the pending write of the fused read).
-/// Graph-capturable.
-void defer_add_rows(const float* parts, const float* w, const float* inject, float* R, int64_t n_embd, int k, int hc,
-                    int n_tok, void* stream);
-/// n floats of +0.0 (n a multiple of 4, 16-byte aligned): a kernel node where a memset node would break the window's
-/// kernel-to-kernel chain (pdl.hpp).  Graph-capturable.
-void fill_zero(float* dst, long long n, void* stream);
-/// STRATA_VERIFY_DEFER_CPU_BELOW: copy_rows_from_mapped's CPU rows split by routing weight - row i (rows = tokens * k) is
-/// copied when it is not one of the plan's GPU rows hit_rows[0, *count) and (w[i] >= heavy) == take_heavy, and is
-/// +0.0 otherwise.  width a multiple of 4, both pointers 16-byte aligned.  Graph-capturable.
-void copy_rows_by_weight(float* dst, const float* src, int64_t rows, int64_t width, const int32_t* hit_rows,
-                         const int32_t* count, const float* w, float heavy, bool take_heavy, void* stream);
 
 /// Rows of the S2/S4/S8 embedding for T token ids read from DEVICE memory; out (T, n).  Bitwise `embedding_gather`.
 void embedding_gather_dev(const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
@@ -154,18 +136,11 @@ void copy_indexed(float* dst, const float* src, int64_t stride, const int32_t* i
 /// into dst + k * blob_bytes with coalesced 16-byte loads - the PCIe share of a layer's missed experts, staged
 /// into VRAM before the grouped expert kernel reads them.  Launched for a capacity of `cap` blobs.
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream);
-/// The same with `dst2` (device memory, may be null): blob k goes to dst2[k] instead where that is not 0
-/// (STRATA_ADAPT_FETCH: a VRAM cache slot).  A separate overload, so the SYCL copy keeps the one above.
-void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream,
-                 const unsigned long long* dst2);
 /// table[pairs[2k]] = pairs[2k + 1] for k < n, `pairs` in mapped host memory: a residency table's changed entries,
 /// stream-ordered before the window that reads it, without the copy engine (where the tier's swaps may queue).
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream);
 /// ptr[k] = base + k * blob_bytes for k < *n (the staged copies `fetch_blobs` made).
 void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream);
-/// The same, or dst2[k] where `dst2` (may be null) is not 0 (fetch_blobs' second target).
-void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream,
-                 const unsigned long long* dst2);
 
 // ---- the MTP draft layer (src/core/mtp.cpp)
 /// R[t][c][:] = h[t][c][:] + e[t][:]  (the embedding branch added to every stream).

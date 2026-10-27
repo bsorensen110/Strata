@@ -169,18 +169,6 @@ void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     sync_if_needed(stream, "f32_to_f16_bulk");
 }
 
-__global__ void from_bf16_bulk_kernel(const uint16_t* x, float* y, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = __uint_as_float((uint32_t) x[i] << 16);
-}
-
-void bf16_to_f32_bulk(const uint16_t* x, float* y, int64_t n, void* stream) {
-    if (n <= 0) return;
-    from_bf16_bulk_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, y, n);
-    check_launch("bf16_to_f32_bulk");
-    sync_if_needed(stream, "bf16_to_f32_bulk");
-}
-
 void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
     to_bf16_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, y, n);
@@ -193,63 +181,6 @@ void silu_inplace(float* x, int64_t n, void* stream) {
     silu_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, n);
     check_launch("silu_inplace");
     sync_if_needed(stream, "silu_inplace");
-}
-
-__global__ void swiglu_kernel(float* gate, const float* up, int64_t n) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) gate[i] = gate[i] / (1.0f + expf(-gate[i])) * up[i];
-}
-
-void swiglu_inplace(float* gate, const float* up, int64_t n, void* stream) {
-    if (n <= 0) return;
-    swiglu_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(gate, up, n);
-    check_launch("swiglu_inplace");
-    sync_if_needed(stream, "swiglu_inplace");
-}
-
-__global__ void bf16_gather_strided_kernel(const uint16_t* src, int64_t src_stride, uint16_t* dst,
-                                           int64_t dst_stride, int n) {
-    const int r = blockIdx.y;
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) dst[(int64_t) r * dst_stride + i] = src[(int64_t) r * src_stride + i];
-}
-
-void bf16_gather_strided(const uint16_t* src, int64_t src_stride, uint16_t* dst, int64_t dst_stride,
-                         int n, int rows, void* stream) {
-    if (n <= 0 || rows <= 0) return;
-    dim3 grid((unsigned) ((n + THREADS - 1) / THREADS), (unsigned) rows);
-    bf16_gather_strided_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(src, src_stride, dst, dst_stride, n);
-    check_launch("bf16_gather_strided");
-    sync_if_needed(stream, "bf16_gather_strided");
-}
-
-template<typename T>
-__global__ void dflash_gather_taps_kernel(const T* src, uint16_t* dst, int taps, int hidden,
-                                         int64_t stride, int64_t count) {
-    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= count) return;
-    const int64_t col = i % hidden, tap = (i / hidden) % taps, row = i / ((int64_t) hidden * taps);
-    const auto value = src[tap * stride + row * hidden + col];
-    if constexpr (sizeof(T) == sizeof(float)) dst[i] = bf16_from_f32(value);
-    else dst[i] = value;
-}
-
-template<typename T>
-void gather_taps(const T* src, uint16_t* dst, int taps, int hidden, int rows, int64_t stride, void* stream) {
-    if (rows <= 0 || taps <= 0 || hidden <= 0) return;
-    const int64_t count = (int64_t) rows * taps * hidden;
-    dflash_gather_taps_kernel<<<grid_for(count), THREADS, 0, (cudaStream_t) stream>>>(
-        src, dst, taps, hidden, stride, count);
-    check_launch("dflash_gather_taps");
-    sync_if_needed(stream, "dflash_gather_taps");
-}
-void dflash_gather_taps(const uint16_t* src, uint16_t* dst, int taps, int hidden,
-                        int rows, int64_t stride, void* stream) {
-    gather_taps(src, dst, taps, hidden, rows, stride, stream);
-}
-void dflash_gather_taps(const float* src, uint16_t* dst, int taps, int hidden,
-                        int rows, int64_t stride, void* stream) {
-    gather_taps(src, dst, taps, hidden, rows, stride, stream);
 }
 
 /// THE DOORBELL.  One thread, one INCREMENT - the cost is the launch, and inside a graph that is paid once.
@@ -459,12 +390,11 @@ void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_r
     check_launch("doorbell_publish_res");
 }
 
-__global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int64_t n) {
-    for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n;
-         i += (int64_t) gridDim.x * blockDim.x)
-        dst[i] = src[i];
+__global__ void copy_i32_from_mapped_kernel(int32_t* __restrict__ dst, const volatile int32_t* src, int n) {
+    for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
 }
 
+#if !defined(__HIPCC__)
 struct MappedCopies {
     MappedCopy c[8];
 };
@@ -481,30 +411,10 @@ __global__ void copy_from_mapped_multi_kernel(MappedCopies a) {
     }
 }
 
-void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
-    if (n <= 0) return;
-    const unsigned bx = (unsigned) ((n + 127) / 128 < 64 ? (n + 127) / 128 : 64);
-    copy_i32_from_mapped_kernel<<<bx < 1 ? 1 : bx, 128, 0, (cudaStream_t) stream>>>(
-        dst, (const volatile int32_t*) src, n);
-    check_launch("copy_i32_from_mapped");
-}
-
 void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
     if (n <= 0) return;
     if (n > 8) { std::fprintf(stderr, "copy_from_mapped_multi: at most 8 copies\n"); std::exit(1); }
-    const char* e = std::getenv("STRATA_MTP_MULTI_COPY");
-    const bool multi_on = e == nullptr || e[0] != '0';
-    if (!multi_on) {
-        for (int i = 0; i < n; ++i) {
-            const MappedCopy& c = copies[i];
-            if (c.words > 1024 && (c.words & 3) == 0 && ((uintptr_t) c.dst & 15) == 0 && ((uintptr_t) c.src & 15) == 0)
-                copy_from_mapped((float*) c.dst, (const float*) c.src, c.words, stream);
-            else
-                copy_i32_from_mapped((int32_t*) c.dst, (const int32_t*) c.src, c.words, stream);
-        }
-        return;
-    }
-    MappedCopies a{};
+    MappedCopies a;
     int64_t most = 0;
     for (int i = 0; i < n; ++i) {
         a.c[i] = copies[i];
@@ -515,6 +425,20 @@ void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
     copy_from_mapped_multi_kernel<<<dim3(bx < 1 ? 1 : bx, (unsigned) n), 256, 0, (cudaStream_t) stream>>>(a);
     check_launch("copy_from_mapped_multi");
 }
+#endif
+
+void copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n, void* stream) {
+    if (n <= 0) return;
+    copy_i32_from_mapped_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(dst, (const volatile int32_t*) src, (int) n);
+    check_launch("copy_i32_from_mapped");
+}
+
+#if defined(__HIPCC__)   // AMD keeps one copy a launch
+void copy_from_mapped_multi(const MappedCopy* copies, int n, void* stream) {
+    for (int i = 0; i < n; ++i)
+        copy_i32_from_mapped((int32_t*) copies[i].dst, (const int32_t*) copies[i].src, copies[i].words, stream);
+}
+#endif
 
 void doorbell_ring(uint32_t* d_seq, void* stream) {
     if (d_seq == nullptr) return;

@@ -1,4 +1,4 @@
-"""The on-demand CPU encoder and elastic GPU encoder ("elastic": true, plus "vram_elastic" for GPU): the first picture makes the
+"""The elastic image encoder (the vision section's "elastic": true with "vram_elastic"): the first picture makes the
 expert cache keep the encoder's VRAM free and then starts it, later pictures use it as it is, an idle encoder stops and
 the cache takes its VRAM back, a POST /v1/vram reserve stacks on the encoder's share, and the engine's load never starts
 it on its own."""
@@ -8,7 +8,6 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, EngineDied, Service, Vision
@@ -20,8 +19,7 @@ IMAGE = {"type": "image", "source": "x.png"}
 
 class ElasticVision:
     """An encoder process stand-in: starts, stops, and turns every picture into three image tokens."""
-    def __init__(self, d, elastic=True, gpu=True):
-        self.gpu = gpu
+    def __init__(self, d, elastic=True):
         self.elastic, self.elastic_mib, self.elastic_idle_s = elastic, 2048, 60.0
         self.up, self.starts, self.unloads = False, 0, 0
         self.dir = Path(d)
@@ -60,18 +58,13 @@ class Elastic(unittest.TestCase):
     def picture(self):
         self.svc.prepare([{"role": "user", "content": [{"type": "text", "text": "what is it"}, IMAGE]}], None, {})
 
-    def reserves(self):
-        """The VRAM sizes the engine was asked for, in order.  serve/test_vram.py's VramEngine (the multi-GPU wave)
-        records each call as (reserve_mib, gpu); this file is about the sizes, so it reads the first half."""
-        return [c[0] for c in self.engine.calls]
-
     def test_the_first_picture_makes_room_then_starts_the_encoder(self):
         self.picture()
-        self.assertEqual(self.reserves(), [2048])           # the cache keeps the encoder's share free first
+        self.assertEqual(self.engine.calls, [2048])         # the cache keeps the encoder's share free first
         self.assertEqual(self.vision.starts, 1)
         self.assertTrue(self.svc.vision_held)
         self.picture()                                      # the next one uses the running encoder
-        self.assertEqual(self.reserves(), [2048])
+        self.assertEqual(self.engine.calls, [2048])
         self.assertEqual(self.vision.starts, 1)
 
     def test_an_idle_encoder_stops_and_the_cache_grows_back_whole(self):
@@ -83,21 +76,21 @@ class Elastic(unittest.TestCase):
         self.assertEqual(self.svc._vision_idle_down(), "down")
         self.assertFalse(self.vision.up)
         self.assertFalse(self.svc.vision_held)
-        self.assertEqual(self.reserves(), [2048, 0])        # 0, not None: the full size, not the start's reserve
+        self.assertEqual(self.engine.calls, [2048, 0])      # 0, not None: the full size, not the start's reserve
         self.assertEqual(self.svc._vision_idle_down(), "nothing")
         self.picture()                                      # and the next picture starts it again
         self.assertEqual(self.vision.starts, 2)
-        self.assertEqual(self.reserves(), [2048, 0, 2048])
+        self.assertEqual(self.engine.calls, [2048, 0, 2048])
 
     def test_a_vram_reserve_stacks_on_the_encoders_share(self):
         self.svc.vram(4000)
         self.picture()
-        self.assertEqual(self.reserves(), [4000, 6048])
+        self.assertEqual(self.engine.calls, [4000, 6048])
         self.svc.vram(1000)                                 # asked while the encoder runs
-        self.assertEqual(self.reserves()[-1], 3048)
+        self.assertEqual(self.engine.calls[-1], 3048)
         self.svc.last_image_at = 0
         self.svc._vision_idle_down()
-        self.assertEqual(self.reserves()[-1], 1000)         # back to the asked reserve, not to 0
+        self.assertEqual(self.engine.calls[-1], 1000)       # back to the asked reserve, not to 0
 
     def test_an_engine_that_cannot_shrink_still_gets_its_encoder(self):
         self.engine.elastic = False
@@ -106,28 +99,7 @@ class Elastic(unittest.TestCase):
         self.assertFalse(self.svc.vision_held)
         self.svc.last_image_at = 0
         self.assertEqual(self.svc._vision_idle_down(), "down")
-        self.assertEqual(self.reserves(), [2048])           # the refused shrink only: nothing to give back
-
-    def test_an_encoder_that_fails_to_start_is_a_503_not_a_dropped_connection(self):
-        def fail():
-            raise RuntimeError("the vision encoder did not start: cudaMalloc failed: out of memory")
-        self.vision.restart = fail
-        with self.assertRaises(EngineDied) as e:            # the handlers answer EngineDied with a 503
-            self.picture()
-        self.assertIn("the image encoder failed to start", str(e.exception))
-        self.svc.last_image_at = 0
-        self.assertEqual(self.svc._vision_idle_down(), "down")
-        self.assertEqual(self.reserves(), [2048, 0])        # the share made for it goes back
-
-    def test_the_stop_is_logged_when_the_cache_never_made_room(self):
-        self.engine.elastic = False                         # a layer split: the engine refuses --vram-elastic
-        self.picture()
-        self.svc.last_image_at = 0
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertEqual(self.svc._vision_idle_down(), "down")
-        self.assertIn("the image encoder stopped after 60 s without a picture", out.getvalue())
-        self.assertNotIn("expert cache", out.getvalue())
+        self.assertEqual(self.engine.calls, [2048])         # the refused shrink only: nothing to give back
 
     def test_an_encoder_that_fails_to_start_is_a_503_not_a_dropped_connection(self):
         def fail():
@@ -168,83 +140,6 @@ class Elastic(unittest.TestCase):
         v = Vision({"exe": "e", "mmproj": "m", "model": "t"}, lazy=True)
         self.assertFalse(v.elastic)
         self.assertEqual((v.elastic_mib, v.elastic_idle_s), (2048, 120.0))
-
-    def test_cpu_text_then_images_idle_and_reload_never_touch_vram(self):
-        self.vision.gpu = False
-        self.engine.loaded = False
-        with mock.patch.object(self.engine, "vram", side_effect=AssertionError("CPU vision resized VRAM")), \
-                mock.patch.object(self.svc, "free_vram_mib", side_effect=AssertionError("CPU vision queried VRAM")):
-            self.svc.ensure_loaded()                       # first text request loads only the text engine
-            self.svc.prepare([{"role": "user", "content": "hello"}], None, {})
-            self.assertEqual(self.engine.starts, 1)
-            self.assertEqual(self.vision.starts, 0)
-            self.assertFalse(self.vision.alive())
-            self.picture()
-            self.assertEqual(self.vision.starts, 1)
-            self.assertFalse(self.svc.vision_held)
-            self.picture()                                 # reuse while warm
-            self.assertEqual(self.vision.starts, 1)
-            self.assertEqual(self.svc._vision_idle_down(), "busy")
-            self.svc.last_image_at = time.time() - 61
-            with self.svc.fifo:
-                self.assertEqual(self.svc._vision_idle_down(), "busy")
-            self.assertEqual(self.svc._vision_idle_down(), "down")
-            self.assertFalse(self.vision.alive())
-            self.assertEqual(self.vision.unloads, 1)
-            self.assertEqual(self.svc._vision_idle_down(), "nothing")
-            self.svc.ensure_loaded()                        # text after idle still leaves vision down
-            self.assertEqual(self.vision.starts, 1)
-            self.picture()
-            self.assertEqual(self.vision.starts, 2)
-            self.svc.unload()
-            self.assertFalse(self.vision.alive())
-
-    def test_cpu_opt_in_and_gpu_gate(self):
-        for gpu in (False, True):
-            for elastic in (False, True):
-                for vram in (False, True):
-                    with self.subTest(gpu=gpu, elastic=elastic, vram=vram):
-                        self.assertEqual(Vision.elastic_enabled({"gpu": gpu, "elastic": elastic}, vram),
-                                         elastic and (not gpu or vram))
-        self.assertFalse(Vision.elastic_enabled({"gpu": False, "elastic": "yes"}))
-        self.assertFalse(Vision.elastic_enabled({"gpu": True, "elastic": True}, "yes"))
-
-    def test_cpu_startup_is_eager_unless_elastic_or_lazy(self):
-        cfg = {"exe": "e", "mmproj": "m", "model": "t", "gpu": False}
-        with mock.patch.object(Vision, "_start") as start:
-            v = Vision(cfg)
-            self.assertFalse(v.gpu or v.elastic)
-            start.assert_called_once_with()
-            start.reset_mock()
-            v = Vision({**cfg, "elastic": True})
-            self.assertTrue(v.elastic)
-            self.assertFalse(v.gpu)
-            start.assert_not_called()
-            Vision(cfg, lazy=True)
-            start.assert_not_called()
-
-    def tool_picture(self):
-        return [{"role": "user", "content": "read it"},
-                {"role": "tool", "tool_call_id": "t1", "content": [dict(IMAGE)]}]
-
-    def test_a_tool_picture_starts_an_idle_encoder_and_holds_it(self):
-        msg = self.tool_picture()
-        self.svc._note_unreadable_tool_images(msg)
-        self.assertEqual(self.vision.starts, 1)             # the picture woke the encoder (it was down: no picture turn
-        self.assertTrue(self.vision.up)                     # ran yet, and encode died on the missing pipe)
-        self.assertGreater(self.svc.last_image_at, 0)       # the turn counted for the idle timer, as prepare's does
-        self.assertEqual(self.svc._vision_idle_down(), "busy")   # so the sweep leaves the new encoder alone
-        self.assertEqual(msg[1]["content"][0]["type"], "image")  # and the picture stays in the history
-
-    def test_a_tool_picture_whose_encoder_cannot_start_becomes_a_note(self):
-        def fail():
-            raise RuntimeError("the vision encoder did not start")  # what _vision_up's start raises
-        self.vision.restart = fail
-        msg = self.tool_picture()
-        self.svc._note_unreadable_tool_images(msg)          # the start's RuntimeError must not escape: the method's
-        self.assertEqual(msg[1]["content"][0],              # contract is a note in the picture's place, not a 500
-                        {"type": "text", "text":           # _vision_up's own prefix, as on the 503 path (see above)
-                         "[image omitted: the image encoder failed to start: the vision encoder did not start]"})
 
 
 if __name__ == "__main__":

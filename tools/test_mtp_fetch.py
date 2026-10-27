@@ -350,7 +350,6 @@ class OneAtATime(unittest.TestCase):
         """#3257: setup killed, its child must not go on: a grandchild whose parent is gone."""
         import subprocess
         import time
-        from strata_mcp import proc_alive, proc_identity, proc_terminate
         child_code = ("import sys,time; sys.path.insert(0, %r); import mtp_fetch as M; M.exit_with_parent(); "
                       "print('up', flush=True); time.sleep(60)" % str(ROOT / "tools"))
         parent_code = ("import subprocess,sys,os; env=dict(os.environ, STRATA_EXIT_WITH_PARENT='1'); "
@@ -359,19 +358,25 @@ class OneAtATime(unittest.TestCase):
         r = subprocess.Popen([sys.executable, "-c", parent_code], stdout=subprocess.PIPE, text=True)
         pid = int(r.stdout.readline())
         r.stdout.readline()
-        # Windows hands a finished process's id to the next one within seconds: "is this pid in tasklist" says a
-        # download that ended with its parent is still running.  strata_mcp's liveness check is the start time
-        # (proc_identity) - the same pair every other caller of these process helpers uses.
-        ident = proc_identity(pid)
-        self.assertIsNotNone(ident, "the download's process was never seen running")
         r.wait(30)
         end = time.time() + 15
         alive = True
         while time.time() < end and alive:
             time.sleep(0.5)
-            alive = proc_alive(pid, ident)
+            if os.name == "nt":
+                out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid], capture_output=True, text=True).stdout
+                alive = str(pid) in out
+            else:
+                try:
+                    os.kill(pid, 0)
+                    alive = True
+                except OSError:
+                    alive = False
         if alive:
-            proc_terminate(pid, ident)
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+            else:
+                os.kill(pid, 9)
         self.assertFalse(alive, "the download kept running after its parent ended")
 
 

@@ -1,7 +1,5 @@
 # Strata on an Intel Arc: the SYCL engine
 
-> **Fork addendum:** passages this page's 0.2.6 doc rewrite displaced — the fork's SYCL/Arc integration notes (expert parallel, setup helpers) — are kept verbatim in [FORK-INTEL.md](FORK-INTEL.md). Archival, not maintained.
-
 This page is for people who build the Intel Arc engine from source or run it in a container, and for those who maintain the
 port. For the released Linux engine package, start with [INTEL_ARC.md](INTEL_ARC.md).
 

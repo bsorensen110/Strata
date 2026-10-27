@@ -1060,6 +1060,7 @@ class PicturesScreen(Base):
             out.append("\nHeads up: the engine installed here does not carry the picture reader, so the model would answer text only. "
                        "Update the engine, or say No.", style=WARN)
         return out
+        return out
 
     def commit(self) -> None:
         key = self.menu().current.key
