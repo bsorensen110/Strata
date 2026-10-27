@@ -56,11 +56,12 @@ def gpu_groups(cfg: dict) -> list[list[int]]:
             raise ReplicaConfigError(f'"replicas": {spec} does not divide the {len(cards)} cards {cards} evenly: name the '
                                      f'groups ("replicas": [{{"gpus": [0, 1]}}, ...]) or change the count')
         n = len(cards) // spec
-        return [cards[i * n:(i + 1) * n] for i in range(spec)]
-    groups = []
-    for e in spec:
-        g = e.get("gpus") if isinstance(e, dict) else e
-        groups.append(_cards(g))
+        groups = [cards[i * n:(i + 1) * n] for i in range(spec)]
+    else:
+        groups = []
+        for e in spec:
+            g = e.get("gpus") if isinstance(e, dict) else e
+            groups.append(_cards(g))
     if any(not g for g in groups):
         raise ReplicaConfigError('every replica needs its cards: {"gpus": [0, 1]}')
     flat = [c for g in groups for c in g]
@@ -211,11 +212,14 @@ class ReplicaEngine:
 
     @property
     def last(self):
-        return self.current.last
+        if not hasattr(self.tl, "last"):
+            self.tl.last = self.current.last
+        return self.tl.last
 
     @last.setter
     def last(self, value):
         self.current.last = value
+        self.tl.last = value
 
     @property
     def batch(self) -> int:
@@ -387,9 +391,11 @@ class ReplicaEngine:
         if k < 0:
             raise EngineDied("no replica is running; this request was not sent")
         e = self.engines[k]
+        _ = self.last
         self.tl.cur = e
         produced: list[int] = []
         held = False
+        gen = None
         nonfinite = False
         try:
             selected = getattr(cancel, "_strata_replica_selected", None)
@@ -402,6 +408,7 @@ class ReplicaEngine:
                     if cancel is not None and cancel.is_set():
                         return
                 held = True
+            native_before = e.last
             if embeddings is not None:
                 gen = e.generate(ids, max_new, sampling, cancel, embeddings=embeddings)
             else:
@@ -414,11 +421,17 @@ class ReplicaEngine:
             nonfinite = True
             raise
         finally:
-            if held:
-                self.run_locks[k].release()
-            with self.lock:
-                self.inflight[k] -= 1
-            if nonfinite:                       # #879: the engine dropped every cached conversation
-                self.router.forget(k)
-            elif produced:
-                self.router.note(k, list(ids) + produced)
+            try:
+                if gen is not None:
+                    gen.close()
+            finally:
+                if gen is not None and e.last is not native_before:
+                    self.tl.last = dict(e.last)
+                if held:
+                    self.run_locks[k].release()
+                with self.lock:
+                    self.inflight[k] -= 1
+                if nonfinite:                       # #879: the engine dropped every cached conversation
+                    self.router.forget(k)
+                elif produced:
+                    self.router.note(k, list(ids) + produced)

@@ -164,12 +164,8 @@ class FakeRoot(unittest.TestCase):
         self.strata.disk_free = lambda p: 1000.0
         self.tools = M.Tools(self.strata)
         self.extra = []
-        # the tests must never see a Strata server that happens to run on the real default port on this PC
-        self._default_port = M.DEFAULT_PORT
-        M.DEFAULT_PORT = free_port()
 
     def tearDown(self):
-        M.DEFAULT_PORT = self._default_port
         for p in self.extra:
             if p.poll() is None:
                 p.kill()
@@ -249,6 +245,23 @@ class Protocol(FakeRoot):
         self.assertEqual(json.loads(call["content"][0]["text"])["recommendation"]["model"], "IQ3_S")
         self.assertEqual(r[4]["result"], {})
         self.assertNotIn(None, r)                       # the notification got no answer
+
+    def test_the_instructions_cover_the_whole_flow(self):
+        """The instructions an assistant gets on initialize: status first, the install gate, every tool, and the
+        localhost rule - so an agent never installs a 58-111 GB model without the user's OK or opens the server
+        to the network without a key."""
+        init = self.run_lines([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                "params": {"protocolVersion": "2025-06-18"}}])[1]["result"]
+        text = init["instructions"]
+        self.assertTrue(text.index("strata_status") < text.index("strata_install"),
+                        "status before install: the agent must know what is there before installing")
+        self.assertIn("confirm=true", text)
+        self.assertIn("58-111 GB", text)
+        for name in ("strata_status", "strata_models", "strata_install", "strata_start",
+                     "strata_stop", "strata_logs", "strata_benchmark", "strata_connect_info"):
+            self.assertIn(name, text, f"the instructions never mention {name}")
+        self.assertIn("127.0.0.1", text)
+        self.assertIn("API key", text)
 
     def test_older_protocol_and_errors(self):
         r = self.run_lines([

@@ -229,6 +229,12 @@ struct QsaState {
     int32_t* page_table = nullptr;   ///< (n_pages,) logical page -> physical page (-1: not resident, streamed)
     int64_t n_pages = 0;
     int64_t max_cells = 0;
+    /// THE PHYSICAL PAGE GRANULE THESE POOLS ARE LAID OUT WITH: `[page][kv_head][page_size][head_dim]`.  0 keeps the
+    /// artifact's own granule (`qsa_real_shapes().page_size`).  A backend whose pools are cell-major
+    /// (`[cell][kv_head][head_dim]`) sets 1 here and the snapshot code reads it directly: at page_size 1 the two
+    /// layouts are the same bytes.  The Metal decode window is the one such backend - its buffers are its own, and
+    /// this field is how the session-file/parking code learns where the K/V really is.
+    int64_t page_size = 0;
 
     /// KV STREAMING (docs/kv-streaming-design.md, `kv_stream.hpp`). `kv_mode` 0: every page in VRAM, identity
     /// table (n_slots == n_pages, no host copy). 1: streamed - the authoritative K/V in `host`, `n_slots` pages
@@ -277,6 +283,19 @@ struct QsaState {
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+
+/// Per-state policy for independently owned K/V (the DFlash drafter). By default
+/// force_owned_kv carves whole-resident FP16 pools from the caller's arena. An
+/// explicit elastic_init_cells instead owns a VMM range, independent of the
+/// target's streaming/format policy. bytes() and init() apply the same options.
+struct QsaStateInitOptions {
+    bool force_owned_kv = false;   ///< independent K/V; in the arena unless explicitly elastic
+    bool force_f16_kv = false;     ///< FP16 K/V regardless of the process KV format
+    bool disable_streaming = false;  ///< never a ring / residency map (ring_cells forced to 0)
+    bool disable_elastic = false;  ///< never in the elastic VMM registry
+    int64_t elastic_init_cells = 0; ///< explicit per-state VMM allocation, independent of the target's policy
+    bool no_indexer = false;        ///< direct attention (DFlash): no pooled sparse-indexer history
+};
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
@@ -300,18 +319,33 @@ int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(VmmChunk)>
 /// Physical bytes the elastic pools hold, and what all of them would at the full context.
 uint64_t qsa_kv_elastic_mapped_bytes();
 uint64_t qsa_kv_elastic_full_bytes();
+/// Release an explicitly owned elastic state; its registry slot is no longer used.
+void qsa_state_release_elastic(QsaState& st);
+uint64_t qsa_state_elastic_bytes(const QsaState& st);
 int64_t qsa_kv_resident();
 /// The fewest resident cells a streamed layer may have: one verify window's selections (8 queries x 2,051 cells
 /// in whole blocks) must fit at once, with room to spare.
 int64_t qsa_kv_resident_min();
 /// Pinned host bytes the streamed states hold (their host copies).
 uint64_t qsa_kv_host_bytes();
+/// A shared KV pool (kv_pool.hpp): a streamed state takes no host copy of its own, the pool attaches one. Set before
+/// initializing the sessions.
+void qsa_set_kv_shared_host(bool enabled);
+bool qsa_kv_shared_host();
+/// Pins `pages` blocks of host K/V in `st`'s format, device-mapped, and points `out`'s arrays into it (the layout
+/// of kv_stream.hpp). False when the driver refuses to pin.
+bool qsa_host_alloc(const ModelGeometry& g, const QsaState& st, int64_t pages, strata::kernels::KvHostPools& out);
 /// Plan v0.3 P7: store K/V as INT8 with FP16 scales per 64 values (half the VRAM of FP16). Set before sizing and
 /// initializing the session; default off until gate G-C accepts it.
 void qsa_set_kv_int8(bool enabled);
 /// INT8 K/V through the Hadamard rotation (off by default: STRATA_KV_ROT=1)
 void qsa_set_kv_int8_rotate(bool enabled);
 bool qsa_kv_int8();
+/// Companion to qsa_kv_int8(): the int8-Hadamard domain is a different K storage
+/// (codes-then-rotation; kv_q8.cu:47-67's writer does NOT include the Hadamard pass
+/// when this is off).  The splice needs this to refuse --kv int8 + STRATA_KV_ROT=1
+/// explicitly (Phase 3 follow-up: dequant -> invH -> rotate -> H -> requant).
+bool qsa_kv_int8_rotate();
 /// PR #21: store K/V as Q4_0 after a Hadamard rotation (`--kv q4_0`): 576 B per cell, vs 1,056 in INT8.
 void qsa_set_kv_q4(bool enabled);
 bool qsa_kv_q4();
@@ -323,6 +357,10 @@ inline int qsa_kv_format(const QsaState& st) {
     if (st.kv_hybrid) return strata::kernels::kKvHybrid;   // K8V4: its own three runs (kv_stream.cu)
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
+                         const QsaStateInitOptions& opts);
+uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+                        const QsaState* share_rope, int64_t ring_cells, const QsaStateInitOptions& opts);
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.

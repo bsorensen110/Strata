@@ -39,7 +39,8 @@ use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod updater;
 mod desktoplog;
-mod shell;
+#[cfg(windows)]
+mod window_lifecycle;
 #[cfg(target_os = "linux")]
 mod supervisor;
 
@@ -253,24 +254,13 @@ fn pick_port() -> Result<u16, String> {
 /// launch starts with empty storage, as before).
 const PREFERRED_PORT: u16 = 47831;
 
-/// Set when the port the person (or the app) wanted was busy: "busy:<wanted>:<used>". The host gets it as STRATA_PORT_NOTICE and tells the
-/// person (the chats and settings saved on the page belong to the port, so a different port starts empty) (#3402).
-static PORT_NOTICE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
 fn pick_stable_port() -> Result<u16, String> {
-    // The person may have chosen a port in Settings (shell-prefs.json); otherwise the app's usual one.
-    let wanted = shell::wanted_port(&shell::read_prefs(), PREFERRED_PORT);
-    *PORT_NOTICE.lock().unwrap() = None;
-    match TcpListener::bind(("127.0.0.1", wanted)) {
+    match TcpListener::bind(("127.0.0.1", PREFERRED_PORT)) {
         Ok(listener) => {
             drop(listener);
-            Ok(wanted)
+            Ok(PREFERRED_PORT)
         }
-        Err(_) => {
-            let used = pick_port()?;
-            *PORT_NOTICE.lock().unwrap() = Some(shell::busy_notice(wanted, used));
-            Ok(used)
-        }
+        Err(_) => pick_port(),
     }
 }
 
@@ -481,9 +471,6 @@ fn host_command(res: &Path, port: u16, shutdown_token: &str) -> Result<Command, 
         .stderr(Stdio::inherit());
     apply_runtime_policy(&mut cmd, res);
     hide_console(&mut cmd);
-    if let Some(notice) = PORT_NOTICE.lock().unwrap().clone() {
-        cmd.env("STRATA_PORT_NOTICE", notice);
-    }
     // A user with the Strata API worker on a different port sets this; unset means the worker's
     // documented loopback default.
     if let Ok(url) = std::env::var("STRATA_SERVER_URL") {
@@ -882,6 +869,8 @@ fn run_embedded() {
     tauri::Builder::default()
         // First, as the plugin requires: a second launch ends here after telling the running app to show itself.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            #[cfg(windows)]
+            if window_lifecycle::second_launch(app, &_args) { return; }
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
@@ -890,7 +879,6 @@ fn run_embedded() {
         }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_notification::init())
         .manage(HostProcess(Mutex::new(None)))
         .manage(HostPort(Mutex::new(None)))
         .manage(ShutdownToken(Mutex::new(None)))
@@ -900,6 +888,16 @@ fn run_embedded() {
                 panic!("STRATA_DESKTOP_TEST_PANIC is set: the app panics on purpose");
             }
             let handle = app.handle().clone();
+            #[cfg(windows)]
+            {
+                // A cold explicit Quit starts neither the Host nor a window.
+                if window_lifecycle::quit_requested(&std::env::args().collect::<Vec<_>>()) {
+                    handle.exit(0);
+                    return Ok(());
+                }
+                handle.manage(window_lifecycle::Policy::from_environment());
+                handle.state::<window_lifecycle::Policy>().watch_owner(handle.clone());
+            }
             // A setup error would become a panic inside Tauri ("Failed to setup app"), and with panic = "abort" a crash with no message.
             // A failed start is reported (log, crash file, message box) and ends the app here instead.
             let port = match start_host(&handle) {
@@ -917,20 +915,8 @@ fn run_embedded() {
             Ok(())
         })
         .on_window_event(|window, event| {
-            // "Minimise to tray" (Settings, off by default): closing the main window hides it and keeps Strata running in the tray; Quit in the
-            // tray menu ends it (#3477). If no tray could be made the window closes as before.
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
-                    let prefs = shell::read_prefs();
-                    if prefs.tray {
-                        api.prevent_close();
-                        shell::hide_to_tray(&window.app_handle().clone(), &prefs.language);
-                        if !shell::tray_exists(&window.app_handle().clone()) {
-                            let _ = window.destroy();
-                        }
-                    }
-                }
-            }
+            #[cfg(windows)]
+            if window_lifecycle::close(window, event) { return; }
             if let tauri::WindowEvent::Destroyed = event {
                 stop_host(&window.app_handle().clone());
             }

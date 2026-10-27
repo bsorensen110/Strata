@@ -4,15 +4,26 @@
 #include "conversation_copy.hpp"
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
 #include <cstring>
-#include <future>
 #include <limits>
 #include <memory>
-#include <mutex>
+#include <vector>
+
+#if defined(STRATA_GPU_METAL)
+#include <cstdio>
+#include <cstdlib>
+namespace strata::metal_engine { bool window_kv_pools(const strata::core::QsaState& st, void* out[5], size_t cap[5]); }
+#endif
+
+#if defined(STRATA_GPU_METAL)
+namespace strata::metal_engine {   // metal/src/engine/window.cpp: the decode window holds the conversation's K/V
+int window_kv_format();
+bool window_kv_layer(const strata::core::QsaState* st, bool index, int64_t upto, void* ptr[5], size_t bytes[5],
+                     std::string& err);
+}  // namespace strata::metal_engine
+#endif
 
 namespace strata::core {
 namespace {
@@ -22,8 +33,14 @@ struct Layout {
     size_t data, scales, pooled, value_data, value_scales;
 };
 
+/// The page granule this state's pools really use: its own, or the artifact's when it never said
+/// (layer.hpp's QsaState::page_size; the Metal window's cell-major pools say 1).
+int64_t page_granule(const QsaState& st) {
+    return st.page_size > 0 ? st.page_size : strata::kernels::qsa_real_shapes().page_size;
+}
+
 bool valid_extent(const QsaState& st, int64_t upto, std::string& error) {
-    const int64_t page = strata::kernels::qsa_real_shapes().page_size;
+    const int64_t page = page_granule(st);
     if (upto < 0 || upto > st.max_cells || upto > std::numeric_limits<int64_t>::max() - (page - 1)) {
         error = "conversation snapshot: invalid K/V extent";
         return false;
@@ -32,6 +49,18 @@ bool valid_extent(const QsaState& st, int64_t upto, std::string& error) {
 }
 
 bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, Layout& l, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    // On Metal the session's QSA states hold no K/V (layer.cpp kv_plan): a snapshot's K/V layer is the decode window's, cells
+    // [0, upto) of the solo conversation's QSA layer (`index`) or of the MTP draft layer, in the window's own layout
+    // (its format key; no pages: cells = tokens).  Any other state is refused.
+    void* ptr[5] = {};
+    size_t n[5] = {};
+    if (!strata::metal_engine::window_kv_layer(&st, index, upto, ptr, n, error)) return false;
+    if (g.idx_key_dim <= 0) { error = "conversation snapshot: invalid K/V geometry"; return false; }
+    l = {strata::metal_engine::window_kv_format(), upto, (int64_t) (n[4] / ((size_t) g.idx_key_dim * sizeof(float))), 1,
+         n[0], n[2], n[4], n[1], n[3]};
+    return true;
+#endif
     if (!valid_extent(st, upto, error)) return false;
     if (st.kv_hybrid && (st.kv_mode == 2 || st.kv_q4 || st.kv_int8)) {   // a streamed one reads its host copy
         error = "conversation snapshot: hybrid K8V4 cannot be a ring and needs distinct format flags";
@@ -44,7 +73,8 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
         error = "conversation snapshot: invalid K/V geometry";
         return false;
     }
-    const int64_t cells = ((upto + s.page_size - 1) / s.page_size) * s.page_size;
+    const int64_t page = page_granule(st);
+    const int64_t cells = ((upto + page - 1) / page) * page;
     const size_t per = st.kv_q4 ? (size_t) strata::kernels::kv_q4_bytes_per_head((int) g.head_dim)
                               : (size_t) g.head_dim * (int8_keys ? 1 : 2);
     // Include the moving spare row, not only completed blocks. The checkpoint
@@ -55,7 +85,7 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
     // snapshot or prompt checkpoint taken with the rotation never restores into one without it, nor the reverse.
     // (Q4_0 is always rotated: nothing to tell apart; without the rotation the format is the one it always was.)
     const int rotated = st.kv_rot && !st.kv_q4 && !st.kv_hybrid ? 16 : 0;
-    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, s.page_size, 0, 0, 0, 0, 0};
+    l = {(st.kv_hybrid ? 3 : qsa_kv_format(st)) + rotated, cells, pooled, page, 0, 0, 0, 0, 0};
     using conversation_detail::product;
     if (!product(l.data, {(uint64_t) cells, (uint64_t) g.n_head_kv, per}) ||
         !product(l.scales, {(uint64_t) cells, (uint64_t) g.n_head_kv,
@@ -78,6 +108,17 @@ bool layout(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index
 }
 
 std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
+#if defined(STRATA_GPU_METAL)
+    // the window's buffers (layout() refused any state that is not the window's): a solo session QSA state, else the
+    // draft layer
+    (void) resident;
+    void* p[5] = {};
+    size_t n[5] = {};
+    std::string e;
+    if (!strata::metal_engine::window_kv_layer(&st, true, 0, p, n, e))
+        strata::metal_engine::window_kv_layer(&st, false, 0, p, n, e);
+    return {p[0], p[1], p[2], p[3], p[4]};
+#endif
     const bool host = st.kv_mode != 0 && !resident;
     if (st.kv_hybrid)
         return {host ? st.host.k_q : st.k_q, host ? st.host.v_q4 : st.v_q4, host ? st.host.k_scale : st.k_scale,
@@ -91,6 +132,10 @@ std::array<void*, 5> pools(const QsaState& st, bool resident = false) {
 }
 
 bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    (void) st; (void) l; (void) upto; (void) error;
+    return true;   // the window's K/V: no pages, no streaming, no ring (layout() checked the extent)
+#endif
     if (upto < 0 || upto > st.max_cells || st.n_pages < 0 || l.cells / l.page_size > st.n_pages ||
         st.kv_mode < 0 || st.kv_mode > 2 || st.n_slots <= 0 ||
         (st.kv_mode == 0 && st.n_slots < st.n_pages) ||
@@ -115,154 +160,63 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
-// STRATA_PARK_VRAM_MIB=N (with STRATA_PARK_ASYNC): a park also keeps the whole K/V of its image in VRAM, in a slot
-// of its own, while the slots' total stays within N MiB; a restore of that image copies from the slot device to
-// device (~1 ms) instead of from the host buffers over PCIe, and needs no wait for the background copy.  A slot is
-// released with the image or its K/V layers (their tokens), or all at once under VRAM pressure
-// (conversation_park_vram_release_all).  Host thread only; the background copy only reads a slot's bytes, and every
-// reuse or free of one comes after a join (conversation_park_async_begin, release_all).
-struct VramKvSlot {
-    void* p = nullptr;
-    size_t cap = 0, used = 0;
-    uint64_t tag = 0;   // 0: free (kept for reuse by size)
-    int dev = -1;
-    struct Part { uint64_t tag; size_t part, offset, bytes; };   // one layer's part (k, v, k_scale, v_scale, pooled)
-    std::vector<Part> parts;
-};
-struct VramKv {
-    std::vector<std::unique_ptr<VramKvSlot>> slots;
-    uint64_t next_tag = 1;   // slot and layer tags, never reused
-};
-VramKv& vram_kv() { static VramKv v; return v; }
-size_t park_vram_budget() {
-    static const size_t b = [] {
-        const char* v = std::getenv("STRATA_PARK_VRAM_MIB");
-        const long long mib = v != nullptr ? std::atoll(v) : 0;
-        return mib > 0 ? (size_t) mib << 20 : (size_t) 0;
-    }();
-    return b;
-}
-bool park_trace() { static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr; return on; }
-void vram_kv_free(VramKvSlot& s) {
-    int cur = s.dev;
-    (void) cudaGetDevice(&cur);
-    if (cur != s.dev) (void) cudaSetDevice(s.dev);
-    (void) cudaFree(s.p);
-    if (cur != s.dev) (void) cudaSetDevice(cur);
-    (void) cudaGetLastError();
-    s.p = nullptr; s.cap = 0;
-}
-void vram_kv_release(VramKvSlot& s) { s.tag = 0; s.used = 0; s.parts.clear(); }   // free, kept for reuse
-// A slot of `need` bytes on `dev`: the best-fitting free one, else (the free ones freed first) a new one, rounded up
-// to 64 MiB so a growing conversation's next parks reuse it, while the slots' total stays within the budget and
-// 1.5 GB of VRAM stays free beside it.  nullptr, with `why`, otherwise.
-VramKvSlot* vram_kv_take(size_t need, int dev, const char*& why) {
-    VramKv& v = vram_kv();
-    const size_t budget = park_vram_budget();
-    if (budget == 0) { why = "off"; return nullptr; }
-    VramKvSlot* best = nullptr;
-    for (auto& s : v.slots)
-        if (s->tag == 0 && s->dev == dev && s->cap >= need && (best == nullptr || s->cap < best->cap)) best = s.get();
-    if (best == nullptr) {
-        size_t held = 0;
-        for (size_t i = 0; i < v.slots.size();) {
-            if (v.slots[i]->tag != 0) { held += v.slots[i]->cap; ++i; continue; }
-            vram_kv_free(*v.slots[i]);
-            v.slots.erase(v.slots.begin() + (std::ptrdiff_t) i);
-        }
-        const size_t want = (need + ((size_t) 64 << 20) - 1) & ~(((size_t) 64 << 20) - 1);
-        if (held > budget || want > budget - held) { why = "budget"; return nullptr; }
-        size_t fr = 0, tot = 0;
-        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess || fr < want + ((size_t) 3 << 29)) {
-            (void) cudaGetLastError();
-            why = "vram";
-            return nullptr;
-        }
-        void* p = nullptr;
-        if (cudaMalloc(&p, want) != cudaSuccess) { (void) cudaGetLastError(); why = "cudaMalloc"; return nullptr; }
-        auto s = std::make_unique<VramKvSlot>();
-        s->p = p; s->cap = want; s->dev = dev;
-        best = s.get();
-        v.slots.push_back(std::move(s));
-    }
-    best->tag = v.next_tag++;
-    best->used = 0;
-    best->parts.clear();
-    return best;
-}
-// The live slot on the current device holding parts under `tag` (nullptr: none, or tag 0)
-const VramKvSlot* vram_kv_find(uint64_t tag) {
-    if (tag == 0) return nullptr;
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return nullptr; }
-    for (const auto& s : vram_kv().slots) {
-        if (s->tag == 0 || s->dev != dev) continue;
-        for (const auto& p : s->parts)
-            if (p.tag == tag) return s.get();
-    }
-    return nullptr;
-}
-// Whether the slot holds, under `tag`, at least sizes[i] bytes of every part i that has any; `at` gets the offsets
-bool vram_kv_locate(const VramKvSlot& s, uint64_t tag, const std::array<size_t,5>& sizes, std::array<size_t,5>& at) {
-    std::array<bool,5> have{};
-    for (const auto& p : s.parts)
-        if (p.tag == tag && p.part < at.size() && p.bytes >= sizes[p.part]) { have[p.part] = true; at[p.part] = p.offset; }
-    for (size_t i = 0; i < sizes.size(); ++i)
-        if (sizes[i] > 0 && !have[i]) return false;
-    return true;
+}  // namespace (the park block below is left open: window_cells is checked model-free by
+   // metal/tests/window_cells_test.cpp)
+#if defined(STRATA_GPU_METAL)
+// park/restore for the Metal decode window: the window stores [cell][head][unit], the session pools (and the
+// snapshot image's bytes) are [page][head][page_size][unit] with a page = one indexer block, so the cold-path
+// copy repacks a page at a time.  The window's own pools were given back at startup; a state the window does
+// not hold (the drafter's ring under --mtp, a streaming mode, a K/V format its kernels do not implement) parks
+// nothing: these copies return false and serve reports the reason instead of touching a dead allocation.
+bool window_pools(const QsaState& st, void* out[5], size_t cap[5]) {
+    return st.kv_int8 && !st.kv_q4 && !st.kv_hybrid && st.kv_mode == 0 &&
+           strata::metal_engine::window_kv_pools(st, out, cap);
 }
 
-struct ParkAsync {
-    std::mutex mu;
-    std::future<cudaError_t> pending;
-    struct Item { uint8_t* dst; size_t n, at; };
-    std::vector<Item> items;
-    uint8_t* stage = nullptr;
-    size_t cap = 0, used = 0;
-    void* host[2] = {nullptr, nullptr};   // pinned, 4 MiB each
-    cudaStream_t stream = nullptr;
-    int dev = -1;
-    bool active = false;
-    VramKvSlot* slot = nullptr;   // STRATA_PARK_VRAM_MIB: the begun park's slot (the stage is not used then)
-    uint64_t slot_tag = 0;        // its tag, kept past launch for the image's and its layers' tokens
-};
-ParkAsync& park_async() { static ParkAsync a; return a; }
-constexpr size_t kParkPiece = (size_t) 4 << 20;
-bool park_async_on() {
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
-    return false;
-#else
-    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
-    return on;
+void window_cells(void* dst, const void* src, int64_t cells, int64_t page, int64_t heads, size_t unit, bool to_image) {
+    uint8_t* d = static_cast<uint8_t*>(dst);
+    const uint8_t* s = static_cast<const uint8_t*>(src);
+    // window order is [cell][head][unit]; the image order is [page][head][cell in page][unit].
+    // pg counts pages, p counts the page's first cell.  to_image runs the park's shuffle; the
+    // restore swaps the two index expressions (running the same one twice is not the identity).
+    for (int64_t pg = 0, p = 0; p < cells; ++pg, p += page)
+        for (int64_t h = 0; h < heads; ++h)
+            for (int64_t r = 0; r < page; ++r) {
+                const size_t wi = size_t(((p + r) * heads + h) * unit);
+                const size_t ii = size_t(((pg * heads + h) * page + r) * unit);
+                std::memcpy(d + (to_image ? ii : wi), s + (to_image ? wi : ii), unit);
+            }
+}
 #endif
-}
-bool on_device(const void* p) {
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
-    (void) p;   // (no pointer-attribute query in the shims: the slot takes no part, as when the query fails)
-    return false;
-#else
-    cudaPointerAttributes at{};
-    if (cudaPointerGetAttributes(&at, p) != cudaSuccess) { cudaGetLastError(); return false; }
-    return at.type == cudaMemoryTypeDevice;
-#endif
-}
-// STRATA_PARK_TRACE: where conversation_kv_save's time goes since the park's begin (ms): the pointer-attribute
-// queries, the host buffer resizes and the copies (into the stage, or the synchronous ones).  Read by the park trace.
-struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; };
-KvSaveTrace& kv_save_trace() { static KvSaveTrace t; return t; }
-bool park_trace_on() {
-    static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
-    return on;
-}
+
+namespace {
 
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
+#if defined(STRATA_GPU_METAL)
+    std::memcpy(dst, src, n);   // unified memory: the window's buffers are host-visible, and the window is idle here
+    return true;
+#endif
     // Default handles both device allocations and device-mapped host pool aliases.
     const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n);
     if (e == cudaSuccess) return true;
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
+}
+
+// The session's own QSA states by owned index (the same carve as conversation_state.cpp's `owned`).
+const QsaState& session_qsa(const SessionState& ss, size_t j) {
+    return ss.qsa_states[(size_t) ss.qsa_ord0 + j];
+}
+// Bytes [at, at + n) of K/V array `i` (pools() order) in the state's memory: `f(state_offset, done, len)` for each
+// piece. A shared KV pool keeps a session's host blocks in chunks (kv_stream.hpp), so a piece ends where a chunk
+// ends; without one the bytes are one piece at `at`. `total` and `cells` size the array: bytes per block from them.
+template <class F>
+bool each_piece(int kv_mode, const strata::kernels::KvHostPools& host, size_t i, size_t total, int64_t cells,
+                int64_t page_size, size_t at, size_t n, F&& f) {
+    if (i >= 4 || kv_mode == 0 || host.chunk_host == nullptr || cells <= 0) return f(at, size_t(0), n);
+    return host.for_each_piece(total / size_t(cells / page_size), at, n, f);
 }
 } // namespace
 
@@ -310,75 +264,42 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const auto src = pools(st);
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    // STRATA_PARK_VRAM_MIB: this layer's parts go into the park's slot under a fresh tag (0: no slot this park)
-    image.dev_tag = park_async().slot != nullptr ? vram_kv().next_tag++ : 0;
+#if defined(STRATA_GPU_METAL)
+    (void) src; (void) whole_cells;
+    void* wp[5]; size_t cap[5];
+    if (!window_pools(st, wp, cap)) { error = "conversation snapshot: the Metal window holds no live cells for this K/V"; return false; }
+    for (size_t i = 0; i < dst.size(); ++i) {
+        // the cells are the live K/V: repack them into the image's page order, whole range (the
+        // incremental prefix below is CUDA's retained-image path; the window park is a cold copy)
+        dst[i]->resize(sizes[i]);
+        if (!sizes[i]) continue;
+        std::vector<uint8_t> scr(sizes[i]);
+        const size_t unit = i == 4 ? 0 : sizes[i] / ((size_t) l.cells * (size_t) g.n_head_kv);
+        if (sizes[i] > cap[i]) { error = "conversation snapshot: the Metal window's cells are smaller than the snapshot range"; return false; }
+        if (std::getenv("STRATA_PARK_DEBUG"))
+            std::fprintf(stderr, "strata metal park: part %zu size %zu cells %lld unit %zu cap %zu\n", i, sizes[i], (long long) l.cells, unit, cap[i]);
+        if (i == 4) std::memcpy(scr.data(), wp[4], sizes[i]);   // indexer pool rows: block-linear in both layouts
+        else window_cells(scr.data(), wp[i], l.cells, l.page_size, g.n_head_kv, unit, true);
+        dst[i]->visit(0, sizes[i], [&](uint8_t* p, size_t n, size_t at) { std::memcpy(p, scr.data() + at, n); return true; });
+    }
+    return true;
+#else
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
-        {   // STRATA_PARK_VRAM_MIB: with a slot, the whole part goes device to device into it (a restore of this image
-            // reads it from there) and the host buffer gets only the bytes past the kept prefix, read from the slot on
-            // the background thread; a part the slot cannot take is copied synchronously - never through the stage,
-            // whose offsets launch would read from the slot
-            ParkAsync& a = park_async();
-            if (a.slot != nullptr) {
-                VramKvSlot& s = *a.slot;
-                const bool fits = src[i] != nullptr && sizes[i] > 0 && s.used + sizes[i] <= s.cap &&
-                                  (st.kv_mode == 0 || on_device(src[i]));   // (kv_mode 0: the pools are device memory)
-                if (fits) {
-                    const size_t at0 = s.used;
-                    const cudaError_t e = conversation_detail::copy_nonblocking(static_cast<uint8_t*>(s.p) + at0, src[i], sizes[i], true);
-                    if (e != cudaSuccess) { error = std::string("conversation snapshot slot copy: ") + cudaGetErrorString(e); return false; }
-                    s.parts.push_back({image.dev_tag, i, at0, sizes[i]});
-                    s.used += sizes[i];
-                    dst[i]->resize_for_overwrite(sizes[i]);
-                    if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                            a.items.push_back({p, n, at0 + at});
-                            return true;
-                        })) return false;
-                } else {
-                    dst[i]->resize(sizes[i]);
-                    if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                            return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
-                        })) return false;
-                }
-                if (reused_bytes) *reused_bytes += keep;
-                continue;
-            }
-        }
-        // STRATA_PARK_ASYNC: device bytes go to the VRAM stage now and into the buffer on the background thread
-        ParkAsync& a = park_async();
-        const bool trace = park_trace_on();
-        auto tick = [trace] { return trace ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
-        const auto t0 = tick();
-        // (kv_mode 0: the pools are device memory by construction, so no pointer-attribute query)
-        const bool staged = a.active && src[i] != nullptr && sizes[i] > keep && a.used + (sizes[i] - keep) <= a.cap &&
-                            (st.kv_mode == 0 || on_device(src[i]));
-        const auto t1 = tick();
-        if (staged) dst[i]->resize_for_overwrite(sizes[i]);
-        else dst[i]->resize(sizes[i]);
-        const auto t2 = tick();
-        const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
-                if (!staged) return transfer(p, s, n, error);
-                const cudaError_t e = conversation_detail::copy_nonblocking(a.stage + a.used, s, n, true);
-                if (e != cudaSuccess) { error = std::string("conversation snapshot stage copy: ") + cudaGetErrorString(e); return false; }
-                a.items.push_back({p, n, a.used});
-                a.used += n;
-                return true;
-            });
-        if (trace) {
-            auto ms = [](std::chrono::steady_clock::time_point x, std::chrono::steady_clock::time_point y) {
-                return std::chrono::duration<double, std::milli>(y - x).count(); };
-            KvSaveTrace& t = kv_save_trace();
-            t.attrs += ms(t0, t1); t.resize += ms(t1, t2); t.copy += ms(t2, tick());
-        }
-        if (!copied) return false;
+        dst[i]->resize(sizes[i]);
+        if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                return each_piece(st.kv_mode, st.host, i, sizes[i], l.cells, l.page_size, at, n, [&](size_t off, size_t done, size_t len) {
+                    return transfer(p + done, src[i] ? static_cast<const uint8_t*>(src[i]) + off : nullptr, len, error);
+                });
+            })) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
     return true;
+#endif
 }
 
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
@@ -421,6 +342,62 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
 }
 } // namespace
 
+bool conversation_kv_validate_meta(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                                   int64_t upto, bool index, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    if (!valid(st, l, upto, error)) return false;
+    if (image.format != l.format || image.cells != l.cells || image.heads != g.n_head_kv ||
+        image.head_dim != g.head_dim || image.page_size != l.page_size || image.pooled_rows != l.pooled_rows ||
+        image.idx_dim != g.idx_key_dim) {
+        error = "conversation snapshot: incompatible K/V geometry";
+        return false;
+    }
+    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const auto dst = pools(st);
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    return true;
+}
+
+bool conversation_kv_targets(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
+                             const QsaState* draft, std::vector<ConversationKvTarget>& targets, std::string& error) {
+    targets.clear();
+    const size_t layers = (size_t) std::max<int64_t>(ss.qsa_alloc, 0);
+    if (image.kv.size() != layers + (draft ? 1 : 0)) { error = "conversation snapshot: invalid K/V layer count"; return false; }
+    const int64_t upto = (int64_t) image.live.ids.size();
+    targets.reserve(image.kv.size());
+    for (size_t j = 0; j < image.kv.size(); ++j) {
+        const bool index = j < layers;
+        const QsaState& st = index ? session_qsa(ss, j) : *draft;
+        if (!conversation_kv_validate_meta(image.kv[j], st, g, upto, index, error)) return false;
+        ConversationKvTarget t;
+        t.state = &st; t.geometry = &g; t.upto = upto; t.index = index;
+        const auto dst = pools(st);
+        for (size_t i = 0; i < 5; ++i) t.pool[i] = static_cast<uint8_t*>(dst[i]);
+        if (!conversation_kv_part_sizes(st, g, upto, index, t.sizes, error)) return false;
+        targets.push_back(t);
+    }
+    return true;
+}
+
+bool conversation_kv_targets(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
+                             const QsaState& draft, std::vector<ConversationKvTarget>& targets, std::string& error) {
+    return conversation_kv_targets(image, ss, g, &draft, targets, error);
+}
+
+bool ConversationKvTarget::apply(size_t part, uint64_t offset, const void* data, size_t n, std::string& error) const {
+    if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) {
+        error = "conversation snapshot: K/V block outside its part";
+        return false;
+    }
+    return transfer(pool[part] + offset, data, n, error);
+}
+
+bool ConversationKvTarget::finish(std::string& error) const {
+    return refresh_residency(*state, *geometry, upto, error);
+}
+
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error, bool queued) {
     Layout lf{}, lt{};
@@ -439,46 +416,83 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
     const auto src = pools(from);
     const auto dst = pools(to);
     const std::array<size_t,5> sizes = {lf.data, lf.value_data, lf.scales, lf.value_scales, lf.pooled};
+#if defined(STRATA_GPU_METAL)
+    (void) src; (void) dst; (void) queued;
+    void* wf[5]; void* wt[5]; size_t cf[5];
+    if (!window_pools(from, wf, cf) || !window_pools(to, wt, cf)) { error = "conversation snapshot: the Metal window holds no live cells for this K/V copy"; return false; }
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i] > cf[i]) { error = "conversation snapshot: the Metal window's cells are smaller than the copy"; return false; }
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (sizes[i]) std::memcpy(wt[i], wf[i], sizes[i]);   // both sides are the window's own cell order
+    return refresh_residency(to, g, upto, error);
+#else
     for (size_t i = 0; i < sizes.size(); ++i) {
         if (!sizes[i]) continue;
         if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
-        const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i], queued);
-        if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+        // A shared KV pool keeps each session's host blocks in its own chunks: copy block runs that are one piece on
+        // both sides. Without a pool (and for the indexer rows) it is one piece at the same offset.
+        const bool chunked = i < 4 && (from.host.chunk_host != nullptr || to.host.chunk_host != nullptr) &&
+                             from.kv_mode != 0 && to.kv_mode != 0 && lf.cells > 0;
+        if (!chunked) {
+            const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i], queued);
+            if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+            continue;
+        }
+        const long long n_blocks = (long long) (lf.cells / lf.page_size);
+        const size_t block = sizes[i] / (size_t) n_blocks;
+        for (long long b = 0; b < n_blocks;) {
+            const long long run = std::min(from.host.contiguous(b, n_blocks - b), to.host.contiguous(b, n_blocks - b));
+            const cudaError_t e = conversation_detail::copy_nonblocking(
+                static_cast<uint8_t*>(dst[i]) + (size_t) to.host.block_host(b) * block,
+                static_cast<const uint8_t*>(src[i]) + (size_t) from.host.block_host(b) * block, (size_t) run * block, queued);
+            if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+            b += run;
+        }
     }
     if (queued && to.kv_mode != 0) {
         const cudaError_t e = conversation_detail::order_after_queued();
         if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
     }
     return refresh_residency(to, g, upto, error);
+#endif
 }
 
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                              int64_t upto, bool index, std::string& error) {
-    // STRATA_PARK_VRAM_MIB: from the image's VRAM slot when it holds every part (no host buffer is read: no join)
-    const VramKvSlot* slot = vram_kv_find(image.dev_tag);
-    if (slot == nullptr) conversation_park_join();
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
-    std::array<size_t,5> sizes{}, off{};
-    for (size_t i = 0; i < src.size(); ++i) sizes[i] = src[i]->size();
-    if (slot != nullptr && !vram_kv_locate(*slot, image.dev_tag, sizes, off)) { slot = nullptr; conversation_park_join(); }
-    if (slot != nullptr) {
-        for (size_t i = 0; i < src.size(); ++i)
-            if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
-        return refresh_residency(st, g, upto, error);
+#if defined(STRATA_GPU_METAL)
+    (void) dst;
+    void* wp[5]; size_t cap[5];
+    if (!window_pools(st, wp, cap)) { error = "conversation snapshot: the Metal window holds no live cells for this K/V"; return false; }
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    for (size_t i = 0; i < src.size(); ++i) {
+        const size_t n = src[i]->size();
+        if (!n) continue;
+        std::vector<uint8_t> scr(n);
+        src[i]->visit(0, n, [&](const uint8_t* p, size_t m, size_t at) { std::memcpy(scr.data() + at, p, m); return true; });
+        const size_t unit = i == 4 ? 0 : n / ((size_t) l.cells * (size_t) g.n_head_kv);
+        if (n > cap[i]) { error = "conversation snapshot: the snapshot is larger than the Metal window's cells"; return false; }
+        if (i == 4) std::memcpy(wp[4], scr.data(), n);
+        else window_cells(wp[i], scr.data(), l.cells, l.page_size, g.n_head_kv, unit, false);
     }
+    return refresh_residency(st, g, upto, error);
+#else
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                return each_piece(st.kv_mode, st.host, i, src[i]->size(), image.cells, image.page_size, at, n,
+                                  [&](size_t off, size_t done, size_t len) {
+                    return transfer(static_cast<uint8_t*>(dst[i]) + off, p + done, len, error);
+                });
             })) return false;
     return refresh_residency(st, g, upto, error);
+#endif
 }
 
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                                     int64_t captured, int64_t upto, bool index, std::string& error) {
-    const VramKvSlot* slot = vram_kv_find(image.dev_tag);   // (STRATA_PARK_VRAM_MIB, as in conversation_kv_restore)
-    if (slot == nullptr) conversation_park_join();
     if (upto < 0 || upto > captured) {
         error = "conversation snapshot: prefix beyond the captured K/V";
         return false;
@@ -491,19 +505,30 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     for (size_t i = 0; i < src.size(); ++i)
         if (sizes[i] > src[i]->size()) { error = "conversation snapshot: prefix beyond the K/V payload"; return false; }
     const auto dst = pools(st);
-    // STRATA_PARK_VRAM_MIB: the prefix is the leading bytes of each part in the slot too
-    std::array<size_t,5> off{};
-    if (slot != nullptr && !vram_kv_locate(*slot, image.dev_tag, sizes, off)) { slot = nullptr; conversation_park_join(); }
-    if (slot != nullptr) {
-        for (size_t i = 0; i < src.size(); ++i)
-            if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
-        return refresh_residency(st, g, upto, error);
+#if defined(STRATA_GPU_METAL)
+    (void) dst;
+    void* wp[5]; size_t cap[5];
+    if (!window_pools(st, wp, cap)) { error = "conversation snapshot: the Metal window holds no live cells for this K/V"; return false; }
+    for (size_t i = 0; i < src.size(); ++i) {
+        if (!sizes[i]) continue;
+        std::vector<uint8_t> scr(sizes[i]);
+        src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) { std::memcpy(scr.data() + at, p, n); return true; });
+        const size_t unit = i == 4 ? 0 : sizes[i] / ((size_t) l.cells * (size_t) g.n_head_kv);
+        if (sizes[i] > cap[i]) { error = "conversation snapshot: the snapshot is larger than the Metal window's cells"; return false; }
+        if (i == 4) std::memcpy(wp[4], scr.data(), sizes[i]);
+        else window_cells(wp[i], scr.data(), l.cells, l.page_size, g.n_head_kv, unit, false);
     }
+    return refresh_residency(st, g, upto, error);
+#else
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                return each_piece(st.kv_mode, st.host, i, src[i]->size(), image.cells, image.page_size, at, n,
+                                  [&](size_t off, size_t done, size_t len) {
+                    return transfer(static_cast<uint8_t*>(dst[i]) + off, p + done, len, error);
+                });
             })) return false;
     return refresh_residency(st, g, upto, error);
+#endif
 }
 
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
@@ -516,6 +541,12 @@ bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int6
 
 bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const ModelGeometry& g,
                             int64_t upto, bool index, std::string& error) {
+#if defined(STRATA_GPU_METAL)
+    // the session K/V file reads the pools linearly; the window's cells are in another order and a byte-range
+    // read would repack on every page boundary.  A parked window can still restore such a file (the copies
+    // above repack); the file save side stays CUDA-only.
+    error = "conversation snapshot: session K/V files are not supported over the Metal window"; return false;
+#endif
     Layout l{};
     if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
     SessionKvSource s;
@@ -525,9 +556,17 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     const auto src = pools(st);
     const auto sizes = s.sizes;
     auto why = std::make_shared<std::string>();
-    s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
+    // a shared KV pool keeps a streamed state's blocks in chunks: the file's bytes are read piece by piece
+    const int kv_mode = st.kv_mode;
+    const strata::kernels::KvHostPools host = st.host;
+    const int64_t cells = l.cells, page_size = l.page_size;
+    s.read = [src, sizes, why, kv_mode, host, cells, page_size](size_t part, size_t offset, void* dst, size_t n) {
         if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
-        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
+        return each_piece(kv_mode, host, part, sizes[part], cells, page_size, offset, n,
+                          [&](size_t off, size_t done, size_t len) {
+            return transfer(static_cast<uint8_t*>(dst) + done, src[part] ? static_cast<const uint8_t*>(src[part]) + off : nullptr,
+                            len, *why);
+        });
     };
     s.error = [why] { return *why; };
     out = std::move(s);
@@ -536,7 +575,6 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                             int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
-    conversation_park_join();
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     std::array<uint8_t, 65536> buffer;
     uint64_t hash = 1469598103934665603ull;
@@ -557,7 +595,10 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     const auto authoritative = pools(st);
     for (size_t i = 0; i < saved.size(); ++i)
         if (!saved[i]->visit(0, saved[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return compare(static_cast<const uint8_t*>(authoritative[i]) + at, p, n, true);
+                return each_piece(st.kv_mode, st.host, i, saved[i]->size(), image.cells, image.page_size, at, n,
+                                  [&](size_t off, size_t done, size_t len) {
+                    return compare(static_cast<const uint8_t*>(authoritative[i]) + off, p + done, len, true);
+                });
             })) return false;
     if (st.kv_mode == 2 && image.cells > 0) {
         const auto resident = pools(st, true);
@@ -576,195 +617,6 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     }
     fingerprint = hash;
     return true;
-}
-
-void conversation_park_join() {
-    ParkAsync& a = park_async();
-    std::lock_guard<std::mutex> lk(a.mu);
-    if (a.pending.valid()) {
-        const cudaError_t e = a.pending.get();
-        if (e != cudaSuccess) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", cudaGetErrorString(e));
-    }
-}
-
-void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms) {
-    const KvSaveTrace& t = kv_save_trace();
-    attrs_ms = t.attrs; resize_ms = t.resize; copy_ms = t.copy;
-}
-
-bool conversation_park_async_begin(size_t need) {
-    if (park_trace_on()) kv_save_trace() = {};   // (the sums cover this park's saves)
-    conversation_park_join();   // (the stage is reused)
-    ParkAsync& a = park_async();
-    a.active = false;
-    a.items.clear();
-    a.used = 0;
-    a.slot = nullptr;
-    a.slot_tag = 0;
-    if (!park_async_on() || need == 0) return false;
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
-    // STRATA_PARK_VRAM_MIB: a slot of the whole K/V instead of the stage, while the budget allows - taken before the
-    // stage would be re-allocated, so a growing conversation's park pays no cudaFree (a device sync) when it gets one
-    const char* why = "";
-    a.slot = vram_kv_take(need, dev, why);
-    a.slot_tag = a.slot != nullptr ? a.slot->tag : 0;
-    if (park_trace() && park_vram_budget() != 0) {
-        if (a.slot != nullptr)
-            std::fprintf(stderr, "strata parktrace: kv slot %zu MB tag %llu\n", need >> 20, (unsigned long long) a.slot_tag);
-        else
-            std::fprintf(stderr, "strata parktrace: kv slot: none (%s)\n", why);
-    }
-    if (a.stage != nullptr && ((a.slot == nullptr && a.cap < need) || a.dev != dev)) {
-        const int cur = dev;
-        (void) cudaSetDevice(a.dev); (void) cudaFree(a.stage); (void) cudaSetDevice(cur);
-        a.stage = nullptr; a.cap = 0;
-    }
-    if (a.stream != nullptr && a.dev != dev) {
-        const int cur = dev;
-        (void) cudaSetDevice(a.dev); (void) cudaStreamDestroy(a.stream);
-        (void) cudaFreeHost(a.host[0]); (void) cudaFreeHost(a.host[1]); (void) cudaSetDevice(cur);
-        a.stream = nullptr; a.host[0] = a.host[1] = nullptr;
-    }
-    a.dev = dev;
-    if (a.stream == nullptr &&
-        (cudaStreamCreateWithFlags(&a.stream, cudaStreamNonBlocking) != cudaSuccess ||
-         cudaMallocHost(&a.host[0], kParkPiece) != cudaSuccess || cudaMallocHost(&a.host[1], kParkPiece) != cudaSuccess)) {
-        if (a.host[0]) (void) cudaFreeHost(a.host[0]);
-        if (a.host[1]) (void) cudaFreeHost(a.host[1]);
-        if (a.stream) (void) cudaStreamDestroy(a.stream);
-        a.stream = nullptr; a.host[0] = a.host[1] = nullptr;
-        (void) cudaGetLastError();
-        if (a.slot != nullptr) { vram_kv_release(*a.slot); a.slot = nullptr; a.slot_tag = 0; }   // (STRATA_PARK_VRAM_MIB)
-        return false;
-    }
-    if (a.slot != nullptr) {   // STRATA_PARK_VRAM_MIB: the slot stands in for the stage this park
-        a.active = true;
-        return true;
-    }
-    if (a.stage == nullptr) {
-        // rounded up to 64 MiB: the next parks of a growing conversation reuse it instead of re-allocating (a cudaFree
-        // synchronizes the device, and the checkpoint DMA is in flight at this point)
-        const size_t want = (need + ((size_t) 64 << 20) - 1) & ~(((size_t) 64 << 20) - 1);
-        size_t fr = 0, tot = 0;
-        if (cudaMemGetInfo(&fr, &tot) != cudaSuccess || fr < want + ((size_t) 3 << 29) ||
-            cudaMalloc((void**) &a.stage, want) != cudaSuccess) {
-            a.stage = nullptr;
-            (void) cudaGetLastError();
-            return false;
-        }
-        a.cap = want;
-    }
-    a.active = true;
-    return true;
-}
-
-void conversation_park_async_abandon() {
-    ParkAsync& a = park_async();
-    if (!a.active) return;
-    a.active = false;
-    a.items.clear();
-    cudaStream_t s = nullptr;
-    if (conversation_detail::private_stream(s) == cudaSuccess) (void) cudaStreamSynchronize(s);   // nothing reads the stage after
-    (void) cudaGetLastError();
-    if (a.slot != nullptr) { vram_kv_release(*a.slot); a.slot = nullptr; a.slot_tag = 0; }   // (STRATA_PARK_VRAM_MIB)
-}
-
-bool conversation_park_async_launch(std::string& error) {
-    ParkAsync& a = park_async();
-    if (!a.active) return true;
-    a.active = false;
-    cudaStream_t s = nullptr;
-    cudaError_t e = conversation_detail::private_stream(s);
-    if (e == cudaSuccess) e = cudaStreamSynchronize(s);   // the device-to-device copies into the stage
-    if (e != cudaSuccess) {
-        a.items.clear();
-        if (a.slot != nullptr) { vram_kv_release(*a.slot); a.slot = nullptr; a.slot_tag = 0; }   // (STRATA_PARK_VRAM_MIB)
-        error = std::string("conversation snapshot stage: ") + cudaGetErrorString(e);
-        return false;
-    }
-    // STRATA_PARK_VRAM_MIB: the host copies read the slot; it stays until the image and its K/V layers go (their tokens)
-    const uint8_t* stage = a.slot != nullptr ? static_cast<const uint8_t*>(a.slot->p) : a.stage;
-    a.slot = nullptr;
-    if (a.items.empty()) return true;
-    std::vector<ParkAsync::Item> items;
-    items.swap(a.items);
-    void* host[2] = {a.host[0], a.host[1]};
-    cudaStream_t st = a.stream;
-    const int dev = a.dev;
-    std::lock_guard<std::mutex> lk(a.mu);
-    // two pinned pieces in turn: the next piece's DMA runs while this one is copied into its segment
-    a.pending = std::async(std::launch::async, [items = std::move(items), stage, host, st, dev] {
-        conversation_detail::background_thread_placement();
-        (void) cudaSetDevice(dev);
-        cudaEvent_t done[2] = {nullptr, nullptr};
-        cudaError_t e = cudaEventCreateWithFlags(&done[0], cudaEventDisableTiming | cudaEventBlockingSync);
-        if (e == cudaSuccess) e = cudaEventCreateWithFlags(&done[1], cudaEventDisableTiming | cudaEventBlockingSync);
-        struct Piece { uint8_t* dst; size_t n; };
-        Piece held[2] = {{nullptr, 0}, {nullptr, 0}};
-        int b = 0;
-        auto land = [&](int k) {
-            if (held[k].dst == nullptr || e != cudaSuccess) return;
-            e = cudaEventSynchronize(done[k]);
-            if (e == cudaSuccess) std::memcpy(held[k].dst, host[k], held[k].n);
-            held[k] = {nullptr, 0};
-        };
-        for (const auto& it : items)
-            for (size_t o = 0; e == cudaSuccess && o < it.n; o += kParkPiece) {
-                const size_t n = std::min(kParkPiece, it.n - o);
-                land(b);
-                if (e == cudaSuccess) e = cudaMemcpyAsync(host[b], stage + it.at + o, n, cudaMemcpyDeviceToHost, st);
-                if (e == cudaSuccess) e = cudaEventRecord(done[b], st);
-                if (e == cudaSuccess) held[b] = {it.dst + o, n};
-                b ^= 1;
-            }
-        land(b);
-        land(b ^ 1);
-        for (cudaEvent_t d : done) if (d) (void) cudaEventDestroy(d);
-        return e;
-    });
-    return true;
-}
-
-uint64_t conversation_park_slot_tag() { return park_async().slot_tag; }
-
-void conversation_park_slot_release(uint64_t tag) {
-    if (tag == 0) return;
-    for (auto& s : vram_kv().slots)
-        if (s->tag == tag) { vram_kv_release(*s); return; }
-}
-
-size_t conversation_park_vram_release_all() {
-    if (park_vram_budget() == 0) return 0;   // off: nothing was taken, and the stage stays as it was
-    conversation_park_join();   // the background copy may be reading a slot or the stage
-    ParkAsync& a = park_async();
-    VramKv& v = vram_kv();
-    size_t freed = 0;
-    for (size_t i = 0; i < v.slots.size();) {
-        if (a.active && v.slots[i].get() == a.slot) { ++i; continue; }   // a park in progress keeps its own
-        freed += v.slots[i]->cap;
-        vram_kv_free(*v.slots[i]);
-        v.slots.erase(v.slots.begin() + (std::ptrdiff_t) i);
-    }
-    if (a.stage != nullptr && !a.active) {
-        int cur = a.dev;
-        (void) cudaGetDevice(&cur);
-        if (cur != a.dev) (void) cudaSetDevice(a.dev);
-        (void) cudaFree(a.stage);
-        if (cur != a.dev) (void) cudaSetDevice(cur);
-        (void) cudaGetLastError();
-        freed += a.cap;
-        a.stage = nullptr; a.cap = 0;
-    }
-    return freed;
-}
-
-void conversation_park_join_for(const SavedConversation& image) {
-    size_t hits = 0;
-    for (const auto& k : image.kv) hits += vram_kv_find(k.dev_tag) != nullptr ? 1 : 0;
-    if (park_trace() && park_vram_budget() != 0)
-        std::fprintf(stderr, "strata parktrace: kv restore: %zu of %zu layers from the slot\n", hits, image.kv.size());
-    if (hits < image.kv.size()) conversation_park_join();
 }
 
 } // namespace strata::core

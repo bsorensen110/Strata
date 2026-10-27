@@ -2,6 +2,7 @@
 // invalid restores must return before the first CUDA call or destination write.
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/kernels/qsa.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -116,6 +117,18 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     if (!zero_qsa) { image.kv.push_back(first.image(g, true)); image.kv.push_back(last.image(g, true)); }
     image.kv.push_back(draft.image(g, false));
     check(conversation_snapshot_validate(image, ss, g, draft.st, error), "complete image validates without CUDA");
+    SessionReadLimits disk_limits;
+    check(conversation_session_read_limits(disk_limits, ss, g, nullptr, 96, 4, error),
+          "MTP-off disk read limits accept no draft state");
+    check(disk_limits.max_kv_layers == (uint64_t) g.n_qsa_layers() &&
+          disk_limits.max_kv_bytes.size() == (size_t) g.n_qsa_layers(),
+          "MTP-off disk limits contain only model QSA layers");
+    auto without_draft = image;
+    without_draft.kv.pop_back();
+    check(conversation_snapshot_validate(without_draft, ss, g, nullptr, error),
+          "MTP-off image validates with matching disk layer count");
+    check(!conversation_snapshot_validate(image, ss, g, nullptr, error),
+          "draft-bearing image cannot silently restore into MTP-off layout");
     size_t estimate = 0;
     check(conversation_snapshot_bytes({image.live.ids,image.live.imgs,image.checkpoints,true},ss,g,draft.st,estimate,error),
           "capture estimate works without CUDA");
@@ -175,6 +188,13 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
     check(!conversation_state_sizes(bad_geometry,z,error), "zero layer interval rejected before division");
     bad_geometry = g; bad_geometry.n_head_kv = std::numeric_limits<int64_t>::max();
     check(conversation_kv_bytes(draft.st,bad_geometry,9,false)==0, "KV byte overflow rejected");
+    // a remote stage worker's part (docs/remote-stage/CHECKPOINTS.md): no ids, the length given; one past the session's
+    // cells is rejected before any transfer
+    ConversationCheckpoint no_ids = image.live;
+    no_ids.ids.clear(); no_ids.imgs.clear();
+    check(!conversation_checkpoint_restore(no_ids,ss,g,97,error) && unchanged(),
+          "explicit length past the cells rejected before writes");
+    check(!conversation_checkpoint_save(no_ids,ss,g,97,error), "explicit-length save past the cells rejected");
 #if defined(CONVERSATION_TEST_TRANSFERS)
     auto reset = [&] {
         for (auto* p : {&first,&last,&draft}) for (auto& bytes : p->data) std::fill(bytes.begin(),bytes.end(),0xa5);
@@ -203,6 +223,43 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
           "injected host transfer backend completes a valid restore");
     check(gdn==image.live.gdn && history==image.live.ple && ss.ple_prev[0]==8 && ss.ple_prev[1]==9,
           "successful restore publishes correct running state and PLE window");
+    // the explicit-length save / restore (a remote stage worker's part, no ids): the sizes are the carve's, the
+    // restore rewrites each indexer's pooled row at L / idx_block from the dead marker and leaves ple_prev alone;
+    // L on a block boundary and inside one
+    for (size_t L : {(size_t) 8, (size_t) 9}) {
+        reset();
+        ConversationCheckpoint part;
+        check(conversation_checkpoint_save(part,ss,g,L,error), "explicit-length save through the host backend");
+        const size_t q = (size_t) g.n_qsa_layers();
+        ConversationStateSizes zz;   // (`z` was overwritten by the overflow checks above)
+        check(conversation_session_sizes(g,ss,zz,error) && part.ids.empty() && part.gdn.size()==zz.gdn &&
+              part.ple.size()==(ple ? zz.ple : 0) && part.tails.size()==q*zz.tail && part.dead.size()==q*zz.dead &&
+              part.block_pos.size()==q*zz.block_pos && zz.gdn > 0 && (zero_qsa || zz.dead > 0),
+              "explicit-length save sizes are the session's running state");
+        std::fill(part.dead.begin(),part.dead.end(),0x3c); std::fill(part.gdn.begin(),part.gdn.end(),0x3d);
+        ss.ple_prev[0] = 5; ss.ple_prev[1] = 6;
+        check(conversation_checkpoint_restore(part,ss,g,L,error), "explicit-length restore through the host backend");
+        check(std::all_of(gdn.begin(),gdn.end(),[](uint8_t b){return b==0x3d;}),
+              "explicit-length restore writes the state");
+        check(ss.ple_prev[0]==5 && ss.ple_prev[1]==6, "explicit-length restore leaves ple_prev alone");
+        const size_t block = (size_t) strata::kernels::qsa_real_shapes().idx_block;
+        const size_t row_bytes = (size_t) g.idx_key_dim * 4;
+        for (const auto* p : {&first,&last}) {
+            if (zero_qsa) break;
+            const auto& pooled = p->data[4];
+            const size_t row = L / block;
+            bool marked = true, rest = true;
+            for (size_t i = 0; i < pooled.size(); ++i) {
+                if (i / row_bytes == row) marked = marked && pooled[i]==0x3c;
+                else rest = rest && pooled[i]==0xa5;
+            }
+            check(marked && rest, L % block == 0 ? "pooled row L / idx_block rewritten (L on a block boundary)"
+                                                 : "pooled row L / idx_block rewritten (L inside a block)");
+        }
+    }
+    reset();
+    check(conversation_snapshot_restore(image,ss,g,draft.st,error)==ConversationRestore::restored,
+          "the valid restore again (the read-back checks below)");
     uint64_t fingerprint = 0;
     check(conversation_kv_verify(image.kv.back(),draft.st,g,9,false,fingerprint,error), "read-back verifies complete draft payload");
     draft.data[0][0] ^= 1;
@@ -228,6 +285,40 @@ void fixture(int format, int experts, bool zero_qsa, bool ple) {
         check(incremental.kv[i].k==full.kv[i].k && incremental.kv[i].v==full.kv[i].v &&
               incremental.kv[i].k_scale==full.kv[i].k_scale && incremental.kv[i].v_scale==full.kv[i].v_scale &&
               incremental.kv[i].pooled==full.kv[i].pooled, "incremental and full capture agree across every payload");
+    {
+        QsaState unloaded;
+        SavedConversation meta, without_draft;
+        std::vector<SessionKvSource> sources;
+        check(!conversation_snapshot_sources(meta,sources,view,ss,g,unloaded,error) &&
+              error == "conversation snapshot: invalid K/V extent", "an explicitly supplied empty drafter remains invalid");
+        check(conversation_snapshot_sources(meta,sources,view,ss,g,nullptr,error), "disk save without an MTP drafter");
+        check(conversation_snapshot_save(without_draft,view,ss,g,nullptr,error), "capture reference without draft");
+        check(meta.kv.empty() && sources.size()==without_draft.kv.size() &&
+              sources.size()==(size_t)ss.qsa_alloc, "disk sources contain only initialized session layers");
+        for (size_t j=0;j<sources.size();++j) {
+            const auto& kv=without_draft.kv[j];
+            const std::array<const ConversationBuffer*,5> parts={&kv.k,&kv.v,&kv.k_scale,&kv.v_scale,&kv.pooled};
+            for (size_t i=0;i<parts.size();++i) {
+                std::vector<uint8_t> actual(sources[j].sizes[i]), expected(parts[i]->size());
+                check(sources[j].sizes[i]==parts[i]->size(), "no-draft source part size");
+                check(sources[j].read(i,0,actual.data(),actual.size()) &&
+                      parts[i]->read(expected.data(),0,expected.size()) && actual==expected,
+                      "no-draft disk source matches captured bytes");
+            }
+        }
+        SessionReadLimits limits, with_draft;
+        check(conversation_session_read_limits(limits,ss,g,nullptr,96,1,error), "no-draft read limits");
+        check(conversation_session_read_limits(with_draft,ss,g,draft.st,96,1,error), "draft read limits unchanged");
+        check(limits.max_kv_layers==(uint64_t)ss.qsa_alloc && limits.max_kv_bytes.size()==limits.max_kv_layers &&
+              with_draft.max_kv_layers==limits.max_kv_layers+1, "read limits omit exactly the absent draft layer");
+        for (size_t j=0;j<limits.max_kv_bytes.size();++j)
+            check(limits.max_kv_bytes[j]==with_draft.max_kv_bytes[j], "main layer byte bounds unchanged");
+        check(conversation_snapshot_validate(without_draft,ss,g,nullptr,error), "no-draft snapshot validates");
+        check(!conversation_snapshot_validate(without_draft,ss,g,draft.st,error) &&
+              !conversation_snapshot_validate(full,ss,g,nullptr,error), "draft-presence mismatch rejected in both directions");
+        check(conversation_snapshot_restore(without_draft,ss,g,nullptr,error)==ConversationRestore::restored,
+              "no-draft restore through host transfer backend");
+    }
     reuse = {full.kv,9,9};
     reuse.kv.back().k.pop_back();
     copy_calls = sync_calls = 0;

@@ -37,6 +37,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -221,6 +222,11 @@ public:
     int numa_slices() const { return numa_n_; }
     /// Accumulated drain time of slice `s` over the mode-5/6 phases, ms: publish to the slice's last `done`.
     double numa_slice_ms(int s) const { return s >= 0 && s < numa_n_ ? slice_ms_[s] : 0.0; }
+    /// Elastic multi-engine (two engine processes on one CPU): hold the LAST `n` workers out of every batch - they
+    /// sleep (still counted as parked) until released, so another engine's workers can have their cores.  0 releases
+    /// all.  Call between batches (the serve loop does it between verify windows / requests).  Returns the number held.
+    int set_hold(int n);
+    int held() const { return held_; }
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
@@ -248,6 +254,11 @@ public:
     void run_split_multi(ExpertJobMulti* jobs, int n);
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
+                                NativeArithmetic arithmetic = NativeArithmetic::Default);
+    /// The same, with `aside` run by the host thread right after the first phase's tasks are published - the workers
+    /// compute while the host does it (a peer GPU's launch, ~30 us a layer, used to run before this call and hold the
+    /// whole pool back by that much).  The host joins the first phase's drain when `aside` returns.
+    void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, const std::function<void()>& aside,
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
@@ -289,7 +300,7 @@ private:
     int tasks_ = 0;
     void worker(int id);
     void drain(int id, ExpertScratch& scratch, uint32_t epoch);
-    void run_phase(int mode, int n_tasks);
+    void run_phase(int mode, int n_tasks, const std::function<void()>* aside = nullptr);
     /// Claim the next job of batch `epoch`, or -1 (that batch is exhausted, or it is not the current one).
     int claim(uint32_t epoch);
     /// Publish the batch whose description the caller has just written: reset `done`, then `head`, then the epoch.
@@ -346,6 +357,10 @@ private:
     alignas(64) std::atomic<uint32_t> sleepers_{0};
     std::mutex sleep_mu_;
     std::condition_variable sleep_cv_;
+    std::unique_ptr<std::atomic<bool>[]> hold_;      ///< set_hold: worker i sits the batches out
+    int held_ = 0;
+    std::mutex hold_mu_;
+    std::condition_variable hold_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data

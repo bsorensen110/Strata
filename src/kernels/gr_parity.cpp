@@ -429,12 +429,61 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
             std::vector<FusedGrArgs> qa(args.begin(), args.begin() + tt);
             for (int t = 0; t < tt; ++t) { qa[t].q8_mixed = d_q + (size_t) t * (N / 32) * 36; qa[t].q8_cnt = d_cnt; }
             for (int rep = 0; rep < 3 && !qbad; ++rep) {
-                check(cudaMemsetAsync(d_q, 0x5a, qbytes, stream), "qfuse poison");
+                check(cudaMemsetAsync(d_q, 0xff, qbytes, stream), "qfuse poison");
                 bool wrote = false;
                 cudaGraph_t qg = nullptr;
                 cudaGraphExec_t qx = nullptr;
                 if (rep == 0) {
+                    const char* prev_gr_ts0 = std::getenv("STRATA_GR_TSUM");
+                    const std::string saved_gr_ts0 = prev_gr_ts0 ? prev_gr_ts0 : "";
+                    const char* prev_ts0 = std::getenv("STRATA_TSUM");
+                    const std::string saved_ts0 = prev_ts0 ? prev_ts0 : "";
+#if defined(_WIN32)
+                    _putenv_s("STRATA_GR_TSUM", "0");
+                    _putenv_s("STRATA_TSUM", "0");
+#else
+                    setenv("STRATA_GR_TSUM", "0", 1);
+                    setenv("STRATA_TSUM", "0", 1);
+#endif
+                    check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "qfuse ts0 R");
                     wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                    check(cudaStreamSynchronize(stream), "qfuse ts0 sync");
+                    const Snapshot s_ts0 = snapshot();
+                    std::vector<uint8_t> q_ts0((size_t) tt * (N / 32) * 36);
+                    check(cudaMemcpy(q_ts0.data(), d_q, q_ts0.size(), cudaMemcpyDeviceToHost), "qfuse ts0 read");
+#if defined(_WIN32)
+                    _putenv_s("STRATA_GR_TSUM", "1");
+                    _putenv_s("STRATA_TSUM", "1");
+#else
+                    setenv("STRATA_GR_TSUM", "1", 1);
+                    setenv("STRATA_TSUM", "1", 1);
+#endif
+                    check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "qfuse ts1 R");
+                    check(cudaMemsetAsync(d_q, 0xff, qbytes, stream), "qfuse ts1 poison");
+                    wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream) && wrote;
+                    check(cudaStreamSynchronize(stream), "qfuse ts1 sync");
+                    const Snapshot s_ts1 = snapshot();
+#if defined(_WIN32)
+                    _putenv_s("STRATA_GR_TSUM", prev_gr_ts0 ? saved_gr_ts0.c_str() : "");
+                    _putenv_s("STRATA_TSUM", prev_ts0 ? saved_ts0.c_str() : "");
+#else
+                    if (prev_gr_ts0) setenv("STRATA_GR_TSUM", saved_gr_ts0.c_str(), 1);
+                    else unsetenv("STRATA_GR_TSUM");
+                    if (prev_ts0) setenv("STRATA_TSUM", saved_ts0.c_str(), 1);
+                    else unsetenv("STRATA_TSUM");
+#endif
+                    if (!v3 && (std::memcmp(s_ts0.r_out.data(), s_ts1.r_out.data(), (size_t) tt * D * 4) != 0 ||
+                                std::memcmp(s_ts0.rs.data(), s_ts1.rs.data(), (size_t) tt * HC * 4) != 0 ||
+                                std::memcmp(s_ts0.inject.data(), s_ts1.inject.data(), (size_t) tt * HC * 4) != 0 ||
+                                std::memcmp(s_ts0.mixed.data(), s_ts1.mixed.data(), (size_t) tt * N * 4) != 0)) {
+                        std::printf("  QFUSE: T=%d: STRATA_GR_TSUM/STRATA_TSUM=0 vs 1 outputs differ\n", tt);
+                        ++qbad;
+                    }
+                    check(cudaMemcpy(hq.data(), d_q, q_ts0.size(), cudaMemcpyDeviceToHost), "qfuse ts1 read");
+                    if (!v3 && std::memcmp(q_ts0.data(), hq.data(), q_ts0.size()) != 0) {
+                        std::printf("  QFUSE: T=%d: STRATA_GR_TSUM/STRATA_TSUM=0 vs 1 q8_1 bytes differ\n", tt);
+                        ++qbad;
+                    }
                 } else {   // a captured read, replayed (twice: rep 1 and 2 use fresh captures, each replayed twice)
                     check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "qfuse begin");
                     wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
@@ -458,136 +507,209 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         }
         std::printf("  fused GR read + q8_1 (STRATA_QFUSE), T 1..8, direct and graph replays: %s\n", qbad ? "FAIL" : "pass");
         bad += qbad;
+
+        // D1: STRATA_HC_Q8=1 (q8_down, q8_up, and q8_inject with w_inject == nullptr) + STRATA_GR_TSUM/STRATA_TSUM=0 vs 1 bitwise parity
+        uint8_t *d_qd = nullptr, *d_qu = nullptr, *d_qi = nullptr;
+        check(cudaMalloc(&d_qd, (size_t) (LR * D / 32) * 34), "q8_down alloc");
+        check(cudaMalloc(&d_qu, (size_t) (D * LR / 32) * 34), "q8_up alloc");
+        check(cudaMalloc(&d_qi, (size_t) (HC * D / 32) * 34), "q8_inject alloc");
+        fused_gr_quantize_q8_0(d_down, d_qd, LR * D / 32, stream);
+        fused_gr_quantize_q8_0(d_up, d_qu, D * LR / 32, stream);
+        fused_gr_quantize_q8_0(d_inject, d_qi, HC * D / 32, stream);
+        int q8_bad = 0;
+        const char* prev_gr_ts = std::getenv("STRATA_GR_TSUM");
+        const std::string saved_gr_ts = prev_gr_ts ? prev_gr_ts : "";
+        const char* prev_ts = std::getenv("STRATA_TSUM");
+        const std::string saved_ts = prev_ts ? prev_ts : "";
+        auto set_ts = [](const char* gr_val, const char* ts_val) {
+#if defined(_WIN32)
+            _putenv_s("STRATA_GR_TSUM", gr_val ? gr_val : "");
+            _putenv_s("STRATA_TSUM", ts_val ? ts_val : "");
+#else
+            if (gr_val) setenv("STRATA_GR_TSUM", gr_val, 1);
+            else unsetenv("STRATA_GR_TSUM");
+            if (ts_val) setenv("STRATA_TSUM", ts_val, 1);
+            else unsetenv("STRATA_TSUM");
+#endif
+        };
+        for (int tt = 1; tt <= T && !q8_bad; ++tt) {
+            for (int qinj = 0; qinj < 2 && !q8_bad; ++qinj) {
+                Snapshot snap_ts[2];
+                std::vector<uint8_t> qimg_ts[2];
+                for (int ts = 0; ts < 2; ++ts) {
+                    const char* mode_str = ts ? "1" : "0";
+                    set_ts(mode_str, mode_str);
+                    check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "q8 R");
+                    check(cudaMemsetAsync(d_inj_out, 0xff, (size_t) T * HC * sizeof(float), stream), "q8 inj poison");
+                    check(cudaMemsetAsync(d_q, 0xff, qbytes, stream), "q8 qimg poison");
+                    std::vector<FusedGrArgs> qa(args.begin(), args.begin() + tt);
+                    for (int t = 0; t < tt; ++t) {
+                        qa[t].q8_down = d_qd;
+                        qa[t].q8_up = d_qu;
+                        qa[t].w_inject = qinj ? nullptr : d_inject;
+                        qa[t].q8_inject = qinj ? d_qi : nullptr;
+                        qa[t].q8_mixed = d_q + (size_t) t * (N / 32) * 36;
+                        qa[t].q8_cnt = d_cnt;
+                    }
+                    const bool wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                    strata::kernels::native_quantize_q8_1(d_mixed, d_ref, N, tt, stream);
+                    check(cudaStreamSynchronize(stream), "q8 sync");
+                    snap_ts[ts] = snapshot();
+                    qimg_ts[ts].resize((size_t) tt * (N / 32) * 36);
+                    check(cudaMemcpy(qimg_ts[ts].data(), d_q, qimg_ts[ts].size(), cudaMemcpyDeviceToHost), "q8 qimg read");
+                    check(cudaMemcpy(hr.data(), d_ref, qimg_ts[ts].size(), cudaMemcpyDeviceToHost), "q8 qref read");
+                    if (!wrote || std::memcmp(qimg_ts[ts].data(), hr.data(), qimg_ts[ts].size()) != 0) ++q8_bad;
+                    for (int i = 0; i < tt * HC; ++i)
+                        if (!std::isfinite(snap_ts[ts].inject[i])) ++q8_bad;
+                }
+                if (std::memcmp(snap_ts[0].r_out.data(), snap_ts[1].r_out.data(), (size_t) tt * D * 4) != 0 ||
+                    std::memcmp(snap_ts[0].rs.data(), snap_ts[1].rs.data(), (size_t) tt * HC * 4) != 0 ||
+                    std::memcmp(snap_ts[0].inject.data(), snap_ts[1].inject.data(), (size_t) tt * HC * 4) != 0 ||
+                    std::memcmp(snap_ts[0].mixed.data(), snap_ts[1].mixed.data(), (size_t) tt * N * 4) != 0 ||
+                    std::memcmp(qimg_ts[0].data(), qimg_ts[1].data(), qimg_ts[0].size()) != 0) {
+                    ++q8_bad;
+                }
+            }
+        }
+        set_ts(prev_gr_ts ? saved_gr_ts.c_str() : nullptr, prev_ts ? saved_ts.c_str() : nullptr);
+        cudaFree(d_qd); cudaFree(d_qu); cudaFree(d_qi);
+        std::printf("  fused GR Q8_0 multi (STRATA_HC_Q8 + q8_inject + STRATA_GR_TSUM/STRATA_TSUM), T 1..8: %s\n", q8_bad ? "FAIL" : "pass");
+        bad += q8_bad;
+
+#if (defined(STRATA_USE_HIP) || defined(__HIP_PLATFORM_AMD__)) && !defined(STRATA_HIP_GFX906)
+        // Counter-free q8_mixed path (q8_cnt == nullptr, used by MTP when STRATA_QFUSE_HC_LOCAL=1 on wave32 HIP where
+        // STRATA_GR_FAST_BUILD == 0): must return true and write identical q8_1 bytes across T=1..8 and graph replays,
+        // and must return false without writing when STRATA_QFUSE_HC_LOCAL=0 and q8_cnt == nullptr.
+        if (!v3) {
+            int cf_bad = 0;
+            const char* prev_loc = std::getenv("STRATA_QFUSE_HC_LOCAL");
+            const std::string saved_loc = prev_loc ? prev_loc : "";
+#if defined(_WIN32)
+            _putenv_s("STRATA_QFUSE_HC_LOCAL", "1");
+#else
+            setenv("STRATA_QFUSE_HC_LOCAL", "1", 1);
+#endif
+            for (int tt = 1; tt <= T && !cf_bad; ++tt) {
+                std::vector<FusedGrArgs> qa(args.begin(), args.begin() + tt);
+                for (int t = 0; t < tt; ++t) { qa[t].q8_mixed = d_q + (size_t) t * (N / 32) * 36; qa[t].q8_cnt = nullptr; }
+                for (int rep = 0; rep < 2 && !cf_bad; ++rep) {
+                    check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "cf R");
+                    check(cudaMemsetAsync(d_q, 0xff, qbytes, stream), "cf poison");
+                    bool wrote = false;
+                    cudaGraph_t qg = nullptr;
+                    cudaGraphExec_t qx = nullptr;
+                    if (rep == 0) {
+                        wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                    } else {
+                        check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "cf begin");
+                        wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                        check(cudaStreamEndCapture(stream, &qg), "cf end");
+                        check(cudaGraphInstantiate(&qx, qg, nullptr, nullptr, 0), "cf inst");
+                        check(cudaGraphLaunch(qx, stream), "cf replay 1");
+                        check(cudaMemsetAsync(d_q, 0x5a, qbytes, stream), "cf poison 2");
+                        check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "cf R2");
+                        check(cudaGraphLaunch(qx, stream), "cf replay 2");
+                    }
+                    strata::kernels::native_quantize_q8_1(d_mixed, d_ref, N, tt, stream);
+                    check(cudaStreamSynchronize(stream), "cf sync");
+                    if (qx) { cudaGraphExecDestroy(qx); cudaGraphDestroy(qg); }
+                    check(cudaMemcpy(hq.data(), d_q, (size_t) tt * (N / 32) * 36, cudaMemcpyDeviceToHost), "cf read");
+                    check(cudaMemcpy(hr.data(), d_ref, (size_t) tt * (N / 32) * 36, cudaMemcpyDeviceToHost), "cf ref");
+                    if (!wrote || std::memcmp(hq.data(), hr.data(), (size_t) tt * (N / 32) * 36) != 0) ++cf_bad;
+                }
+            }
+#if defined(_WIN32)
+            _putenv_s("STRATA_QFUSE_HC_LOCAL", "0");
+#else
+            setenv("STRATA_QFUSE_HC_LOCAL", "0", 1);
+#endif
+            {
+                std::vector<FusedGrArgs> qa(args.begin(), args.begin() + 2);
+                for (int t = 0; t < 2; ++t) { qa[t].q8_mixed = d_q + (size_t) t * (N / 32) * 36; qa[t].q8_cnt = nullptr; }
+                check(cudaMemsetAsync(d_q, 0xa5, qbytes, stream), "cf off poison");
+                const bool wrote = fused_gr_read_multi(qa.data(), 2, d_xn, stream);
+                check(cudaStreamSynchronize(stream), "cf off sync");
+                check(cudaMemcpy(hq.data(), d_q, (size_t) 2 * (N / 32) * 36, cudaMemcpyDeviceToHost), "cf off read");
+                bool untouched = true;
+                for (size_t i = 0; i < (size_t) 2 * (N / 32) * 36; ++i) untouched = untouched && (hq[i] == 0xa5);
+                if (wrote || !untouched) ++cf_bad;
+            }
+#if defined(_WIN32)
+            _putenv_s("STRATA_QFUSE_HC_LOCAL", prev_loc ? saved_loc.c_str() : "");
+#else
+            if (prev_loc) setenv("STRATA_QFUSE_HC_LOCAL", saved_loc.c_str(), 1);
+            else unsetenv("STRATA_QFUSE_HC_LOCAL");
+#endif
+            std::printf("  fused GR counter-free q8_1 (q8_cnt == nullptr), T 1..8, direct/graph + LOCAL=0 guard: %s\n",
+                        cf_bad ? "FAIL" : "pass");
+            bad += cf_bad;
+        }
+#endif
         cudaFree(d_q); cudaFree(d_ref); cudaFree(d_cnt);
     }
-
-    // #3948: STRATA_QFUSE in a verify window of TWO GROUPS (verify.cpp gr_read_group with G = 2): the window's tokens are
-    // read in two calls one after the other, the same group counters, each call with its own tokens' destinations - the
-    // attention half's xq_ is indexed from the group's first token, the expert half's nat_xq_ by the window's token.
-    // Fresh random inputs every repetition, 200 repetitions for each T = 2..8 (a race that fires one launch in a hundred
-    // shows), direct and as a graph replay. After every repetition: both groups' q8_1 bytes equal what
-    // native_quantize_q8_1 makes of `mixed`, nothing outside the written ranges changed, and the counters are back at zero.
-    if (!v3) {
-        // (STRATA_GRP_REPS=N more repetitions, STRATA_GRP_KEEP_GOING=1 counts every failure instead of stopping at the first: to measure a rare one)
-        const int REPS = std::getenv("STRATA_GRP_REPS") ? std::max(1, std::atoi(std::getenv("STRATA_GRP_REPS"))) : 200;
-        const bool keep_going = std::getenv("STRATA_GRP_KEEP_GOING") != nullptr;
-        const size_t B = (size_t) (N / 32) * 36;   // one token's q8_1 image
-        uint8_t *d_qa = nullptr, *d_qb = nullptr, *d_qabs = nullptr, *d_ref2 = nullptr;
-        unsigned* d_cnt2 = nullptr;
-        check(cudaMalloc(&d_qa, (size_t) T * B), "qfuse2 qa");
-        check(cudaMalloc(&d_qb, (size_t) T * B), "qfuse2 qb");
-        check(cudaMalloc(&d_qabs, (size_t) T * B), "qfuse2 qabs");
-        check(cudaMalloc(&d_ref2, (size_t) T * B), "qfuse2 ref");
-        check(cudaMalloc(&d_cnt2, (N / 32) * sizeof(unsigned)), "qfuse2 counters");
-        check(cudaMemset(d_cnt2, 0, (N / 32) * sizeof(unsigned)), "qfuse2 counters zero");
-        std::mt19937 prng(0x3948u);
-        std::normal_distribution<float> pn(0.0f, 0.3f);
-        std::vector<uint8_t> g_all((size_t) T * B), g_ref((size_t) T * B), g_a((size_t) T * B), g_b((size_t) T * B);
-        std::vector<unsigned> h_cnt(N / 32);
-        int g2bad = 0;
-        long runs = 0;
-        for (int tt = 2; tt <= T && (!g2bad || keep_going); ++tt) {
-            const int h = (tt + 1) / 2;   // verify.cpp: tb_/te_ = {0, (T + 1) / 2}, {(T + 1) / 2, T}
-            std::vector<FusedGrArgs> rel1(args.begin(), args.begin() + h), rel2(args.begin() + h, args.begin() + tt);
-            std::vector<FusedGrArgs> abs1 = rel1, abs2 = rel2;
-            for (int t = 0; t < h; ++t) {
-                rel1[t].q8_mixed = d_qa + (size_t) t * B;     rel1[t].q8_cnt = d_cnt2;
-                abs1[t].q8_mixed = d_qabs + (size_t) t * B;   abs1[t].q8_cnt = d_cnt2;
+    // P1: vectorized fused_gr_dequant_q8_0 + fused_gr_dequant_q8_0_pair bitwise parity against scalar reference
+    // across normal, subnormal, zero, +-Inf, and NaN fp16 scales, plus aligned and unaligned pointers.
+    {
+        const int64_t nb = 1093; // non-multiple of 64 blocks to exercise tail and special blocks
+        std::vector<uint8_t> h_q8_0((size_t) nb * 34), h_q8_1((size_t) nb * 34);
+        for (int64_t b = 0; b < nb; ++b) {
+            uint16_t d_u16 = (uint16_t) ((b * 40503u) & 0xFFFFu);
+            if (b == 0) d_u16 = 0x0000u;      // +0.0
+            else if (b == 1) d_u16 = 0x8000u; // -0.0
+            else if (b == 2) d_u16 = 0x0001u; // smallest subnormal
+            else if (b == 3) d_u16 = 0x7C00u; // +Inf
+            else if (b == 4) d_u16 = 0xFC00u; // -Inf
+            else if (b == 5) d_u16 = 0x7E00u; // qNaN
+            else if (b == 6) d_u16 = 0x7C01u; // sNaN
+            h_q8_0[(size_t) b * 34 + 0] = (uint8_t) (d_u16 & 0xFFu);
+            h_q8_0[(size_t) b * 34 + 1] = (uint8_t) (d_u16 >> 8);
+            const uint16_t d1_u16 = (uint16_t) (d_u16 ^ 0x3C00u);
+            h_q8_1[(size_t) b * 34 + 0] = (uint8_t) (d1_u16 & 0xFFu);
+            h_q8_1[(size_t) b * 34 + 1] = (uint8_t) (d1_u16 >> 8);
+            for (int j = 0; j < 32; ++j) {
+                h_q8_0[(size_t) b * 34 + 2 + j] = (uint8_t) ((b * 31 + j * 17 - 128) & 0xFF);
+                h_q8_1[(size_t) b * 34 + 2 + j] = (uint8_t) ((b * 13 - j * 29 + 64) & 0xFF);
             }
-            for (int t = h; t < tt; ++t) {
-                rel2[t - h].q8_mixed = d_qb + (size_t) (t - h) * B;   rel2[t - h].q8_cnt = d_cnt2;
-                abs2[t - h].q8_mixed = d_qabs + (size_t) t * B;       abs2[t - h].q8_cnt = d_cnt2;
-            }
-            cudaGraph_t gg = nullptr;
-            cudaGraphExec_t gx = nullptr;
-            check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "qfuse2 begin");
-            const bool w1 = fused_gr_read_multi(rel1.data(), h, d_xn, stream);
-            const bool w2 = fused_gr_read_multi(rel2.data(), tt - h, d_xn + (size_t) h * D, stream);
-            check(cudaStreamEndCapture(stream, &gg), "qfuse2 end");
-            check(cudaGraphInstantiate(&gx, gg, nullptr, nullptr, 0), "qfuse2 instantiate");
-            if (!w1 || !w2) { std::printf("  QFUSE two groups: T=%d: a group did not write its q8_1\n", tt); ++g2bad; }
-            for (int rep = 0; rep < REPS && (!g2bad || keep_going); ++rep) {
-                for (auto& x : r) x = pn(prng);
-                for (auto& x : bo) x = pn(prng);
-                for (auto& x : inj) x = pn(prng);
-                check(cudaMemcpy(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice), "qfuse2 R");
-                check(cudaMemcpy(d_bo, bo.data(), bo.size() * sizeof(float), cudaMemcpyHostToDevice), "qfuse2 bo");
-                check(cudaMemcpy(d_inj, inj.data(), inj.size() * sizeof(float), cudaMemcpyHostToDevice), "qfuse2 inj");
-                check(cudaMemsetAsync(d_qa, 0x5a, (size_t) T * B, stream), "qfuse2 poison a");
-                check(cudaMemsetAsync(d_qb, 0x5a, (size_t) T * B, stream), "qfuse2 poison b");
-                check(cudaMemsetAsync(d_qabs, 0x5a, (size_t) T * B, stream), "qfuse2 poison abs");
-                const int mode = rep % 3;   // 0: group-relative, direct; 1: window-indexed, direct; 2: group-relative, graph replay
-                if (mode == 0) {
-                    fused_gr_read_multi(rel1.data(), h, d_xn, stream);
-                    fused_gr_read_multi(rel2.data(), tt - h, d_xn + (size_t) h * D, stream);
-                } else if (mode == 1) {
-                    fused_gr_read_multi(abs1.data(), h, d_xn, stream);
-                    fused_gr_read_multi(abs2.data(), tt - h, d_xn + (size_t) h * D, stream);
-                } else {
-                    check(cudaGraphLaunch(gx, stream), "qfuse2 replay");
-                }
-                strata::kernels::native_quantize_q8_1(d_mixed, d_ref2, N, tt, stream);
-                check(cudaStreamSynchronize(stream), "qfuse2 sync");
-                ++runs;
-                check(cudaMemcpy(g_ref.data(), d_ref2, (size_t) tt * B, cudaMemcpyDeviceToHost), "qfuse2 read ref");
-                check(cudaMemcpy(h_cnt.data(), d_cnt2, h_cnt.size() * sizeof(unsigned), cudaMemcpyDeviceToHost), "qfuse2 read counters");
-                for (size_t i = 0; i < h_cnt.size(); ++i)
-                    if (h_cnt[i] != 0) {
-                        std::printf("  QFUSE two groups: T=%d rep %d: counter %zu left at %u\n", tt, rep, i, h_cnt[i]);
-                        ++g2bad;
-                        break;
-                    }
-                if (mode == 1) {
-                    check(cudaMemcpy(g_all.data(), d_qabs, (size_t) T * B, cudaMemcpyDeviceToHost), "qfuse2 read abs");
-                    if (std::memcmp(g_all.data(), g_ref.data(), (size_t) tt * B) != 0) {
-                        for (int t = 0; t < tt; ++t)
-                            if (std::memcmp(g_all.data() + (size_t) t * B, g_ref.data() + (size_t) t * B, B) != 0) {
-                                std::printf("  QFUSE two groups (window-indexed): T=%d rep %d: token %d (group %d) differs\n", tt, rep, t, t < h ? 0 : 1);
-                                int nd = 0;   // where: block = 32 columns, bytes 0-3 the (scale, sum) pair, 4-35 the codes
-                                for (size_t o = 0; o < B && nd < 6; ++o)
-                                    if (g_all[(size_t) t * B + o] != g_ref[(size_t) t * B + o]) {
-                                        std::printf("    block %zu byte %zu (%s): got 0x%02x, separate quantise 0x%02x\n", o / 36, o % 36,
-                                                    o % 36 < 4 ? "scale/sum" : "code", g_all[(size_t) t * B + o], g_ref[(size_t) t * B + o]);
-                                        ++nd;
-                                    }
-                                break;
-                            }
-                        ++g2bad;
-                    }
-                    for (size_t i = (size_t) tt * B; i < (size_t) T * B; ++i)
-                        if (g_all[i] != 0x5a) { std::printf("  QFUSE two groups: T=%d rep %d: wrote past the window at byte %zu\n", tt, rep, i); ++g2bad; break; }
-                } else {
-                    check(cudaMemcpy(g_a.data(), d_qa, (size_t) T * B, cudaMemcpyDeviceToHost), "qfuse2 read a");
-                    check(cudaMemcpy(g_b.data(), d_qb, (size_t) T * B, cudaMemcpyDeviceToHost), "qfuse2 read b");
-                    if (std::memcmp(g_a.data(), g_ref.data(), (size_t) h * B) != 0) {
-                        std::printf("  QFUSE two groups (group-relative, %s): T=%d rep %d: group 0 differs\n", mode == 2 ? "graph" : "direct", tt, rep);
-                        for (size_t o = 0, nd = 0; o < (size_t) h * B && nd < 6; ++o)
-                            if (g_a[o] != g_ref[o]) {
-                                std::printf("    token %zu block %zu byte %zu (%s): got 0x%02x, separate quantise 0x%02x\n", o / B, (o % B) / 36,
-                                            o % 36, o % 36 < 4 ? "scale/sum" : "code", g_a[o], g_ref[o]);
-                                ++nd;
-                            }
-                        ++g2bad;
-                    }
-                    if (std::memcmp(g_b.data(), g_ref.data() + (size_t) h * B, (size_t) (tt - h) * B) != 0) {
-                        std::printf("  QFUSE two groups (group-relative, %s): T=%d rep %d: group 1 differs\n", mode == 2 ? "graph" : "direct", tt, rep);
-                        ++g2bad;
-                    }
-                    for (size_t i = (size_t) h * B; i < (size_t) T * B; ++i)
-                        if (g_a[i] != 0x5a) { std::printf("  QFUSE two groups: T=%d rep %d: group 0 wrote past its tokens at byte %zu\n", tt, rep, i); ++g2bad; break; }
-                    for (size_t i = (size_t) (tt - h) * B; i < (size_t) T * B; ++i)
-                        if (g_b[i] != 0x5a) { std::printf("  QFUSE two groups: T=%d rep %d: group 1 wrote past its tokens at byte %zu\n", tt, rep, i); ++g2bad; break; }
-                }
-            }
-            cudaGraphExecDestroy(gx);
-            cudaGraphDestroy(gg);
         }
-        // the inputs the rest of the test (and its caller) expect again
-        check(cudaDeviceSynchronize(), "qfuse2 done");
-        std::printf("  fused GR read + q8_1 (STRATA_QFUSE), a window of two groups, T 2..8, %ld runs (%d random inputs each T), "
-                    "group-relative and window-indexed, direct and graph: %s\n", runs, REPS, g2bad ? "FAIL" : "pass");
-        bad += g2bad;
-        cudaFree(d_qa); cudaFree(d_qb); cudaFree(d_qabs); cudaFree(d_ref2); cudaFree(d_cnt2);
+        uint8_t *d_q8_0 = nullptr, *d_q8_1 = nullptr;
+        uint16_t *d_ref_0 = nullptr, *d_ref_1 = nullptr, *d_out_0 = nullptr, *d_out_1 = nullptr;
+        check(cudaMalloc(&d_q8_0, h_q8_0.size() + 34), "deq q8_0");
+        check(cudaMalloc(&d_q8_1, h_q8_1.size() + 34), "deq q8_1");
+        check(cudaMalloc(&d_ref_0, ((size_t) nb * 32 + 8) * sizeof(uint16_t)), "deq ref_0");
+        check(cudaMalloc(&d_ref_1, ((size_t) nb * 32 + 8) * sizeof(uint16_t)), "deq ref_1");
+        check(cudaMalloc(&d_out_0, ((size_t) nb * 32 + 8) * sizeof(uint16_t)), "deq out_0");
+        check(cudaMalloc(&d_out_1, ((size_t) nb * 32 + 8) * sizeof(uint16_t)), "deq out_1");
+        check(cudaMemcpyAsync(d_q8_0, h_q8_0.data(), h_q8_0.size(), cudaMemcpyHostToDevice, stream), "deq cp q0");
+        check(cudaMemcpyAsync(d_q8_1, h_q8_1.data(), h_q8_1.size(), cudaMemcpyHostToDevice, stream), "deq cp q1");
+        // Use unaligned output pointer (+1 uint16_t) to force scalar reference path on the device
+        strata::kernels::fused_gr_dequant_q8_0(d_q8_0, d_ref_0 + 1, nb, stream);
+        strata::kernels::fused_gr_dequant_q8_0(d_q8_1, d_ref_1 + 1, nb, stream);
+        // Vectorized single and pair paths on aligned output pointers
+        strata::kernels::fused_gr_dequant_q8_0(d_q8_0, d_out_0, nb, stream);
+        std::vector<uint16_t> hr0((size_t) nb * 32), hr1((size_t) nb * 32), ho0((size_t) nb * 32), ho1((size_t) nb * 32);
+        check(cudaMemcpyAsync(hr0.data(), d_ref_0 + 1, hr0.size() * 2, cudaMemcpyDeviceToHost, stream), "deq r0");
+        check(cudaMemcpyAsync(hr1.data(), d_ref_1 + 1, hr1.size() * 2, cudaMemcpyDeviceToHost, stream), "deq r1");
+        check(cudaMemcpyAsync(ho0.data(), d_out_0, ho0.size() * 2, cudaMemcpyDeviceToHost, stream), "deq o0 single");
+        check(cudaStreamSynchronize(stream), "deq sync 1");
+        int dbad = (std::memcmp(hr0.data(), ho0.data(), hr0.size() * 2) != 0) ? 1 : 0;
+        check(cudaMemsetAsync(d_out_0, 0x5a, ho0.size() * 2, stream), "deq poison 0");
+        check(cudaMemsetAsync(d_out_1, 0x5a, ho1.size() * 2, stream), "deq poison 1");
+        strata::kernels::fused_gr_dequant_q8_0_pair(d_q8_0, d_out_0, d_q8_1, d_out_1, nb, stream);
+        check(cudaMemcpyAsync(ho0.data(), d_out_0, ho0.size() * 2, cudaMemcpyDeviceToHost, stream), "deq o0 pair");
+        check(cudaMemcpyAsync(ho1.data(), d_out_1, ho1.size() * 2, cudaMemcpyDeviceToHost, stream), "deq o1 pair");
+        check(cudaStreamSynchronize(stream), "deq sync 2");
+        if (std::memcmp(hr0.data(), ho0.data(), hr0.size() * 2) != 0 ||
+            std::memcmp(hr1.data(), ho1.data(), hr1.size() * 2) != 0) {
+            ++dbad;
+        }
+        std::printf("  fused GR Q8_0 dequant (vec8 + pair), finite/Inf/NaN scales: %s\n", dbad ? "FAIL" : "pass");
+        bad += dbad;
+        check(cudaFree(d_q8_0), "free deq q8_0");
+        check(cudaFree(d_q8_1), "free deq q8_1");
+        check(cudaFree(d_ref_0), "free deq ref_0");
+        check(cudaFree(d_ref_1), "free deq ref_1");
+        check(cudaFree(d_out_0), "free deq out_0");
+        check(cudaFree(d_out_1), "free deq out_1");
     }
     std::printf("  fused GR multi max-T=8 LDS launch and changing graph replay %s\n",
                 bad == 0 ? "pass" : "FAIL");
@@ -609,12 +731,6 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
 }  // namespace
 
 int main(int argc, char** argv) {
-    // this test compares the default kernels bit for bit; the split read (a default on a 12.0 card since 0.2.7) is STRATA_GR_V3=1 below
-#if defined(_WIN32)
-    if (std::getenv("STRATA_GR_V3") == nullptr) _putenv_s("STRATA_GR_V3", "0");
-#else
-    if (std::getenv("STRATA_GR_V3") == nullptr) setenv("STRATA_GR_V3", "0", 1);
-#endif
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;

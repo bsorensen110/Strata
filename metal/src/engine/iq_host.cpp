@@ -16,7 +16,8 @@ namespace {
 bool is_tq(int t) { return t == 144 || t == 145 || t == 146; }
 bool is_iq(int t) {
     return t == 16 || t == 17 || t == 18 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 11 ||
-           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8;   // 14: Q6_K (Unsloth's Q5/Q6 gate/up)
+           t == 12 || t == 13 || t == 14 || t == 7 || t == 6 || t == 2 || t == 3 || t == 8 ||   // 14: Q6_K (Unsloth's Q5/Q6 gate/up)
+           t == 144 || t == 145 || t == 146;   // Gyro's trellis experts (the kernels: quant.metal, moe.metal)
 }
 // values per block of the types the grouped expert kernels take (0 = none): STRATA_GU_FMTS / STRATA_D_FMTS
 int gu_qk(int t) {
@@ -66,6 +67,9 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 145: return (size_t) (n / 128) * sizeof(block_tqk6);
         case 146: return (size_t) (n / 128) * sizeof(block_tqk7);
         case 30: return (size_t) n * 2;
+        case 144: return (size_t) (n / 128) * sizeof(block_tq2_t);   // Gyro's trellis types
+        case 145: return (size_t) (n / 128) * sizeof(block_tqk6);
+        case 146: return (size_t) (n / 128) * sizeof(block_tqk7);
         default: return 0;
     }
 }

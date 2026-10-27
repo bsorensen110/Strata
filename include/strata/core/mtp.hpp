@@ -26,7 +26,6 @@
 
 #include <cuda_runtime.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -46,7 +45,13 @@ public:
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
     /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-              int64_t window = 32768, const MtpDrafter* shared = nullptr);
+              int64_t window = 32768, const MtpDrafter* shared = nullptr, bool defer_experts = false);
+    /// Completes a manually requested split load after prompt prefill. The prompt K/V pass does not need routed
+    /// MTP experts, so their VRAM can temporarily be used by the target model's prompt workspace.
+    bool load_experts(std::string& err);
+    /// Releases only decode-time routed experts, draft-head rows and decode graphs. Dense/KV prompt state remains
+    /// resident, so a later prompt can use the freed VRAM and the decode side can be rebound after the loan.
+    bool release_decode_resources(std::string& err);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, opt-in, changes the output): the draft layer's router is biased like
@@ -73,6 +78,29 @@ public:
     int32_t top2(int j) const { return j >= 0 && j < (int) top2_.size() ? top2_[(size_t) j] : -1; }
     int max_t() const { return max_t_; }
     uint64_t vram_bytes() const { return vram_; }
+
+    /// THE PROMPT ROOM (STRATA_MTP_ROOM_MIN).  The layer's 512 routed experts (708 MB) are read by the DECODE alone:
+    /// `record_rest` is their only reader, and every prompt pass - the capture's K/V (record_front) and the prompt
+    /// path's Prefill::draft_kv - touches the dense tensors and the K/V state instead.  So a long prompt may take
+    /// their bytes: the prompt path's ring is pointed AT this block (Prefill::set_ring_room_base), and every expert
+    /// blob it stages overwrites an expert.  `experts_lend` copies the block into pinned host memory first (taken
+    /// once, so the `experts_reclaim` after the prompt is a DMA and not another read of experts.bin); `reclaim`
+    /// copies it back IN PLACE.
+    /// THE BLOCK IS NEVER FREED, NEVER REALLOCATED AND NEVER MOVES: the round and step graphs were captured with its
+    /// address as the MoE kernel's argument, and lending it in place is what keeps them valid - nothing is dropped
+    /// and no round pays a re-capture.
+    /// While the experts are lent no decode pass may run: `draft`, `draft_first`, `chain_launch` and `record_rest`
+    /// refuse (with `err`), rather than read the prompt's staged bytes as experts.
+    uint64_t experts_bytes() const;    ///< 0: this drafter does not own the experts (shared weights: --batch-mtp)
+    void* experts_base() const { return experts_; }   ///< the bytes the room's slots are carved from
+    bool experts_resident() const { return experts_ != nullptr && !experts_lent_; }
+    bool experts_lend(std::string& err);      ///< snapshot to pinned host (the block stays in place)
+    bool experts_reclaim(std::string& err);   ///< the snapshot back into the block, at the address it never left
+
+    /// Bytes which a deferred expert load and bind will require at the prompt/decode boundary.
+    uint64_t deferred_bytes(uint64_t head_row_bytes, int64_t n_vocab) const;
+    /// Supplies target weights to the prompt-only MTP K/V pass before the normal bind allocates its draft head.
+    void set_prompt_weights(const WeightTable& wt) { wt_ = &wt; }
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
@@ -172,25 +200,7 @@ public:
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
     QsaState& kv_state_rw() { return st_; }
-    /// The first cell whose K/V the draft layer can still read: the window's start for this prompt, and never below
-    /// the KVA floor (cells built from approximated rows are not read, so they are not built either).
-    int64_t first_needed() const {
-        const int64_t w = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
-        return std::max<int64_t>(w, cell_floor_);
-    }
-    /// The cells the draft layer attends to (0 = every cell), as load() settled it.
-    int64_t window() const { return window_; }
-    /// KVA: call before load().  The draft layer's attention then reads its cell range through a floor, which stays 0
-    /// (the plain window, cell for cell) until set_cell_floor() raises it.  Off (the default): the code is 0.2.6's.
-    void enable_cell_floor(bool on) { floor_on_ = on; }
-    bool cell_floor_enabled() const { return floor_on_ && m_floor_ != nullptr; }
-    /// KVA: the first draft cell that holds a K/V built from a real (not approximated) row.  The attention starts no
-    /// lower; draft_kv / prefill build no cell below it.  Between requests (the drafter idle).  0 = every cell is real.
-    void set_cell_floor(int64_t cell) {
-        cell_floor_ = std::max<int64_t>(0, cell);
-        if (m_floor_ != nullptr) *(volatile int32_t*) h_floor_ = (int32_t) std::min<int64_t>(cell_floor_, 0x7fffffff);
-    }
-    int64_t cell_floor() const { return cell_floor_; }
+    int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
     int device() const { return device_; }
     bool idle(std::string& err) {
         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
@@ -199,6 +209,13 @@ public:
 
 private:
     bool record_forward(int T, int step_row0, cudaStream_t cs, std::string& err);
+    /// False (with `err`) while the experts are lent to a prompt: the prompt path's ring is pointed at their bytes
+    /// (STRATA_MTP_ROOM_MIN), so a decode pass would read the prompt's staged blobs as experts.  Every decode entry
+    /// checks this before it launches anything.
+    bool decode_ready(std::string& err) const {
+        if (experts_lent_) { err = "mtp: the 512 experts are lent to a prompt (STRATA_MTP_ROOM_MIN)"; return false; }
+        return true;
+    }
     /// The layer's front for T rows at step rows [row0, +T): the embedding, the fc projections, the attention
     /// hyper-connection read (R_, inj_, mixed_) and the K/V appended.
     bool record_front(int T, int row0, cudaStream_t cs, std::string& err);
@@ -262,6 +279,8 @@ private:
     float chain_prob_[8] = {};
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
+    uint64_t experts_vram_ = 0;
+    uint64_t draft_head_vram_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaGraphExec_t prefill_exec_[9] = {};
     cudaGraphExec_t prefill_dev_exec_[9] = {};
@@ -276,6 +295,12 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    // the prompt room: the experts' pinned host snapshot, its size, and whether a prompt has taken their contents
+    // (the block itself stays where it is - see experts_lend)
+    void* experts_host_ = nullptr;
+    uint64_t experts_host_bytes_ = 0;
+    bool experts_lent_ = false;
+    bool experts_deferred_ = false;
     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;
@@ -295,9 +320,6 @@ private:
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
-    int64_t cell_floor_ = 0;    // KVA: no draft cell below this one is read or built (set_cell_floor)
-    bool floor_on_ = false;     // enable_cell_floor: the attention goes through window_ids_floor
-    int32_t *h_floor_ = nullptr, *m_floor_ = nullptr;   // the floor, mapped: the kernel reads it when it runs
     int64_t prompt_len_ = 0;
     const int32_t* rr_res_ = nullptr;
     float rr_margin_ = 0.0f;

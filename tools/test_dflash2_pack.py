@@ -86,6 +86,21 @@ class PackWithoutTorch(unittest.TestCase):
     def pack(self, out):
         return new.pack(str(self.dir / "model.safetensors"), str(self.dir / "config.json"), str(out), say=lambda *_: None)
 
+    def test_explicit_window_override_changes_only_pack_metadata(self):
+        out = self.dir / "window4k.pack"
+        size = new.pack(str(self.dir / "model.safetensors"), str(self.dir / "config.json"), str(out),
+                        say=lambda *_: None, window=4096)
+        data = out.read_bytes()
+        index_len = struct.unpack("<I", data[8:12])[0]
+        index = data[12:12 + index_len].decode().splitlines()
+        self.assertIn("cfg window 4096", index)
+        self.assertEqual(len(data), size)
+        self.assertEqual(size, self.pack(self.dir / "default.pack"), "overridden pack must preserve tensor payload extents")
+        default = (self.dir / "default.pack").read_bytes()
+        default_index_len = struct.unpack("<I", default[8:12])[0]
+        default_index = default[12:12 + default_index_len].decode().splitlines()
+        self.assertIn("cfg window 128", default_index)
+
     def test_reader_widens_bf16_exactly(self):
         f = new.SafeTensors(str(self.dir / "model.safetensors"))
         got = f.get_float32("fc.weight")

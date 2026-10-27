@@ -1,15 +1,20 @@
 #pragma once
 
+#include "strata/core/numa_policy.hpp"
 #include "strata/core/progress.hpp"
 
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <initializer_list>
-#include <memory>
+#include <string>
 #include <utility>
 #include <vector>
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
 
 namespace strata::core {
 
@@ -62,27 +67,40 @@ public:
             (count > SIZE_MAX / sizeof(Segment) || !add(total, count * sizeof(Segment)))) return SIZE_MAX;
         return total;
     }
-    void resize(size_t n, uint8_t value = 0) { resize_impl(n, &value); }
-    void resize_impl(size_t n, const uint8_t* value) {
+    void resize(size_t n, uint8_t value = 0) {
         if (n > size_) {
             const size_t held = size_;
             const bool growing = held != 0;
             const size_t spare = segments_.empty() ? 0 : segments_.back().capacity() - segments_.back().size();
             const size_t extend = std::min(n - size_, spare);
             const size_t extra = n - size_ - extend;
+            // S3 (`--numa-hot-node`): glibc hands these fresh ranges back as untouched pages, so it is the zero fill
+            // (the resize below) that faults them in, and those faults follow THIS thread's memory policy - which is
+            // what the cold node is for.  The scope starts before `reserve` because the directory is malloc'd here
+            // too.  Off (cold < 0: the default, and the one-node host): no syscall, and the segment is the one it
+            // always was.
+            const int cold = detail::numa_cold_node();
+            detail::ThreadNodeBinding nb;
+            std::string why;
+            if (cold >= 0 && !nb.bind(cold, why))
+                std::fprintf(stderr, "ConversationBuffer: WARNING: cannot bind this thread to NUMA node %d (%s): "
+                                     "the segment's pages take the process's memory policy\n", cold, why.c_str());
             segments_.reserve(segments_.size() + extra / segment_bytes + (extra % segment_bytes != 0));
             if (extend) {
-                if (value) segments_.back().resize(segments_.back().size() + extend, *value);
-                else segments_.back().resize(segments_.back().size() + extend);
+                segments_.back().resize(segments_.back().size() + extend, value);
                 size_ += extend;
             }
             while (size_ < n) {
                 const size_t count = std::min(segment_bytes, n - size_);
                 const size_t previous = segments_.empty() ? 0 : segments_.back().capacity();
                 Segment segment;
-                segment.reserve(segment_capacity(count, previous, growing, held));
-                if (value) segment.resize(count, *value);
-                else segment.resize(count);
+                const size_t cap = segment_capacity(count, previous, growing, held);
+                segment.reserve(cap);
+                // #3321: a fresh 16 MiB segment is a new mapping. Advise huge pages before the
+                // zero-fill touches it, so the first fault is not one 4 KiB page at a time.
+                // Linux only; other systems keep the ordinary pages. Failure is ignored.
+                advise_hugepage(segment.data(), segment.capacity());
+                segment.resize(count, value);
                 segments_.push_back(std::move(segment));
                 size_ += count;
                 progress_beat();   // #2049: zero-filling 16 MiB of fresh pages is slow when the host is paging
@@ -97,9 +115,6 @@ public:
         }
     }
     void pop_back() { resize(size_ - 1); }
-    // resize() without the zero fill of what it adds (the fresh pages are not touched here): only for a caller that
-    // writes every added byte before anything reads it (STRATA_PARK_ASYNC's background copy)
-    void resize_for_overwrite(size_t n) { resize_impl(n, nullptr); }
 
     // fn(pointer, count, absolute_offset); false aborts a transfer immediately.
     template<class Fn> bool visit(size_t offset, size_t count, Fn fn) {
@@ -130,15 +145,7 @@ public:
     }
 
 private:
-    // value-initializes only when asked (resize's explicit fill value): resize_for_overwrite leaves the bytes alone
-    template<class T> struct DefaultInit : std::allocator<T> {
-        template<class U> struct rebind { using other = DefaultInit<U>; };
-        DefaultInit() = default;
-        template<class U> DefaultInit(const DefaultInit<U>&) noexcept {}
-        template<class U> void construct(U* p) { ::new ((void*) p) U; }
-        template<class U, class... A> void construct(U* p, A&&... a) { ::new ((void*) p) U(std::forward<A>(a)...); }
-    };
-    using Segment = std::vector<uint8_t, DefaultInit<uint8_t>>;
+    using Segment = std::vector<uint8_t>;
     // A fresh capture allocates exactly its payload. Later appends reserve
     // geometrically growing segments, bounded by 16 MiB. Small chat turns then
     // extend the final allocation instead of adding one transfer per turn.
@@ -150,6 +157,22 @@ private:
         if (!growing) return count;
         const size_t geometric = std::min(segment_bytes, std::max<size_t>(65536, std::min(previous, segment_bytes/2)*2));
         return std::max(count, std::min(geometric, std::max<size_t>(65536, held / 8)));
+    }
+    static void advise_hugepage(void* p, size_t n) {
+#if defined(__linux__)
+        if (p == nullptr || n < (size_t{2} << 20)) return;
+        // madvise requires a page-aligned address. The kernel uses huge pages for the 2 MiB-aligned
+        // middle of that range; an unaligned edge is left as ordinary pages.
+        const uintptr_t raw = reinterpret_cast<uintptr_t>(p);
+        constexpr uintptr_t page = 4096;
+        const uintptr_t start = (raw + page - 1) & ~(page - 1);
+        const uintptr_t end = (raw + n) & ~(page - 1);
+        if (end <= start) return;
+        (void) ::madvise(reinterpret_cast<void*>(start), static_cast<size_t>(end - start), MADV_HUGEPAGE);
+#else
+        (void) p;
+        (void) n;
+#endif
     }
     static bool add(size_t& n, size_t extra) {
         if (extra > SIZE_MAX - n) return false;

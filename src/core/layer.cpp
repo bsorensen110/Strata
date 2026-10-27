@@ -4,6 +4,7 @@
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
+#include "strata/core/numa_policy.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -30,6 +31,7 @@
 #include "strata/kernels/native_flash_attn.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/lora.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/fused_gdn.hpp"
 #include "strata/kernels/qsa_select.hpp"
@@ -205,6 +207,7 @@ namespace { bool g_kv_int8 = false, g_kv_q4 = false, g_kv_hybrid = false, g_kv_i
 void qsa_set_kv_int8(bool enabled) { g_kv_int8 = enabled; }
 void qsa_set_kv_int8_rotate(bool enabled) { g_kv_int8_rot = enabled; }
 bool qsa_kv_int8() { return g_kv_int8; }
+bool qsa_kv_int8_rotate() { return g_kv_int8_rot; }
 void qsa_set_kv_q4(bool enabled) { g_kv_q4 = enabled; }
 bool qsa_kv_q4() { return g_kv_q4; }
 void qsa_set_kv_hybrid(bool enabled) { g_kv_hybrid = enabled; }
@@ -380,7 +383,11 @@ st_begin(layer, 15, stream);
         quantize_q8_K(b.y, b.y_q8k, g.ssm_value_dim, stream);
         quantize_q8_0(b.y, b.y_q8_0, g.ssm_value_dim, stream);
     }
-    }    if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,                        v.name("ssm_out.weight"), stream, err, b.y)) return false;    st_end(layer, 15, stream);    return true;}
+    }    if (!gemv_quantized(*w_out, p_out, f_out, b.y_q8_0, b.y_q8k, out, g.ssm_value_dim, g.n_embd,                        v.name("ssm_out.weight"), stream, err, b.y)) return false;
+    // --lora: out += s B (A y), the adapter on this projection
+    try { strata::kernels::lora_apply(layer, b.y, 0, 1, out, 0, stream); }
+    catch (const std::exception& error) { err = v.name("lora") + ": " + error.what(); return false; }
+       st_end(layer, 15, stream);    return true;}
 // ================================ the MoE block ================================
 uint64_t moe_buffers_bytes(const ModelGeometry& g, int64_t k) {    const uint64_t parts[] = {        (uint64_t) g.n_embd * 2,
 // x_bf16
@@ -573,6 +580,7 @@ namespace {
 // KV streaming (docs/kv-streaming-design.md): 0 keeps every cell in VRAM.
 int64_t g_kv_resident = 0;
 uint64_t g_kv_host_bytes = 0;
+bool g_kv_shared_host = false;
 
 // The KV host copy: pinned and device-mapped. cudaHostAlloc is the default, but under WSL2 the driver caps what
 // cudaHostAlloc(Mapped) may pin at about 1 GiB in all, while cudaHostRegister of ordinary memory is not capped there:
@@ -684,13 +692,14 @@ void qsa_set_kv_elastic(bool enabled, int64_t init_cells) {
 bool qsa_kv_elastic() { return g_kv_elastic; }
 int64_t qsa_kv_elastic_cells() {
     int64_t cells = std::numeric_limits<int64_t>::max();
-    for (const auto& p : g_pools) cells = std::min<int64_t>(cells, pool_slots_mapped(*p) * p->page_size);
+    for (const auto& p : g_pools) if (p) cells = std::min<int64_t>(cells, pool_slots_mapped(*p) * p->page_size);
     return cells;
 }
 int64_t qsa_kv_elastic_need(int64_t cells) {
     const uint64_t G = strata::core::vmm_granularity();
     int64_t n = 0;
     for (const auto& p : g_pools) {
+        if (!p) continue;
         const int64_t slots = pool_slots(*p, cells);
         for (size_t a = 0; a < p->off.size(); ++a) {
             const int64_t c0 = (int64_t) (p->off[a] / G), c1 = c0 + pool_chunks(*p, a, slots);
@@ -701,13 +710,14 @@ int64_t qsa_kv_elastic_need(int64_t cells) {
 }
 bool qsa_kv_elastic_grow(int64_t cells, const std::function<strata::core::VmmChunk()>& take) {
     for (auto& p : g_pools)
-        if (!pool_grow(*p, cells, take)) return false;
+        if (p && !pool_grow(*p, cells, take)) return false;
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::core::VmmChunk)>& give) {
     const uint64_t G = strata::core::vmm_granularity();
     int64_t n = 0;
     for (auto& p : g_pools) {
+        if (!p) continue;
         const int64_t slots = pool_slots(*p, cells);
         for (size_t a = 0; a < p->off.size(); ++a) {
             const int64_t c0 = (int64_t) (p->off[a] / G), c1 = c0 + pool_chunks(*p, a, slots);
@@ -720,13 +730,23 @@ int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::co
 }
 uint64_t qsa_kv_elastic_mapped_bytes() {
     uint64_t n = 0;
-    for (const auto& p : g_pools) n += (uint64_t) p->range.mapped_count() * strata::core::vmm_granularity();
+    for (const auto& p : g_pools) if (p) n += (uint64_t) p->range.mapped_count() * strata::core::vmm_granularity();
     return n;
 }
 uint64_t qsa_kv_elastic_full_bytes() {
     uint64_t n = 0;
-    for (const auto& p : g_pools) n += (uint64_t) p->range.chunks() * strata::core::vmm_granularity();
+    for (const auto& p : g_pools) if (p) n += (uint64_t) p->range.chunks() * strata::core::vmm_granularity();
     return n;
+}
+void qsa_state_release_elastic(QsaState& st) {
+    if (st.kv_elastic >= 0 && (size_t) st.kv_elastic < g_pools.size()) {
+        g_pools[(size_t) st.kv_elastic].reset();
+        st.kv_elastic = -1;
+    }
+}
+uint64_t qsa_state_elastic_bytes(const QsaState& st) {
+    if (st.kv_elastic < 0 || (size_t) st.kv_elastic >= g_pools.size() || !g_pools[(size_t) st.kv_elastic]) return 0;
+    return (uint64_t) g_pools[(size_t) st.kv_elastic]->range.mapped_count() * strata::core::vmm_granularity();
 }
 namespace {
 
@@ -740,6 +760,17 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     p.pages = (max_cells + s.page_size - 1) / s.page_size;
     p.slots = p.pages;
     p.pooled_rows = max_cells / s.idx_block + 2;
+#if defined(STRATA_GPU_METAL)
+    // THE METAL DECODE WINDOW KEEPS ITS OWN K/V AND INDEXER per QSA layer (metal/src/engine/window.cpp), sized by
+    // the same max cells; the session's pools are never read or written there.  On Metal a session buffer is one
+    // shared MTLBuffer in the residency set, resident in full whether touched or not (measured: 6.0 GiB of K/V pools at
+    // 262K), so its QSA states carry no K/V pools and no pooled indexer keys.  `n_slots == 0` makes every
+    // conversation-snapshot copy refuse the state (conversation_snapshot.cpp `valid`) instead of reading them.
+    (void) ring_cells;
+    p.slots = 0;
+    p.pooled_rows = 0;
+    return p;
+#endif
     if (g_kv_resident <= 0 || ring_cells < 0) return p;   // ring_cells < 0: always fully resident
     // A/B only: STRATA_KV_RING_OFF keeps the drafter fully resident, STRATA_KV_MAIN_OFF the main layers
     static const bool ring_off = std::getenv("STRATA_KV_RING_OFF") != nullptr;
@@ -754,13 +785,13 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     }
     return p;
 }
-uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8) {
+uint64_t kv_pool_bytes(const QsaShapes& s, int64_t pages, bool hybrid, bool int8, bool q4) {
     if (hybrid) {   // K8V4: the INT8 K half (codes + scales) plus the Q4_0 V half (kv_q4.hpp's rotation)
         const uint64_t rows = (uint64_t) pages * s.page_size * s.n_head_kv;
         return rows * (uint64_t) s.head_dim + rows * (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2 +
                rows * strata::kernels::kv_q4_bytes_per_head((int) s.head_dim) + 64;
     }
-    if (g_kv_q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
+    if (q4) return (uint64_t) pages * s.page_size * strata::kernels::kv_q4_bytes_per_cell(s) + 64;
     return int8 ? (uint64_t) pages * s.page_size * strata::kernels::kv_q8_bytes_per_cell(s) + 64
                 : (uint64_t) pages * s.n_head_kv * s.page_size * s.head_dim * 2 * 2;
 }
@@ -770,21 +801,95 @@ void qsa_set_kv_resident(int64_t cells) { g_kv_resident = cells > 0 ? cells : 0;
 int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
+void qsa_set_kv_shared_host(bool enabled) { g_kv_shared_host = enabled; }
+bool qsa_kv_shared_host() { return g_kv_shared_host; }
+
+bool qsa_host_alloc(const ModelGeometry& g, const QsaState& st, int64_t pages, strata::kernels::KvHostPools& out) {
+    const QsaShapes s = qsa_shapes(g);
+    const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
+    const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
+    uint8_t* h = nullptr;
+    uint8_t* d = nullptr;
+    {
+        // S2: the pages the driver takes for this pinned KV copy are faults on THIS thread, so the light rule of
+        // S1 - bind the thread for the scope that allocates - decides which node they come from.  Off (hot < 0):
+        // no syscall, the allocation is the one it always was.
+        const int hot = detail::numa_hot_node();
+        detail::ThreadNodeBinding nb;
+        std::string why;
+        if (hot >= 0 && !nb.bind(hot, why))
+            std::fprintf(stderr, "strata: KV streaming: WARNING: cannot bind this thread to NUMA node %d (%s): "
+                                 "the pinned KV copy takes the process's memory policy\n", hot, why.c_str());
+        if ((h = kv_host_alloc(bytes)) == nullptr ||
+            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
+            // both cudaHostRegister and cudaHostAlloc were refused (kv_host_alloc): usually not enough free RAM
+            if (st.kv_mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
+                                     "(%.2f GiB pinned so far): RAM or the driver refused to pin it - lower the context, "
+                                     "or run without --kv-resident\n", (double) bytes / 1073741824.0,
+                                     (double) g_kv_host_bytes / 1073741824.0);
+            return false;
+        }
+    }
+    g_kv_host_bytes += bytes;
+    Cursor hc{d};
+    out = strata::kernels::KvHostPools{};
+    if (st.kv_hybrid) {   // K8V4: the same three runs as the VRAM pools (kv_stream.cu, kKvHybrid)
+        out.k_q = hc.take<int8_t>(hrows * s.head_dim);
+        out.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        out.v_q4 = hc.take<uint8_t>(hrows * q4_row);
+    } else if (st.kv_q4) {
+        out.k_q4 = hc.take<uint8_t>(hrows * q4_row);
+        out.v_q4 = hc.take<uint8_t>(hrows * q4_row);
+    } else if (st.kv_int8) {
+        out.k_q = hc.take<int8_t>(hrows * s.head_dim);
+        out.v_q = hc.take<int8_t>(hrows * s.head_dim);
+        out.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+        out.v_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+    } else {
+        out.k_pool = hc.take<uint16_t>(hrows * s.head_dim);
+        out.v_pool = hc.take<uint16_t>(hrows * s.head_dim);
+    }
+    return true;
+}
+
+// **THE K/V POOLS AND THE ROPE TABLE ARE THE ONLY PARTS OF A QSA STATE A BACKEND MAY OWN ITSELF.**  Every backend
+// that reads them from the arena wants them carved here.  The Metal backend does not: it publishes its decode
+// window's own buffers into `QsaState` (`Window::bind_session`) before anything reads a state, so a copy in the
+// arena would be a second one that nothing writes and nothing reads - 12 GiB at 512K (fp16) plus the 128 MiB rope
+// table.  Compile-time, so the CUDA and SYCL builds keep their byte-for-byte layout.
+static constexpr bool qsa_pools_in_arena =
+#if defined(STRATA_GPU_METAL)
+    false;
+#else
+    true;
+#endif
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
+    return qsa_state_bytes(g, max_cells, with_rope, ring_cells, QsaStateInitOptions{});
+}
+
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
+                         const QsaStateInitOptions& opts) {
+    if (opts.disable_streaming) ring_cells = 0;   // bytes and init force this identically
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    KvPlan p = kv_plan(s, max_cells, ring_cells);
+    if (opts.no_indexer) p.pooled_rows = 0;
+    const bool elastic = !opts.disable_elastic && strata::core::vmm_available() &&
+                         (opts.elastic_init_cells > 0 || (g_kv_elastic && !opts.force_owned_kv));
+    const bool hybrid = g_kv_hybrid && !opts.force_owned_kv && !opts.force_f16_kv;
+    const bool int8 = (g_kv_int8 || g_kv_hybrid) && !opts.force_owned_kv && !opts.force_f16_kv;
     uint64_t n = 0;
-    if (!(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
+    if (qsa_pools_in_arena && !(g_kv_elastic && p.mode == 0))   // the elastic K/V's pools are in their own VMM range
         n += kv_pool_bytes(s, p.slots, g_kv_hybrid && ring_cells <= 0,
-                           g_kv_int8 || g_kv_hybrid) + 4 * 16;   // K/V pools (the VRAM slots)
+                           g_kv_int8 || g_kv_hybrid, g_kv_q4) + 4 * 16;   // K/V pools (the VRAM slots)
     n += (uint64_t) p.pages * 4;                                               // page_table
     if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
     n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
     n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
+    if (qsa_pools_in_arena && with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;   // cos + sin tables
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     return align_up16(n) + 256;
@@ -792,15 +897,26 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
 
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
                         const QsaState* share_rope, int64_t ring_cells) {
+    return qsa_state_init(g, max_cells, base, st, share_rope, ring_cells, QsaStateInitOptions{});
+}
+
+uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
+                        const QsaState* share_rope, int64_t ring_cells, const QsaStateInitOptions& opts) {
+    if (opts.disable_streaming) ring_cells = 0;   // bytes and init force this identically
     const QsaShapes s = qsa_shapes(g);
-    const KvPlan p = kv_plan(s, max_cells, ring_cells);
+    KvPlan p = kv_plan(s, max_cells, ring_cells);
+    if (opts.no_indexer) p.pooled_rows = 0;
+    const bool elastic = !opts.disable_elastic && strata::core::vmm_available() &&
+                         (opts.elastic_init_cells > 0 || (g_kv_elastic && !opts.force_owned_kv));
+    const bool hybrid = g_kv_hybrid && !opts.force_owned_kv && !opts.force_f16_kv;
+    const bool int8 = (g_kv_int8 || g_kv_hybrid) && !opts.force_owned_kv && !opts.force_f16_kv;
     const int64_t pages = p.pages;
     Cursor c{(uint8_t*) base};
-    st.kv_int8 = g_kv_int8 && !g_kv_q4;
-    st.kv_q4 = g_kv_q4;
+    st.kv_int8 = int8 && !g_kv_q4;
+    st.kv_q4 = g_kv_q4 && !opts.force_owned_kv && !opts.force_f16_kv;
     // Hybrid K8V4, main layers only (the drafter's state is created with the globals toggled to INT8 -
     // mtp.cpp). A streamed one keeps its host copy in the same three runs (kv_stream.cu, kKvHybrid).
-    if (g_kv_hybrid && ring_cells <= 0) {
+    if (hybrid && ring_cells <= 0) {
         st.kv_hybrid = true;
         st.kv_int8 = false;
         st.kv_q4 = false;
@@ -811,7 +927,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     const uint64_t rows = (uint64_t) p.slots * s.n_head_kv * s.page_size;   // VRAM rows: the slots
     const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
     st.kv_elastic = -1;
-    if (g_kv_elastic && p.mode == 0) {
+    // The backend owns the K/V where qsa_pools_in_arena is false: these pointers stay null until it publishes its
+    // own pools into this state, and that happens before anything reads them (nothing between `session_init` and
+    // the backend's window init touches a K/V pointer: `session_zero` returns before `qsa_state_zero` there).
+    if (!qsa_pools_in_arena) {
+        // nothing to carve
+    } else if (g_kv_elastic && p.mode == 0) {
         // the elastic K/V: each array at a chunk boundary of the state's own range, the first cells mapped
         const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
         const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
@@ -830,7 +951,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         pool->per_slot = per;
         pool->n_slots = p.slots;
         pool->page_size = s.page_size;
-        if (!pool->range.reserve(at) || !pool_grow(*pool, g_kv_elastic_init, [] { return (strata::core::VmmChunk) 0; })) {
+        if (!pool->range.reserve(at) || !pool_grow(*pool, opts.elastic_init_cells > 0 ? opts.elastic_init_cells : g_kv_elastic_init, [] { return (strata::core::VmmChunk) 0; })) {
             std::fprintf(stderr, "strata: the elastic K/V could not reserve or map its pools\n");
             return 0;
         }
@@ -881,11 +1002,14 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
     st.idx_pooled_rows = p.pooled_rows;
     st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+#if defined(STRATA_GPU_METAL)
+    if (p.pooled_rows == 0) st.idx_pooled = nullptr;   // none on Metal (kv_plan), not an alias of block_pos
+#endif
     st.idx_block_pos = c.take<int32_t>(1);
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
-    } else {
+    } else if (qsa_pools_in_arena) {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
     }
@@ -900,46 +1024,15 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         return 0;   // the caller sees a zero byte count; a half-built state is worse than none
     }
     st.host_step[strata::kernels::kStepCount] = 0;
-    // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
+    // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout; with a
+    // shared KV pool a streamed state's copy is the pool's (KvPool::attach), the drafter's ring keeps its own
     st.host = strata::kernels::KvHostPools{};
-    if (p.mode != 0) {
-        const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
-        const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
-        uint8_t* h = nullptr;
-        uint8_t* d = nullptr;
-        if ((h = kv_host_alloc(bytes)) == nullptr ||
-            cudaHostGetDevicePointer((void**) &d, h, 0) != cudaSuccess) {
-            // both cudaHostRegister and cudaHostAlloc were refused (kv_host_alloc): usually not enough free RAM
-            if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
-                                 "(%.2f GiB pinned so far): RAM or the driver refused to pin it - lower the context, "
-                                 "or run without --kv-resident\n", (double) bytes / 1073741824.0,
-                                 (double) g_kv_host_bytes / 1073741824.0);
-            return 0;
-        }
-        g_kv_host_bytes += bytes;
-        Cursor hc{d};
-        if (st.kv_hybrid) {
-            st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
-            st.host.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
-            st.host.v_q4 = hc.take<uint8_t>(hrows * q4_row);
-        } else if (st.kv_q4) {
-            st.host.k_q4 = hc.take<uint8_t>(hrows * q4_row);
-            st.host.v_q4 = hc.take<uint8_t>(hrows * q4_row);
-        } else if (st.kv_int8) {
-            st.host.k_q = hc.take<int8_t>(hrows * s.head_dim);
-            st.host.v_q = hc.take<int8_t>(hrows * s.head_dim);
-            st.host.k_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
-            st.host.v_scale = hc.take<uint16_t>(hrows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
-        } else {
-            st.host.k_pool = hc.take<uint16_t>(hrows * s.head_dim);
-            st.host.v_pool = hc.take<uint16_t>(hrows * s.head_dim);
-        }
-    }
+    if (p.mode != 0 && !(p.mode == 1 && g_kv_shared_host) && !qsa_host_alloc(g, st, pages, st.host)) return 0;
     // THE ROPE TABLE IS BUILT ON THE HOST IN FLOAT64 and uploaded once, because the reference computes its
     // frequencies in float64 and reproducing that on device means double-precision `pow`/`cos` that need not
     // agree with the host's libm.  A table shorter than the sequence would have the rotation read past it.
     // The process's rope scaling (none by default) is INSIDE the table - the rotation kernels cannot tell.
-    if (share_rope == nullptr) {
+    if (share_rope == nullptr && qsa_pools_in_arena) {
         std::vector<float> hc((size_t) max_cells * (s.n_rot / 2)), hs((size_t) max_cells * (s.n_rot / 2));
         strata::kernels::build_rope_table((int) s.n_rot, strata::kernels::rope_scaling(), (int) max_cells,
                                           hc.data(), hs.data());
@@ -1305,14 +1398,17 @@ try {
 } else {
     s_gemv_q8k_split(b.attn_q8k, p_o.codes, p_o.scales, p_o.offset, out,
                     g.n_head * g.head_dim, g.n_embd, f_o, stream);
-}    return true;}
+}
+// --lora: out += s B (A attn32)
+try { strata::kernels::lora_apply(layer, b.attn32, 0, 1, out, 0, stream); }
+catch (const std::exception& error) { err = v.name("lora") + ": " + error.what(); return false; }    return true;}
 // ================================ THE DOORBELL ================================
 namespace {}
 // namespace
 uint64_t doorbell_init(const ModelGeometry& g, int64_t k, Doorbell& db) {    db.n_embd = g.n_embd;    db.k = k;    uint64_t bytes = 0;
 // ONE region per field, each MAPPED PINNED, so the device and the host have different pointers to the same
 // bytes and no copy is needed to publish them.
-auto alloc = [&](size_t n, void** h, void** d, const char* what) {        if (cudaHostAlloc(h, n, cudaHostAllocMapped) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);            return false;        }        if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostGetDevicePointer(%s) failed\n", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(4, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
+auto alloc = [&](size_t n, void** h, void** d, const char* what) {        const int hot = detail::numa_hot_node();        detail::ThreadNodeBinding nb;        std::string why;        if (hot >= 0 && !nb.bind(hot, why))            std::fprintf(stderr, "doorbell_init: WARNING: cannot bind this thread to NUMA node %d (%s): the pinned doorbell takes the process's memory policy\n", hot, why.c_str());        if (cudaHostAlloc(h, n, cudaHostAllocMapped) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostAlloc(%s) failed\n", what);            return false;        }        if (cudaHostGetDevicePointer(d, *h, 0) != cudaSuccess) {            std::fprintf(stderr, "doorbell_init: cudaHostGetDevicePointer(%s) failed\n", what);            return false;        }        std::memset(*h, 0, n);        bytes += n;        return true;    };    if (!alloc((size_t) g.n_embd * 4, (void**) &db.h_x_f, (void**) &db.d_x_f, "x_f")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_ids, (void**) &db.d_ids, "ids")) return 0;    if (!alloc((size_t) k * 4, (void**) &db.h_weights, (void**) &db.d_weights, "weights")) return 0;    if (!alloc(4, (void**) &db.h_seq, (void**) &db.d_seq, "seq")) return 0;    if (!alloc(4, (void**) &db.h_flag, (void**) &db.d_flag, "flag")) return 0;    return bytes;}
 void doorbell_free(Doorbell& db) {    if (db.h_x_f) (void) cudaFreeHost(db.h_x_f);    if (db.h_ids) (void) cudaFreeHost(db.h_ids);    if (db.h_weights) (void) cudaFreeHost(db.h_weights);    if (db.h_seq) (void) cudaFreeHost(db.h_seq);    if (db.h_flag) (void) cudaFreeHost(db.h_flag);    db = Doorbell{};}
 void doorbell_reset(const Doorbell& db) {
     if (db.h_seq) *db.h_seq = 0;
@@ -1533,15 +1629,17 @@ float* R = bb.R;
     // and 0 is what every caller before this used.
     if (run0) {
 st_begin(layer, 0, stream);
+    const uint16_t *vd0 = nullptr, *vu0 = nullptr;
+    NativeDense::hc_bf16_view_pair(*w_down[0], *w_up[0], stream, vd0, vu0, 1);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = pending_ffn; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject2;
-        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = NativeDense::hc_bf16_view(*w_down[0], stream, 0, 1);
-        fa.w_up = NativeDense::hc_bf16_view(*w_up[0], stream, 1, 1); fa.s_down = w_down[0]->q8_scale; fa.s_up = w_up[0]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[0]->data;
+        fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = vd0;
+        fa.w_up = vu0; fa.s_down = w_down[0]->q8_scale; fa.s_up = w_up[0]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[0]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    if (w_down[0]->q8_scale || w_up[0]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[0]->data, NativeDense::hc_bf16_view(*w_down[0], stream, 0, 1),            NativeDense::hc_bf16_view(*w_up[0], stream, 1, 1), (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    if (w_down[0]->q8_scale || w_up[0]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[0]->data, vd0, vu0, (const uint16_t*) w_inject[0]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
     st_end(layer, 0, stream);    dump_half(bb, g, layer, bb.inject, 2 * g.n_embd, g.hc, stream);        }
     if (run1) {
@@ -1556,15 +1654,17 @@ st_begin(layer, 0, stream);
     // the same contract `block_layer_post` has, and the reason the two are only meaningful in order.
     if (run3) {
 st_begin(layer, 3, stream);
+    const uint16_t *vd1 = nullptr, *vu1 = nullptr;
+    NativeDense::hc_bf16_view_pair(*w_down[1], *w_up[1], stream, vd1, vu1, 1);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = true; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject;
-        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = NativeDense::hc_bf16_view(*w_down[1], stream, 0, 1);
-        fa.w_up = NativeDense::hc_bf16_view(*w_up[1], stream, 1, 1); fa.s_down = w_down[1]->q8_scale; fa.s_up = w_up[1]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[1]->data;
+        fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = vd1;
+        fa.w_up = vu1; fa.s_down = w_down[1]->q8_scale; fa.s_up = w_up[1]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[1]->data;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
-    if (w_down[1]->q8_scale || w_up[1]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[1]->data, NativeDense::hc_bf16_view(*w_down[1], stream, 0, 1),            NativeDense::hc_bf16_view(*w_up[1], stream, 1, 1), (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
+    if (w_down[1]->q8_scale || w_up[1]->q8_scale) { err = "STRATA_HC_REQ8 needs the fused hyper-connection read"; return false; }    gr_read(R, (const float*) w_norm[1]->data, vd1, vu1, (const uint16_t*) w_inject[1]->data, RMS_EPS, gs, bb.gr, bb.mixed,            bb.inject, stream);
     }
     st_end(layer, 3, stream);        }
     if (run4) {

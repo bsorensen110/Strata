@@ -17,7 +17,7 @@ struct PcGemmArgs { int M, N, K, pad; };
 struct PcEpiArgs { uint32_t n_tok, n_embd, hc, hc_lr; };
 struct PcGdnPArgs { uint32_t n_tok, h_k, h_v, channels; float eps; uint32_t f32; };
 struct PcMmPlanArgs { uint32_t n_ent, topk, n_expert, tm, n_blocks; };
-struct PcMmArgs { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff; };
+struct PcMmArgs { uint64_t gate_off, up_off, down_off, gu_stride, d_stride; uint32_t gu_row, d_row, n_embd, n_ff, ebase, ecount; };
 int pc_unit_of(int t) {
     return t == ref::Q2_0 || t == ref::IQ3_S || t == ref::BF16 || t == ref::F32 || t == 18 || t == 16 || t == 17 || t == 22 ? 16 : 32;
 }
@@ -25,6 +25,7 @@ int pc_unit_of(int t) {
 
 bool Window::coop_k4() {
     if (const char* e = std::getenv("COOP_K4")) return std::atoi(e) != 0;
+    if (!cx_->supports_metal4()) return false;
     const int lib = cx_->compile({"mm_bench.metal"}, "#define NO_GGML_COMMON 1\n");
     mtl::Pipeline p = cx_->pipeline(lib, "coop_layout_16_64_32");
     mtl::Buffer out = cx_->alloc(4 * 3 * 32 * 128 * 4);
@@ -52,11 +53,14 @@ bool Window::pc_setup(int C) {
     const double t0 = now_ms();
     if (b.C == 0) {
         b.lib = cx_->compile({"quant.metal", "units.metal", "mma.metal", "dense_mm.metal", "moe_mm.metal", "gr.metal",
-                              "gemv.metal", "prompt.metal"});
+                              "gemv.metal", "prompt.metal", "hadamard.metal"});
         b.lgdn = cx_->compile({"gdn.metal", "gdn_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
         b.lqsa = cx_->compile({"qsa.metal", "qsa_prompt.metal"}, "#define NO_GGML_COMMON 1\n");
         b.k4 = coop_k4();
     }
+    // pc_chunk's GPU submissions complete before it returns. Only scratch buffers are replaced;
+    // the window's KV, recurrent state and compiled libraries remain alive.
+    for (auto& buffer : b.owned) cx_->free(buffer);
     b = PromptBufs{b.lib, b.lgdn, b.lqsa, b.k4};   // (re)allocated below for the larger chunk
     b.v3e = b.k4 && T("blk.0.ffn_gate_exps.weight").type < 144;   // the trellis experts have the v2 kernels only
     b.C = C;
@@ -64,8 +68,13 @@ bool Window::pc_setup(int C) {
     const int MB = (int) max_cells_ / 4 + 2;
     b.maxrows = (int) MT * TOPK + NEXP * PC_TM;
     const int nblk_max = ((int) MT * TOPK + 1023) / 1024;
-    auto F32 = [&](size_t n) { return cx_->alloc(4 * n); };
-    auto F16 = [&](size_t n) { return cx_->alloc(2 * n); };
+    auto alloc = [&](size_t bytes) {
+        mtl::Buffer buffer = cx_->alloc(bytes);
+        b.owned.push_back(buffer);
+        return buffer;
+    };
+    auto F32 = [&](size_t n) { return alloc(4 * n); };
+    auto F16 = [&](size_t n) { return alloc(2 * n); };
     b.R = F32(MT * HC * N); b.bo = F32(MT * N); b.inj[0] = F32(MT * HC); b.inj[1] = F32(MT * HC); b.xn = F32(MT * HC * N);
     b.xnh = F16(MT * HC * N); b.V = F32(MT * (LR + HC)); b.loh = F16(MT * LR); b.mixed = F32(MT * N); b.mixh = F16(MT * N);
     b.qkv = F32(MT * 10240); b.z = F32(MT * 6144); b.al = F32(MT * 48); b.be = F32(MT * 48); b.yg = F32(MT * 6144);
@@ -73,18 +82,18 @@ bool Window::pc_setup(int C) {
     b.ggb = F32(MT * 48 * 2); b.gkq = F32(MT * 16); b.go = F32(MT * 6144);
     b.qfull = F32(MT * 12288); b.kcur = F32(MT * 512); b.vcur = F32(MT * 512); b.iqr = F32(MT * 512); b.ikr = F32(MT * 128);
     b.qcur = F32(MT * 24 * 256); b.qcurh = F16(MT * 24 * 256); b.qidx = F32(MT * 4 * 128); b.scores = F32(MT * MB);
-    b.qids = cx_->alloc(4 * MT * PC_QB); b.part = F32(MT * PC_QCHUNKS * 24 * 258); b.XQ = F32(4 * MT * 6144 + MT * 384);
+    b.qids = alloc(4 * MT * PC_QB); b.part = F32(MT * PC_QCHUNKS * 24 * 258); b.XQ = F32(4 * MT * 6144 + MT * 384);
     b.xqh = F16(MT * 6144);
-    b.logits = F32(MT * NEXP); b.ids = cx_->alloc(4 * MT * TOPK); b.wts = F32(MT * TOPK);
-    b.bcnt = cx_->alloc(4 * (size_t) nblk_max * NEXP); b.boff = cx_->alloc(4 * (size_t) nblk_max * NEXP);
-    b.eoff = cx_->alloc(4 * NEXP); b.tiles = cx_->alloc(8 * (size_t) (b.maxrows / PC_TM + 1)); b.meta = cx_->alloc(64);
-    b.stok = cx_->alloc(4 * (size_t) b.maxrows); b.sw = F32(b.maxrows); b.pos = cx_->alloc(4 * MT * TOPK);
+    b.logits = F32(MT * NEXP); b.ids = alloc(4 * MT * TOPK); b.wts = F32(MT * TOPK);
+    b.bcnt = alloc(4 * (size_t) nblk_max * NEXP); b.boff = alloc(4 * (size_t) nblk_max * NEXP);
+    b.eoff = alloc(4 * NEXP); b.tiles = alloc(8 * (size_t) (b.maxrows / PC_TM + 1)); b.meta = alloc(64);
+    b.stok = alloc(4 * (size_t) b.maxrows); b.sw = F32(b.maxrows); b.pos = alloc(4 * MT * TOPK);
     b.XS = F16((size_t) b.maxrows * N); b.HS = F16((size_t) b.maxrows * NFF); b.YE = F32((size_t) b.maxrows * N);
     b.yr = F32(MT * N); b.gsh = F32(MT * NFF); b.ush = F32(MT * NFF); b.hh = F16(MT * NFF); b.ys = F32(MT * N); b.sgv = F32(MT);
     b.WD = F16((size_t) (LR + HC) * HC * N); b.WU = F16((size_t) HC * N * LR); b.Wqkv = F16((size_t) 10240 * N);
     b.Wz = F16((size_t) 6144 * N); b.Wal = F16((size_t) 48 * N); b.Wbe = F16((size_t) 48 * N); b.Wout = F16((size_t) N * 6144);
     b.Wq = F16((size_t) 12288 * N); b.Wk = F16((size_t) 512 * N); b.Wv = F16((size_t) 512 * N); b.Wiq = F16((size_t) 512 * N);
-    b.Wik = F16((size_t) 128 * N); b.Wr = F16((size_t) NEXP * N); b.Wsg = F16((size_t) N); b.Wshg = F16((size_t) NFF * N);
+    b.Wik = F16((size_t) 128 * N); b.Wr = F16((size_t) n_expert_ * N); b.Wsg = F16((size_t) N); b.Wshg = F16((size_t) NFF * N);
     b.Wshu = F16((size_t) NFF * N); b.Wshd = F16((size_t) N * NFF);
     // the PLE block's rows and projections
     b.pemb = F32(MT * N); b.pembh = F16(MT * N); b.pkey = F32(MT * 10240); b.pval = F32(MT * N); b.keyn = F32(MT * 10240);
@@ -133,6 +142,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     std::vector<mtl::Dispatch> ds;
     ds.reserve(2400);
     nb_ = false;
+    cv_begin();
     if (pend_fold_ > 0) {   // the last window's commit, first
         fold(ds, pend_fold_, 1 - hp_);
         pend_fold_ = 0;
@@ -189,7 +199,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     int gi = 0, qi = 0;
     for (int l = 0; l < 48; ++l) {
         const std::string bl = "blk." + std::to_string(l) + ".";
-        hc_read(bl + "hc_attn", l > 0 && !(l == 1 && ple_on_));
+        hc_read(bl + "hc_attn", l > 0 && !(l == 1 && ple_on_) && !cv_at(l - 1));
         if (l % 4 != 3) {
             dq(T(bl + "attn_qkv.weight"), b.Wqkv);
             dq(T(bl + "attn_gate.weight"), b.Wz);
@@ -202,13 +212,13 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             gemm(b.mixh, b.Wbe, b.be, nT, 48, N);
             PcGdnPArgs ga{(uint32_t) nT, 16, 48, 10240, eps_, 0};
             D(P_(b.lgdn, "gdn_pre"),
-              {mtl::Arg::B(b.qkv), mtl::Arg::B(ghist_[hp][(size_t) gi]), mtl::Arg::B(W_, T(bl + "ssm_conv1d.weight").offset),
+              {mtl::Arg::B(b.qkv), mtl::Arg::B(slot_.ghist[hp][(size_t) gi]), mtl::Arg::B(W_, T(bl + "ssm_conv1d.weight").offset),
                mtl::Arg::B(b.al), mtl::Arg::B(b.be), mtl::Arg::B(W_, T(bl + "ssm_dt.bias").offset),
                mtl::Arg::B(W_, T(bl + "ssm_a").offset), mtl::Arg::B(b.gqn), mtl::Arg::B(b.gkn), mtl::Arg::B(b.gvc),
-               mtl::Arg::B(b.ggb), mtl::Arg::B(b.gkq), mtl::Arg::B(ghist_[1 - hp][(size_t) gi]), mtl::Arg::V(ga)},
+               mtl::Arg::B(b.ggb), mtl::Arg::B(b.gkq), mtl::Arg::B(slot_.ghist[1 - hp][(size_t) gi]), mtl::Arg::V(ga)},
               16 + 24, nT, 256);
             D(P_(b.lgdn, "gdn_scanr_4", mtl::Constants().i(6, 0)),
-              {mtl::Arg::B(gst_[(size_t) gi]), mtl::Arg::B(b.gqn), mtl::Arg::B(b.gkn), mtl::Arg::B(b.gvc), mtl::Arg::B(b.ggb),
+              {mtl::Arg::B(slot_.gst[(size_t) gi]), mtl::Arg::B(b.gqn), mtl::Arg::B(b.gkn), mtl::Arg::B(b.gvc), mtl::Arg::B(b.ggb),
                mtl::Arg::B(b.gkq), mtl::Arg::B(b.go), mtl::Arg::V(ga)},
               48 * 4, 1, 32 * 4);
             D(P_(b.lgdn, "gdn_post"), {mtl::Arg::B(b.go), mtl::Arg::B(b.z), mtl::Arg::B(W_, T(bl + "ssm_norm.weight").offset),
@@ -233,17 +243,17 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
               {mtl::Arg::B(b.qfull), mtl::Arg::B(b.kcur), mtl::Arg::B(b.vcur), mtl::Arg::B(b.iqr), mtl::Arg::B(b.ikr),
                mtl::Arg::B(W_, T(bl + "attn_q_norm.weight").offset), mtl::Arg::B(W_, T(bl + "attn_k_norm.weight").offset),
                mtl::Arg::B(W_, T(bl + "indexer.q_norm.weight").offset), mtl::Arg::B(W_, T(bl + "indexer.k_norm.weight").offset),
-               mtl::Arg::B(cs_), mtl::Arg::B(b.qcur), mtl::Arg::B(b.qidx), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]),
-               mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(tail_[(size_t) qi]),
-               mtl::Arg::B(dead_[(size_t) qi]), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::V(a), mtl::Arg::B(mrope_)},
+               mtl::Arg::B(cs_), mtl::Arg::B(b.qcur), mtl::Arg::B(b.qidx), mtl::Arg::B(slot_.kq[(size_t) qi]), mtl::Arg::B(slot_.vq[(size_t) qi]),
+               mtl::Arg::B(slot_.ksc[(size_t) qi]), mtl::Arg::B(slot_.vsc[(size_t) qi]), mtl::Arg::B(slot_.tail[(size_t) qi]),
+               mtl::Arg::B(slot_.dead[(size_t) qi]), mtl::Arg::B(slot_.pooled[(size_t) qi]), mtl::Arg::V(a), mtl::Arg::B(mrope_)},
               33, nT, 256);
             if (pos0 + nT > PC_QB) {   // some row's context is past the budget: the indexer selects
                 if (b.k4)
-                    D(P_(b.lqsa, "qsa_score_mm"), {mtl::Arg::B(b.qidx), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]),
+                    D(P_(b.lqsa, "qsa_score_mm"), {mtl::Arg::B(b.qidx), mtl::Arg::B(slot_.pooled[(size_t) qi]), mtl::Arg::B(slot_.dead[(size_t) qi]),
                                                  mtl::Arg::B(b.scores), mtl::Arg::V(a)},
                       (uint32_t) (((pos0 + nT) / 4 + 1 + 63) / 64), (nT + 15) / 16, 128);
                 else
-                    D(P_(b.lqsa, "qsa_score"), {mtl::Arg::B(b.qidx), mtl::Arg::B(pooled_[(size_t) qi]), mtl::Arg::B(dead_[(size_t) qi]),
+                    D(P_(b.lqsa, "qsa_score"), {mtl::Arg::B(b.qidx), mtl::Arg::B(slot_.pooled[(size_t) qi]), mtl::Arg::B(slot_.dead[(size_t) qi]),
                                               mtl::Arg::B(b.scores), mtl::Arg::V(a)},
                       (uint32_t) (((pos0 + nT) / 4 + 1 + 7) / 8), nT, 256);
             }
@@ -252,12 +262,12 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
                 const uint32_t nq = (uint32_t) nT * 24 * 256;
                 D(P_(b.lqsa, "qsa_q_f16"), {mtl::Arg::B(b.qcur), mtl::Arg::B(b.qcurh), mtl::Arg::V(nq)}, (nq + 255) / 256, 1, 256);
                 D(P_(b.lqsa, "qsa_attn_mm", mtl::Constants().b(7, true), "qsa_attn_mm#k4"),
-                  {mtl::Arg::B(b.qcurh), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]), mtl::Arg::B(ksc_[(size_t) qi]),
-                   mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(b.qids), mtl::Arg::B(b.part), mtl::Arg::V(a)},
+                  {mtl::Arg::B(b.qcurh), mtl::Arg::B(slot_.kq[(size_t) qi]), mtl::Arg::B(slot_.vq[(size_t) qi]), mtl::Arg::B(slot_.ksc[(size_t) qi]),
+                   mtl::Arg::B(slot_.vsc[(size_t) qi]), mtl::Arg::B(b.qids), mtl::Arg::B(b.part), mtl::Arg::V(a)},
                   PC_QCHUNKS, 2, 32, nT);
             } else {
-                D(P_(b.lqsa, "qsa_attn"), {mtl::Arg::B(b.qcur), mtl::Arg::B(kq_[(size_t) qi]), mtl::Arg::B(vq_[(size_t) qi]),
-                                          mtl::Arg::B(ksc_[(size_t) qi]), mtl::Arg::B(vsc_[(size_t) qi]), mtl::Arg::B(b.qids),
+                D(P_(b.lqsa, "qsa_attn"), {mtl::Arg::B(b.qcur), mtl::Arg::B(slot_.kq[(size_t) qi]), mtl::Arg::B(slot_.vq[(size_t) qi]),
+                                          mtl::Arg::B(slot_.ksc[(size_t) qi]), mtl::Arg::B(slot_.vsc[(size_t) qi]), mtl::Arg::B(b.qids),
                                           mtl::Arg::B(b.part), mtl::Arg::V(a)},
                   PC_QCHUNKS, 2, 256, nT);
             }
@@ -274,16 +284,16 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         dq(T(bl + "ffn_gate_shexp.weight"), b.Wshg);
         dq(T(bl + "ffn_up_shexp.weight"), b.Wshu);
         dq(T(bl + "ffn_down_shexp.weight"), b.Wshd);
-        gemm(b.mixh, b.Wr, b.logits, nT, NEXP, N);
+        gemm(b.mixh, b.Wr, b.logits, nT, n_expert_, N);
         const uint32_t nt = (uint32_t) nT;
-        D(P_(b.lib, "route_topk"), {mtl::Arg::B(b.logits), mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::V(nt)}, (nT + 7) / 8, 1, 256);
+        D(P_(b.lib, n_expert_ == 256 ? "route_topk_256" : "route_topk"), {mtl::Arg::B(b.logits), mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::V(nt)}, (nT + 7) / 8, 1, 256);
         const int nent = nT * TOPK, nblk = (nent + 1023) / 1024;
-        PcMmPlanArgs pa{(uint32_t) nent, TOPK, NEXP, (uint32_t) PC_TM, (uint32_t) nblk};
+        PcMmPlanArgs pa{(uint32_t) nent, TOPK, (uint32_t) n_expert_, (uint32_t) PC_TM, (uint32_t) nblk};
         const uint32_t nclr = (uint32_t) b.maxrows;
         D(P_(b.lib, "mm_clear"), {mtl::Arg::B(b.stok), mtl::Arg::V(nclr)}, (b.maxrows + 255) / 256, 1, 256);
         D(P_(b.lib, "mm_hist"), {mtl::Arg::B(b.ids), mtl::Arg::B(b.bcnt), mtl::Arg::V(pa)}, nblk, 1, 1024);
         D(P_(b.lib, "mm_scan"), {mtl::Arg::B(b.bcnt), mtl::Arg::B(b.boff), mtl::Arg::B(b.eoff), mtl::Arg::B(b.tiles), mtl::Arg::B(b.meta),
-                                mtl::Arg::V(pa)}, 1, 1, NEXP);
+                                mtl::Arg::V(pa)}, 1, 1, n_expert_);
         D(P_(b.lib, "mm_place"), {mtl::Arg::B(b.ids), mtl::Arg::B(b.wts), mtl::Arg::B(b.boff), mtl::Arg::B(b.eoff), mtl::Arg::B(b.stok),
                                  mtl::Arg::B(b.sw), mtl::Arg::B(b.pos), mtl::Arg::V(pa)}, nblk, 1, 1024);
         PcMmArgs ma{eg.offset, eu.offset, ed.offset, 0, 0, (uint32_t) ref::row_bytes(eg.type, N), (uint32_t) ref::row_bytes(ed.type, NFF),
@@ -321,7 +331,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
             const std::string fn = "mm_down3_" + std::to_string(ed.type) + "_" + tl3(b.dn3);
             dn.p = P_(b.lib, fn, mtl::Constants().b(7, true), fn + "#k4");
         } else {
-            dn.p = P_(b.lib, "mm_down2_" + std::to_string(ed.type) + dn2_tile(ed.type));
+            dn.p = P_(b.lib, "mm_down2_" + std::to_string(ed.type) + dn2_tile(ed.type, 16));   // the bench plans 16-row tiles
         }
         dn.args = {mtl::Arg::B(W_, ebase), mtl::Arg::B(b.HS), mtl::Arg::B(b.YE), mtl::Arg::B(b.tiles), mtl::Arg::V(ma)};
         dn.tg[0] = b.v3e ? 32 * b.dn3[3] : 64;
@@ -340,6 +350,10 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
         const uint32_t oa[2] = {(uint32_t) nT, N};
         D(P_(b.lib, "moe_out"), {mtl::Arg::B(b.yr), mtl::Arg::B(b.ys), mtl::Arg::B(b.sgv), mtl::Arg::B(b.bo), mtl::Arg::V(oa)},
           (nT * N + 255) / 256, 1, 256);
+        if (cv_at(l)) {   // the FFN write, then the vector (the next read does not apply it)
+            const mtl::Dispatch cd = cv_dispatch(b.R, b.bo, b.inj[cur_inj], l, nT);
+            D(cd.p, cd.args, cd.grid[0], cd.grid[1], cd.tg[0]);
+        }
         if (l == 0 && ple_on_) {
             // layer 0's FFN write applied to R, then the PLE block (as the window: msl/ple.metal over nT rows)
             GrArgs a{N, HC, LR, (uint32_t) nT, 1u, eps_};
@@ -361,12 +375,12 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
               {mtl::Arg::B(b.keyn), mtl::Arg::B(b.qn), mtl::Arg::B(b.pval), mtl::Arg::B(W_, off("blk.1.ple_norm_conv.weight")),
                mtl::Arg::B(b.gated), mtl::Arg::B(b.normW), mtl::Arg::V(pa2)}, HC, nT, 256);
             D(P(lple_, "ple_conv_add", {}, "ple_conv_add"),
-              {mtl::Arg::B(pleHist_), mtl::Arg::B(b.normW), kw_arg(), mtl::Arg::B(b.gated),
+              {mtl::Arg::B(slot_.pleHist), mtl::Arg::B(b.normW), kw_arg(), mtl::Arg::B(b.gated),
                mtl::Arg::B(b.R), mtl::Arg::V(pa2)}, HC * N / 256, nT, 256);
         }
     }
-    // every row's final residual (the last write applied): the drafter's prompt rows
-    {
+    // every row's final residual (the last write applied - already, when steered): the drafter's prompt rows
+    if (!cv_at(47)) {
         GrArgs a{N, HC, LR, (uint32_t) nT, 1u, eps_};
         D(P_(b.lib, "gr_norm"), {mtl::Arg::B(b.R), mtl::Arg::B(b.bo), mtl::Arg::B(b.inj[cur_inj]),
                                 mtl::Arg::B(W_, T("output_hc_norm.weight").offset), mtl::Arg::B(b.xn), mtl::Arg::V(a)}, HC, nT, 256);
@@ -378,7 +392,7 @@ bool Window::pc_chunk(const int64_t* tokens, int nT, int64_t pos0, std::string& 
     if (ple_on_) {
         using namespace strata::kernels;
         const float* nw = b.normW.as<float>();
-        float* hist = pleHist_.as<float>();
+        float* hist = slot_.pleHist.as<float>();
         for (int c = 0; c < NG_HC_DIM; ++c) {
             float* col = hist + (size_t) c * NG_HIST;
             float tmp[NG_HIST * 2];
@@ -403,6 +417,7 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
         const char* e = std::getenv("STRATA_METAL_PROMPT_CHUNK");
         return std::max(64, std::min(8192, e ? std::atoi(e) : 2048));
     }();
+    if (!cx_ || !cx_->supports_metal4()) { err = "metal prompt: prompt kernels require Metal 4"; return false; }
     if (!pc_setup((int) std::min<int64_t>(C, std::max<int64_t>(n, 64)))) { err = "metal prompt: setup failed"; return false; }
     const double t0 = now_ms();
     pb_.gpu_ms = pb_.host_ms = pb_.mtp_ms = 0;
@@ -410,6 +425,7 @@ bool Window::prompt(const int64_t* tokens, int64_t n, int64_t pos0,
         const int nT = (int) std::min<int64_t>(C, n - c);
         if (pos0 + c + nT + 1 >= max_cells_) { err = "metal prompt: the prompt runs past the context"; return false; }
         if (!pc_chunk(tokens + c, nT, pos0 + c, err)) return false;
+        df_src_ = df_on_ ? &pb_.F : nullptr;
         if (on_chunk) {
             const double tm0 = now_ms();
             mpsrc_ = &pb_.R;   // the drafter's prompt rows are this chunk's final residuals

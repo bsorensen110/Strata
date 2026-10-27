@@ -251,6 +251,7 @@ bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set
 static void* g_hc_scratch[64][2][2] = {};     // [device][class][slot]
 static cudaEvent_t g_hc_ev[64][2] = {};        // [device][slot]: the prompt path's last reader of the slot
 static bool g_hc_ev_set[64][2] = {};
+static void* g_hc_ev_stream[64][2] = {};       // [device][slot]: stream that recorded g_hc_ev (same-stream wait elision)
 
 NativeDense::~NativeDense() {
     for (auto& dev : g_hc_scratch)
@@ -402,6 +403,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     static const bool q8_inject = [] { const char* v = std::getenv("STRATA_HC_Q8_INJECT"); return v && v[0] == '1'; }();
                     const bool f32_inject = q8_inject && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
                     if ((tensor.type != 8 && !f32_inject) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2) continue;
+                    // a layer split: only this stage's layers (another stage's rows would cost VRAM and never be read)
+                    if (outside(tensor.name) || !in_range(tensor.name)) continue;
                     auto found = table.table_.find(tensor.name);
                     if (found == table.table_.end() || found->second.hc_q8 != nullptr) continue;
                     auto& ref = found->second;
@@ -424,9 +427,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         }
         if (hc_q8_env()) {
             // a bf16 pack stores no Q8_0 copy: quantize the layers' down / up projections. A row the arena kept
-            // (--keep-canonical, a layer split) is quantized on the GPU from the arena's bf16; a skipped row (the
-            // single-GPU default: add_hc_skip) from the pack file on the host, and has no bf16 copy at all. The
-            // inject rows stay bf16 (82 KB), the final mixer stays bf16 (it runs once a window).
+            // (--keep-canonical) is quantized on the GPU from the arena's bf16; a skipped row
+            // (add_hc_skip - single GPU and layer split alike) from the pack file on the host, and has no bf16 copy
+            // at all. The inject rows stay bf16 (82 KB), the final mixer stays bf16 (it runs once a window).
             uint64_t made = 0;
             for (auto& [name, ref] : table.table_) {
                 if (ref.hc_q8 != nullptr || name.rfind("blk.", 0) != 0 || !in_range(name) ||
@@ -540,10 +543,47 @@ const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int 
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || slot < 0 || slot > 1 || cls < 0 || cls > 1) return nullptr;
     void* buf = g_hc_scratch[dev][cls][slot];
     if (buf == nullptr) return nullptr;
-    // the prompt path: the scratch may still be read by a GEMM another stream enqueued (batch serving: several slots' prompts)
-    if (cls == 0 && g_hc_ev_set[dev][slot]) cudaStreamWaitEvent((cudaStream_t) stream, g_hc_ev[dev][slot], 0);
+    // the prompt path: the scratch may still be read by a GEMM another stream enqueued (batch serving: several slots' prompts).
+    // When the previous reader ran on the exact same stream, stream program order already serializes the reuse without an HSA barrier wait.
+    if (cls == 0 && g_hc_ev_set[dev][slot] && g_hc_ev_stream[dev][slot] != stream) {
+        cudaStreamWaitEvent((cudaStream_t) stream, g_hc_ev[dev][slot], 0);
+        g_hc_ev_stream[dev][slot] = stream;
+    }
     strata::kernels::fused_gr_dequant_q8_0((const uint8_t*) w.hc_q8, (uint16_t*) buf, w.elements / 32, stream);
     return (const uint16_t*) buf;
+}
+
+bool NativeDense::hc_bf16_view_pair(const WeightRef& w0, const WeightRef& w1, void* stream, const uint16_t*& out0,
+                                    const uint16_t*& out1, int cls) {
+    if (w0.data == nullptr && w0.hc_q8 != nullptr && w1.data == nullptr && w1.hc_q8 != nullptr &&
+        w0.elements == w1.elements) {
+        int dev = 0;
+        if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || cls < 0 || cls > 1) {
+            out0 = nullptr; out1 = nullptr; return false;
+        }
+        void* buf0 = g_hc_scratch[dev][cls][0];
+        void* buf1 = g_hc_scratch[dev][cls][1];
+        if (buf0 == nullptr || buf1 == nullptr) {
+            out0 = nullptr; out1 = nullptr; return false;
+        }
+        if (cls == 0) {
+            for (int slot = 0; slot < 2; ++slot) {
+                if (g_hc_ev_set[dev][slot] && g_hc_ev_stream[dev][slot] != stream) {
+                    cudaStreamWaitEvent((cudaStream_t) stream, g_hc_ev[dev][slot], 0);
+                    g_hc_ev_stream[dev][slot] = stream;
+                }
+            }
+        }
+        strata::kernels::fused_gr_dequant_q8_0_pair((const uint8_t*) w0.hc_q8, (uint16_t*) buf0,
+                                                    (const uint8_t*) w1.hc_q8, (uint16_t*) buf1,
+                                                    w0.elements / 32, stream);
+        out0 = (const uint16_t*) buf0;
+        out1 = (const uint16_t*) buf1;
+        return true;
+    }
+    out0 = hc_bf16_view(w0, stream, 0, cls);
+    out1 = hc_bf16_view(w1, stream, 1, cls);
+    return out0 != nullptr && out1 != nullptr;
 }
 
 void NativeDense::hc_bf16_release(void* stream, int slot, int cls) {
@@ -551,5 +591,18 @@ void NativeDense::hc_bf16_release(void* stream, int slot, int cls) {
     if (cls != 0 || slot < 0 || slot > 1 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || g_hc_ev[dev][slot] == nullptr) return;
     cudaEventRecord(g_hc_ev[dev][slot], (cudaStream_t) stream);
     g_hc_ev_set[dev][slot] = true;
+    g_hc_ev_stream[dev][slot] = stream;
+}
+
+void NativeDense::hc_bf16_release_pair(void* stream, int cls) {
+    int dev = 0;
+    if (cls != 0 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return;
+    for (int slot = 0; slot < 2; ++slot) {
+        if (g_hc_ev[dev][slot] != nullptr) {
+            cudaEventRecord(g_hc_ev[dev][slot], (cudaStream_t) stream);
+            g_hc_ev_set[dev][slot] = true;
+            g_hc_ev_stream[dev][slot] = stream;
+        }
+    }
 }
 } // namespace strata::core

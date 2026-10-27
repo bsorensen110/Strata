@@ -585,18 +585,25 @@ bool prompt_f16() {
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDev) { (void) hipGetLastError(); return false; }
     if (const int8_t c = cached[dev].load(std::memory_order_relaxed)) return c == 2;
-    // Opt-in (#835): only STRATA_HIP_PROMPT_F16=1 turns it on.  It changes the prompt path's numbers (an FP16 rounding of
-    // each 16-bit GEMM's output), so no card gets it unasked.  On gfx103x it is ~2x faster, so we say so once.
+    // Opt-in (#835): preserve the historical first-character `1` check for all-device FP16; `all` is a new explicit
+    // alias. `gfx103x` selects FP16 only on RDNA2 devices, leaving other architectures on BF16 for mixed layer splits.
     const char* e = std::getenv("STRATA_HIP_PROMPT_F16");
-    const bool on = e != nullptr && e[0] == '1';
     hipDeviceProp_t p{};
     if (hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); p.gcnArchName[0] = 0; }
-    if (on) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=1: the prompt's 16-bit GEMMs run FP16 in and out "
+    const bool gfx103x = std::strncmp(p.gcnArchName, "gfx103", 6) == 0;
+    // The upstream parser accepted any nonempty value beginning with `1`; retain that undocumented behavior.
+    const bool all = e != nullptr && (e[0] == '1' || std::strcmp(e, "all") == 0);
+    const bool gfx103x_only = e != nullptr && std::strcmp(e, "gfx103x") == 0;
+    const bool on = all || (gfx103x_only && gfx103x);
+    if (on) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=%s: the prompt's 16-bit GEMMs run FP16 in and out "
                                  "(rocBLAS is tuned only for that on gfx103x; not bit-identical to the default)%s",
-                         dev, p.gcnArchName[0] ? " " : "", p.gcnArchName, "\n");
-    else if (e == nullptr && std::strncmp(p.gcnArchName, "gfx103", 6) == 0)
-        std::fprintf(stderr, "strata prefill: HIP device %d %s - tip: STRATA_HIP_PROMPT_F16=1 reads long prompts about 2x faster here "
-                             "(FP16 prompt GEMMs, rocBLAS is tuned only for FP16 on gfx103x; the numbers differ slightly, see docs/AMD_HIP.md)%s",
+                         dev, p.gcnArchName[0] ? " " : "", p.gcnArchName, e, "\n");
+    else if (gfx103x_only)
+        std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=gfx103x ignored; this device keeps BF16\n",
+                     dev, p.gcnArchName[0] ? " " : "", p.gcnArchName);
+    else if (e == nullptr && gfx103x)
+        std::fprintf(stderr, "strata prefill: HIP device %d %s - tip: STRATA_HIP_PROMPT_F16=gfx103x selects FP16 prompt GEMMs here "
+                             "(rocBLAS is tuned only for FP16 on gfx103x; results differ slightly, see docs/AMD_HIP.md)%s",
                      dev, p.gcnArchName, "\n");
     cached[dev].store(on ? 2 : 1, std::memory_order_relaxed);
     return on;
@@ -627,21 +634,7 @@ const uint16_t* Gemm::unpad_x(const uint16_t* X, int64_t T, int64_t K, int64_t l
     return unpadded_x_;
 }
 
-bool gemm_dequant_side() {
-#if defined(__HIPCC__)
-    return false;
-#else
-    static const bool on = [] { const char* v = std::getenv("STRATA_DEQUANT_SIDE"); return v && v[0] == '1'; }();
-    return on;
-#endif
-}
-
 Gemm::~Gemm() {
-    for (void* e : side_ready_)
-        if (e) (void) cudaEventDestroy((cudaEvent_t) e);
-    for (void* e : side_free_)
-        if (e) (void) cudaEventDestroy((cudaEvent_t) e);
-    if (side_stream_) (void) cudaStreamDestroy((cudaStream_t) side_stream_);
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
     delete static_cast<strata::prefill::mmq::Context*>(mmq_ctx_);
     if (mmq_buf_) cudaFree(mmq_buf_);
@@ -699,38 +692,6 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, siz
         state->workspace_bytes = ws_bytes;
     }
 #endif
-}
-
-bool Gemm::set_dequant_side(uint16_t* scratch2, std::string& err) {
-    side_scratch_ = scratch2;
-    side_cur_ = 0;
-    if (scratch2 == nullptr) return true;
-    if (side_stream_ == nullptr) {   // once: the stream and the four events outlive every rebind
-        cudaStream_t s = nullptr;
-        if (const cudaError_t e = cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking); e != cudaSuccess) {
-            err = std::string("prefill gemm: dequant side stream: ") + cudaGetErrorString(e);
-            side_scratch_ = nullptr;
-            return false;
-        }
-        side_stream_ = s;
-        for (int i = 0; i < 2; ++i) {
-            cudaEvent_t r = nullptr, f = nullptr;
-            const bool made = cudaEventCreateWithFlags(&r, cudaEventDisableTiming) == cudaSuccess &&
-                              cudaEventCreateWithFlags(&f, cudaEventDisableTiming) == cudaSuccess;
-            side_ready_[i] = r;   // kept even on a failure: the destructor frees what was made
-            side_free_[i] = f;
-            if (!made) {
-                err = "prefill gemm: dequant side events";
-                side_scratch_ = nullptr;
-                return false;
-            }
-        }
-    }
-    // both scratches are free once what the compute stream holds now is done (a rebind follows a stream sync, so
-    // this is belt and braces; a wait on an event never recorded would pass anyway)
-    for (int i = 0; i < 2; ++i)
-        (void) cudaEventRecord((cudaEvent_t) side_free_[i], (cudaStream_t) stream_);
-    return true;
 }
 
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
@@ -1402,24 +1363,6 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
             strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
             f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
         }
-        // the side stream's next dequant into scratch_ waits for these slices' reads and writes of it
-        if (side_scratch_) (void) cudaEventRecord((cudaEvent_t) side_free_[0], (cudaStream_t) stream_);
-        return;
-    }
-    if (side_scratch_) {
-        // STRATA_DEQUANT_SIDE: the dequant on the side stream, into the scratch the compute stream read last but one.
-        // free[cur] -> dequant -> ready[cur] -> GEMM -> free[cur] orders the dequant after the GEMM that last read
-        // this scratch and the GEMM after the dequant that filled it, so every read and write of a scratch is where
-        // the serial form had it - the same kernels, the same bits - and the dequant runs while the kernels queued
-        // ahead of this GEMM do.
-        uint16_t* const s = side_cur_ == 0 ? scratch_ : side_scratch_;
-        (void) cudaStreamWaitEvent((cudaStream_t) side_stream_, (cudaEvent_t) side_free_[side_cur_], 0);
-        strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, s, side_stream_);
-        (void) cudaEventRecord((cudaEvent_t) side_ready_[side_cur_], (cudaStream_t) side_stream_);
-        (void) cudaStreamWaitEvent((cudaStream_t) stream_, (cudaEvent_t) side_ready_[side_cur_], 0);
-        f16(X, s, Y, T, N, K, ldy, beta);
-        (void) cudaEventRecord((cudaEvent_t) side_free_[side_cur_], (cudaStream_t) stream_);
-        side_cur_ ^= 1;
         return;
     }
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);

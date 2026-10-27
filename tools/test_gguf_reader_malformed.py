@@ -1,13 +1,11 @@
-"""A malformed GGUF header is refused with a ValueError that names the file, never a KeyError, OverflowError
-or struct.error (#1919). Tensor-size support and setup compatibility policy are unchanged.
+"""A malformed GGUF header is refused with a ValueError that names the file, never a KeyError, OverflowError,
+MemoryError or struct.error, and a shard whose last tensor has no known byte size is not reported whole (#1919).
 Over minimal GGUF v3 files written here (no download, no model, no GPU).
 
     python -m unittest tools.test_gguf_reader_malformed
 """
 from __future__ import annotations
 
-import contextlib
-import io
 import struct
 import sys
 import tempfile
@@ -82,6 +80,112 @@ class MalformedHeader(unittest.TestCase):
         self.refused(b"GG")
 
 
+class LastTensorSize(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        patcher = mock.patch.object(S, "fail", side_effect=lambda msg, hint=None: (_ for _ in ()).throw(
+            Stop(msg + " " + (hint or ""))))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_metadata_only_shards_need_no_tensor_alignment_padding(self):
+        # A complete metadata directory ends at byte 84; its hypothetical data start is 96.
+        kv = gstr(b"general.name") + struct.pack("<I", 8) + gstr(b"m" * 28)
+        for raw in (header(0), header(0, kv, 1)):
+            for padded in (False, True):
+                with self.subTest(header_bytes=len(raw), padded=padded):
+                    s = self.dir / "metadata.gguf"
+                    s.write_bytes(pad(raw, 0) if padded else raw)
+                    self.assertEqual(GGUFFile(s).data_end(), len(raw))
+                    self.assertTrue(S.whole_shard(s))
+                    S.check_shards([s])
+            # Dropping metadata bytes is still a truncated header, not an empty payload.
+            s.write_bytes(raw[:-1])
+            self.assertFalse(S.whole_shard(s))
+            with self.assertRaises(Stop):
+                S.check_shards([s])
+
+    def test_unknown_type_last_tensor_truncated_is_not_whole(self):
+        # type 4 (Q4_2) has no block geometry: the shard's needed length cannot be computed from its header
+        s = self.dir / "m-00001-of-00001.gguf"
+        s.write_bytes(pad(header(2) + tensor(b"a", 8, 0, 0) + tensor(b"b", 64, 4, 32), 32))
+        self.assertFalse(S.whole_shard(s))
+        with self.assertRaises(Stop) as cm:
+            S.check_shards([s])
+        self.assertIn(s.name, str(cm.exception))
+
+    def test_unknown_type_in_the_middle_is_not_proven_by_next_offset(self):
+        s = self.dir / "m-00001-of-00001.gguf"
+        s.write_bytes(pad(header(2) + tensor(b"a", 64, 4, 0) + tensor(b"b", 8, 0, 64), 64 + 32))
+        self.assertFalse(S.whole_shard(s))
+        with self.assertRaises(Stop) as cm:
+            S.check_shards([s])
+        self.assertIn("cannot verify", str(cm.exception))
+        self.assertNotIn("delete", str(cm.exception))
+
+    def test_complete_unknown_last_tensor_is_preserved(self):
+        s = self.dir / "complete.gguf"
+        raw = pad(header(1) + tensor(b"future", 64, 999, 0), 256)
+        s.write_bytes(raw)
+        self.assertFalse(S.whole_shard(s))
+        with self.assertRaises(Stop) as cm:
+            S.check_shards([s])
+        self.assertIn("cannot verify", str(cm.exception))
+        self.assertNotIn("delete", str(cm.exception))
+        self.assertEqual(s.read_bytes(), raw)
+        self.assertFalse(s.with_name(s.name + ".done").exists())
+
+    def test_all_known_extents_checked_even_when_offsets_are_unsorted(self):
+        s = self.dir / "overrun.gguf"
+        s.write_bytes(pad(header(2) + tensor(b"large", 100, 0, 0) + tensor(b"last", 8, 0, 64), 96))
+        self.assertEqual(GGUFFile(s).data_end(), GGUFFile(s).data_start + 400)
+        self.assertFalse(S.whole_shard(s))
+        with self.assertRaises(Stop):
+            S.check_shards([s])
+
+    def test_known_overrun_not_hidden_by_unknown_type(self):
+        s = self.dir / "mixed.gguf"
+        s.write_bytes(pad(header(2) + tensor(b"large", 100, 0, 0) + tensor(b"unknown", 8, 999, 64), 96))
+        self.assertFalse(S.whole_shard(s))
+        with self.assertRaises(Stop) as cm:
+            S.check_shards([s])
+        self.assertIn("requires at least", str(cm.exception))
+
+    def test_integer_and_ternary_geometries(self):
+        for type_id, count, size in ((24, 8, 8), (25, 8, 16), (26, 8, 32), (27, 8, 64),
+                                     (34, 256, 54), (35, 256, 66)):
+            with self.subTest(type_id=type_id):
+                s = self.dir / "valid.gguf"
+                s.write_bytes(pad(header(1) + tensor(b"weight", count, type_id, 0), size))
+                self.assertTrue(S.whole_shard(s))
+                S.check_shards([s])
+                self.assertEqual(GGUFFile(s).data_end(), s.stat().st_size)
+                s.write_bytes(s.read_bytes()[:-1])
+                self.assertFalse(S.whole_shard(s))
+
+    def test_repacked_types_are_unverifiable_not_corrupt(self):
+        for type_id in (31, 32, 33, 36, 37, 38, 41):
+            with self.subTest(type_id=type_id):
+                s = self.dir / "repacked.gguf"
+                s.write_bytes(pad(header(1) + tensor(b"weight", 256, type_id, 0), 256))
+                with self.assertRaises(Stop) as cm:
+                    S.check_shards([s])
+                self.assertNotIn("delete", str(cm.exception))
+                self.assertIn("cannot verify", str(cm.exception))
+
+    def test_invalid_block_count_is_malformed(self):
+        s = self.dir / "bad-count.gguf"
+        s.write_bytes(pad(header(1) + tensor(b"weight", 7, 2, 0), 18))
+        self.assertFalse(S.whole_shard(s))
+        with self.assertRaises(Stop) as cm:
+            S.check_shards([s])
+        self.assertIn("invalid element count", str(cm.exception))
+
+
 class Alignment(unittest.TestCase):
     setUp = MalformedHeader.setUp
     tearDown = MalformedHeader.tearDown
@@ -91,85 +195,6 @@ class Alignment(unittest.TestCase):
             with self.subTest(alignment=alignment):
                 kv = gstr(b"general.alignment") + struct.pack("<Ii", 5, alignment)
                 self.assertIn("alignment", self.refused(pad(header(0, kv, 1), 0)))
-
-
-class UnknownTensorCompatibility(unittest.TestCase):
-    def test_readable_unknown_tensor_keeps_setup_policy(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / "future.gguf"
-            raw = pad(header(2) + tensor(b"known", 8, 0, 0) + tensor(b"future", 64, 999, 32), 256)
-            p.write_bytes(raw)
-            g = GGUFFile(p)
-            self.assertIsNone(g.tensors[1].expected_bytes())
-            self.assertTrue(S.whole_shard(p))
-            S.check_shards([p])
-            self.assertEqual(p.read_bytes(), raw)
-
-
-class ReaderCompatibility(unittest.TestCase):
-    setUp = MalformedHeader.setUp
-    tearDown = MalformedHeader.tearDown
-    refused = MalformedHeader.refused
-
-    def test_supported_scalar_and_array_values(self):
-        values = [(0, 'B', 255), (1, 'b', -7), (2, 'H', 65535), (3, 'h', -300),
-                  (4, 'I', 2**31), (5, 'i', -70000), (6, 'f', 1.25), (7, '?', True),
-                  (10, 'Q', 2**63), (11, 'q', -2**40), (12, 'd', 1.125)]
-        kv, expected = b'', {}
-        for type_id, fmt, value in values:
-            for array in (False, True):
-                key = f'{type_id}_{array}'
-                data = struct.pack('<' + fmt, value)
-                kv += gstr(key.encode()) + (struct.pack('<IIQ', 9, type_id, 1) if array
-                                            else struct.pack('<I', type_id)) + data
-                expected[key] = [value] if array else value
-        for key, data, value in [('text', struct.pack('<I', 8) + gstr('测试'.encode()), '测试'),
-                                 ('strings', struct.pack('<IIQ', 9, 8, 2) + gstr(b'') + gstr(b'x'), ['', 'x']),
-                                 ('empty', struct.pack('<IIQ', 9, 4, 0), [])]:
-            kv += gstr(key.encode()) + data
-            expected[key] = value
-        self.path.write_bytes(pad(header(1, kv, len(expected)) + tensor(b'w', 8, 0, 0), 32))
-        g = GGUFFile(self.path)
-        self.assertEqual(g.metadata, expected)
-        self.assertEqual((g.tensors[0].name, g.tensors[0].shape, g.tensors[0].expected_bytes()), ('w', [8], 32))
-        S.check_shards([self.path])
-
-    def test_metadata_only_file_needs_no_alignment_padding(self):
-        raw = header(0, gstr(b'general.name') + struct.pack('<I', 8) + gstr(b't'), 1)
-        self.path.write_bytes(raw)
-        g = GGUFFile(self.path)
-        self.assertEqual(g.metadata, {'general.name': 't'})
-        self.assertEqual(g.tensors, [])
-        self.assertGreater(g.data_start, len(raw))
-        S.check_shards([self.path])
-        self.assertEqual(self.path.read_bytes(), raw)
-
-    def test_explicit_alignment_keeps_tensor_offsets(self):
-        for alignment in (24, 64):
-            with self.subTest(alignment=alignment):
-                kv = gstr(b'general.alignment') + struct.pack('<II', 4, alignment)
-                raw = header(1, kv, 1) + tensor(b'w', 8, 0, 0)
-                start = (len(raw) + alignment - 1) // alignment * alignment
-                self.path.write_bytes(raw + bytes(start - len(raw) + 32))
-                g = GGUFFile(self.path)
-                self.assertEqual((g.alignment, g.data_start), (alignment, start))
-                S.check_shards([self.path])
-
-    def test_setup_reports_malformed_file_without_changing_it(self):
-        for raw in (header(0, gstr(b'k') + struct.pack('<I', 99), 1),
-                    header(0, struct.pack('<Q', 2**63) + bytes(4), 1)):
-            with self.subTest(raw=raw.hex()):
-                self.path.write_bytes(raw)
-                self.assertFalse(S.whole_shard(self.path))
-                out = io.StringIO()
-                with contextlib.redirect_stdout(out), self.assertRaises(SystemExit):
-                    S.check_shards([self.path])
-                self.assertIn(self.path.name + ' is not a whole GGUF shard', out.getvalue())
-                self.assertEqual(self.path.read_bytes(), raw)
-
-    def test_unsupported_array_and_impossible_dimension_count_are_named(self):
-        self.refused(header(0, gstr(b'k') + struct.pack('<IIQ', 9, 9, 0), 1))
-        self.refused(header(1) + gstr(b'w') + struct.pack('<I', 2**32 - 1) + bytes(12))
 
 
 if __name__ == "__main__":

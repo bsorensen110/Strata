@@ -18,6 +18,23 @@ a `--serve` engine, with a layer split, with helper caches on other GPUs, with a
 (NVIDIA only). If the driver offers no virtual memory management the start fails with an error naming it **(code)**.
 Without the flag nothing changes: the same answers as without it.
 
+The engine also has an experimental, request-scoped use of this cache. `STRATA_PREFILL_ELASTIC_LOAN=1` in the
+config's `env` grows the cache for prompt processing and shrinks it before the first output window.
+`STRATA_PREFILL_MTP_LOAN=1` delays the MTP routed experts and draft head until that boundary, and
+`STRATA_PREFILL_HEAD_LOAN=1` can delay the native output head and verifier too.
+`STRATA_PREFILL_RETAIN_STARTUP_CHUNK=1` applies only to the first prompt while those weights are still deferred;
+later conversation turns grow the cache again before their prompt. `STRATA_PREFILL_REPEAT_LOAN=1` (also requiring
+the MTP and head loans) repeats that release on later prompts whose unread portion is at least 1,024 tokens;
+`STRATA_PREFILL_REPEAT_MIN_TOKENS` changes that threshold (minimum 256). The repeat arm invalidates and recaptures
+decode graphs because they contain the released device addresses, then reloads the head and MTP resources before
+generation. It is intentionally manual and rejects batch/shared drafters. These are manual switches: `--vram-elastic`
+alone never activates them. The engine refuses them with batch slots, pipeline windows, a layer split, helper GPU
+caches, `--peer-device`, `--prefill-head-alias`, HIP, or a segment below 64 MiB.
+
+The repeat arm retries a prompt-resource carve in smaller 256-token steps if allocator-page overhead makes the selected
+borrowed region slightly short. On small cards, a smaller manual `--vram-segment-mib` (for example 128 instead of the
+512-MiB default) can also let the cache grow in finer increments between the prompt and decode boundaries.
+
 ## The request
 
 ```
@@ -92,6 +109,17 @@ expert outside the cache), but I have not run a fault-injection test of these tw
    where the adaptive tier already brought an expert back, the layer's most-routed missing expert takes the slot **(code)**.
    Check `expert_cache_mib` against `expert_cache_full_mib` to know it is whole again.
 
+## With `--kv-grow`
+
+`--vram-elastic` with `--kv-grow` keeps `--kv-grow`'s cache: one address range of 2 MiB chunks, not segments. A shrink
+takes its VRAM where the K/V grows into, the slots just below the prompt path's loan (the loan is not touched, so the
+prompt chunk stays as it is): those slots give up their experts - a hotter one there first moves into the slot of the
+coldest expert in the loan region, as for the K/V - and their chunks go to the driver instead of to the K/V. A grow maps
+new chunks there and fills those slots with the profile's hottest experts the GPU does not hold, so after a grow the
+cache holds what the K/V's trim would leave, not necessarily the experts the shrink took (unlike the segments above,
+which put the same experts back). The K/V keeps growing while the cache is shrunk: it takes slots from the cache, not
+the reserve. `expert_slots` counts the slots that hold experts; `expert_cache_mib` the chunks mapped **(code)**.
+
 ## Unload, restart and crash
 
 - The server remembers the last `reserve_mib` **in memory** and sends it again after the engine has started again
@@ -107,6 +135,12 @@ expert outside the cache), but I have not run a fault-injection test of these tw
 
 ## The image encoder on demand
 
+For a CPU encoder, set `"gpu": false` and `"elastic": true` in the existing `"vision"` section. It starts with the
+first picture and stops after `"elastic_idle_s"` (default 120) without one, between requests. Text requests do not
+start it. CPU on-demand loading needs no `"vram_elastic"`, reserves no VRAM and leaves the expert cache alone.
+The next picture pays the encoder's load time again; unloading ends its process, but the OS may keep reclaimable
+file-cache pages. Without `"elastic": true`, startup is unchanged.
+
 With `"elastic": true` in the config's `"vision"` section (and `"vram_elastic": true`; without it the server says so
 and starts the encoder with the model, as before) the GPU encoder is not started with the server or with a load:
 
@@ -116,6 +150,10 @@ and starts the encoder with the model, as before) the GPU encoder is not started
   without `--vram-elastic`, a layer split) it starts anyway, as a non-elastic encoder would, and the log says why; on a
   layer split the server says at start that the encoder's VRAM has to be kept free with `--vram-reserve-mib`. An
   encoder that fails to start (out of VRAM) ends the request with a `503`; the next picture tries again.
+- **Pictures the hash cache already knows never wake it**: the cache and its `.sve` files survive a stop, and most
+  clients re-send the conversation's pictures on every turn - such a turn (every picture a hit, elastic only) takes
+  neither the FIFO turn nor a start **(code; `serve/test_vision_cache_wake.py`)**. A turn with one picture the cache
+  lacks takes both, for all of its pictures.
 - **Idle** for `"elastic_idle_s"` (default 120) without a picture: a thread stops the encoder between requests and
   sends `VRAM` with that reserve again, so the cache grows back to the size it had (0, not the start's reserve: that
   would leave it a segment or more smaller).
@@ -124,10 +162,19 @@ and starts the encoder with the model, as before) the GPU encoder is not started
 - An unload of the model stops the encoder too. The log lines start with `[strata] images:` **(code; the unit tests in
   `serve/test_vision_elastic.py` pin each case)**.
 
-`--vram-elastic` turns `--kv-grow` off (the engine says so at start): with both asked, the whole K/V is in VRAM.
+With `--kv-grow` too, the encoder's share is taken where the K/V grows into ([With `--kv-grow`](#with---kv-grow)), and
+the K/V keeps growing while the encoder runs.
 
 ## What to build on
 
 For automation: treat only `200` with `status: "ok"` as a call that ran, then check `vram_free_mib >= reserve_mib`
 yourself; retry a `409` later; on `503` or a `400` from the failure paths above, unload and load; keep your own record
 of what you asked for, because a server restart forgets it.
+
+## HIP runtime safety
+
+On Linux, HIP virtual memory is enabled only after a per-device startup probe. It requires a recommended
+allocation granularity of at least 2 MiB, checks that mapped VRAM is returned after release, and checks the
+open-file limit needed by ROCm physical allocations. The soft limit is raised only up to the hard limit.
+A failed probe disables the opt-in path with a reason, retaining a single-allocation cache. Windows HIP
+elastic resizing remains disabled. Without either opt-in, this probe is not called.

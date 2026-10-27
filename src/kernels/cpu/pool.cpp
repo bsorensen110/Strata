@@ -9,7 +9,7 @@
 #include <atomic>
 #include <cmath>
 #include <chrono>
-#include "strata/platform/cpu_relax.hpp"
+#include <immintrin.h>
 #if defined(_MSC_VER)
 #include <intrin.h>   // __cpuidex, __rdtsc (STRATA_POOL_UMWAIT)
 #endif
@@ -848,6 +848,8 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
+    hold_.reset(new std::atomic<bool>[(size_t) n_]);
+    for (int i = 0; i < n_; ++i) hold_[(size_t) i].store(false);
     hstate_ms_.store(now_ms());
     g_diag_pool.store(this);
     strata::core::diag_pool_fn().store(&diag_active_pool);
@@ -955,7 +957,20 @@ ExpertPool::~ExpertPool() {
     stop_.store(true, std::memory_order_release);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
     publish();
+    {   // and a HELD one (set_hold)
+        std::lock_guard<std::mutex> lk(hold_mu_);
+        hold_cv_.notify_all();
+    }
     for (auto& t : threads_) t.join();
+}
+
+int ExpertPool::set_hold(int n) {
+    n = (std::max)(0, (std::min)(n, n_ - 1));   // one worker always stays (and the host drains too)
+    std::lock_guard<std::mutex> lk(hold_mu_);
+    for (int i = 0; i < n_; ++i) hold_[(size_t) i].store(i >= n_ - n, std::memory_order_release);
+    held_ = n;
+    hold_cv_.notify_all();
+    return n;
 }
 
 void ExpertPool::publish() {
@@ -1010,7 +1025,7 @@ void ExpertPool::worker(int id) {
             } else
 #endif
             {
-                strata_cpu_pause();
+                _mm_pause();
                 if ((++spins & 1023u) != 0) continue;
             }
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
@@ -1026,6 +1041,19 @@ void ExpertPool::worker(int id) {
         if (stop_.load(std::memory_order_acquire)) return;
         // acquire: the batch this epoch published (`head`, and the description before it) is visible from here
         seen = epoch_.load(std::memory_order_acquire);
+        if (hold_[(size_t) id].load(std::memory_order_acquire)) {
+            // set_hold: sit this batch (and every next one) out, asleep and still counted as parked, so the batch's
+            // other claimants finish it and wait_parked() sees n_; woken by set_hold(0) or the destructor
+            std::unique_lock<std::mutex> lk(hold_mu_);
+            wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
+            hold_cv_.wait(lk, [&] {
+                return !hold_[(size_t) id].load(std::memory_order_acquire) || stop_.load(std::memory_order_relaxed);
+            });
+            wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
+            if (stop_.load(std::memory_order_acquire)) return;
+            seen = epoch_.load(std::memory_order_acquire);   // what was published meanwhile is the others' batch
+            continue;
+        }
         parked_of(id).fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
 
         // Drain: one claim per iteration, so a slow worker takes fewer experts and a fast one takes more.
@@ -1131,7 +1159,7 @@ void ExpertPool::wait_parked(const char* what) {
     uint32_t spins = 0;
     std::chrono::steady_clock::time_point t0{};
     while (parked_count() != (uint32_t) n_) {
-        strata_cpu_pause();
+        _mm_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u) t0 = now;
@@ -1158,7 +1186,7 @@ void ExpertPool::wait_done(int n) {
         else
             d = done_.load(std::memory_order_acquire);
         if (d >= (uint32_t) n) return;                                // `>=`: never a wait that an overshoot outlives
-        strata_cpu_pause();
+        _mm_pause();
         if ((++spins & 1023u) != 0) continue;
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
@@ -1231,10 +1259,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    if (narithmetic_ == NativeArithmetic::WindowInvariant)
-                        native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                    else
-                        native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    const auto gu = narithmetic_ == NativeArithmetic::WindowInvariant ? native_gu_rows_invariant : native_gu_rows;
+                    gu(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
                 } else if (q2_native_kernels(nfmt->d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const ActQ* a2[MAXT];
@@ -1244,10 +1270,8 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 } else {
                     const void* hq[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    if (narithmetic_ == NativeArithmetic::WindowInvariant)
-                        native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                    else
-                        native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    const auto down = narithmetic_ == NativeArithmetic::WindowInvariant ? native_down_rows_invariant : native_down_rows;
+                    down(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
                 }
                 g += l1 - l0;
             }
@@ -1283,11 +1307,12 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     }
 }
 
-void ExpertPool::run_phase(int mode, int n_tasks) {
+void ExpertPool::run_phase(int mode, int n_tasks, const std::function<void()>* aside) {
     wait_parked("before a phase");
     mode_ = mode;
     njobs_ = n_tasks;
     const uint32_t e = begin_batch(n_tasks);
+    if (aside != nullptr && *aside) (*aside)();   // the workers are on the tasks already; the host joins them after this
     if (host_works_) drain(-1, host_scratch_, e);
     wait_done(n_tasks);
     wait_parked("after a phase");
@@ -1363,7 +1388,12 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 }
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic) {
-    if (n <= 0) return;
+    run_split_multi_native(f, jobs, n, std::function<void()>(), arithmetic);
+}
+
+void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, const std::function<void()>& aside,
+                                        NativeArithmetic arithmetic) {
+    if (n <= 0) { if (aside) aside(); return; }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
@@ -1374,7 +1404,7 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, nb) : phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();
-        run_phase(5, mtasks_);
+        run_phase(5, mtasks_, b0 == 0 ? &aside : nullptr);
         const auto b = std::chrono::steady_clock::now();
         for (int e = 0; e < nb; ++e)
             for (int t = 0; t < mjobs_[e].nt; ++t)
@@ -1415,7 +1445,7 @@ void ExpertPool::run(ExpertJob* jobs, int n) {
 
     // ---- **THE HOST DRAINS TOO (R2.2), INSTEAD OF SPINNING ON `done_`.**
     //
-    // The loop below used to be `while (done_ != n) strata_cpu_pause();`.  The host is pinned to core 0 - the core
+    // The loop below used to be `while (done_ != n) _mm_pause();`.  The host is pinned to core 0 - the core
     // `physical_cores(true)` deliberately keeps the five workers off - so for the whole drain that core was
     // idle while five cores did six cores' worth of work.  Measured before the change: 33.7 GB/s against
     // 5/6 x 44.14 = 36.8 for five workers and 44.14 for six.

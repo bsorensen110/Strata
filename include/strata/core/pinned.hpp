@@ -26,7 +26,8 @@ enum class PageBacking { LargePages, NormalPages, PinnedByCuda };
 
 /// #243: STRATA_ARENA_PIN_GIB, the cap on the expert arena's CUDA registration in GiB.  -1 when unset (the engine
 /// decides, as in 0.1.30), 0 = no cap (the whole arena, or as many slices as the driver takes), N > 0 = at most N GiB,
-/// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget).
+/// -2 for "auto" (Windows: the sliced pin stays below the GPU's shared-memory budget), -3 for "none"
+/// (nothing pinned: every streamed expert goes through the prompt path's staging ring; the A/B arm of an unpinned arena).
 int arena_pin_cap_gib();
 
 /// 153-igpu, UMA mode: the engine sets this on an integrated GPU whose firmware cannot survive a KFD queue eviction (the Radeon
@@ -41,6 +42,12 @@ inline std::atomic<bool>& arena_uma_no_register_flag() {
 /// True when the arena is to stay unregistered: STRATA_ARENA_PIN_GIB=none always, otherwise the flag above unless the user set
 /// STRATA_ARENA_PIN_GIB to a number (STRATA_ARENA_PIN_GIB=0 registers the whole arena as before).
 bool arena_no_register();
+
+/// #243: what a page-locked registration that CUDA device `dev` reads may pin on Windows: the shared (non-local) WDDM
+/// segment budget of its adapter (DXGI, found by cudaDeviceProp::luid) less this process's use of it less a margin
+/// (STRATA_PIN_MARGIN_GIB, default 4 GiB); without the DXGI numbers RAM/2 - 8 GiB.  False where there is no such
+/// budget (not Windows); `why` says where the number came from.
+bool shared_pin_limit_for(int dev, uint64_t& limit, std::string& why);
 
 struct PinnedArena {
     void* base = nullptr;
@@ -86,10 +93,16 @@ struct PinnedArena {
     /// Registers the deferred slices in order, publishing how many are done in `ready`, and INT_MAX once it
     /// returns (a slice CUDA refuses ends the registration, and the rest is kept resident by the working-set lock).
     void register_slices(std::atomic<int>& ready);
+    /// STRATA_ARENA_REUSE: record that a shared-file arena is now fully populated, by setting the header's
+    /// completion flag through the MAP_SHARED mapping (a no-op without a shared-file backing).  A later start
+    /// that finds the flag set (and the pack hash matching) attaches the arena instead of copying it again.
+    void mark_shared_complete();
     std::vector<uint64_t> bounds_;
     std::vector<uint64_t> slice_starts;
     void* mapping_base = nullptr;     ///< actual mapping start; differs from base when a shared-file header exists
     uint64_t mapping_bytes = 0;       ///< bytes to release from mapping_base
+    bool shared_existing = false;     ///< the shared-file backing was found on disk, not created by this call
+    bool shared_complete = false;     ///< its header's completion flag was set when it was found
     ~PinnedArena();
     PinnedArena(const PinnedArena&) = delete;
     PinnedArena& operator=(const PinnedArena&) = delete;
@@ -153,11 +166,13 @@ struct PadMap {
 /// arena under WDDM, even on large pages; a layer boundary inside a page puts that page in both registrations).
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
-                              const std::atomic<int>* ready = nullptr);
+                              const std::atomic<int>* ready = nullptr, uint64_t dst_bias = 0);
 /// (an overload, not a default argument: the SYCL build has its own pinned.dp.cpp that defines the signature above only)
+/// `dst_bias`: the file offset that maps to `dst[0]`.  The loader writes at `dst + layer_off[L] - dst_bias`, which lets a
+/// caller split one file across several allocations (the arena's blocks) without changing the offsets it seeks to.
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
-                              const std::atomic<int>* ready, const PadMap* pad);
+                              const std::atomic<int>* ready, const PadMap* pad, uint64_t dst_bias);
 
 /// The same ranges read UNBUFFERED straight into `dst` (Windows): no staging buffer and no file-cache copy - the
 /// drive's DMA lands where the experts live. Every range, `dst` and `chunk` must be 4 KiB aligned; returns ok =

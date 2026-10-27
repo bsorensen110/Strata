@@ -39,12 +39,27 @@ target_compile_definitions(mtl_rt PRIVATE
 target_link_libraries(mtl_rt PUBLIC "-framework Metal" "-framework Foundation")
 
 file(GLOB STRATA_METAL_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
-list(REMOVE_ITEM STRATA_METAL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_hello.cpp)
+list(REMOVE_ITEM STRATA_METAL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_hello.cpp
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/session_limits_test.cpp)
+list(REMOVE_ITEM STRATA_METAL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/window_cells_test.cpp)   # links the engine host library, not just mtl_rt
 foreach(src ${STRATA_METAL_TESTS})
   get_filename_component(t ${src} NAME_WE)
   add_executable(${t} ${src})
   target_link_libraries(${t} PRIVATE mtl_rt)
 endforeach()
+# Gyro's trellis experts: the Metal kernels against the CPU reference (scalar trellis rows, the Hadamard rotation)
+target_sources(tq_parity PRIVATE ${STRATA_ROOT}/src/kernels/cpu/tq_cpu.cpp ${STRATA_ROOT}/src/kernels/cpu/hadamard.cpp)
+target_include_directories(tq_parity PRIVATE ${STRATA_ROOT}/include)
+
+enable_testing()
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND)
+  add_test(NAME prompt_workspace_growth
+    COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_prompt_workspace.py"
+      --cxx "${CMAKE_OBJCXX_COMPILER}" --runtime "$<TARGET_FILE:mtl_rt>"
+      --build-dir "${CMAKE_BINARY_DIR}/prompt-workspace-test")
+  set_tests_properties(prompt_workspace_growth PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+endif()
 
 # ---- the device runtime and the engine (mac-design) ---------------------------------------------------------------
 set(METAL_CPP_DIR "" CACHE PATH "metal-cpp headers (https://developer.apple.com/metal/cpp/), e.g. metal-cpp_26")
@@ -108,9 +123,10 @@ file(GLOB STRATA_METAL_ENGINE_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_D
 add_library(strata_metal_host STATIC ${STRATA_METAL_HOST_SOURCES})
 target_include_directories(strata_metal_host PUBLIC ${STRATA_ROOT}/include ${S}/core ${STRATA_ROOT}/third_party/ggml
                            ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src ${STRATA_GGML_DIR}/ggml/src/ggml-cpu)
-target_compile_definitions(strata_metal_host PUBLIC STRATA_NATIVE_EXPERTS=1 STRATA_VERSION="0.1.52-metal")
+target_compile_definitions(strata_metal_host PUBLIC STRATA_NATIVE_EXPERTS=1 STRATA_VERSION="0.1.50-metal")
 target_compile_options(strata_metal_host PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations)
 target_link_libraries(strata_metal_host PUBLIC strata_gpu_metal ggml-cpu ggml-base)
+
 
 add_library(strata_metal_kernels STATIC ${STRATA_METAL_ENGINE_SOURCES})
 target_include_directories(strata_metal_kernels PRIVATE src ${STRATA_ROOT}/third_party/ggml)
@@ -120,5 +136,54 @@ target_compile_definitions(strata_metal_kernels PRIVATE
   STRATA_METAL_DATA_DEFAULT="${STRATA_ROOT}/data")
 target_link_libraries(strata_metal_kernels PUBLIC strata_metal_host mtl_rt)
 
-add_executable(strata ${S}/program/generate.cpp)
+# the park's repack shuffle, model-free (pure CPU; the engine libraries provide the symbol)
+add_executable(window_cells_test tests/window_cells_test.cpp)
+target_link_libraries(window_cells_test PRIVATE strata_metal_kernels)
+add_test(NAME window_cells_test COMMAND window_cells_test)
+
+add_executable(strata ${S}/program/generate.cpp ${S}/net/stage_link.cpp)   # (the remote stage, refused on Metal at start)
 target_link_libraries(strata PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
+
+# The host sampler (src/engine/host_sampler.cpp: the request's sampling over the window's head logits) against a serial
+# transcription of the CUDA sampler, draw for draw; --bench times it per row.  CPU only: no GPU, no model.  In its own
+# folder: tests/*.cpp above are the kernel tree's mtl_rt-only programs.
+add_executable(host_sampler_parity tests/engine/host_sampler_parity.cpp)
+target_link_libraries(host_sampler_parity PRIVATE strata_metal_kernels)
+add_test(NAME host_sampler_parity COMMAND host_sampler_parity)
+
+# The session file's read limits against the sizes the decode window saves (no GPU, no model)
+add_executable(session_limits_test tests/session_limits_test.cpp)
+target_link_libraries(session_limits_test PRIVATE strata_metal_kernels strata_metal_host strata_metal_kernels)
+add_test(NAME session_limits_test COMMAND session_limits_test)
+>
+# --dflash (opt-in): the DFlash2 drafter in place of the MTP layer, on Strata's own Metal kernels (src/engine/dflash.cpp).
+# STRATA_DFLASH=ON builds it.  STRATA_DFLASH_LLAMA (optional, implies STRATA_DFLASH): a shared build of STRATA_GGML_DIR
+# with GGML_METAL (cmake -S $STRATA_GGML_DIR -B <dir> -DGGML_METAL=ON -DLLAMA_BUILD_SERVER=OFF; its bin/ holds
+# libllama.dylib and the ggml dylibs) adds llama.cpp's DFLASH graph as a second backend (STRATA_DFLASH_NATIVE=0) and the
+# parity tests.  Neither set: --dflash is refused.
+option(STRATA_DFLASH "--dflash: the DFlash2 drafter (native Metal kernels)" OFF)
+set(STRATA_DFLASH_LLAMA "" CACHE PATH "llama.cpp Metal build dir (bin/libllama.dylib): --dflash's llama.cpp backend and parity tests")
+if(STRATA_DFLASH OR STRATA_DFLASH_LLAMA)
+  add_library(strata_dflash STATIC ${S}/spec/dflash_drafter.cpp)
+  target_include_directories(strata_dflash PRIVATE ${STRATA_ROOT}/include)
+  # the native backend lives in the engine's kernel library
+  target_link_libraries(strata_dflash PUBLIC strata_metal_kernels)
+  target_compile_definitions(strata PRIVATE STRATA_DFLASH=1)
+  target_link_libraries(strata PRIVATE strata_dflash)
+endif()
+if(STRATA_DFLASH_LLAMA)
+  if(NOT EXISTS "${STRATA_DFLASH_LLAMA}/bin/libllama.dylib")
+    message(FATAL_ERROR "STRATA_DFLASH_LLAMA='${STRATA_DFLASH_LLAMA}' has no bin/libllama.dylib")
+  endif()
+  # llama.h and llama-ext.h (the DFlash2 lattice) only: ggml's headers come through llama.h from the same checkout
+  target_include_directories(strata_dflash PRIVATE ${STRATA_GGML_DIR}/include ${STRATA_GGML_DIR}/src ${STRATA_GGML_DIR}/ggml/include)
+  target_compile_definitions(strata_dflash PRIVATE STRATA_DFLASH_LLAMA=1)
+  target_link_libraries(strata_dflash PUBLIC "${STRATA_DFLASH_LLAMA}/bin/libllama.dylib")
+  target_link_options(strata_dflash INTERFACE "LINKER:-rpath,${STRATA_DFLASH_LLAMA}/bin")
+  add_executable(dflash_drafter_test ${S}/spec/dflash_drafter_test.cpp)
+  target_include_directories(dflash_drafter_test PRIVATE ${STRATA_ROOT}/include)
+  target_link_libraries(dflash_drafter_test PRIVATE strata_dflash)
+  add_executable(dflash_native_parity_test ${S}/spec/dflash_native_parity_test.cpp)
+  target_include_directories(dflash_native_parity_test PRIVATE ${STRATA_ROOT}/include src)   # src: the reference reads the GGUF with gguf_lite / ref_quant
+  target_link_libraries(dflash_native_parity_test PRIVATE strata_dflash)
+endif()

@@ -13,6 +13,8 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/ep_mem.hpp"
+#include "strata/kernels/ep_kernels.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
@@ -34,6 +36,7 @@
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/qsa_decode_attn_multi.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/rope.hpp"
@@ -151,6 +154,16 @@ int pipe_helper_cpu() {
 }
 const bool g_no_multi_gr = env_on("STRATA_NO_MULTI_GR");   // #783 PR-g: per-token GR reads/writes and generic-T kernels again
 const bool g_no_batch_kv = env_on("STRATA_NO_BATCH_KV_STEP");   // #783 PR-d: per-token K/V and indexer appends again
+// STRATA_BATCH_QSA_ATTN=1 (opt-in): a batch window's QSA selection and attention per slot instead of per row - the
+// scores once per slot (its rows share its pooled keys), the top-k once for the window, the attention once for the
+// window over every slot's pools (qsa_decode_attn_multi).  Each kernel's work for a row reads only that row's q, step,
+// scores, selection and scratch, so the rows get the per-row calls' bits.
+const bool g_batch_qsa_attn = [] {
+    const bool on = env_on("STRATA_BATCH_QSA_ATTN");
+    if (on) std::fprintf(stderr, "strata verify: STRATA_BATCH_QSA_ATTN=1 (batch windows: QSA selection and attention "
+                                 "per slot; the same bits)\n");
+    return on;
+}();
 
 // The shared expert runs on its own stream, forked off and joined back per layer (`sh_fork` in record_window).  The
 // overlap pays off on CUDA, where it was added (cfd3b72).  On HIP a cross-stream event dependency costs more than the
@@ -416,6 +429,7 @@ Verifier::~Verifier() try {
     // that throws aborts the process (exit 139); the waits and frees below are best-effort then.
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);
+    ep_free();
     for (auto& slot : g_live) {
         Verifier* me = this;
         slot.compare_exchange_strong(me, nullptr);
@@ -716,7 +730,8 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
             bool all_ok = true;
             for (int64_t l = lb_; l < le_ && all_ok; ++l) {
                 for (int64_t e = 0; e < g.n_expert; ++e) {
-                    if (hits.h_res[l * g.n_expert + e] < 0) {
+                    const int64_t i = l * g.n_expert + e;
+                    if (hits.h_res[i] < 0 && !(ep_on() && ep_cfg_.h_res1 != nullptr && ep_cfg_.h_res1[i] >= 0)) {
                         all_ok = false;
                         break;
                     }
@@ -775,6 +790,7 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         */
         if (!ok2) {; all_resident_ = false; device_plan_ = false; }
     }
+    if (ep_on() && !ep_init(err)) return false;
     if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {   // SYCL port: the per-layer residual ladder (token 0)
         dbgR_ = (float*) sycl::malloc_device((size_t) g.n_layers * g.n_embd * 4, dpct::get_in_order_queue());
         dbgM_ = (float*) sycl::malloc_device((size_t) g.n_layers * g.n_embd * 4, dpct::get_in_order_queue());
@@ -829,7 +845,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
-    const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
+    const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // SYCL port, STRATA_VERIFY_EAGER=1: the window runs on the queue instead of as a graph, and each stage stamp is
     // a host-side wait + clock (there is no %globaltimer here), so the existing stage profiler reports ms per stage.
@@ -853,6 +870,11 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     auto slot_ss = [&](int t) -> SessionState& { return batch_rec_ ? *slots_[(size_t) brow_[t]] : ss; };
     const int hrow0 = batch_rec_ ? row_base_ : 0;   // a slot group's own hand-off rows
 
+    // expert parallelism: both cards' first node advances their window epoch (the flags of this window carry it)
+    if (ep_on()) {
+        ep_bump(ep_ctr0_, cs);
+        ep_bump(ep_ctr1_, ep_q_);
+    }
     // ---- the window's inputs, from mapped staging
     copy_i32_from_mapped(tok_, m_tok_, T, cs);
     copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, cs);
@@ -1244,6 +1266,32 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 }
                 }
                 stamp(l, 10, grp);
+                // opt-in (above): per slot, then once for the window.  A streamed K/V (kv_mode 1) keeps the per-row
+                // path, which makes each row's selected blocks resident just before that row attends.
+                const auto streamed = [&] {
+                    for (int t = tb; t < te; ++t)
+                        if (slot_ss(t).qsa_states[qi].kv_mode == 1) return true;
+                    return false;
+                };
+                if (g_batch_qsa_attn && batch_rec_ && !streamed()) {
+                    QsaAttnPools px[kVerifyMaxT];
+                    int rows[kVerifyMaxT], ng = 0;
+                    for (int t = tb; t < te;) {   // a slot's rows are contiguous
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        const QsaState& sx = slot_ss(first).qsa_states[qi];
+                        qsa_block_scores(sx.idx_pooled, sx.idx_dead, qidx_ + first * IQ * ID,
+                                         step_ + first * kStepCount, t - first, max_blocks_, s,
+                                         scores_ + (size_t) first * max_blocks_, cs);
+                        px[ng] = qsa_attn_pools(sx);
+                        rows[ng++] = t - first;
+                    }
+                    qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_,
+                                   cap_, s, sel_ + (size_t) tb * cap_, cs);
+                    qsa_decode_attn_multi(qcur_ + tb * NH * HD, px, rows, ng, sel_ + (size_t) tb * cap_,
+                                          step_ + tb * kStepCount, cap_, s,
+                                          attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, cs);
+                } else
                 if (batch_rec_) {   // each row selects and attends over its own slot's K/V
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
@@ -1340,7 +1388,13 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        if (ar_on()) {
+        static const bool ep_self = [] { const char* v = std::getenv("STRATA_EP_SELF"); return v && v[0] == '1'; }();
+        if (ar_on() && ep_on() && !ep_self && !ep_verify_) {   // expert parallelism: this card's entries only, the peer's are its own plan
+            resident_plan_ep(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert,
+                             ep_cfg_.res1_on0 + l * g.n_expert, 1, (int) g.n_expert, hits_.cache_base, slot_off_d_,
+                             (long long) hits_.blob, plan_ + (size_t) grp * (size_t) (plan_i32_ + 16),
+                             (long long) max_t_ * K, cs, m_plan_err_);
+        } else if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                           plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, nullptr, 0, cs, m_plan_err_);
@@ -1421,6 +1475,33 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             }
         } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
+        if (ar_on() && ep_on()) {
+            // expert parallelism: the ids and q8_1 rows go to the peer's inbox; the peer's graph waits for them, plans
+            // and computes its own entries and sends their rows with this ring's return flag (ep_send_rows), which
+            // post() waits for.  STRATA_EP_SELF=1 (a check, needs STRATA_EP_MIRROR=1): this card computes every entry.
+            const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
+            const size_t xq_bytes = (size_t) n * (N / 32) * 36;
+            uint8_t* slot0 = ep_inbox_on0_ + (size_t) grp * ep_slot_bytes_;
+            uint8_t* slot1 = ep_in1_ + (size_t) grp * ep_slot_bytes_;   // the inbox slot, copied past the caches
+            ep_push(ids_ + tb * K, n * (int) K, nat_xq_ + (size_t) tb * (N / 32) * 36, xq_bytes, (int32_t*) slot0,
+                    slot0 + ep_xq_off_, ep_inflag_on0_ + (size_t) ring * 16, ep_ctr0_, cs);
+            ep_wait(ep_inflag1_ + (size_t) ring * 16, ep_ctr1_, ep_spin_, ep_err1_, ring, ep_q_);
+            ep_copy_uncached(slot1, ep_inbox1_ + (size_t) grp * ep_slot_bytes_, ep_xq_off_ + xq_bytes, ep_q_);
+            const int64_t capx = (int64_t) max_t_ * K, cap = (int64_t) n * K;
+            int32_t* pl1 = ep_plan1_ + (size_t) grp * (size_t) (plan_i32_ + 16);
+            resident_plan_ep((const int32_t*) slot1, (int) cap, (int) K, ep_cfg_.res0_on1 + l * g.n_expert,
+                             ep_cfg_.res1 + l * g.n_expert, 2, (int) g.n_expert, ep_cfg_.cache_base1, ep_cfg_.slot_off1,
+                             (long long) ep_cfg_.blob1, pl1, (long long) capx, ep_q_, ep_plan_err1_);
+            const int64_t ptr_off = ((4 + (capx + 1) + 2 * capx) + 1) & ~1ll;
+            const auto& f = strata::kernels::cpu::expert_layout().fmt[(size_t) l];
+            const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            native_expert_grouped(L, (const unsigned long long*) (pl1 + ptr_off), pl1 + 4, pl1, pl1 + 4 + capx + 1,
+                                  pl1 + 4 + capx + 1 + capx, cap, cap, slot1 + ep_xq_off_, ep_scratch1_,
+                                  ep_rows1_ + (size_t) tb * K * N, ep_q_, 0);
+            ep_send_rows(ep_parts_on1_ + (size_t) tb * K * N, ep_rows1_ + (size_t) tb * K * N, (const int32_t*) slot1,
+                         ep_cfg_.res0_on1 + l * g.n_expert, (int) cap, N, ep_done1_, ep_ret_on1_ + (size_t) ring * 16,
+                         ep_ctr1_, ep_q_);
+        }
         stamp(l, 18, grp);
         return true;
     };
@@ -1466,6 +1547,14 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         if (ar_on()) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, parts_out);
+            static const bool ep_self = [] { const char* v = std::getenv("STRATA_EP_SELF"); return v && v[0] == '1'; }();
+            if (ep_on() && ep_verify_) {   // the check: this card computed every row; compare the peer's with them
+                ep_wait(ep_ret0_ + (size_t) ring * 16, ep_ctr0_, ep_spin_, ep_err0_, ring, cs);
+                ep_compare(parts_out, ep_rows0_ + (size_t) tb * K * N, ids_ + tb * K, hits_.d_res + l * g.n_expert,
+                           (int) cap, N, ep_err0_ + 8, cs);
+            } else if (ep_on() && !ep_self) {   // the peer's rows are in parts_ once its flag is up
+                ep_wait(ep_ret0_ + (size_t) ring * 16, ep_ctr0_, ep_spin_, ep_err0_, ring, cs);
+            }
             stamp(l, 20, grp);
         } else {
             if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
@@ -1692,7 +1781,8 @@ void Verifier::refresh_ar() {
     const int32_t* r = h_res_ + lb_ * ne;
     const int64_t n = (le_ < 0 ? g_->n_layers : le_) * ne - lb_ * ne;
     int32_t lo = 0;
-    for (int64_t i = 0; i < n; ++i) lo = std::min(lo, r[i]);
+    const int32_t* r1 = ep_on() && ep_cfg_.h_res1 != nullptr ? ep_cfg_.h_res1 + lb_ * ne : nullptr;
+    for (int64_t i = 0; i < n; ++i) lo = std::min(lo, r1 != nullptr && r[i] < 0 ? r1[i] : r[i]);   // the peer's count
     const bool off = lo < 0;
     if (off != ar_off_) {
         ar_off_ = off;
@@ -1749,6 +1839,114 @@ catch (sycl::exception const& exc) {
     return false;
 }
 
+// ---- SYCL port: expert parallelism (ep_kernels.hpp) ----------------------------------------------------------------
+bool Verifier::ep_init(std::string& err) {
+    const ModelGeometry& g = *g_;
+    const int64_t N = g.n_embd, K = ss_->k, MT = max_t_;
+    const int d0 = device_, d1 = ep_cfg_.device;
+    if (!strata::kernels::cpu::expert_layout().native) { err = "verify: expert parallel needs a native pack"; return false; }
+    if (!all_resident_) {
+        err = "verify: expert parallel: some experts are on neither card (every expert must be in one card's VRAM)";
+        return false;
+    }
+    if (d1 < 0 || d1 == d0 || ext_stream_ != nullptr) {   // not with pipelined windows
+        err = "verify: expert parallel needs a second card and no pipelined windows";
+        return false;
+    }
+    if (const char* v = std::getenv("STRATA_EP_SPIN_MAX")) ep_spin_ = (uint32_t) std::strtoul(v, nullptr, 10);
+    auto align = [](size_t b) { return (b + 255) / 256 * 256; };
+    ep_xq_off_ = align((size_t) MT * K * 4);
+    ep_slot_bytes_ = ep_xq_off_ + align((size_t) MT * (N / 32) * 36);
+    const size_t flag_bytes = (size_t) (g.n_layers * 2 + 2) * 64;   // a 64-byte line per ring (G <= 2)
+    auto* inbox = new EpRegion, *inflag = new EpRegion, *parts = new EpRegion, *ret = new EpRegion;
+    ep_inbox_ = inbox; ep_inflag_ = inflag; ep_parts_ = parts; ep_ret_ = ret;
+    if (!ep_region_alloc(d1, d0, 2 * ep_slot_bytes_, *inbox, err) || !ep_region_alloc(d1, d0, flag_bytes, *inflag, err) ||
+        !ep_region_alloc(d0, d1, (size_t) MT * K * N * 4, *parts, err) || !ep_region_alloc(d0, d1, flag_bytes, *ret, err))
+        return false;
+    ep_inbox1_ = (uint8_t*) inbox->local;   ep_inbox_on0_ = (uint8_t*) inbox->remote;
+    ep_inflag1_ = (uint32_t*) inflag->local; ep_inflag_on0_ = (uint32_t*) inflag->remote;
+    ep_ret0_ = (uint32_t*) ret->local;       ep_ret_on1_ = (uint32_t*) ret->remote;
+    ep_rows0_ = (float*) parts->local;       ep_parts_on1_ = (float*) parts->remote;
+    // the peer writes its rows straight into parts_; the two checks keep this card's own rows apart from them
+    static const bool self = [] { const char* v = std::getenv("STRATA_EP_SELF"); return v && v[0] == '1'; }();
+    if (!ep_verify_ && !self) parts_ = ep_rows0_;
+    ep_ctr0_ = sycl::malloc_device<uint32_t>(16, *cs_);
+    cs_->memset(ep_ctr0_, 0, 64).wait();
+    ep_err0_ = (uint32_t*) strata::host_malloc_polled(64, *cs_);
+    std::memset(ep_err0_, 0, 64);
+    {
+        const OnDevice on(d1);
+        ep_q_ = dpct::get_current_device().create_queue(true);
+        ep_ctr1_ = sycl::malloc_device<uint32_t>(16, *ep_q_);
+        ep_plan1_ = sycl::malloc_device<int32_t>((size_t) 2 * (plan_i32_ + 16), *ep_q_);
+        ep_in1_ = sycl::malloc_device<uint8_t>(2 * ep_slot_bytes_, *ep_q_);
+        ep_rows1_ = sycl::malloc_device<float>((size_t) MT * K * N, *ep_q_);
+        ep_done1_ = sycl::malloc_device<uint32_t>(16, *ep_q_);
+        if (ep_done1_ != nullptr) ep_q_->memset(ep_done1_, 0, 64).wait();
+        ep_scratch1_ = sycl::malloc_device<uint8_t>(strata::kernels::native_expert_scratch_bytes(MT * K, g.n_ff), *ep_q_);
+        ep_q_->memset(ep_ctr1_, 0, 64).wait();
+        ep_err1_ = (uint32_t*) strata::host_malloc_polled(64, *ep_q_);
+        ep_plan_err1_ = (uint32_t*) strata::host_malloc_polled(64, *ep_q_);
+        std::memset(ep_err1_, 0, 64);
+        std::memset(ep_plan_err1_, 0, 64);
+    }
+    if (ep_plan1_ == nullptr || ep_in1_ == nullptr || ep_rows1_ == nullptr || ep_done1_ == nullptr || ep_scratch1_ == nullptr || ep_ctr0_ == nullptr || ep_ctr1_ == nullptr) {
+        err = "verify: expert parallel: device buffers failed";
+        return false;
+    }
+    std::fprintf(stderr, "strata verify: expert parallel with card %d: the peer computes the experts this card does not hold "
+                         "(inbox %.1f KiB per group, spin bound %u)\n", d1, ep_slot_bytes_ / 1024.0, ep_spin_);
+    return true;
+}
+
+void Verifier::ep_free() {
+    if (!ep_on()) return;
+    try {
+        if (ep_q_ != nullptr) ep_q_->wait();
+        for (auto& x : ep_exec_) { delete x; x = nullptr; }
+        for (auto& kv : ep_exec_bm_) delete kv.second;
+        ep_exec_bm_.clear();
+        for (void** r : {&ep_inbox_, &ep_inflag_, &ep_parts_, &ep_ret_})
+            if (*r != nullptr) { ep_region_free(*(EpRegion*) *r); delete (EpRegion*) *r; *r = nullptr; }
+        if (ep_q_ != nullptr) {
+            for (void* p : {(void*) ep_ctr1_, (void*) ep_plan1_, (void*) ep_in1_, (void*) ep_rows1_, (void*) ep_done1_,
+                            (void*) ep_scratch1_})
+                if (p) sycl::free(p, *ep_q_);
+            for (uint32_t* p : {ep_err1_, ep_plan_err1_}) if (p) strata::host_free_polled(p, *ep_q_);
+        }
+        if (ep_ctr0_ != nullptr) sycl::free(ep_ctr0_, *cs_);
+        if (ep_err0_ != nullptr) strata::host_free_polled(ep_err0_, *cs_);
+    } catch (...) {}   // at process exit the context can already be gone (see ~Verifier)
+    ep_q_ = nullptr; ep_ctr0_ = ep_ctr1_ = nullptr; ep_plan1_ = nullptr; ep_in1_ = nullptr; ep_rows1_ = nullptr; ep_done1_ = nullptr; ep_scratch1_ = nullptr;
+    ep_err0_ = ep_err1_ = ep_plan_err1_ = nullptr;
+}
+
+bool Verifier::ep_check(std::string& err) {
+    // the peer's last node (a flag store) may still be in flight when this card's window is done: it is the only
+    // thing left on the peer's queue, so this wait is short
+    ep_q_->wait();
+    if (ep_verify_) {   // STRATA_EP_VERIFY: the peer's rows that differed from this card's own, per window and in all
+        static uint64_t total = 0, windows = 0, bad_windows = 0;
+        const uint32_t m = *(volatile uint32_t*) (ep_err0_ + 8);
+        *(volatile uint32_t*) (ep_err0_ + 8) = 0;
+        total += m; ++windows; bad_windows += m != 0;
+        if (m != 0 || (windows & 63) == 0)
+            std::fprintf(stderr, "strata verify: EP check: %u rows differ in this window; %llu rows in %llu of %llu windows\n",
+                         m, (unsigned long long) total, (unsigned long long) bad_windows, (unsigned long long) windows);
+    }
+    const uint32_t e0 = *(volatile uint32_t*) ep_err0_, e1 = *(volatile uint32_t*) ep_err1_,
+                   pe = *(volatile uint32_t*) ep_plan_err1_;
+    if (e0 == 0 && e1 == 0 && pe == 0) return true;
+    *(volatile uint32_t*) ep_err0_ = 0;
+    *(volatile uint32_t*) ep_err1_ = 0;
+    *(volatile uint32_t*) ep_plan_err1_ = 0;
+    char b[256];
+    std::snprintf(b, sizeof b, "verify: expert parallel: %s (ring %u / %u, plan error %u)",
+                  pe ? "the peer met an expert on neither card" : "a wait for the other card ran to its bound", e0, e1, pe);
+    err = b;
+    return false;
+}
+
 bool Verifier::capture(int T, std::string &err) try {
     // stepped mode: the doorbell window as segments; the all-resident (zero-doorbell) graph has no serves and is
     // captured whole below, its one host flag raised before launch (run)
@@ -1757,8 +1955,17 @@ bool Verifier::capture(int T, std::string &err) try {
         ar_off_ ? exec_nr_[T] : exec_[T];
     if (exec_t != nullptr) return true;
     if (std::getenv("STRATA_VERIFY_EAGER") != nullptr) return true;   // SYCL port: no graph, run() replays the body
+    if (ep_on() && ar_off_) {
+        err = "verify: expert parallel: an expert is on neither card (a prompt loan, a shrink or a swap)";
+        return false;
+    }
     if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
         err = "verify: begin capture failed";
+        return false;
+    }
+    // expert parallelism: the peer's half of the window records into a graph of its own on its queue
+    if (ep_on() && DPCT_CHECK_ERROR(dpct::experimental::begin_recording(ep_q_)) != 0) {
+        err = "verify: expert parallel: begin capture on the peer failed";
         return false;
     }
     std::string rerr;
@@ -1766,10 +1973,18 @@ bool Verifier::capture(int T, std::string &err) try {
     dpct::experimental::command_graph_ptr graph = nullptr;
     const dpct::err0 ce =
         DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs_, &graph));
-    if (!ok) {
+    dpct::experimental::command_graph_ptr graph1 = nullptr;
+    const dpct::err0 ce1 = ep_on() ? DPCT_CHECK_ERROR(dpct::experimental::end_recording(ep_q_, &graph1)) : 0;
+    if (!ok || ce1 != 0) {
         if (graph) delete (graph);
-        err = rerr;
+        if (graph1) delete (graph1);
+        err = !ok ? rerr : "verify: expert parallel: end capture on the peer failed";
         return false;
+    }
+    if (graph1 != nullptr) {
+        ep_exec_[T] = new sycl::ext::oneapi::experimental::command_graph<
+            sycl::ext::oneapi::experimental::graph_state::executable>(graph1->finalize());
+        delete graph1;
     }
     /*
     DPCT1000: Error handling if-stmt was detected but could not be rewritten.
@@ -2050,15 +2265,22 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         // started when it was launched behind that work still in flight on another queue (no GPU breadcrumb, 20 s
         // timeout, the engine dies). Letting the other queues drain before every window removes it (9 of 9 three-request runs pass; before, almost all
         // failed; the gap rule alone (=2) did not help, so it is the windows after each other, not only the first). The cost is
-        // the overlap of a window with the previous commit's tail.  STRATA_WINDOW_SYNC=1 always drains, =0 never, =2 the gap rule; the default is 1 on an i915 card, 0 elsewhere.
+        // the overlap of a window with the previous commit's tail.  STRATA_WINDOW_SYNC=1 always drains, =0 never, =2 the gap rule; the default is 1 on an i915 card, an Alchemist card and an integrated GPU, 0 elsewhere.
         // #2194: the same never-starting first window on an Arc A770 under xe (main thread in this function's stepped
         // serve, queue::wait, no xe reset) - an Alchemist card, whatever its driver. Reproduced on the A750 with
         // STRATA_WINDOW_SYNC=0 (stepped, --resident-experts, IQ3_XXS): 1 of 6 runs hung there (same stack), against 0 of 11
         // with the drain. So the default drain is per GPU generation now: every Alchemist card (i915 or xe), as before
         // every i915 card; Battlemage and the others are unchanged (0).
+        // An integrated GPU (the Arc 140T on xe, 2026-10-12) has the same hang: with 0 the first window after the prompt
+        // never rang (10 of 10 requests stalled, cache all-resident or mirrored); with 1, 10 of 10 decode at 11.5-17.2 tok/s
+        // mirrored and 12.0-17.4 all-resident (0.1.40: 11.2-16.9 mirrored, same boot), so it is 1 there too.
+        static const bool igpu = [] {
+            try { return dpct::get_current_device().get_info<sycl::info::device::host_unified_memory>(); }
+            catch (...) { return false; }
+        }();
         static const char* wv = std::getenv("STRATA_WINDOW_SYNC");
         static const int wmode = wv ? std::atoi(wv)
-                                    : ((intel_i915_gpu() || strata::intel_gpu_gen(cs_->get_device()) == strata::IntelGpuGen::Alchemist) ? 1 : 0);
+                                    : ((intel_i915_gpu() || strata::intel_gpu_gen(cs_->get_device()) == strata::IntelGpuGen::Alchemist || igpu) ? 1 : 0);
         const bool first_or_gap = t_prev_end.time_since_epoch().count() == 0 || (t_launch - t_prev_end) > std::chrono::milliseconds(20);
         if (wmode == 1 || (wmode == 2 && first_or_gap)) dpct::get_current_device().queues_wait_and_throw();
     }
@@ -2174,6 +2396,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         ms_pool += st_pool;
         if (le != 0) return false;
     } else {
+        // expert parallelism: the peer's graph first - its first wait is for this card's layer 0
+        if (ep_on() && std::getenv("STRATA_VERIFY_EAGER") == nullptr) ep_q_->ext_oneapi_graph(*ep_exec_[T]);
         le = (std::getenv("STRATA_VERIFY_EAGER") != nullptr)
                  ? (record_window(T, cs_, err) ? 0 : 1)   // SYCL port: eager replay of the window body
                  : DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*(ar_off_ ? exec_nr_[T] : exec_[T])));
@@ -2417,6 +2641,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         err = "verify: the all-resident plan met an expert that is not in VRAM (the residency table changed during the window)";
         return false;
     }
+    if (ep_on() && !ep_check(err)) return false;
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
@@ -2645,7 +2870,7 @@ bool Verifier::commit(int n_keep, std::string &err) try {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && one_token_self_commit()) {
+    if (last_t_ == 1 && !always_publish_ && one_token_self_commit()) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2826,8 +3051,17 @@ bool Verifier::capture_batch(const int *rows, int S, int hbase,
     dpct::experimental::command_graph_exec_ptr &ex =
         exec_bm_[bkey(rows, S, hbase)];
     if (ex != nullptr) return true;
+    if (ep_on() && ar_off_) {
+        err = "verify: expert parallel: an expert is on neither card (a prompt loan, a shrink or a swap)";
+        return false;
+    }
     if (DPCT_CHECK_ERROR(dpct::experimental::begin_recording(cs_)) != 0) {
         err = "verify: begin batch capture failed";
+        return false;
+    }
+    // expert parallelism: as capture() - the peer's half of the batch window is a graph of its own, per row layout
+    if (ep_on() && DPCT_CHECK_ERROR(dpct::experimental::begin_recording(ep_q_)) != 0) {
+        err = "verify: expert parallel: begin batch capture on the peer failed";
         return false;
     }
     batch_rec_ = true;
@@ -2840,6 +3074,18 @@ bool Verifier::capture_batch(const int *rows, int S, int hbase,
     dpct::experimental::command_graph_ptr graph = nullptr;
     const dpct::err0 ce =
         DPCT_CHECK_ERROR(dpct::experimental::end_recording(cs_, &graph));
+    dpct::experimental::command_graph_ptr graph1 = nullptr;
+    const dpct::err0 ce1 = ep_on() ? DPCT_CHECK_ERROR(dpct::experimental::end_recording(ep_q_, &graph1)) : 0;
+    if (ok && ce == 0 && ce1 == 0 && graph1 != nullptr) {
+        ep_exec_bm_[bkey(rows, S, hbase)] = new sycl::ext::oneapi::experimental::command_graph<
+            sycl::ext::oneapi::experimental::graph_state::executable>(graph1->finalize());
+    }
+    if (graph1) delete graph1;
+    if (ce1 != 0) {
+        if (graph) delete (graph);
+        err = "verify: expert parallel: end batch capture on the peer failed";
+        return false;
+    }
     if (!ok || ce != 0) {
         if (graph) delete (graph);
         /*
@@ -3053,6 +3299,12 @@ bool Verifier::stage_batch(const int *rows, int S, int hbase,
             const auto old_key = old->first;
             if (old->second) delete (old->second);
             exec_bm_.erase(old);
+            auto ep_old = ep_exec_bm_.find(old_key);
+            if (ep_old != ep_exec_bm_.end()) {
+                if (ep_q_ != nullptr) ep_q_->wait();
+                delete ep_old->second;
+                ep_exec_bm_.erase(ep_old);
+            }
             bm_used_.erase(old_key);
             auto commit_old = commit_bm_.find(old_key);
             if (commit_old != commit_bm_.end()) {
@@ -3133,6 +3385,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    if (ep_on()) ep_q_->ext_oneapi_graph(*ep_exec_bm_[bkey(rows, S, 0)]);   // the peer's half first, as run()
     const dpct::err0 le =
         DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*exec_bm_[bkey(rows, S, 0)]));
     /*
@@ -3185,6 +3438,7 @@ bool Verifier::run_slot_rows(const int *rows, int S, const int32_t *tokens,
           return false;
         }
         copy_->wait();
+        if (ep_on() && !ep_check(err)) return false;
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -3387,13 +3641,18 @@ catch (sycl::exception const &exc) {
   std::exit(1);
 }
 
-bool Verifier::batch_launch(int base, int S, const int32_t *tokens,
-                            const int64_t *pos, std::string &err) try {
-    const OnDevice on_device(device_);
-    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
+bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
     int rows[8] = {};
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+    return batch_launch_rows(base, S, rows, tokens, pos, err);
+}
+
+bool Verifier::batch_launch_rows(int base, int S, const int* rows, const int32_t* tokens,
+                                 const int64_t* pos, std::string& err) try {
+    const OnDevice on_device(device_);
+    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
+    if (ep_on()) ep_q_->ext_oneapi_graph(*ep_exec_bm_[bkey(rows, S, base)]);   // the peer's half first, as run()
     dpct::err0 le = DPCT_CHECK_ERROR(
         (cs_)->ext_oneapi_graph(*exec_bm_[bkey(rows, S, base)]));
     if (le == 0) le = DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*commit_bm_[bkey(
@@ -3534,6 +3793,7 @@ int Verifier::batch_poll(PoolMultiFn pool, void *user, std::string &err) try {
     to rewrite this code.
     */
     if (qc == 1) return 0;
+    if (ep_on() && !ep_check(err)) { b_running_ = false; return -1; }
     if (prof_on_) collect_profile();
     if (last_stage()) {
         if (!sample_rows(S, err)) { b_running_ = false; return -1; }
@@ -3842,23 +4102,14 @@ catch (sycl::exception const &exc) {
 bool Verifier::done(std::string &err) try {
     if (!fl_active_ || fl_k_ < fl_total_) return false;
     const OnDevice on_device(device_);
-    const dpct::err0 q = dpct::sycl_event_query(ev_done_);
-
-    /*
-    DPCT1009: SYCL reports errors using exceptions and does not use error
-    codes. Please replace the "get_error_string_dummy(...)" with a real
-    error-handling function.
-    */
-    /*
-    DPCT1001: The statement could not be removed.
-    */
-    /*
-    DPCT1000: Error handling if-stmt was detected but could not be
-    rewritten.
-    */
-    if (q != 0) {
-      err = std::string("verify: ") + dpct::get_error_string_dummy(q);
-      return false;
+    // dpct's query is 0 (complete) or 1 (still running); a SYCL error arrives as an exception, caught below.  The CUDA
+    // path's cudaErrorNotReady branch: a window still on the GPU is polled again, not failed.
+    if (dpct::sycl_event_query(ev_done_) != 0) {
+        const double now = now_ms();
+        if (now - fl_flush_ms_ > 2.0) { fl_flush_ms_ = now; (void) cs_->ext_oneapi_empty(); }
+        if (now - fl_since_ms_ > 20000.0)   // every layer served, and the graph still runs: #267 as in service()
+            err = "verify: the window never finished" + released_note(release_gpu_waits(5000));
+        return false;
     }
     if (copy_used_) {   // no host function of this window may raise flag B in the next one
         if (((copy_)->ext_oneapi_empty() ? 0 : 1) == 1) return false;

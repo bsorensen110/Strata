@@ -19,7 +19,13 @@ public:
     NativeHead(const NativeHead&) = delete;
     NativeHead& operator=(const NativeHead&) = delete;
 
-    bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err);
+    /// Validates the head and returns its eventual device weight allocation without uploading it.
+    static uint64_t weight_bytes_for(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out,
+                                     std::string& err);
+    /// allow_bf16 is for a private DFlash head; other callers retain the quantized-only guard.
+    bool load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err, bool allow_bf16 = false);
+    /// Releases the device weight and scratch while retaining the descriptor object for a later load.
+    /// The caller must invalidate any captured graph which refers to this head first.
     void unload();
     bool run(const float* mixed, float* logits, void* stream, std::string& err) const;
     uint64_t weight_bytes() const { return bytes_; }
@@ -43,8 +49,7 @@ private:
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row
 /// is read over PCIe per token, so the table costs no VRAM.  `embed_row`, the verify window and the MTP drafter
-/// use it instead of the canonical table when it is set (`set_native_embed`).  `STRATA_EMBED_VRAM=1` places the
-/// same bytes in VRAM instead (slow PCIe links); the gathers read `dev_` either way.
+/// use it instead of the canonical table when it is set (`set_native_embed`).
 class NativeEmbed {
 public:
     NativeEmbed() = default;
@@ -58,8 +63,6 @@ public:
     void gather_one(int64_t token, float* out, void* stream) const;
     uint64_t bytes() const { return bytes_; }
     int type() const { return type_; }
-    /// The table was placed in VRAM (STRATA_EMBED_VRAM=1, or the pinned / alias fallbacks) rather than mapped.
-    bool in_vram() const { return dev_ != nullptr && host_ == nullptr; }
 
 private:
     void* host_ = nullptr;

@@ -4,7 +4,6 @@
 //     build/iq_nibble_parity --header                    the host half of expert_nibble.hpp (no GPU)
 //     build/iq_nibble_parity <shard.gguf> [<shard.gguf> ...] [--layers-per-fmt 2] [--layers 1,17] [--ne 512]
 //                            [--plans 8] [--synthetic 64] [--no-ggml] [--negative]
-//     build/iq_nibble_parity --synthetic-only [--synthetic 64] [--plans 8] [--no-ggml]      no model, no shard
 //
 // Each model (any shard of it; its other shards are opened beside it) gives `--layers-per-fmt` layers of each
 // converted format (IQ2_S, IQ3_XXS, IQ3_S; or `--layers`), `--ne` experts each, read from the GGUF tensors into the
@@ -29,8 +28,6 @@
 // `--synthetic N`: per format, N experts whose gate/up blocks are random bytes (every grid index, sign byte and scale
 // nibble the format has; the coverage is counted and must be complete) and whose fp16 d cycle through +-the smallest
 // subnormal, +-65504, +-1, the smallest normal and two ordinary values; checks (1)-(7) on them.
-// `--synthetic-only`: the synthetic experts alone, for every gate/up format x both down types (IQ4_NL, Q2_0), the down rows
-// random bytes with ordinary fp16 scales: checks (1)-(7) with no model file (a GP100 is still needed).
 // `--negative`: the control - one code byte per slot changed after the transcode; (6) and (7) must then report differences.
 // Exit 0 when every check is equal; 1 otherwise; 2 on a usage or setup error.  A build without STRATA_EXPERT_NIBBLE_BUILT
 // (the CUDA build with STRATA_EXPERIMENTAL_SM60) has no 4-bit kernels: --header only.
@@ -660,10 +657,7 @@ long long grouped_parity(const Layer& Y, std::mt19937& rng, int plans, const voi
     // mode 0: the CUDA layout
     const Var vars[] = { { -1, -1, false, "default, card" }, { 0, -1, false, "S, card" }, { 1, -1, false, "P, card" },
                          { -1, -1, true, "default, card, V1" }, { -1, 0, false, "default, mode 0" },
-                         { 0, 0, false, "S, mode 0" }, { 1, 0, false, "P, mode 0" }, { -1, 0, true, "default, mode 0, V1" },
-                         // STRATA_NIB_GU_PROTO (nib_gu_proto.cuh): the staged-once kernel, id 31
-                         { 31, -1, false, "gu-proto 31, card" }, { 31, 0, false, "gu-proto 31, mode 0" },
-                         { 31, 0, true, "gu-proto 31, mode 0, V1" } };
+                         { 0, 0, false, "S, mode 0" }, { 1, 0, false, "P, mode 0" }, { -1, 0, true, "default, mode 0, V1" } };
     constexpr int NV = (int) (sizeof vars / sizeof vars[0]);
     long long rows[NV] = {}, bad[NV][5] = {}, total = 0;
     for (const Case& cs : cases)
@@ -784,7 +778,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "--header") == 0) return header_check();
     std::vector<std::string> shards;
     int per_fmt = 2, NE = 512, plans = 8, syn = 64;
-    bool ggml_check = true, negative = false, syn_only = false;
+    bool ggml_check = true, negative = false;
     std::vector<int> only;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -802,18 +796,16 @@ int main(int argc, char** argv) {
         else if (a == "--synthetic") syn = std::atoi(next());
         else if (a == "--no-ggml") ggml_check = false;
         else if (a == "--negative") negative = true;
-        else if (a == "--synthetic-only") syn_only = true;
         else if (a.size() > 5 && a.substr(a.size() - 5) == ".gguf") shards.push_back(a);
         else {
             std::fprintf(stderr,
                          "usage: iq_nibble_parity --header\n"
                          "       iq_nibble_parity <shard.gguf> [<shard.gguf> ...] [--layers-per-fmt 2] [--layers 1,17] [--ne 512]\n"
-                         "                        [--plans 8] [--synthetic 64] [--no-ggml] [--negative]\n"
-                         "       iq_nibble_parity --synthetic-only [--synthetic 64] [--plans 8] [--no-ggml]\n");
+                         "                        [--plans 8] [--synthetic 64] [--no-ggml] [--negative]\n");
             return 2;
         }
     }
-    if ((shards.empty() && !syn_only) || NE < 16 || NE > 512) {
+    if (shards.empty() || NE < 16 || NE > 512) {
         std::fprintf(stderr, "iq_nibble_parity: give at least one model shard (.gguf); --ne 16..512\n");
         return 2;
     }
@@ -824,9 +816,9 @@ int main(int argc, char** argv) {
     CK(cudaDeviceGetPCIBusId(bus, sizeof bus, 0));
     std::printf("device 0: %s, bus %s, cc %d.%d, %d SMs\n", prop.name, bus, prop.major, prop.minor, prop.multiProcessorCount);
     if (prop.major != 6 || prop.minor != 0) {
-        std::fprintf(stderr, "iq_nibble_parity: the 4-bit kernels are the sm_60 build's; this GPU is cc %d.%d (skipped)\n",
-                     prop.major, prop.minor);
-        return 77;
+        std::fprintf(stderr, "iq_nibble_parity: the 4-bit kernels are the sm_60 build's; this GPU is cc %d.%d\n", prop.major,
+                     prop.minor);
+        return 2;
     }
     if (!STRATA_EXPERT_NIBBLE_BUILT || nib::prepare(nullptr) != 0) {
         std::fprintf(stderr, "iq_nibble_parity: no 4-bit kernels in this build, or the GGUF codebooks are not unique\n");
@@ -843,40 +835,6 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&dx, hx.size() * sizeof(Q81)));
     CK(cudaMemcpy(dx, hx.data(), hx.size() * sizeof(Q81), cudaMemcpyHostToDevice));
 
-    if (syn_only) {   // no model: every gate/up format with each down type, random experts
-        long long total_s = 0;
-        int done = 0;
-        for (const int gt : {nib::kIQ2_S, nib::kIQ3_XXS, nib::kIQ3_S})
-            for (const int dt : {20, 42}) {   // the packs' down types: IQ4_NL, Q2_0
-                Layer S;
-                std::string err;
-                if (!cpu::native_fmt(gt, dt, kEmbd, kFf, S.f, err)) {
-                    std::printf("%s / down type %d: %s\n", nib::fmt_name(gt), dt, err.c_str());
-                    ++total_s;
-                    continue;
-                }
-                S.tag = "syn";
-                S.layer = 0;
-                S.ne = std::max(16, std::min(syn, NE));
-                S.host.resize((size_t) S.ne * S.f.bytes);
-                for (auto& b : S.host) b = (uint8_t) rng();
-                // block_iq4_nl and block_q2_0 are 18 bytes, the fp16 scale first: an ordinary scale in every block of the down rows
-                for (int e = 0; e < S.ne; ++e)
-                    for (size_t o = S.f.down_off; o + 18 <= S.f.bytes; o += 18) {
-                        const uint16_t sc = (uint16_t) ((9u << 10) | (rng() & 0x3FFu));
-                        std::memcpy(S.host.data() + (size_t) e * S.f.bytes + o, &sc, 2);
-                    }
-                long long sb = synthesize(S, rng);
-                sb += convert(S, ggml_check);
-                sb += grouped_parity(S, rng, plans, dx, scr, dout);
-                total_s += sb;
-                ++done;
-                CK(cudaFree(S.raw));
-                CK(cudaFree(S.slots));
-            }
-        std::printf("\n%s: %d synthetic format pairs, %lld differences\n", total_s == 0 && done == 6 ? "PASS" : "FAIL", done, total_s);
-        return total_s == 0 && done == 6 ? 0 : 1;
-    }
     long long total = 0;
     int layers_done = 0;
     std::vector<int> syn_done;

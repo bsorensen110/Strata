@@ -45,10 +45,11 @@ namespace strata::core {
 /// bytes arrive layer by layer: `run` holds a layer's plan (the first thing that lets the GPU read the layer's expert
 /// slots) back until `landed >= layer` for a layer with a swap (`has[layer]`).  Set `active` only around one window.
 struct AdaptGate {
-    struct Tick { AdaptGate* gate; int32_t layer; };
+    struct Tick { std::atomic<int32_t>* counter; int32_t layer; };
     std::atomic<int32_t> landed{-1};      ///< the highest layer whose swap copies have landed (n_layers: all of them)
     std::atomic<bool> active{false};
     std::vector<uint8_t> has;             ///< per layer: a swap copies into this layer's slots
+    int32_t last = -1;                    ///< the highest layer with a swap this round (-1: none)
     std::vector<Tick> ticks;              ///< host-function contexts, one per layer and the final one (stable storage)
     const int32_t* dvals = nullptr;       ///< device [0..n_layers]: the source of those copies
     volatile int32_t* hland = nullptr;   ///< pinned host int the copy stream writes (a D2H copy of the layer number), instead of a host function; null: host functions
@@ -56,6 +57,19 @@ struct AdaptGate {
         const int32_t a = landed.load(std::memory_order_acquire);
         if (hland == nullptr) return a;
         const int32_t b = *hland;
+        return a > b ? a : b;
+    }
+    /// The peer tier's copies (--peer-device with STRATA_ADAPT_OVERLAP=1): its own counter, raised on its refill stream
+    /// in layer order the same two ways (`peer_hland`: the pinned int its D2H copies write; null: host functions); a
+    /// layer with a peer swap waits for it as well.
+    std::atomic<int32_t> peer_landed{-1};
+    std::vector<uint8_t> peer_has;
+    int32_t peer_last = -1;
+    volatile int32_t* peer_hland = nullptr;
+    int32_t peer_reached() const {
+        const int32_t a = peer_landed.load(std::memory_order_acquire);
+        if (peer_hland == nullptr) return a;
+        const int32_t b = *peer_hland;
         return a > b ? a : b;
     }
 };
@@ -99,6 +113,10 @@ public:
     /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
+    /// Releases the verifier's decode-only device/graph state so a repeat prefill can grow the elastic expert cache.
+    /// The object is reset to its default state and must be initialized again before the next decode window. This is
+    /// restricted to the serialized single-GPU verifier; the caller must reapply its configuration after init().
+    bool release_decode_resources(std::string& err);
 
     /// One window: `tokens[0..T)` at positions pos0.., the pool served per layer; `out[t]` = argmax after token t.
     /// The PLE rows are gathered here from `ss.ple_prev` and the tokens.  Captures the T-token graph on first use.
@@ -112,7 +130,9 @@ public:
     /// the sync the window already does: no extra sync).  On the stage with the head (a layer split asks the last
     /// stage).  STRATA_NAN_GUARD=0: off (always -1).  STRATA_NAN_INJECT=<n>[,<n>...] (debug): the n-th window the
     /// guard checks in this process (counted from 1 over every stage-with-head verifier: prompt-tail windows, decode
-    /// windows and batch windows alike) reports row 0 as non-finite, so the whole response can be tested.
+    /// windows and batch windows alike) reports row 0 as non-finite, so the whole response can be tested.  Ports
+    /// whose window graphs carry no such kernel (Metal) are covered beside the pick read: an all-non-finite row
+    /// leaves the sampler's sentinel INT32_MAX in it, and that id is past every vocabulary.
     int nonfinite_row() const { return next_ != nullptr && !last_stage() ? next_->nonfinite_row() : nf_row_; }
     int64_t nonfinite_pos() const { return next_ != nullptr && !last_stage() ? next_->nonfinite_pos() : nf_pos_; }
     /// Row t of the last window (a batch window: each slot's own rows) held a non-finite logit.
@@ -199,11 +219,35 @@ public:
     void set_handoff_flags(uint32_t* in_host, uint32_t* in_dev, uint32_t* out_host, uint32_t* out_dev) {
         hflag_in_h_ = in_host; hflag_in_d_ = in_dev; hflag_out_h_ = out_host; hflag_out_d_ = out_dev;
     }
+    /// #533: the expert cache's live slots changed (a `VRAM` shrink/grow).  Re-check the 100%-resident fast path
+    /// against the residency table and take the cache's current slots/offsets: a shrink that takes the last
+    /// resident expert of this stage's range MUST leave the zero-doorbell graph, or the CPU pool is never told
+    /// about the misses.  Call it on every stage whose cache moved, with that stage's own hits.
+    void refresh_residency(const VerifyHits& hits);
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.
     void set_next(Verifier* next, void* next_user) { next_ = next; next_user_ = next_user; }
     /// floats per token in a hand-off buffer
     static int64_t handoff_floats(const ModelGeometry& g) { return (int64_t) g.hc * g.n_embd + g.n_embd + g.hc; }
+
+    /// REMOTE STAGE, the worker's side: run the stage's layers up to the last one but no head -
+    /// the residual after the last layer (its pending write folded in, as the unsplit window folds it before the
+    /// head) goes to `handoff_out` like an earlier stage's.  Set before `init`.
+    void set_no_head(bool on) { no_head_ = on; }
+    /// REMOTE STAGE, the main side: the layers between this stage's predecessor and this stage run in another
+    /// process.  `run` first calls `remote_run(T, tokens, pos0, err)`, which must leave that process's hand-off rows
+    /// in this stage's `handoff_in`; `commit` calls `remote_commit(n_keep, err)`.  A stage set with
+    /// set_stage(n_layers, -1, in, nullptr) runs no layer, only the head (the worker ran the last layer).
+    /// `remote_abort` (pipelined): ends a remote_run waiting on another thread, so the verifier can join that thread
+    /// when it goes before the worker answered (the engine ending after an error).
+    void set_remote(std::function<bool(int T, const int32_t* tokens, int64_t pos0, std::string& err)> remote_run,
+                    std::function<bool(int n_keep, std::string& err)> remote_commit,
+                    std::function<void()> remote_abort = nullptr) {
+        remote_run_ = std::move(remote_run);
+        remote_commit_ = std::move(remote_commit);
+        remote_abort_ = std::move(remote_abort);
+    }
+    bool remote() const { return (bool) remote_run_; }
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
@@ -243,27 +287,12 @@ public:
     // a window in flight from one thread (batch_poll does not block).  Stage k can then run group g while stage k+1
     // runs group g-1.  Rows of group `base` use hand-off rows [base, base + S), so groups never share a hand-off row.
     bool batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
+    // STRATA_PIPELINE_ACTIVE_ROWS=1: packed active rows bind actual slot states; hand-off storage still starts at base.
+    bool batch_launch_rows(int base, int S, const int* rows, const int32_t* tokens, const int64_t* pos, std::string& err);
     /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
     bool batch_busy() const { return b_running_.load(std::memory_order_acquire); }
-    // ---- STRATA_PIPED_MTP: the pipelined groups with --batch-mtp's drafts.  A group's window holds its slot's token
-    // and its drafts, so how many rows to keep is known only once the LAST stage has picked - and by then this stage
-    // runs another group's window, which reuses the scratch the commit replays from.  So right behind the window a
-    // save graph copies those rows (each GDN layer's conv and recurrence inputs, each QSA layer's raw indexer keys, the
-    // PLE history snapshot) to the group's own rows [hbase, hbase + S) of the saved buffers, and the commit, queued
-    // after the verdict, replays from there.  Everything else the commit reads is per slot already.
-    /// The saved buffers for `rows` hand-off rows (after init_slots).
-    bool init_deferred_commit(int rows, std::string& err);
-    bool deferred_commit_on() const { return dc_rows_ > 0; }
-    /// The window over the slots `rows` (a slot's rows contiguous) at hand-off rows [hbase, hbase + S), its save right
-    /// behind it, and no commit (batch_commit_rows, after the verdict).  The PLE history advances at the commit.
-    bool batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
-                           std::string& err);
-    /// Queue the commit of that window's accepted prefixes on this stage's stream (no host wait): `keep` per slot ID,
-    /// 1..the slot's rows.  `rows`, `S`, `hbase`, `tokens` and `pos` are the window's, as batch_launch_rows got them.
-    bool batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
-                           const int64_t* pos, std::string& err);
     /// Serves the layers of this stage's window that have rung (the CPU pool and the flags), with no CUDA call: 1 once
     /// every layer is served (or the window raises no host doorbells), 0 while one is still to ring.  batch_poll
     /// calls it, unless set_external_serve(true) moved it to a thread of its own (STRATA_PIPED_CONCURRENT: a CUDA
@@ -275,8 +304,19 @@ public:
     /// its row is drawn again on the last stage with Philox(seed, position), as a solo window draws it.  Greedy by
     /// default.  Set on the first stage, it reaches the last.
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) {
-        if (slot >= 0 && slot < (int) slot_sp_.size()) slot_sp_[(size_t) slot] = sp;
+        if (slot >= 0 && slot < (int) slot_sp_.size()) {
+            slot_sp_[(size_t) slot] = sp;
+            // the slot's bias table (set_slot_logit_bias) belongs to the slot: the caller's pointer is not used
+            slot_sp_[(size_t) slot].logit_bias = slot_has_bias(slot) ? slot_bias_dev_[(size_t) slot] : nullptr;
+        }
         if (next_) next_->set_slot_sampling(slot, sp);
+    }
+    /// One slot's vocabulary bias, the table `set_logit_bias` keeps for the solo path: -inf bans.  Empty clears it.
+    /// Kept per slot on the final stage's device (the stage that draws the rows), copied only when changed; it
+    /// survives set_slot_sampling, so call it for every request admitted into the slot (an empty one clears).
+    bool set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err);
+    bool slot_has_bias(int slot) const {
+        return slot >= 0 && slot < (int) slot_bias_host_.size() && !slot_bias_host_[(size_t) slot].empty();
     }
     const int32_t* batch_out() const { return b_out_; }
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
@@ -337,6 +377,17 @@ public:
     bool pl_commit_async(int n_keep, std::string& err);
     /// Fold another verifier's counters and GPU profile into this one's (the two verifiers of one stage report once).
     void absorb_stats(Verifier& o);
+    /// REMOTE STAGE, pipelined (--pipeline-windows with --remote-stage): `pl_launch` of a stage set with set_remote
+    /// does not block on `remote_run`.  It runs on a thread of its own, and `service` launches the window's graph once
+    /// the worker's rows are back; a `pl_commit_async` made before then is queued behind that launch, and the worker's
+    /// commit goes out after its reply.  The worker gets the windows and commits in the order this stage gets them.
+    /// True while a window waits for the worker's rows.
+    bool remote_waiting() const { return rl_wait_; }
+    /// A drain that stops at an error: a window still waiting for the worker's rows is given up once its job has
+    /// ended (the worker's reply, or the link's own timeout), so no thread uses the link after it.  Its graph never
+    /// runs and its queued commit is not sent: the worker's session stays unconfirmed until a Reset or a checkpoint
+    /// restore replaces it.
+    void remote_settle();
     /// The watchdog's line for a pipelined verifier: in flight, layers served, the GPU's ring and flags, its events.
     void diag_pipelined(std::FILE* f, const char* name) const;
 
@@ -348,6 +399,13 @@ public:
     /// to the stage that holds the head.
     bool window_logprobs(const int32_t* targets, int T, int64_t pos0, int32_t extra_id, std::FILE* out,
                          std::string& err);
+
+    /// jev systemone (M3.0, --jev-brow): the LAST window's final row (position pos0 + last_T - 1),
+    /// copied device-to-host for `n` token ids (their logits, in the order asked).  Fails closed
+    /// (false + err) when no window has run, the row is gone, a token is out of range, or the
+    /// copy fails - the server never gets a partial or fabricated row.  A layer split's earlier
+    /// stage forwards to the stage that holds the head (same as window_logprobs).
+    bool brow_row(const int32_t* tokens, int n, float* out, std::string& err);
 
     /// Token t's residual after the last layer, (hc, n_embd) on the device, valid until the next `run`.
     const float* final_R(int t) const;
@@ -371,7 +429,8 @@ public:
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
     void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
     /// Called before every window this verifier launches (run, the batch and pipelined launches): the device's
-    /// residency table catches up with the host's (the adaptive tier's evictions while its copies are in flight).
+    /// residency table catches up with the host's (the adaptive tier's evictions while its copies are in flight,
+    /// STRATA_ADAPT_FETCH's admissions).
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
@@ -441,6 +500,8 @@ private:
     std::chrono::steady_clock::time_point ext_checked_{};   ///< batch_poll's last check with external serving
     int32_t b_out_[8] = {};
     std::vector<strata::kernels::SamplerParams> slot_sp_;
+    std::vector<std::vector<float>> slot_bias_host_;   ///< per slot (final stage only): the bias table it was last given
+    std::vector<float*> slot_bias_dev_;                ///< per slot (final stage only): that table on the device
     bool sample_rows(int S, std::string& err);   ///< the sampled slots' rows of the last batch window
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
@@ -448,37 +509,11 @@ private:
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
-    // STRATA_PIPED_MTP (init_deferred_commit): the saved rows, laid out as the window scratch (global layer index) with
-    // dc_rows_ rows per layer instead of max_t_; the slots' accepted prefixes (mapped and device, 2 + max_t_ per slot)
-    int dc_rows_ = 0;
-    bool staging_deferred_ = false;   ///< stage_batch for batch_launch_rows: no capture_commit_batch
-    float *dc_qkv_ = nullptr, *dc_h_ = nullptr, *dc_gate_ = nullptr, *dc_beta_ = nullptr, *dc_idx_ = nullptr;
-    float* dc_hist_ = nullptr;
-    void* dc_arena_ = nullptr;
-    int32_t *h_commitd_ = nullptr, *m_commitd_ = nullptr, *commitd_ = nullptr;
-    std::map<std::vector<int>, cudaGraphExec_t> save_bm_, dcommit_bm_;
-    bool capture_deferred(const int* rows, int S, int hbase, std::string& err);
     /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
     bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err);
-    /// cudaGraphInstantiate; out of VRAM, batch layouts other than `key` are evicted (LRU) until it fits, and then (a
-    /// single-request window, `keep_t` > 0) the graphs of the other window sizes, largest first (#3702): a window size
-    /// whose graph does not fit used to end the engine ("verify: instantiate: out of memory"); a freed size is captured
-    /// again when it is next used.
+    /// cudaGraphInstantiate; out of VRAM, batch layouts other than `key` are evicted (LRU) until it fits.
     bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key, const char* what,
-                              std::string& err, int keep_t = -1, unsigned long long flags = 0);
-    /// Free the graph of the largest window size other than `keep_t` (and the prelaunched one); `evicted`: there was one.
-    bool evict_window_graph(int keep_t, bool& evicted, std::string& err);
-    bool no_window_eviction_ = false;   ///< capture_all wants every size at once: it must not free one to capture another
-    // STRATA_GRAPH_PRIO (record_window / capture): the captured tails of the priority streams at their joins and the
-    // main stream's tails at their forks, so that a capture that dropped the stream priorities can be repaired per
-    // node (apply_node_priorities walks each tail back to its fork)
-#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)   // (the three methods are no-ops there)
-    std::vector<cudaGraphNode_t> prio_forks_;
-    std::vector<std::pair<cudaGraphNode_t, int>> prio_tails_;
-#endif
-    void note_prio_fork(cudaStream_t from);
-    void note_prio_tail(cudaStream_t on, int prio);
-    void apply_node_priorities(cudaGraph_t graph, int T);
+                              std::string& err);
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
     void accumulate_profile(const unsigned long long* stamps);
     void accumulate_profile_inner(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
@@ -496,6 +531,13 @@ private:
     double fl_since_ms_ = 0, fl_flush_ms_ = 0, fl_launch_ms_ = 0;
     int32_t pl_prev_[2] = {-1, -1};
     std::vector<uint32_t> pl_ple_rows_;   ///< the window's PLE rows (T x PLE_N_HEADS), gathered when layer 0 is served
+    bool pl_graph_launch(std::string& err);   ///< pl_launch's graph launch (a remote stage's: once its rows are back)
+    // remote-stage, pipelined (remote_waiting)
+    struct RemoteJob;                     ///< one window's remote_run_ on a thread of its own (verify.cpp)
+    RemoteJob* rjob_ = nullptr;           ///< (owned; a plain pointer: the type is complete only in verify.cpp)
+    bool rl_wait_ = false;                ///< the window in flight waits for the worker's rows (its graph not launched)
+    int rl_commit_ = 0;                   ///< a pl_commit_async (its count) queued behind that launch; 0: none
+    int remote_poll(std::string& err);    ///< 1: the rows are back and the graph launched; 0: not yet; -1: an error
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     strata::kernels::SamplerParams sampling_ = [] {
@@ -529,6 +571,7 @@ private:
     void refresh_ar();
     uint32_t* h_plan_err_ = nullptr; uint32_t* m_plan_err_ = nullptr;   // set by resident_plan on a -1 (all-resident graph)
     const int32_t* h_res_ = nullptr;      ///< the host residency table (VerifyHits::h_res)
+    bool graphs_resident_ = false;      ///< the residency the captured window graphs were built with (#533)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
     uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
@@ -554,6 +597,11 @@ private:
     bool chain_overlap() const;          ///< this stage hands off through a flag to a next stage that waits on it
     Verifier* next_ = nullptr;
     void* next_user_ = nullptr;
+    bool no_head_ = false;                 ///< set_no_head: the remote worker's last stage (hand-off, no head)
+    std::function<bool(int, const int32_t*, int64_t, std::string&)> remote_run_;   ///< set_remote
+    std::function<bool(int, std::string&)> remote_commit_;
+    std::function<void()> remote_abort_;
+    bool writes_handoff() const { return le_ < g_->n_layers || no_head_; }   ///< no head here: the residual goes on
     bool ple_stage() const { return lb_ <= 1 && 1 < le_; }   ///< holds layer 1, where the PLE block runs
     void stage_inputs(int T, const int32_t* tokens, int64_t pos0);
     bool staged_ = false;
@@ -566,7 +614,7 @@ private:
     unsigned long long* trace_h_ = nullptr;
     unsigned long long* trace_m_ = nullptr;
     size_t trace_n_ = 0;
-    static constexpr int kProfPer = 33;              // stamps per layer (32 left the hc-read second
+    static constexpr int kProfPer = 34;              // stamps per layer (32 left the hc-read second
                                       // half's up-stamp at slot 32 = the next layer's slot 0: D8)
     bool prof_on_ = false;
     unsigned long long* prof_ = nullptr;              // device: n_layers * kProfPer + 4 stamps
@@ -600,12 +648,9 @@ private:
     cudaStream_t df_side_[2] = {};
     cudaEvent_t df_fork_ = nullptr;
     cudaEvent_t df_join_[2] = {};
-    // [sel_long_][T]: 1 is the long-context QSA select (STRATA_SELECT_LONG=1: multi-CTA top-k, shuffle-free decode
-    // scores; see run()); without it only [0] is ever captured
-    cudaGraphExec_t exec_[2][9] = {};
-    cudaGraphExec_t exec_nr_[2][9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
-    bool launched_[2][9] = {}, launched_nr_[2][9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
-    int sel_long_ = 0;
+    cudaGraphExec_t exec_[9] = {};
+    cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    bool launched_[9] = {}, launched_nr_[9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
     cudaStream_t side_ = nullptr;
@@ -639,7 +684,9 @@ private:
     int nf_row_ = -1;                     ///< nonfinite_row()
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
     uint32_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
-    void note_nonfinite(int T, const int64_t* pos_b);   ///< the window's flags (+ STRATA_NAN_INJECT) -> nf_row_
+    void note_nonfinite(int T, const int64_t* pos_b, const int32_t* picks);   ///< the window's flags, + the picks
+    /// read beside it (a sentinel INT32_MAX marks its row: the host-side arm of the guard, covering ports whose
+    /// graphs carry no logits_nonfinite_rows), + STRATA_NAN_INJECT -> nf_row_
     float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
@@ -666,14 +713,30 @@ private:
     static void raise_flag(uint32_t* flag, uint32_t value);
     int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
     int64_t plan_i32_ = 0;                                        // int32 words in the plan block
+    int64_t dst2_off_ = 0;                                        // its PCIe groups' slot targets (GpuPlanSink::dst2)
     GpuPlanSink sink_;
     uint32_t cur_layer_ = 0;
     static void publish_plan(void* ctx);
+    static void raise_partial(void* ctx);   // STRATA_VERIFY_DEFER_CPU_BELOW: the pool's partial hook (h_pflag_)
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
     int groups_[9] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
+    // STRATA_VERIFY_DEFER_CPU=1 (opt-in, changes the output): a decode window's layer l adds the CPU's expert rows to the
+    // residual before layer l+1's FFN-side read instead of waiting for them in its own combine (record_window)
+    bool defer_ = false;
+    bool defer_check_ = false;             ///< STRATA_VERIFY_DEFER_CPU=check: the same steps, the rows added back in layer l
+                                           ///< itself (no deferral: the default's sums in another order)
+    bool defer_said_ = false;              ///< the reason a window runs without deferral was printed
+    float* def_parts_ = nullptr;           ///< device: a deferred layer's CPU rows (T * k * n_embd)
+    // STRATA_VERIFY_DEFER_CPU_BELOW=<w> (with =1 or =check; 0.1 when unset, 0 when w >= 1): the pool computes the CPU
+    // rows whose routing weight is >= w first and raises h_pflag_; post(l) of a deferred layer waits for that and
+    // combines those rows, the lighter ones join late.  Not with STRATA_VERIFY_DEVICE_PLAN.
+    float defer_heavy_ = 0.0f;
+    uint32_t* h_pflag_ = nullptr; uint32_t* m_pflag_ = nullptr;  // the pool has written the heavy CPU rows (partial flag)
+    bool defer_ok(int T, std::string* why) const;   ///< the T-token window may be captured with deferral
+    bool heavy_layer(int T, int64_t l) const;       ///< STRATA_VERIFY_DEFER_CPU_BELOW: post(l) waits for the partial flag
 
     // device
     void* arena_ = nullptr;
@@ -689,7 +752,6 @@ private:
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer
     int32_t* sel_ = nullptr;
-    int32_t* topk_scratch_ = nullptr;   // qsa_block_topk_long's multi-CTA exchange (STRATA_SELECT_LONG=1 only)
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
     int32_t* plan_ = nullptr;                                     // device copy of the plan block
@@ -705,6 +767,7 @@ private:
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
+    int last_row_T_ = 0;   ///< jev --jev-brow: the last accepted window's T (its final row is brow_row's)
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
     int32_t* one_ = nullptr;           ///< device {1}: the n_keep of a one-token window, which commits itself

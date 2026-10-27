@@ -8,6 +8,10 @@
 #include <fstream>
 #include <limits>
 #include <sstream>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #include <string>
 #include <system_error>
 #include <vector>
@@ -17,6 +21,14 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#elif defined(STRATA_GPU_METAL)
+namespace strata::metal_engine {   // metal/src/engine/host_memory.h: the engine's one reading of the free memory
+bool host_memory_now(double& available, double& phys);
+}  // namespace strata::metal_engine
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <sys/sysctl.h>
+#include <unistd.h>
 #endif
 
 namespace strata::core {
@@ -286,8 +298,40 @@ std::optional<HostMemoryReading> sample_host_memory() {
     return combine(std::min<uint64_t>(status.ullAvailPhys, status.ullAvailPageFile), status.ullTotalPhys, CgroupScan{}, memory_limit_bytes());
 #elif defined(__linux__)
     return sample_host_memory(MemoryProbePaths{}, memory_limit_bytes());
+#elif defined(STRATA_GPU_METAL)
+    // macOS (the Metal engine): no /proc/meminfo.  The engine's own reading (host_memory.h), the rule its streaming
+    // arena uses: free and purgeable pages and the clean file cache, not other programs' inactive anonymous memory;
+    // hw.memsize is the total.  No cgroups.
+    double avail = 0, phys = 0;
+    if (!strata::metal_engine::host_memory_now(avail, phys) || phys <= 0) return {};
+    const uint64_t total = (uint64_t) phys;
+    return combine(std::min((uint64_t) std::max(0.0, avail), total), total, CgroupScan{}, memory_limit_bytes());
+#elif defined(__APPLE__)
+    // macOS has no /proc/meminfo.  What the kernel can hand out without swapping further: free, inactive and
+    // speculative pages (the same set Activity Monitor counts as available); hw.memsize is the total.
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    vm_statistics64_data_t vm{};
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vm, &count) != KERN_SUCCESS) return {};
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return {};
+    const uint64_t avail = (uint64_t) (vm.free_count + vm.inactive_count + vm.speculative_count) * (uint64_t) page;
+    uint64_t total = 0;
+    size_t len = sizeof total;
+    if (sysctlbyname("hw.memsize", &total, &len, nullptr, 0) != 0) total = 0;
+    return combine(avail, total ? std::optional<uint64_t>(total) : std::nullopt, CgroupScan{}, memory_limit_bytes());
 #else
     return {};
+#endif
+}
+
+// Hand the free heap the allocator still holds back to the kernel, so that a parked conversation that was
+// dropped shows up in the next reading of the host's free RAM.  glibc keeps freed segments in its heap once its
+// mmap threshold has risen (a ConversationBuffer is a list of 16 MiB segments and that threshold rises to
+// 32 MiB); measured on a serving box: freeing a 64 MiB snapshot in the middle of the heap moved RSS by -0.3 MB,
+// malloc_trim(0) then returned 127.7 MB.  Elsewhere freed segments of this size already go back at once.
+void conversation_release_freed_memory() {
+#if defined(__GLIBC__)
+    malloc_trim(0);
 #endif
 }
 

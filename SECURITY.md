@@ -23,9 +23,8 @@ this PC only. The details and every setting are in [docs/DETAILS.md](docs/DETAIL
 - **Where it listens.** `127.0.0.1` by default. `--host 0.0.0.0` (or `"host"` in `strata-<model>.json`) opens it to
   your network, and the server then warns when no API key is set.
 - **API key.** `"api_key"` in the run config (or `STRATA_API_KEY`) is required on `/v1/*` and on every endpoint
-  that shows the model's state, requests or answers (`/status`, `/metrics`, `/metrics/prometheus`, `/settings`,
-  `/mcp`, `/props`, `/slots`, `/api/requests`, `/config`) and on every `POST`. It is compared in constant time.
-  Set one before you open the
+  that shows the model's state, requests or answers (`/status`, `/metrics`, `/settings`, `/mcp`, `/props`, `/slots`,
+  `/api/requests`, `/config`) and on every `POST`. It is compared in constant time. Set one before you open the
   server to your network or put a tunnel in front of it.
 - **Host check (DNS rebinding, 0.1.38).** Without an API key the server answers only requests whose `Host` is a name
   it knows (`localhost`, an IP address, the address it listens on and, when it listens beyond this PC, this PC's
@@ -43,6 +42,15 @@ this PC only. The details and every setting are in [docs/DETAILS.md](docs/DETAIL
   `"api_monitor": true` is set. Apart from it, the server keeps in its process memory the text and tokens of its
   last few prompts, whatever `"api_monitor"` says, to encode the next turn faster; no endpoint shows them, and they
   are gone when the server stops.
+- **Tracing** (`--trace-otlp`, `"trace_otlp"`, `$STRATA_TRACE_OTLP`) sends OpenTelemetry spans of each `/v1` request -
+  timings and token counts - to an OTLP endpoint you name. It is off by default; with no endpoint nothing runs. With
+  the request monitor off, the spans carry timings and token counts, not the prompt and not the answer - with one
+  exception: a request that ends in an error carries its server-authored error text (up to 2000 characters) as the
+  span's `exception.message`, and on a structured-output validation failure that text quotes the model's answer. A
+  completed request's trace carries no conversation text; treat the collector as a place that can see answer text on
+  a failed request. The endpoint
+  is yours to set; the value `default` points at this PC (`http://localhost:4318/v1/traces`). Details:
+  [docs/DETAILS.md](docs/DETAILS.md#opentelemetry-traces-of-every-request).
 
 ## The desktop app and the Terminal
 

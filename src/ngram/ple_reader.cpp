@@ -347,12 +347,13 @@ bool PleReader::open(const std::string& path, uint64_t table_offset, uint64_t n_
     }
     impl_->table_offset = table_offset;
     impl_->n_rows = n_rows;
-    impl_->max_inflight = max_inflight;
     impl_->slab = (uint8_t*) DirectFile::alloc_aligned((size_t) max_inflight * 2 * PAGE);
     if (impl_->slab == nullptr) { err = "PleReader: cannot allocate read buffers"; close(); return false; }
     impl_->inflight.assign(max_inflight, Job{});
     impl_->free_slots.clear();
     for (uint32_t s = max_inflight; s-- > 0;) impl_->free_slots.push_back(s);
+    // Publish the slot count only after every slot is free. A failed initialization has no reads to drain.
+    impl_->max_inflight = max_inflight;
     impl_->cache.init(cache_rows, row_bytes);
     impl_->error.clear();
     impl_->keep_us = 0;
@@ -409,6 +410,7 @@ void PleReader::close() {
     m.delayed.clear();
     m.inflight.clear();
     m.free_slots.clear();
+    m.max_inflight = 0;
     m.cache.init(0);
     m.threaded = false;
     m.stop = false;
@@ -429,13 +431,6 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     const bool rearm = m.keep_us > 0 && (m.last_issue_us <= 0 || now - m.last_issue_us > m.keep_window_us);
     m.last_issue_us = now;
     TicketState& ts = m.tickets[id];
-    // After a failed read the reader stays failed (`collect` reports `error` until the next `open`) and its worker has
-    // parked (worker_loop). A ticket queued now would never be read and `collect` would wait for it for ever, so it
-    // is not queued: it has no jobs, and `collect` returns the error at once.
-    if (!m.error.empty()) {
-        ts.pending = 0;
-        return Ticket{id};
-    }
     std::unordered_map<uint64_t, size_t> by_page;     // aligned offset -> index in `jobs`
     std::vector<Job> jobs;
     for (size_t i = 0; i < n; ++i) {
@@ -502,7 +497,7 @@ bool PleReader::collect(Ticket t, std::string& err) {
         });
         it = m.tickets.find(t.id);
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
-        if (!m.error.empty()) { err = m.error; m.tickets.erase(it); return false; }
+        if (!m.error.empty()) { err = m.error; return false; }
         m.stats.wait_us += now_us() - start;
         m.tickets.erase(it);
         return true;
@@ -515,7 +510,7 @@ bool PleReader::collect(Ticket t, std::string& err) {
         it = m.tickets.find(t.id);
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
     }
-    if (!m.error.empty()) { err = m.error; m.tickets.erase(it); return false; }
+    if (!m.error.empty()) { err = m.error; return false; }
     m.stats.wait_us += now_us() - start;
     m.tickets.erase(it);
     return true;

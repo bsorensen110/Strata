@@ -57,6 +57,7 @@ public:
     // the arena's buffers (at most 4, each within the device's maxBufferLength): chunk(i) for i >= count is chunk 0
     const mtl::Buffer& chunk(int i) const { return chunks_[(size_t) i < chunks_.size() ? (size_t) i : 0]; }
     const mtl::Buffer& smap() const { return smap_; }
+    int n_expert() const { return ne_; }
     uint64_t up_in_slot(int l) const { return lay_[(size_t) l].gs; }
     uint64_t down_in_slot(int l) const { return lay_[(size_t) l].gs + lay_[(size_t) l].us; }
     // The host's turn at layer l: ids = the window's T x topk routed ids; pred = T x 512 router logits of layer l + 1
@@ -69,7 +70,6 @@ public:
     uint8_t* region(uint64_t bytes);
     void hold_region(bool hold);
     void report(FILE* f) const;
-    void reset_stats();
 
 private:
     uint64_t shrink_to_ = 0;
@@ -118,6 +118,7 @@ private:
     bool stop_ = false;
     int outstanding_ = 0;
     int nio_ = 6, pre_k_ = 10, pre_k2_ = 0, split_ = 2;
+    int ne_ = 512;
     bool prefetch_ = true, fake_ = false, pre_mru_ = false;
     // stats
     uint64_t stamp_ = 1;   // the handshake count: slots pinned with the current one are in use on the GPU
@@ -125,6 +126,7 @@ private:
     double p_wait_ms_ = 0, p_host_ms_ = 0;
     uint64_t lookups_ = 0, hits_ = 0, pre_hits_ = 0, late_ = 0, misses_ = 0, pre_issued_ = 0, pre_cancel_ = 0, windows_ = 0;
     std::atomic<uint64_t> bytes_read_{0}, reads_{0};
+    uint64_t bytes_pre_ = 0, reads_pre_ = 0;   // bytes_read_ / reads_ when the first decode window began (the startup arena fill and prompt reads)
     double wait_ms_ = 0, host_ms_ = 0, fill_s_ = 0;
     uint64_t fill_bytes_ = 0;
 };

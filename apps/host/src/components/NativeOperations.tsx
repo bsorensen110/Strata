@@ -49,6 +49,7 @@ export function NativeBenchmark({ open, onClose }: {
 }
 export function NativeOperations() {
     const native = useNative();
+    const diagnostics = nativeJobDiagnostics(native?.jobs ?? []);
     const [error, setError] = useState(''), [saved, setSaved] = useState(''), [saving, setSaving] = useState(false);
     const [logs, setLogs] = useState<{
         at: string;

@@ -18,6 +18,8 @@
 #define cudaDevAttrMaxSharedMemoryPerBlockOptin hipDeviceAttributeMaxSharedMemoryPerBlock
 #define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
 #define cudaDevAttrClockRate hipDeviceAttributeClockRate
+#define cudaDevAttrMemoryClockRate hipDeviceAttributeMemoryClockRate
+#define cudaDevAttrGlobalMemoryBusWidth hipDeviceAttributeMemoryBusWidth
 #define cudaDevAttrComputeCapabilityMajor hipDeviceAttributeComputeCapabilityMajor
 #define cudaDevAttrComputeCapabilityMinor hipDeviceAttributeComputeCapabilityMinor
 #define cudaDevAttrIntegrated hipDeviceAttributeIntegrated
@@ -105,6 +107,11 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 #define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
+// the suffix-reuse splice's host/device probe (kv_splice_transport.hpp) asks the runtime what a pointer is
+#define cudaMemoryTypeDevice hipMemoryTypeDevice
+#define cudaMemoryTypeManaged hipMemoryTypeManaged
+#define cudaPointerAttributes hipPointerAttribute_t
+#define cudaPointerGetAttributes hipPointerGetAttributes
 #define cudaPeekAtLastError hipPeekAtLastError
 #define cudaRuntimeGetVersion hipRuntimeGetVersion
 #define cudaSetDevice hipSetDevice
@@ -114,6 +121,8 @@ hipError_t mem_get_info(size_t* free_bytes, size_t* total_bytes);
 #define cudaStreamCaptureStatusNone hipStreamCaptureStatusNone
 #define cudaStreamCreate hipStreamCreate
 #define cudaStreamCreateWithFlags hipStreamCreateWithFlags
+#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
+#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
 #define cudaStreamDestroy hipStreamDestroy
 #define cudaStreamEndCapture hipStreamEndCapture
 #define cudaStreamIsCapturing hipStreamIsCapturing

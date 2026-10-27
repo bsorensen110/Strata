@@ -6,9 +6,10 @@ import { useStore } from '../lib/store';
 import type { SoftwareUpdate, UpdateCheckResult } from '../lib/types';
 import { nativeAction, useNative } from '../lib/native';
 import { NativeProgress } from './NativeModels';
-import { jobErrorText } from '../lib/native-job-diagnostics';
+import { jobErrorText, nativeJobDiagnostics } from '../lib/native-job-diagnostics';
 import { appVersionLabel } from '../lib/app-version';
 import { fetchUpdateCheck, publishUpdateCheck, useInstalledVersions, useLastUpdateCheck } from '../lib/update-check';
+import { RecoveredUpdateHistory } from './RecoveredUpdateHistory';
 import { shownEngineVersion } from '../lib/engine-version';
 /** A check from an earlier day shows its date too, because the result is kept between visits. */
 function checkedLabel(at: string) {
@@ -18,6 +19,7 @@ function checkedLabel(at: string) {
 /** Installed versions are real host values. Installation needs a host updater. */
 export function SettingsUpdates() {
     const native = useNative();
+    const diagnostics = nativeJobDiagnostics(native?.jobs ?? []);
     const [confirm, setConfirm] = useState('');
     const appVersion = appVersionLabel(useStore(s => s.setup?.app.version), native?.version);
     const engineVersion = useStore(s => s.engine?.engine.version);
@@ -96,7 +98,7 @@ export function SettingsUpdates() {
   </>;
 }
 
-/** "Strata 0.2.7 · Engine 0.1.52": the app's own version first, the engine's beside it (About). */
+/** "Strata 0.2.6 · Engine 0.1.51": the app's own version first, the engine's beside it (About). */
 export function AboutVersions() {
     const native = useNative();
     const app = appVersionLabel(useStore(s => s.setup?.app.version), native?.version);

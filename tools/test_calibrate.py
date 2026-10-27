@@ -61,11 +61,11 @@ BASE = ["--pack", "p", "--spec", "4", "--spec-min-p", "0.5", "--max-context", "8
 
 
 class Calibrate(unittest.TestCase):
-    def run_with(self, speed, workers=6, base=BASE, adapt=None, read=None, reads=None, dies=()):
+    def run_with(self, speed, workers=6, base=BASE, adapt=None, read=None, reads=None, dies=(), say=lambda *_: None):
         starts = []
         res = CAL.measure(base, [[1, 2, 3]] * 3,
                           lambda a: FakeEngine(a, speed, workers, starts, adapt, read, reads, dies),
-                          say=lambda *_: None, long_prompt=lambda i, n: [1] * n)
+                          say=say, long_prompt=lambda i, n: [1] * n)
         return res, starts
 
     def test_prefill_pipe_on_a_layer_split(self):
@@ -180,10 +180,64 @@ class Calibrate(unittest.TestCase):
             self.assertTrue(all(before[0] <= after[0] and before[1] == after[1]
                                 for before, after in zip(readings, readings[1:])))
 
-    def test_small_gain_is_noise(self):
-        # 2% better at pcie 0.35: below MIN_GAIN, so the default stays
-        res, _ = self.run_with(lambda f, p, w: 51.0 if abs(f - 0.35) < 1e-6 else 50.0)
-        self.assertEqual(res["settings"], {})
+    def test_a_gain_that_beats_the_run_noise_is_kept(self):
+        # the 2026-10 ud-q4_k_xl report: the sweep winner is worth ~+2%, under the old fixed 3% margin,
+        # but every confirmation round repeats it - a gain bigger than the variation is real, keep it
+        said = []
+        res, _ = self.run_with(lambda f, p, w: 50.0 * (1.02 if abs(f - 0.75) < 1e-6 else 1.0), say=said.append)
+        self.assertEqual(res["settings"].get("--pcie-frac"), "0.75")
+        self.assertNotIn("--spec-min-p", res["settings"])     # the flat floor sweep chose nothing
+        self.assertTrue(any(x.endswith("-> kept") for x in said))
+        self.assertEqual(res["report"]["confirm_t"], 99.0)     # a zero-scatter run: no noise to beat
+        self.assertIn("confirm_noise", res["report"])
+
+    def test_a_gain_that_only_scatters_pair_to_pair_is_dropped(self):
+        # +18% on the median of the first three pairs, but the paired rounds scatter from -14% to +20%:
+        # the margin is the run's own variation, and a lucky best-of-eight draw does not beat it
+        calls = {"c": 0}
+        gains = (0.18, -0.14, 0.20, -0.10, 0.06, 0.14, -0.12)
+
+        def speed(f, p, w):
+            if abs(f - 0.75) < 1e-6:
+                calls["c"] += 1
+                return 55.0 if calls["c"] <= 36 else 50.0 * (1.0 + gains[(calls["c"] - 37) // 3 % 7])
+            return 50.0
+        res, _ = self.run_with(speed)
+        self.assertNotIn("--pcie-frac", res["settings"])
+
+    def test_the_measured_noise_floor_drops_a_steady_tiny_gain(self):
+        # sweeps wobble +-1.5% round to round (pooled sigma 0.0173); the confirmation gains a steady +1.0025%
+        # (0.5% x 0.5% from winning both sweeps), so the pairs' own stdev is 0 and the floor sets the scatter.
+        # Over the 7 pairs: t = 0.010025*sqrt(7)/(sqrt(2)*0.017252) = 1.087 < T_KEEP, dropped (reported truncated)
+        # - without the floor s would be 0, t = 99
+        counts = {}
+
+        def speed(f, p, w):
+            n = counts[(f, p)] = counts.get((f, p), 0) + 1   # 3 prompt calls per rate(): wobble flips per rate
+            wob = 1.015 if (n - 1) % 6 < 3 else 0.985
+            return 50.0 * (1.005 if abs(f - 0.75) < 1e-6 else 1.0) * (1.005 if abs(p - 0.7) < 1e-6 else 1.0) * wob
+        res, _ = self.run_with(speed)
+        self.assertNotIn("--pcie-frac", res["settings"])
+        self.assertEqual(res["report"]["confirm_noise"], 0.0173)
+        self.assertEqual(res["report"]["confirm_t"], 1.08)
+        self.assertEqual(len(res["report"]["confirm"]["0.75/0.7"]), 7)   # all 7 pairs, always
+
+    def test_a_gain_that_needs_seven_pairs_to_be_seen_is_kept(self):
+        # the first three pairs only reach t 2.0, but the run always pays for all 7 pairs: no early stop on a
+        # noisy start, and 7 pairs settle this at t ~ 4.7 - kept
+        calls = {"c": 0}
+        gains = (0.03, 0.03, 0.0, 0.03, 0.02, 0.03, 0.01)
+
+        def speed(f, p, w):
+            if abs(f - 0.75) < 1e-6:
+                calls["c"] += 1
+                return 55.0 if calls["c"] <= 36 else 50.0 * (1.0 + gains[(calls["c"] - 37) // 3 % 7])
+            return 50.0
+        res, _ = self.run_with(speed)
+        self.assertEqual(res["settings"].get("--pcie-frac"), "0.75")
+        self.assertEqual(len(res["report"]["confirm"]["0.75/0.5"]), 7)   # all 7 pairs, always;
+        # the floor sweep is flat, so the default floor wins its tie and only the chosen pcie share lands
+        self.assertEqual(res["settings"], {"--pcie-frac": "0.75"})
 
     def test_finds_pcie_and_min_p(self):
         def speed(f, p, w):
@@ -329,6 +383,15 @@ class Calibrate(unittest.TestCase):
         self.assertIsNone(CAL.arg_value(b, "--pool-workers"))
         self.assertEqual(b.count("--spec-min-p"), 1)
 
+    def test_apply_does_not_add_flags_it_did_not_choose(self):
+        # the 2026-10 report: a hand-written config without --spec-min-p got "0.5" added by apply() and it read
+        # as a calibration choice; only a flag the config already carried is reset to the product default
+        hand = ["--pack", "p", "--spec", "4"]
+        self.assertIsNone(CAL.arg_value(CAL.apply(hand, {"--pool-workers": "7"}), "--spec-min-p"))
+        self.assertEqual(CAL.arg_value(CAL.apply(hand, {"--spec-min-p": "0.70"}), "--spec-min-p"), "0.70")
+        self.assertEqual(CAL.apply(hand + ["--spec-min-p", "0.70"], {}),
+                         ["--pack", "p", "--spec", "4", "--spec-min-p", "0.5"])
+
     def test_engine_args_are_the_servers(self):
         # #447: a "gpu" list is a layer split only with two or more cards; "0,2" is one too; split_skip_if_fits counts
         helper = {"args": BASE + ["--expert-cache-device1", "1800"], "gpu": [0], "env": {"CUDA_VISIBLE_DEVICES": "0,1"}}
@@ -378,6 +441,21 @@ class Calibrate(unittest.TestCase):
             self.assertIsNone(CAL.engine_error(None))
             self.assertIsNone(CAL.engine_error(str(Path(d) / "missing.log")))
 
+    def test_apply_removes_all_duplicate_overrides(self):
+        args = BASE + ["--pcie-frac", "0.2", "--pcie-frac", "0.75", "--spec-min-p", "0.7"]
+        default = CAL.apply(args, {})
+        self.assertNotIn("--pcie-frac", default)
+        self.assertEqual(default.count("--spec-min-p"), 1)
+        self.assertEqual(CAL.arg_value(default, "--spec-min-p"), "0.5")
+
+    def test_close_reaps_a_killed_engine(self):
+        import subprocess
+        eng = mock.Mock()
+        eng.proc.wait.side_effect = [subprocess.TimeoutExpired("engine", 60), 0]
+        CAL.close(eng)
+        eng.proc.kill.assert_called_once()
+        self.assertEqual(eng.proc.wait.call_args_list, [mock.call(60), mock.call(timeout=10)])
+
     def test_worker_candidates(self):
         self.assertEqual(CAL.worker_candidates(6), [6, 4, 3, 2])
         self.assertEqual(CAL.worker_candidates(23), [23, 15, 12, 6])        # a quarter: 4 beat 15 on 8P + 16E
@@ -391,6 +469,76 @@ class Calibrate(unittest.TestCase):
         self.assertEqual(CAL.pick({"a": [50, 51, 49], "b": [53, 52, 60]}, "a"), "b")
         self.assertEqual(CAL.pick({"a": [50, 51, 49], "b": [51, 51.5, 51]}, "a"), "a")
         self.assertEqual(CAL.pick({}, "a"), "a")
+
+    def test_a_dead_pair_skips_instead_of_scoring_minus_100(self):
+        # a zero candidate rate (dead engine, short decode) must not score as a -100% pair: 6 of 7 pairs at
+        # +5% still keep (t = 0.05*sqrt(6)/(sqrt(2)*0.01) = 8.66)
+        keep, mean, t = CAL.paired_decision([50.0] * 7, [52.5] * 6 + [0.0], 0.01)
+        self.assertTrue(keep)
+        self.assertAlmostEqual(mean, 0.05)
+        self.assertAlmostEqual(t, 8.66, places=1)
+
+    def test_pooled_sigma(self):
+        # the root-mean-square of the values' CVs: stdev(100,98,102)/100 = 2/100, stdev(50,49,51)/50 = 1/50
+        self.assertAlmostEqual(CAL.pooled_sigma([[100.0, 98.0, 102.0], [50.0, 49.0, 51.0]]), 0.02, places=4)
+        self.assertEqual(CAL.pooled_sigma([[50.0]]), 0.0)               # no repeats: no scatter to measure
+
+
+class DFlashCalibration(unittest.TestCase):
+    def measure(self, speed, maximum=7, base=None):
+        starts = []
+        base = base or CAL.with_arg(BASE, "--spec", "8") + ["--dflash", "draft.gguf"]
+        class DraftEngine(FakeEngine):
+            def __init__(self, args):
+                super().__init__(args, lambda *a: 50, info_workers=0, starts=starts)
+                self.info.update(dflash_block=int(CAL.arg_value(args, "--dflash-block") or maximum), dflash_max=maximum)
+            def generate(self, ids, max_new, sampling, cancel):
+                tune = sampling.get("strata_tune") or {}
+                k = tune.get("dflash_block", self.info["dflash_block"])
+                assert 1 <= k <= maximum
+                rate = speed(k, tune.get("pcie_frac", 0.55), tune.get("spec_min_p", self.info["spec_min_p"]))
+                yield from [1] * max_new
+                self.last = {"generated": max_new, "decode_ms": max_new / rate * 1000}
+        return CAL.measure(base, [[1]] * 3, DraftEngine, say=lambda *_: None), starts
+
+    def test_forward_width_persisted_through_restarts(self):
+        res, starts = self.measure(lambda k, f, p: 60 if k == 4 else 50)
+        self.assertEqual(res["settings"]["--dflash-block"], "4")
+        self.assertTrue(all(CAL.arg_value(a, "--dflash-block") == "4" for a in starts[1:]))
+        self.assertEqual(len(res["report"]["dflash_block_sweeps"]), 2)
+
+    def test_noise_keeps_default_and_resets_old_width(self):
+        # a +2% winner inside this run's own scatter: the paired confirmation keeps the default, and
+        # the config's old --dflash-block width goes back to the product default
+        import itertools
+        wobble = itertools.cycle((1.5, -1.5))
+        res, starts = self.measure(lambda k, f, p: (51 if k == 4 else 50) + next(wobble),
+                                  base=BASE + ["--dflash", "draft.gguf", "--dflash-block", "4"])
+        self.assertEqual(res["settings"], {})
+        self.assertIsNone(CAL.arg_value(starts[0], "--dflash-block"))
+
+    def test_loaded_capacity_limits_candidates(self):
+        res, _ = self.measure(lambda k, f, p: 60 if k == 2 else 50, maximum=3)
+        self.assertEqual(res["settings"]["--dflash-block"], "2")
+        self.assertEqual(set(res["report"]["dflash_block_sweeps"][0]["rates"]), {"1", "2", "3"})
+
+    def test_retunes_width_after_pcie_change(self):
+        # A GPU-favouring share changes which forward width wins.
+        def speed(k, f, p):
+            if f == 0.2:
+                return 80 if k == 3 else 65
+            return 60 if k == 4 else 50
+        res, _ = self.measure(speed)
+        self.assertEqual(res["settings"]["--dflash-block"], "3")
+        self.assertEqual(res["settings"]["--pcie-frac"], "0.20")
+
+    def test_six_row_forward_is_measured(self):
+        res, _ = self.measure(lambda k, f, p: 60 if k == 6 else 50)
+        self.assertEqual(res["settings"]["--dflash-block"], "6")
+
+    def test_mtp_never_receives_dflash_setting(self):
+        args = CAL.apply(BASE, {"--dflash-block": "4"})
+        self.assertNotIn("--dflash-block", args)
 
 
 class SetupIntegration(unittest.TestCase):
@@ -445,6 +593,38 @@ class SetupIntegration(unittest.TestCase):
         CAL.run = lambda c, say=print, start_engine=None: {"settings": {}, "env": {}, "report": {"tok_s": 65.0}}
         self.assertTrue(self.S.calibrate_config(cfg_path))
         self.assertEqual(json.loads(cfg_path.read_text())["env"], {"STRATA_ROCBLAS_TUNING": "t"})
+
+    def test_calibration_keys_separate_drafters_and_quantization(self):
+        cfg = {"args": BASE + ["--mtp", "mtp"], "model_name": "m", "drafter": "mtp"}
+        df = dict(cfg, args=BASE + ["--dflash", "q4.gguf", "--dflash-vocab", "vocab.bin"], drafter="dflash")
+        keys = [self.S.hardware_key(cfg), self.S.hardware_key(df),
+                self.S.hardware_key(dict(df, args=CAL.with_arg(df["args"], "--dflash", "q8.gguf"))),
+                self.S.hardware_key(dict(cfg, args=BASE, drafter="none"))]
+        self.assertEqual(len(set(keys)), 4)
+        # The calibrated width itself is not part of its cache key.
+        self.assertEqual(keys[1], self.S.hardware_key(dict(df, args=df["args"] + ["--dflash-block", "4"])))
+
+    def test_dflash2_profile_survives_reinstall_and_keeps_measurements(self):
+        cfg_path = Path(self.tmp.name) / "strata-dflash2.json"
+        cfg = {"exe": "x", "args": BASE + ["--dflash", "q8.gguf", "--dflash-block", "3"],
+               "model_name": "m", "drafter": "dflash2", "dflash2_quant": "q8"}
+        settings = {"--prefill": "512", "--short-read": "64", "--dflash-block": "6",
+                    "--spec-min-p": "0.85", "--vram-reserve-mib": "1024"}
+        report = {"tok_s": None, "dflash2_profiles": {"selected": "prefill-512", "confirmation_gain": .15}}
+        cfg_path.write_text(json.dumps(cfg))
+        CAL.run = lambda *a, **k: {"settings": settings, "report": report}
+        self.assertTrue(self.S.calibrate_config(cfg_path))
+        written = json.loads(cfg_path.read_text())
+        self.assertEqual(self.S.hardware_key(cfg), self.S.hardware_key(written))
+        self.assertEqual(self.S.saved_calibration(cfg)["settings"], settings)
+        self.assertEqual(self.S.saved_calibration(cfg)["report"], report)
+        restored = CAL.apply(cfg["args"], self.S.saved_calibration(cfg)["settings"])
+        self.assertEqual(CAL.arg_value(restored, "--prefill"), "512")
+        self.assertEqual(CAL.arg_value(restored, "--dflash-block"), "6")
+        changed = dict(cfg, args=CAL.with_arg(cfg["args"], "--dflash", "q4.gguf"))
+        self.assertIsNone(self.S.saved_calibration(changed))
+        changed_env = dict(cfg, env={"STRATA_DFLASH_HEAD_IL": "1"})
+        self.assertIsNone(self.S.saved_calibration(changed_env))
 
     def test_failed_calibration_keeps_defaults(self):
         cfg_path = Path(self.tmp.name) / "strata-q2_0.json"

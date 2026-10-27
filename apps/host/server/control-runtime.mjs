@@ -74,17 +74,6 @@ export function findControl({ env = process.env, platform = process.platform, ex
   return control;
 }
 
-/**
- * The environment of the server the host starts from a source checkout (#3851): the key travels in the run configuration, so a
- * STRATA_API_KEY the host itself was started with is removed. Setting it to an empty string made serve/server.py stop with
- * "an API key was given but it is empty".
- */
-export function sourceServerEnvironment(env = process.env) {
-  const next = { ...env, PYTHONUNBUFFERED: '1', PYTHONUTF8: '1', PYTHONIOENCODING: 'utf-8' };
-  delete next.STRATA_API_KEY;
-  return next;
-}
-
 /** The environment Control runs in: nothing from the user's Python, and acquiring forbidden. */
 export function controlEnvironment(control, { env = process.env, components = componentsDirectory({ env }), acquire = false } = {}) {
   const next = { ...env };
@@ -92,6 +81,8 @@ export function controlEnvironment(control, { env = process.env, components = co
   const result = {
     ...next,
     PYTHONNOUSERSITE: '1', PYTHONUTF8: '1', PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8',
+    // Python must not create or refresh bytecode inside a signed application bundle.
+    ...(env.STRATA_PACKAGED === '1' ? { PYTHONDONTWRITEBYTECODE: '1' } : {}),
     STRATA_NO_ACQUIRE: '1', STRATA_COMPONENTS_DIR: components,
     // The app's own settings file, beside its components: Control and the installer never read or write the file an older
     // command-line Strata keeps in %APPDATA% / ~/.config (its list of Strata folders), so an old install is never adopted.

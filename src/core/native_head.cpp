@@ -1,4 +1,6 @@
 #include "strata/core/native_head.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
+#include "strata/core/numa_policy.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -7,7 +9,6 @@
 #include <cuda_runtime.h>
 #include <climits>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <exception>
 
@@ -26,7 +27,38 @@ void NativeHead::unload() {
     weights_ = nullptr;
 }
 
-bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {
+uint64_t NativeHead::weight_bytes_for(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out,
+                                      std::string& err) {
+    if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
+        err = "native head requires positive int32 dimensions and whole 256-value rows";
+        return 0;
+    }
+    try {
+        const strata::GgufModel model(shards);
+        err = strata::check_engine_architecture(model.meta());
+        if (!err.empty()) return 0;
+        size_t at = 0;
+        const strata::TensorInfo* tensor = model.find("output.weight", &at);
+        if (!tensor || !strata::kernels::native_mmvq_supported((int) tensor->type) || tensor->shape.size() != 2 ||
+            tensor->shape[0] != (uint64_t) n_in || tensor->shape[1] != (uint64_t) n_out) {
+            err = "native head: expected a natively supported output.weight with the canonical head dimensions";
+            return 0;
+        }
+        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);
+        const strata::GgufFile& gguf = model.shard(at);
+        const uint64_t payload = gguf.file_size() - gguf.data_start();
+        if (tensor->offset > payload || bytes > payload - tensor->offset) {
+            err = "native head: truncated output.weight payload";
+            return 0;
+        }
+        return bytes;
+    } catch (const std::exception& error) {
+        err = std::string("native head: ") + error.what();
+        return 0;
+    }
+}
+
+bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err, bool allow_bf16) {
     if (loaded()) { err = "native head is already loaded"; return false; }
     if (n_in <= 0 || n_out <= 0 || n_in > INT_MAX || n_out > INT_MAX || n_in % 256) {
         err = "native head requires positive int32 dimensions and whole 256-value rows";
@@ -41,12 +73,14 @@ bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int6
         size_t at = 0;
         const strata::TensorInfo* tensor = model.find("output.weight", &at);
         const strata::GgufFile& gguf = model.shard(at);
-        if (!tensor || !strata::kernels::native_mmvq_supported((int) tensor->type) || tensor->shape.size() != 2 ||
+        if (!tensor || !(strata::kernels::native_mmvq_supported((int) tensor->type) ||
+                         (allow_bf16 && tensor->type == 30)) || tensor->shape.size() != 2 ||
             tensor->shape[0] != (uint64_t) n_in || tensor->shape[1] != (uint64_t) n_out) {
             err = "native head: expected a natively supported output.weight with the canonical head dimensions";
             return false;
         }
-        const uint64_t bytes = strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);
+        const uint64_t bytes = tensor->type == 30 ? (uint64_t) n_in * n_out * 2
+            : strata::kernels::native_mmvq_weight_bytes((int) tensor->type, (int) n_in, (int) n_out);
         const uint64_t payload = gguf.file_size() - gguf.data_start();
         if (tensor->offset > payload || bytes > payload - tensor->offset) {
             err = "native head: truncated output.weight payload";
@@ -90,7 +124,9 @@ bool NativeHead::run(const float* mixed, float* logits, void* stream, std::strin
         return false;
     }
     try {
-        if (type_ == 13) {
+        if (type_ == 30) {
+            strata::kernels::bf16_gemv_fp32_mmvf(mixed, (const uint16_t*) weights_, logits, n_in_, n_out_, stream);
+        } else if (type_ == 13) {
             strata::kernels::native_q5_k_f32(weights_, mixed, scratch_, logits, n_in_, n_out_, 1, stream);
         } else {
             strata::kernels::native_quantize_q8_1(mixed, scratch_, n_in_, 1, stream);
@@ -147,35 +183,19 @@ bool NativeEmbed::load(const std::vector<std::string>& shards, int64_t n_embd, i
             return false;
         }
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
-        // STRATA_EMBED_VRAM=1: the table in the current device's VRAM instead of mapped host memory. The same
-        // bytes, read by the same gather kernels through dev_ (bitwise the same rows); what changes is where a
-        // prompt's scattered row reads go: over a PCIe Gen2 x4 link they cost more than the table's size in VRAM
-        // is worth. Taken only with the table plus 512 MiB free; otherwise, or when the upload fails, the mapped
-        // placement below is used as before (and the fallback is said).
-        if (const char* ev = std::getenv("STRATA_EMBED_VRAM"); ev != nullptr && ev[0] == '1') {
-            size_t free_b = 0, total_b = 0;
-            const bool have_free = cudaMemGetInfo(&free_b, &total_b) == cudaSuccess;
-            void* d = nullptr;
-            if (have_free && (uint64_t) free_b > bytes_ + ((uint64_t) 512 << 20) &&
-                cudaMalloc(&d, bytes_) == cudaSuccess) {
-                if (cudaMemcpy(d, gguf.tensor_data(*t), bytes_, cudaMemcpyHostToDevice) == cudaSuccess) {
-                    std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1: %llu MiB placed in VRAM "
-                                         "(%llu MiB were free)\n",
-                                 (unsigned long long) (bytes_ >> 20), (unsigned long long) (free_b >> 20));
-                    dev_ = d;   // host_ stays null: the destructor frees dev_
-                    type_ = (int) t->type;
-                    n_embd_ = n_embd;
-                    n_vocab_ = n_vocab;
-                    return true;
-                }
-                (void) cudaFree(d);
-            }
-            (void) cudaGetLastError();
-            std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1 not taken (%llu MiB free, the table "
-                                 "needs %llu MiB plus 512 MiB): kept in mapped host memory\n",
-                         (unsigned long long) (have_free ? free_b >> 20 : 0), (unsigned long long) (bytes_ >> 20));
+        cudaError_t host_err = cudaSuccess;
+        {
+            // S2: the table's pages are this thread's faults, so S1's light rule - bind the thread for the scope that
+            // allocates - decides the node they come from.  Off (hot < 0): no syscall; the VRAM fallback below is
+            // untouched either way.
+            const int hot = detail::numa_hot_node();
+            detail::ThreadNodeBinding nb;
+            std::string why;
+            if (hot >= 0 && !nb.bind(hot, why))
+                std::fprintf(stderr, "native embedding: WARNING: cannot bind this thread to NUMA node %d (%s): the "
+                                     "pinned table takes the process's memory policy\n", hot, why.c_str());
+            host_err = cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable);
         }
-        cudaError_t host_err = cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable);
         if (host_err != cudaSuccess) {
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
             // themselves (three cards). The table is only gathered from, so keep it in the current device's VRAM

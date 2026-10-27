@@ -30,6 +30,13 @@ size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 /// Bytes of `rows` activation rows of `cols` values quantized for MMQ (the row padded to 512 values).
 size_t q8_bytes(int64_t rows, int64_t cols);
 
+/// Lend the MMQ kernels' device scratch (their stream-k fixup tiles, which mmq.cuh allocates lazily through
+/// `ggml_cuda_pool` and this build's pool backs with a cudaMalloc on the card's free VRAM) the part of the borrowed
+/// expert-cache region a chunk's layout did not use, so it costs VRAM the prompt has already taken.  Call per
+/// layout from the prompt path, with the tail its carve left (a null `base` - the loan is gone, or the layout used
+/// all of it - drops the buffers cached from the previous layout).
+void pool_slab(int dev, void* base, size_t bytes);
+
 /// q8_1 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
 /// ids is null); `x` has `ld` floats per row.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
@@ -122,11 +129,6 @@ void gather_strata_q2(const uint8_t* blob, void* gu_dst, void* d_dst, void* stre
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
-/// swiglu (n_ff 640), then quantize() of its rows for a down product of `ggml_type`, in one pass: H never stored,
-/// the same bytes in hq.  Only where swiglu_quant_ok (a q8_1 D4 down type; gu 16-byte aligned): CUDA, the
-/// STRATA_EXPERIMENTAL_SM60 build.
-bool swiglu_quant_ok(int ggml_type);
-void swiglu_quant(const float* gu, void* hq, int64_t rows, bool interleaved, void* stream);
 /// swiglu of an NVFP4 group's gate/up rows (split halves) with scale_gu_rows' scales applied as they are read.
 void swiglu_scaled(const float* gu, float* h, int64_t rows, int64_t n_ff, const int32_t* bounds, int n,
                    const float* tails, int64_t row0, void* stream);

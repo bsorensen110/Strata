@@ -79,8 +79,13 @@ def _content(content, param):
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
             parts.append({"type": "input_image", "image_url": part["image_url"]})
+        elif kind in ("input_video", "video_url"):
+            if not part.get("video_url"):
+                raise ResponsesError("only videos given as video_url (a data: or http(s) URL) are supported; "
+                                     "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
+            parts.append(dict(part, type="input_video"))
         else:
-            raise ResponsesError(f"content parts of type {kind!r} are not supported (text and images are)",
+            raise ResponsesError(f"content parts of type {kind!r} are not supported (text, images and videos are)",
                                  f"{param}[{j}].type", "unsupported_parameter")
     return _parts_of(parts)
 
@@ -420,12 +425,11 @@ def text_format(req: dict):
     kind = fmt.get("type")
     if kind in (None, "text"):
         return None
-    extra = {"repair_latex_escapes": True} if fmt.get("repair_latex_escapes") is True else {}   # #2893, opt-in
     if kind == "json_object":
-        return {"type": "json_object", **extra}
+        return {"type": "json_object"}
     if kind == "json_schema":
         spec = {k: fmt[k] for k in ("name", "schema", "strict", "description") if k in fmt}
-        return {"type": "json_schema", "json_schema": spec, **extra}
+        return {"type": "json_schema", "json_schema": spec}
     raise ResponsesError("text.format.type must be text, json_object or json_schema", "text.format.type")
 
 
@@ -444,10 +448,8 @@ def check_request(req: dict) -> None:
         raise ResponsesError("stored prompt templates are not supported: send instructions and input",
                              "prompt", "unsupported_parameter")
     n = req.get("max_output_tokens")
-    # -1 and 0 mean no cap, as max_tokens does on the chat path (docs/DETAILS.md); anything lower is a mistake
-    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < -1):
-        raise ResponsesError("max_output_tokens must be a whole number, 1 or more, or -1 or 0 for no cap",
-                             "max_output_tokens")
+    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 1):
+        raise ResponsesError("max_output_tokens must be a positive whole number", "max_output_tokens")
     reasoning = req.get("reasoning")
     if reasoning is not None and not isinstance(reasoning, dict):
         raise ResponsesError("reasoning must be an object", "reasoning")
