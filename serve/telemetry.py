@@ -3,12 +3,9 @@
 A background thread samples once a second and keeps the last 60 readings of each series for the sparklines:
 - GPU: NVIDIA's own NVML library (nvml.dll / libnvidia-ml.so.1, installed with every driver) through ctypes, so no
   pip package is needed: load, VRAM, temperature, power, PCIe link and throughput.  With the AMD backend (#301): the
-  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power; on Windows the AMD driver's ADL library
-  (atiadlxx.dll, installed with Adrenalin) gives load, temperature and power, the OS's GPU memory counter the VRAM
-  in use, and the OS's own device properties the PCIe link (ADL's PMLog link channels fill in where those are
-  missing).  On macOS (Metal backend):
-  IOKit's IOAccelerator registry - load and VRAM; the temperature and power sensors need root (`powermetrics`), and an
-  Apple Silicon GPU sits on the die, so there is no PCIe link.
+  amdgpu driver's Linux sysfs files - load, VRAM, temperature and power.  On macOS (Metal backend): IOKit's
+  IOAccelerator registry - load and VRAM; the temperature and power sensors need root (`powermetrics`), and an Apple
+  Silicon GPU sits on the die, so there is no PCIe link.
 - CPU, RAM, disk: `psutil` when it is installed (setup installs it); without it the CPU and RAM readings fall back to
   the OS (Windows GlobalMemoryStatusEx / GetSystemTimes, Linux /proc) and the disk rate is absent.
 Anything that cannot be read is None; nothing here can stop the server.
@@ -72,16 +69,6 @@ class _Nvml:
             return v.value if getattr(self.lib, fn)(self.dev, *args, ctypes.byref(v)) == 0 else None
         except (AttributeError, OSError):
             return None
-
-    def energy_mj(self):
-        """NVML cumulative board energy in millijoules, when supported."""
-        value = ctypes.c_ulonglong()
-        try:
-            if self.lib.nvmlDeviceGetTotalEnergyConsumption(self.dev, ctypes.byref(value)) == 0:
-                return value.value
-        except (AttributeError, OSError):
-            pass
-        return None
 
     def name(self):
         buf = ctypes.create_string_buffer(96)
@@ -358,298 +345,12 @@ class _Metal:
         return out
 
 
-# ------------------------------------------------------------------------------------------------ AMD (Windows)
-WINDOWS = os.name == "nt"
-
-# ADL's PMLog sensor ids (ADLSensorType in the ADL SDK's adl_defines.h), first supported one wins.  Checked on a
-# Radeon 8060S (Strix Halo, driver 32.0.31041.1004) against a prompt: activity 6 -> 85-96 %, the graphics temperature
-# 48 -> 53-81 C, ASIC power 45 -> 80-110 W (the whole APU; GFX power alone 4 -> 22-31 W).  Power is the board's where
-# the card reports it (73: an RX 7900 XTX does, and has neither 23 nor 30 - #1434's review), else ASIC power, the
-# counterpart of NVML's board power on an APU, whose CPU, GPU and memory share that package (the 8060S has no 73).
-ADL_UTIL = (19,)                    # PMLOG_INFO_ACTIVITY_GFX
-ADL_TEMP = (28, 8, 27, 29)          # PMLOG_TEMPERATURE_GFX, _EDGE, _HOTSPOT, _SOC
-ADL_POWER = (73, 23, 30)            # PMLOG_BOARD_POWER, PMLOG_ASIC_POWER, PMLOG_GFX_POWER
-ADL_BUS_SPEED, ADL_BUS_LANES = 40, 41       # PMLOG_BUS_SPEED / PMLOG_BUS_LANES
-
-# Windows' own PCIe link values for a started PCI device: the DEVPKEY_PciDevice_* property set
-# {3AB22E31-8264-4B4E-9AF5-A8D2D8E33E62}, pids current speed 9, current width 10, maximum speed 11 (verified on
-# an R9700 against Get-PnpDeviceProperty).  #2614 (RX 7900 XTX) and our RDNA4 test PC have both seen ADL's PMLog
-# BUS_SPEED sit a generation under the link Windows reports, so the OS values come first and the PMLog channels
-# only back them up.
-PCI_SET = (0x3AB22E31, 0x8264, 0x4B4E, (0x9A, 0xF5, 0xA8, 0xD2, 0xD8, 0xE3, 0x3E, 0x62))
-PCI_SPEED, PCI_WIDTH, PCI_SPEED_MAX = 9, 10, 11
-
-
-def _valid_gen(value):
-    """A PCIe generation (1..6), or None for anything else."""
-    return value if isinstance(value, int) and 1 <= value <= 6 else None
-
-
-def _valid_lanes(value):
-    """A PCIe link width (1..256 lanes), or None for anything else."""
-    return value if isinstance(value, int) and 1 <= value <= 256 else None
-
-
-def adl_pick(sensors: dict, ids):
-    """The value of the first of `ids` the card supports (`sensors`: {sensor id: value} of the supported ones)."""
-    return next((sensors[i] for i in ids if i in sensors), None)
-
-
-def luid_instance(high: int, low: int) -> str:
-    """The instance name Windows' GPU counters give an adapter LUID ("luid_0x00000000_0x000179e6_phys_0")."""
-    return f"luid_0x{high & 0xFFFFFFFF:08x}_0x{low & 0xFFFFFFFF:08x}_phys_0"
-
-
-class _AmdWindows:
-    """An AMD card's readings on Windows, with _Nvml's interface: load, temperature and power from the PMLog sensors
-    of the driver's ADL library (atiadlxx.dll, part of every Adrenalin install), the memory size from ADL, the
-    memory in use from the OS counter "\\GPU Adapter Memory(<luid>)\\Dedicated Usage" (pdh.dll) - its adapter found
-    by PCI bus through D3DKMT - and the PCIe link from the card's own device properties (cfgmgr32), with ADL's PMLog
-    link channels as the fallback.  (ADL's own VRAM-usage call reads nonsense on a Strix Halo.)  `index`: the AMD
-    cards in PCI bus order, as HIP numbers them."""
-
-    class _AdapterInfo(ctypes.Structure):
-        _fields_ = [("iSize", ctypes.c_int), ("iAdapterIndex", ctypes.c_int), ("strUDID", ctypes.c_char * 256),
-                    ("iBusNumber", ctypes.c_int), ("iDeviceNumber", ctypes.c_int), ("iFunctionNumber", ctypes.c_int),
-                    ("iVendorID", ctypes.c_int), ("strAdapterName", ctypes.c_char * 256),
-                    ("strDisplayName", ctypes.c_char * 256), ("iPresent", ctypes.c_int), ("iExist", ctypes.c_int),
-                    ("strDriverPath", ctypes.c_char * 256), ("strDriverPathExt", ctypes.c_char * 256),
-                    ("strPNPString", ctypes.c_char * 256), ("iOSDisplayIndex", ctypes.c_int)]
-
-    class _MemInfo2(ctypes.Structure):
-        _fields_ = [("iMemorySize", ctypes.c_longlong), ("strMemoryType", ctypes.c_char * 256),
-                    ("iMemoryBandwidth", ctypes.c_longlong), ("iHyperMemorySize", ctypes.c_longlong),
-                    ("iInvisibleMemorySize", ctypes.c_longlong), ("iVisibleMemorySize", ctypes.c_longlong)]
-
-    class _PdhValue(ctypes.Structure):
-        _fields_ = [("CStatus", ctypes.c_ulong), ("largeValue", ctypes.c_longlong)]
-
-    class _Key(ctypes.Structure):
-        """DEVPROPKEY as cfgmgr32 takes it: the property-set GUID and the property id in one struct."""
-        class _Guid(ctypes.Structure):
-            _fields_ = [("d1", ctypes.c_ulong), ("d2", ctypes.c_ushort), ("d3", ctypes.c_ushort),
-                        ("d4", ctypes.c_ubyte * 8)]
-        _fields_ = [("fmtid", _Guid), ("pid", ctypes.c_ulong)]
-
-    _MALLOC = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_int)
-    _malloc = None                  # ADL allocates through this; kept alive with the class
-
-    def __init__(self, index=0):
-        self.adl = self.ctx = self.adapter = self._lib = None
-        self.bus = self.label = self.total = self.pnp = None
-        self.pdh = self.query = self.counter = None
-        try:
-            self._open_adl(index)
-        except (AttributeError, OSError, ValueError):
-            self.adl = None
-        if self.adl is not None:
-            try:
-                self._open_counter()
-            except (AttributeError, OSError, ValueError):
-                self.pdh = None
-        if not self.ok():
-            self.close()            # a reader that reads nothing holds nothing (an ADL context made before it failed)
-
-    def close(self):
-        """Give back the ADL context and the PDH query (both are OS handles: #1434's review saw +2 per reader that
-        was never closed).  Safe to call again; a closed reader reads nothing."""
-        q, self.query, self.counter = self.query, None, None
-        if q is not None and self.pdh is not None:
-            try:
-                self.pdh.PdhCloseQuery(q)
-            except OSError:
-                pass
-        ctx, self.ctx = self.ctx, None
-        if ctx is not None and self._lib is not None:
-            try:
-                self._lib.ADL2_Main_Control_Destroy(ctx)
-            except (AttributeError, OSError):
-                pass
-        self.adl = self.adapter = None
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:  # noqa: BLE001 - interpreter shutdown: the OS takes the handles back anyway
-            pass
-
-    def _open_adl(self, index):
-        self.adl = self._lib = ctypes.CDLL("atiadlxx.dll")
-        if _AmdWindows._malloc is None:
-            crt_malloc = ctypes.CDLL("msvcrt").malloc
-            crt_malloc.restype = ctypes.c_void_p
-            _AmdWindows._malloc = self._MALLOC(lambda n: crt_malloc(ctypes.c_size_t(n)))
-        ctx = ctypes.c_void_p()
-        if self.adl.ADL2_Main_Control_Create(self._malloc, 1, ctypes.byref(ctx)) != 0:
-            self.adl = None
-            return
-        self.ctx = ctx
-        n = ctypes.c_int()
-        if self.adl.ADL2_Adapter_NumberOfAdapters_Get(self.ctx, ctypes.byref(n)) != 0 or n.value <= 0:
-            self.adl = None
-            return
-        infos = (self._AdapterInfo * n.value)()
-        if self.adl.ADL2_Adapter_AdapterInfo_Get(self.ctx, infos, ctypes.sizeof(infos)) != 0:
-            self.adl = None
-            return
-        cards = {}                  # ADL lists one entry per display output: one card per PCI bus
-        for a in infos:
-            if a.iVendorID == 1002 and a.iExist and a.iBusNumber not in cards:
-                cards[a.iBusNumber] = a
-        ordered = [cards[b] for b in sorted(cards)]
-        if not 0 <= index < len(ordered):
-            self.adl = None
-            return
-        a = ordered[index]
-        self.adapter, self.bus = a.iAdapterIndex, a.iBusNumber
-        self.label = a.strAdapterName.decode(errors="replace").strip() or "AMD Radeon"
-        self.pnp = a.strPNPString.decode(errors="replace").strip() or None
-        m = self._MemInfo2()
-        if self.adl.ADL2_Adapter_MemoryInfo2_Get(self.ctx, self.adapter, ctypes.byref(m)) == 0 and m.iMemorySize > 0:
-            self.total = m.iMemorySize
-
-    def _luid_of_bus(self, bus):
-        """The LUID of the display adapter on PCI bus `bus` (D3DKMTEnumAdapters2 + KMTQAITYPE_ADAPTERADDRESS)."""
-        class AdapterInfo(ctypes.Structure):
-            _fields_ = [("hAdapter", ctypes.c_uint), ("LowPart", ctypes.c_ulong), ("HighPart", ctypes.c_long),
-                        ("NumOfSources", ctypes.c_ulong), ("bPrecisePresentRegionsPreferred", ctypes.c_int)]
-
-        class Enum2(ctypes.Structure):
-            _fields_ = [("NumAdapters", ctypes.c_ulong), ("pAdapters", ctypes.POINTER(AdapterInfo))]
-
-        class Query(ctypes.Structure):
-            _fields_ = [("hAdapter", ctypes.c_uint), ("Type", ctypes.c_int),
-                        ("pPrivateDriverData", ctypes.c_void_p), ("PrivateDriverDataSize", ctypes.c_uint)]
-
-        class Address(ctypes.Structure):
-            _fields_ = [("BusNumber", ctypes.c_uint), ("DeviceNumber", ctypes.c_uint), ("FunctionNumber", ctypes.c_uint)]
-
-        gdi = ctypes.WinDLL("gdi32")
-        e = Enum2()
-        if gdi.D3DKMTEnumAdapters2(ctypes.byref(e)) != 0 or not e.NumAdapters:
-            return None
-        arr = (AdapterInfo * e.NumAdapters)()
-        e.pAdapters = arr
-        if gdi.D3DKMTEnumAdapters2(ctypes.byref(e)) != 0:
-            return None
-        found = None
-        for a in arr[:e.NumAdapters]:
-            addr = Address()
-            q = Query(a.hAdapter, 6, ctypes.cast(ctypes.pointer(addr), ctypes.c_void_p), ctypes.sizeof(addr))
-            if found is None and gdi.D3DKMTQueryAdapterInfo(ctypes.byref(q)) == 0 and addr.BusNumber == bus:
-                found = (a.HighPart, a.LowPart)
-            gdi.D3DKMTCloseAdapter(ctypes.byref(ctypes.c_uint(a.hAdapter)))
-        return found
-
-    def _open_counter(self):
-        luid = self._luid_of_bus(self.bus)
-        if luid is None:
-            return
-        self.pdh = ctypes.WinDLL("pdh")
-        q, c = ctypes.c_void_p(), ctypes.c_void_p()
-        path = f"\\GPU Adapter Memory({luid_instance(*luid)})\\Dedicated Usage"
-        if self.pdh.PdhOpenQueryW(None, None, ctypes.byref(q)) != 0:
-            self.pdh = None
-            return
-        if self.pdh.PdhAddEnglishCounterW(q, ctypes.c_wchar_p(path), None, ctypes.byref(c)) != 0:
-            self.pdh.PdhCloseQuery(q)
-            self.pdh = None
-            return
-        self.query, self.counter = q, c
-
-    def ok(self):
-        return self.adl is not None and self.adapter is not None
-
-    def name(self):
-        return self.label
-
-    def _sensors(self):
-        buf = (ctypes.c_int * (1 + 2 * 256))()          # ADLPMLogDataOutput: int size; {int supported, value}[256]
-        if self.adl.ADL2_New_QueryPMLogData_Get(self.ctx, self.adapter, buf) != 0:
-            return {}
-        return {i: buf[2 + 2 * i] for i in range(256) if buf[1 + 2 * i]}
-
-    def _mem_used(self):
-        if self.counter is None or self.pdh.PdhCollectQueryData(self.query) != 0:
-            return None
-        v = self._PdhValue()
-        if self.pdh.PdhGetFormattedCounterValue(self.counter, 0x00000400, None, ctypes.byref(v)) != 0:  # PDH_FMT_LARGE
-            return None
-        return v.largeValue if v.CStatus in (0, 1) else None   # PDH_CSTATUS_VALID_DATA / _NEW_DATA
-
-    def _pci_props(self) -> dict:
-        """What Windows itself says about this card's PCIe link: the current speed and width and the maximum
-        speed, from the device properties (cfgmgr32 CM_Get_DevNode_PropertyW, DEVPKEY_PciDevice_*).  The device
-        is the one ADL names by its PnP instance string, so a disconnected phantom instance of the same card
-        model cannot be picked (#2614 saw one carry an old link value).  {} off Windows or when nothing reads."""
-        if not self.pnp:
-            return {}
-        try:
-            cm = ctypes.WinDLL("cfgmgr32")
-        except (AttributeError, OSError):
-            return {}
-
-        def prop(pid):
-            key = self._Key()
-            key.fmtid.d1, key.fmtid.d2, key.fmtid.d3 = PCI_SET[0], PCI_SET[1], PCI_SET[2]
-            key.fmtid.d4 = PCI_SET[3]
-            key.pid = pid
-            kind, value = ctypes.c_ulong(), ctypes.c_uint()
-            size = ctypes.c_ulong(ctypes.sizeof(value))
-            if cm.CM_Get_DevNode_PropertyW(dev, ctypes.byref(key), ctypes.byref(kind),
-                                           ctypes.cast(ctypes.byref(value), ctypes.c_void_p),
-                                           ctypes.byref(size), ctypes.c_uint(0)) != 0 or size.value != 4:
-                return None
-            return value.value
-
-        dev = ctypes.c_uint()
-        if cm.CM_Locate_DevNodeW(ctypes.byref(dev), ctypes.c_wchar_p(self.pnp), ctypes.c_uint(0)) != 0:
-            return {}
-        return {"gen": prop(PCI_SPEED), "width": prop(PCI_WIDTH), "speed_max": prop(PCI_SPEED_MAX)}
-
-    def _link(self, sensors: dict) -> dict:
-        """The PCIe tile's readings, following the same conservative rule as the Linux reader (#1733): never
-        claim a wider or faster link than is known.  The OS values come first, because #2614's RX 7900 XTX and
-        our RDNA4 PC have both seen ADL's PMLog BUS_SPEED (40) sit generations under the link Windows reports;
-        a current speed above its own capability is clamped to it, and PMLog's 40/41 fill in only where a
-        property is missing.  For the width the **smaller** of the OS value and PMLog's lanes wins: #2614 saw a
-        device property report the card's wiring (x16) over a narrower negotiated link (x4 in a slot), while
-        PMLog's lane count agreed with the slot."""
-        os_link = self._pci_props()
-        gen = _valid_gen(os_link.get("gen"))
-        gen_max = _valid_gen(os_link.get("speed_max"))
-        width = _valid_lanes(os_link.get("width"))
-        if gen is not None and gen_max is not None and gen > gen_max:
-            gen = gen_max
-        pm_gen, pm_lanes = _valid_gen(sensors.get(ADL_BUS_SPEED)), _valid_lanes(sensors.get(ADL_BUS_LANES))
-        if gen is None and pm_gen is not None and (gen_max is None or pm_gen <= gen_max):
-            gen = pm_gen
-        if gen_max is None:
-            gen_max = gen                        # as on Linux: only the negotiated link is known
-        lanes = [w for w in (width, pm_lanes) if w is not None]
-        return {"pcie_gen": gen, "pcie_gen_max": gen_max, "pcie_width": min(lanes) if lanes else None}
-
-    def read(self):
-        if not self.ok():
-            return {}
-        try:
-            s = self._sensors()
-            used = self._mem_used()
-            link = self._link(s)
-        except (AttributeError, OSError):
-            return {}
-        util, temp, power = adl_pick(s, ADL_UTIL), adl_pick(s, ADL_TEMP), adl_pick(s, ADL_POWER)
-        return {"util": util, "mem_used": used, "mem_total": self.total if used is not None else None,
-                "temp": float(temp) if temp is not None else None,
-                "power": float(power) if power is not None else None, "power_limit": None, **link}
-
-
 def gpu_reader(index=0, amd=False):
-    """The card's readings: NVML (NVIDIA); with the AMD backend the amdgpu sysfs files (Linux, #301) or ADL plus the
-    OS's GPU memory counter (Windows); or IOKit's IOAccelerator registry on macOS (Metal backend).  `amd` comes first:
-    no Mac runs the HIP backend, and the tests' AMD trees are read on a Mac too."""
+    """The card's readings: NVML (NVIDIA), the amdgpu sysfs files with the AMD backend (#301), or IOKit's
+    IOAccelerator registry on macOS (Metal backend).  `amd` comes first: no Mac runs the HIP backend, and the
+    tests' AMD trees are read on a Mac too."""
     if amd:
-        return _AmdWindows(index) if WINDOWS else _Amd(index)
+        return _Amd(index)
     return _Metal(index) if sys.platform == "darwin" else _Nvml(index)
 
 
@@ -711,16 +412,11 @@ def windows_amd_cards(adapters=None) -> list:
 
 
 def free_vram_mib(index=0, amd=False):
-    """Free VRAM of a card in MiB, or None when it cannot be read.  A one-off reader: closed again here (#1434)."""
+    """Free VRAM of a card in MiB, or None when it cannot be read."""
     g = gpu_reader(index, amd)
-    try:
-        if not g.ok():
-            return None
-        r = g.read()
-    finally:
-        close = getattr(g, "close", None)
-        if close is not None:
-            close()
+    if not g.ok():
+        return None
+    r = g.read()
     if r.get("mem_total") is None or r.get("mem_used") is None:
         return None
     return int((r["mem_total"] - r["mem_used"]) >> 20)
@@ -777,10 +473,9 @@ def _cpu_name():
         except OSError:
             pass
     elif os.path.exists("/proc/cpuinfo"):
-        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if line.startswith("model name"):
-                    return line.split(":", 1)[1].strip()
+        for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
     return platform.processor() or None
 
 
@@ -797,8 +492,7 @@ class _CpuRamFallback:
                 return idle.value, kern.value + user.value           # kernel time includes idle
             return None
         try:
-            with open("/proc/stat", encoding="utf-8") as fh:
-                f = [int(x) for x in fh.readline().split()[1:]]
+            f = [int(x) for x in open("/proc/stat").readline().split()[1:]]
             return f[3] + f[4], sum(f)
         except (OSError, ValueError):
             return None
@@ -825,8 +519,7 @@ class _CpuRamFallback:
                 return m.ullTotalPhys - m.ullAvailPhys, m.ullTotalPhys
             return None, None
         try:
-            with open("/proc/meminfo", encoding="utf-8") as fh:
-                info = dict(line.split(":", 1) for line in fh)
+            info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
             total = int(info["MemTotal"].split()[0]) * 1024
             avail = int(info["MemAvailable"].split()[0]) * 1024
             return total - avail, total
@@ -836,7 +529,7 @@ class _CpuRamFallback:
 
 # ------------------------------------------------------------------------------------------------ the sampler
 class Telemetry:
-    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False, electricity=None):
+    def __init__(self, extra=None, gpu_index=0, gpu_indices=None, amd=False):
         """`extra()` -> dict of more series to record each second (the server's tok/s).  `gpu_index`: the card the
         engine runs on, numbered as nvidia-smi and NVML number them (by PCI bus); `gpu_indices`: all of them when
         the model is split across several (issue #112) - the gpu_* readings are then their total (memory, power,
@@ -850,12 +543,6 @@ class Telemetry:
         self.gpus = [(i, gpu_reader(i, amd)) for i in idx]
         self.gpus = [(i, g) for i, g in self.gpus if g.ok()] or self.gpus[:1]
         self.gpu = self.gpus[0][1]
-        # The optional electricity configuration enables energy monitoring.
-        self._energy_enabled = isinstance(electricity, dict)
-        self._energy_base_mj = self._energy_mj() if self._energy_enabled else None
-        self._energy_j = 0.0
-        self._energy_valid = self._energy_base_mj is not None
-        self._energy_prev = None
         try:
             import psutil  # noqa: F401
             self.ps = sys.modules["psutil"]
@@ -880,11 +567,10 @@ class Telemetry:
             "gpu_vram_total_mib": (sum(c["vram_bytes"] for c in win_amd) >> 20
                                    if win_amd and all(c["vram_bytes"] for c in win_amd) else vram_total),
             "gpu_count": len(self.gpus),
-            # #1380: an AMD card whose readings cannot be read says why, instead of "not readable (NVML)" or empty tiles
-            "gpu_note": (("no GPU readings: AMD's ADL library (atiadlxx.dll, installed with the Adrenalin driver) did "
-                          "not answer for this card" if WINDOWS else
-                          "no GPU readings: the amdgpu driver's sysfs files were not found for this card")
-                         + "; the engine's own VRAM figures are in its log" if amd and not self.gpu.ok()
+            # #1380: the AMD readings are the amdgpu driver's Linux sysfs files; a Windows AMD card has none yet, and the
+            # dashboard said "not readable (NVML)" or showed empty tiles with no word why
+            "gpu_note": ("no GPU load or VRAM readings for AMD cards on Windows yet (Linux reads them from the amdgpu "
+                         "driver); the engine's own VRAM figures are in its log" if amd and not self.gpu.ok()
                          else getattr(self.gpu, "note", None)),
             "cpu_name": _cpu_name(),
             "cores": (self.ps.cpu_count(logical=False) if self.ps else None) or None,
@@ -893,30 +579,10 @@ class Telemetry:
             "numa_nodes": _cpu_topology()[1],
             "psutil": self.ps is not None,
         }
-        if self._energy_enabled:
-            # Optional electricity price in major currency units per kWh.
-            try:
-                price = float(electricity.get("price_per_kwh"))
-                if not 0 <= price < float("inf"):
-                    price = None
-            except (TypeError, ValueError):
-                price = None
-            self.static["electricity_price_per_kwh"] = price
-            self.static["electricity_currency"] = str(electricity.get("currency") or "EUR").upper()
         self._disk_prev = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-
-    def _energy_mj(self):
-        readings = []
-        for _, gpu in self.gpus:
-            reader = getattr(gpu, "energy_mj", None)
-            value = reader() if reader else None
-            if value is None:
-                return None
-            readings.append(value)
-        return sum(readings) if readings else None
 
     def _disk(self):
         if not self.ps:
@@ -976,25 +642,23 @@ class Telemetry:
         self._stop.set()
 
     def _loop(self):
+        """One sample a second, for as long as the server lives.
+
+        A failing sample must not end the thread: on a machine where the GPU/psutil source is not readable
+        (a CI runner, a container without NVML) the first exception used to kill the sampler outright, so
+        `GET /metrics` silently stopped updating and `test_responses.NoLeakedSampler` saw "the server did
+        not start its hardware sampler" - the thread had started and died between two readings.
+        """
+        complained = False
         while not self._stop.is_set():
-            s = self.sample()
-            if self._energy_enabled:
-                if self._energy_base_mj is not None:
-                    reading = self._energy_mj()
-                    if reading is not None and reading >= self._energy_base_mj:
-                        self._energy_j = max(self._energy_j, (reading - self._energy_base_mj) / 1000.0)
-                else:
-                    # Fallback: approximate energy from the existing 1 Hz GPU power samples.
-                    now, power = time.monotonic(), s.get("gpu_power")
-                    if isinstance(power, (int, float)) and 0 <= power < float("inf"):
-                        if self._energy_prev is not None:
-                            t0, p0 = self._energy_prev
-                            self._energy_j += (p0 + power) / 2.0 * max(0.0, now - t0)
-                        self._energy_prev = (now, power)
-                        self._energy_valid = True
-                    else:
-                        self._energy_prev = None
-                s["gpu_energy_kwh"] = self._energy_j / 3_600_000.0 if self._energy_valid else None
+            try:
+                s = self.sample()
+            except Exception as e:                    # noqa: BLE001 - a monitor must outlive its source
+                if not complained:                    # once, not once a second
+                    print(f"[strata] metrics: a sample failed ({e}); the sampler keeps trying", flush=True)
+                    complained = True
+                self._stop.wait(1.0)
+                continue
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",

@@ -95,27 +95,14 @@ def current_user_sid() -> str:
     return _sid_cache
 
 
-def _as_sid(name: str) -> str:
-    """An SDDL alias (``LA``, ``SY``, ``BA``, ...) as its string SID, or ``name`` unchanged.
-
-    The DACL that :func:`restrict_to_current_user` writes names the user by SID, but Windows renders
-    the built-in Administrator (RID 500) back as the alias ``LA``. Comparing that text to
-    :func:`current_user_sid` never matches, so every entry is normalised first (#3406).
-    """
-    if not WINDOWS:
-        return name
-    resolved = _string_sid(name)                       # the text itself when Windows does not know it
-    return resolved if resolved.startswith("S-1-") else name
-
-
 def _same_sid(sddl_trustee: str, sid: str) -> bool:
     """True when an SDDL trustee names ``sid``. SDDL prints well-known accounts as two-letter aliases (the built-in
-    Administrator, RID 500, is ``LA``), so an alias is turned into its string SID before the compare (#3302, #3406)."""
+    Administrator, RID 500, is ``LA``), so an alias is turned into its string SID before the compare (#3302)."""
     if sddl_trustee == sid:
         return True
     if not WINDOWS:
         return False
-    return _as_sid(sddl_trustee).upper() == sid.upper()
+    return _string_sid(sddl_trustee) == sid.upper()
 
 
 def restrict_to_current_user(path: str | os.PathLike, *, directory: bool | None = None) -> None:
@@ -385,9 +372,9 @@ def adopt_user_defaults() -> bool:
             ok_owner = bool(_advapi.SetTokenInformation(token, _TOKEN_OWNER, ctypes.byref(_Owner(psid)),
                                                         ctypes.sizeof(_Owner)))
             descriptor = ctypes.c_void_p()
-            # A token default DACL also applies to process/thread objects, not just files. FA is
-            # FILE_ALL_ACCESS (0x1f01ff), which omits process query/set-information rights; GA is
-            # mapped to the full rights of the object being created.
+            # A token default DACL also applies to processes, not just files. FA is
+            # FILE_ALL_ACCESS (0x1f01ff), which omits process query/set-information.
+            # GA is mapped to the full rights of the object being created.
             if not _advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
                     f"D:(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GA;;;BA)", _SDDL_REVISION_1, ctypes.byref(descriptor), None):
                 return False

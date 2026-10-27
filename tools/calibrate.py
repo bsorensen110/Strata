@@ -1,6 +1,6 @@
 """Tune the engine's hardware-dependent settings on this PC (setup's --calibrate).
 
-These settings depend on the machine more than on the model, and the defaults are right for the PC they were
+Three settings depend on the machine more than on the model, and the defaults are right for the PC they were
 measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
   --pcie-frac     the share of the experts missing from VRAM that are copied over PCIe and run on the GPU instead of
                   on the CPU.  A fast PCIe link and a slow CPU want more; a laptop's x8 link or a fast CPU want less.
@@ -24,38 +24,18 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
                   2x RX 6900 XT on Linux, 6-11% faster with it), so it is measured here, per PC, and written into the
                   config's "env" only when it wins.  The output is identical either way (same token ids).
 
-  --dflash-block   the actual DFlash forward length, capped by the loaded artifact and --spec.
-
-DFlash2 additionally measures fresh-request profiles (calibrate_dflash2.py): prompt chunks,
-startup memory headroom and a joint block/floor grid, with short/long request costs recorded
-separately. This explicit calibration can take 30-90 minutes. It never changes uncalibrated
-MTP/plain-DFlash defaults and does not select a drafter quantization.
-
-The PCIe share, probability floor, DFlash block and prompt chunks are measured through one engine (per-request `strata_tune` keys); the worker
+The first two and the prompt chunks are measured through one engine (per-request `strata_tune` keys); the worker
 count, the adaptive tier and the shared-expert stream need a restart per value.  Those are decode speed: the prompt
 path streams every expert whatever they say.
-The first two and the prompt chunks are measured through one engine (per-request `strata_tune` keys); the worker
-count and the adaptive tier need a restart per value.  Those are decode speed: the prompt path streams every expert
-whatever they say.
 
-The sweep's PCIe/floor winner is kept only when a paired re-measurement (default and candidate back to back, the
-order alternating, all 7 pairs - a fixed budget, because stopping early strands winners) clearly beats this run's
-own variation: the sweeps repeat every value, so the scatter is measured on the spot (a user's log from 2026-10:
-1.9% sample sigma, 3.8% median max-minus-median spread across 21 repeated values), and adjacent pairing cancels
-the block-to-block drift of the run (#1332 measured 8-28% between engine starts even at an unchanged setting).
-The pair is judged as one unit: a coordinate enters the config as part of the pair that won.  A fixed percent margin could not tell a real +2.8% from a
-+2.8% draw - the 2026-10 report shows it dropping exactly such a winner while the sweep's "-> best" line stayed on
-screen unexplained.  The restart-only steps (the worker counts, the expert tier, the shared-expert stream) and
---prefill-pipe keep the fixed
-MIN_GAIN margin: values measured in different engine starts cannot be paired, and --prefill-pipe's own step
-judges its 3 paired rounds by winning every one of them.
+A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
+adaptive expert tier and the OS make single measurements noisy by a few percent.
 
     python tools/calibrate.py strata-q2_0.json        # measure and print; setup.py --calibrate also saves it
 """
 from __future__ import annotations
 
 import json
-import math
 import statistics
 import sys
 import threading
@@ -66,16 +46,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 
-MIN_GAIN = 0.03                    # the margin for the steps that need a restart per value (the worker counts,
-                                   # the expert tier, the shared-expert stream), and for --prefill-pipe, whose own
-                                   # step re-measures in 3 paired rounds and keeps a value only winning every round
-CONFIRM_PAIRS = 7                  # the confirmation's interleaved default-vs-candidate pairs, always all of them:
-                                   # stopping early on a 3-pair mean strands true winners - a few noisy pairs go
-                                   # negative on a gain the full 7 decide to be real
-T_KEEP = 2.5                       # keep at t >= T_KEEP
+MIN_GAIN = 0.03                    # a setting must beat the default by this much to be kept
 PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75, 0.9, 1.0)   # 1.0: every miss over PCIe, the CPU pool gets no expert
 SPEC_MIN_PS = (0.3, 0.5, 0.7)
-DFLASH_BLOCKS = (1, 2, 3, 4, 5, 6, 7)
 SWEEP_ROUNDS = 3                   # how many times the sweep visits each value (see `sweep`)
 # the adaptive tier's candidates (every, swaps, decay) against the engine's own (None): swapping more and remembering
 # longer, the rest of the set as the engine has it
@@ -123,7 +96,7 @@ def arg_value(args: list[str], flag: str) -> str | None:
 def with_arg(args: list[str], flag: str, value: str | None) -> list[str]:
     """`args` with `flag value` set (replaced if present), or removed when value is None."""
     out = list(args)
-    while flag in out:
+    if flag in out:
         i = out.index(flag)
         del out[i:i + 2]
     if value is not None:
@@ -219,32 +192,6 @@ def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
     return best if med[best] > med[default_key] * (1.0 + min_gain) else default_key
 
 
-def pooled_sigma(samples) -> float:
-    """This engine run's own run-to-run noise: the root-mean-square relative scatter of the sweeps' repeated
-    draws.  A fixed percent margin cannot fit every PC, so the margin is measured on the spot."""
-    cvs = [statistics.stdev(v) / statistics.mean(v)
-           for v in samples if len(v) > 1 and statistics.mean(v) > 0]
-    return math.sqrt(sum(cv * cv for cv in cvs) / len(cvs)) if cvs else 0.0
-
-
-def paired_decision(dflt_samples: list, cand_samples: list, sigma: float) -> tuple[bool, float, float]:
-    """The candidate against the default over interleaved pairs - the pairing cancels the drift between blocks
-    that #1332 measured.  Kept when the mean paired gain beats its own scatter by T_KEEP: a gain bigger than the
-    variation is real, a lucky best-of-eight sweep draw is not.  Returns (keep, mean gain, t), t clamped to
-    ±99 so the report stays finite JSON and carries the gain's sign when the scatter is zero."""
-    gains = [(c - d) / d for d, c in zip(dflt_samples, cand_samples) if d > 0 and c > 0]   # a dead arm skips the pair
-    if not gains:
-        return False, 0.0, 0.0
-    mean = statistics.mean(gains)
-    n = len(gains)
-    # the floor carries the sweeps' block-to-block drift that adjacent pairing cancels, so a drift-heavy PC is
-    # judged stricter than its own paired noise would say - a conservative ceiling; T_KEEP is the dial
-    s = max(statistics.stdev(gains) if n > 1 else 0.0, math.sqrt(2.0) * sigma)
-    t = min(max(mean / (s / math.sqrt(n)), -99.0), 99.0) if s > 0 else (
-        99.0 if mean > 0 else -99.0 if mean < 0 else 0.0)
-    return t >= T_KEEP, mean, t
-
-
 class Session:
     """One running engine: measure decode tok/s for a setting (the median of the prompts' rates)."""
 
@@ -293,12 +240,11 @@ def run(cfg: dict, say=print, start_engine=None, *, progress=None, cancel_event=
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    profile_options = {"dflash2": True} if cfg.get("drafter") == "dflash2" else {}
     if progress is None and cancel_event is None:
         return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok),
-                       hip=cfg.get("backend") == "hip", **profile_options)
+                       hip=cfg.get("backend") == "hip")
     return measure(engine_args(cfg), ids_list, start_engine, say, host_worker_extras(), doc_prompt(tok),
-                   hip=cfg.get("backend") == "hip", progress=progress, cancel_event=cancel_event, **profile_options)
+                   hip=cfg.get("backend") == "hip", progress=progress, cancel_event=cancel_event)
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -325,7 +271,7 @@ def engine_error(log: str | None, since: int = 0) -> str | None:
 
 
 def sweep(s, values: list, base_tune: dict, key: str, label: str, say,
-          progress=None, stage: str | None = None, prefer=None) -> dict:
+          progress=None, stage: str | None = None) -> dict:
     """Every value, `SWEEP_ROUNDS` times, one round visiting all of them and every other round in reverse order.
 
     A single rate per value cannot order neighbours.  #1332 has 0.75 to 0.95 inside each other's noise at 72.7,
@@ -350,18 +296,17 @@ def sweep(s, values: list, base_tune: dict, key: str, label: str, say,
     med = {v: statistics.median(out[v]) for v in values}
     say(f"    {label}, median of {SWEEP_ROUNDS}: " +
         ", ".join(f"{v:g}: {med[v]:.1f} ({min(out[v]):.1f}-{max(out[v]):.1f})" for v in values) +
-        f" -> best {max(med, key=lambda k: (med[k], k == prefer)):g}")
+        f" -> best {max(med, key=lambda k: med[k]):g}")
     return out
 
 
 def measure(base_args: list[str], ids_list, start_engine, say=print, extra_workers=(), long_prompt=None, hip: bool = False,
-            *, progress=None, cancel_event=None, dflash2=False) -> dict:
+            *, progress=None, cancel_event=None) -> dict:
     t0 = time.time()
     report: dict = {}
     _check_cancel(cancel_event)
     _progress(progress, "loading", 0, 1)
     say("  Loading the model for the measurements ...")
-    original_args = list(base_args)
     base_args = apply(base_args, {})                   # the product defaults: what the measurements must beat
     eng = start_engine(base_args)
     try:
@@ -382,95 +327,44 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             say("  Measuring the prompt chunks of the layer split ...")
             pipe, rep_pipe = measure_pipe(eng, long_prompt, say)
             report.update(rep_pipe)
-
-        # DFlash's actual forward width is independent of the confidence-gated verify prefix.
-        # Query the loaded artifact/arena capacity; MTP and older engines have no such tuning key.
-        d_block = int(info.get("dflash_block", 0)) if "--dflash" in base_args else 0
-        max_block = int(info.get("dflash_max", 0)) if d_block else 0
-        blocks = sorted({k for k in DFLASH_BLOCKS if k <= max_block} | {d_block}) if max_block else []
-        best_block = d_block
-        block_sweeps = []
-
-        def tune(f, p, block):
-            out = {"pcie_frac": f, "spec_min_p": p}
-            if blocks:
-                out["dflash_block"] = block
-            return out
-
-        def sweep_blocks(f, p):
-            rates = sweep(s, blocks, {"pcie_frac": f, "spec_min_p": p},
-                          "dflash_block", "DFlash forward block", say)
-            block_sweeps.append({"pcie_frac": f, "spec_min_p": p, "rates": {str(k): v for k, v in rates.items()}})
-            return max(rates, key=lambda k: statistics.median(rates[k]))
-
-        if blocks:
-            best_block = sweep_blocks(d_pcie, d_minp)
         # 1. the PCIe share, at the default draft floor
-        by_pcie = sweep(s, sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}),
-                        ({"spec_min_p": d_minp, "dflash_block": best_block} if blocks else {"spec_min_p": d_minp}), "pcie_frac",
-                        "PCIe share", say, progress, "pcie_share", prefer=round(d_pcie, 2))
-        best_pcie = max(by_pcie, key=lambda k: (statistics.median(by_pcie[k]), k == round(d_pcie, 2)))
+        by_pcie = sweep(s, sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}), {"spec_min_p": d_minp}, "pcie_frac",
+                        "PCIe share", say, progress, "pcie_share")
+        best_pcie = max(by_pcie, key=lambda k: statistics.median(by_pcie[k]))
         # 2. the draft floor, at that share
-        by_minp = sweep(s, sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}),
-                        ({"pcie_frac": best_pcie, "dflash_block": best_block} if blocks else {"pcie_frac": best_pcie}), "spec_min_p",
-                        "draft floor", say, progress, "draft_floor", prefer=round(d_minp, 2))
-        best_minp = max(by_minp, key=lambda k: (statistics.median(by_minp[k]), k == round(d_minp, 2)))
-        if blocks:
-            best_block = sweep_blocks(best_pcie, best_minp)
-        # 3. the winner against the default, in all 7 interleaved pairs: kept when the gain beats this run's own
-        #    noise.  The pair is judged as one unit; adjacent pairing cancels the run's block-to-block drift
-        #    (#1332 measured 8-28% between engine starts), and the sweeps' repeats measured that noise (a fixed
-        #    percent margin could not tell a real +2.8% from a +2.8% draw).
-        dflt, cand = (round(d_pcie, 2), round(d_minp, 2), d_block), (best_pcie, best_minp, best_block)
+        by_minp = sweep(s, sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}), {"pcie_frac": best_pcie}, "spec_min_p",
+                        "draft floor", say, progress, "draft_floor")
+        best_minp = max(by_minp, key=lambda k: statistics.median(by_minp[k]))
+        # 3. the winner against the default, interleaved, the same number of rounds
+        dflt, cand = (round(d_pcie, 2), round(d_minp, 2)), (best_pcie, best_minp)
         confirm = {dflt: [], cand: []}
-        chosen = dflt
-        noise = pooled_sigma(list(by_pcie.values()) + list(by_minp.values()))
-        t = None
+        confirm_total = SWEEP_ROUNDS * 2 if cand != dflt else 1
+        _progress(progress, "confirmation", 0, confirm_total)
         if cand != dflt:
-            confirm_total = CONFIRM_PAIRS * 2
-            _progress(progress, "confirmation", 0, confirm_total)
-            while len(confirm[cand]) < CONFIRM_PAIRS:
-                for k in ((dflt, cand) if len(confirm[dflt]) % 2 == 0 else (cand, dflt)):
-                    confirm[k].append(s.rate(tune(*k)))
-                    _progress(progress, "confirmation",
-                              len(confirm[dflt]) + len(confirm[cand]), confirm_total)
-            keep, gain, t = paired_decision(confirm[dflt], confirm[cand], noise)
-            # truncate, never round: the shown t must never land on the 2.5 threshold beside the other verdict
-            t_show = math.copysign(math.floor(abs(t) * 100.0), t) / 100.0
-            _progress(progress, "confirmation", confirm_total, confirm_total)
-            say(f"    confirmation over {len(confirm[cand])} pairs: mean {gain:+.1%} against this run's "
-                f"noise {noise:.1%} (t {t_show:.2f}) -> " + ("kept" if keep else "kept the default"))
-            chosen = cand if keep else dflt
+            for _ in range(SWEEP_ROUNDS):
+                for k in (dflt, cand):
+                    confirm[k].append(s.rate({"pcie_frac": k[0], "spec_min_p": k[1]}))
+                    _progress(progress, "confirmation", sum(map(len, confirm.values())), confirm_total)
         else:
-            _progress(progress, "confirmation", 0, 1)
             _progress(progress, "confirmation", 1, 1)
-        if blocks:
-            say(f"    Confirmed settings: PCIe share {chosen[0]:.2f}, draft floor {chosen[1]:.2f}, DFlash block {chosen[2]}")
+        chosen = pick(confirm, dflt) if cand != dflt else dflt
         report.update(default={"pcie_frac": dflt[0], "spec_min_p": dflt[1], "pool_workers": d_workers},
                       pcie_sweep={str(k): v for k, v in by_pcie.items()},
                       min_p_sweep={str(k): v for k, v in by_minp.items()},
-                      confirm={"/".join(map(str, k if blocks else k[:2])): v for k, v in confirm.items()},
-                      confirm_noise=round(noise, 4),
-                      **({"confirm_t": t_show} if t is not None else {}))
-        if blocks:
-            report["default"]["dflash_block"] = d_block
-            report["dflash_block_sweeps"] = block_sweeps
+                      confirm={f"{k[0]}/{k[1]}": v for k, v in confirm.items()})
     finally:
         close(eng)
     settings = {}
     if pipe:
         settings["--prefill-pipe"] = str(int(pipe))
-    if chosen[0] != dflt[0]:
+    if chosen != dflt:
         settings["--pcie-frac"] = f"{chosen[0]:.2f}"
-    if chosen[1] != dflt[1]:
         settings["--spec-min-p"] = f"{chosen[1]:.2f}"
-    if blocks and chosen[2] != d_block:
-        settings["--dflash-block"] = str(chosen[2])
     base_rate = statistics.median(confirm[chosen]) if confirm.get(chosen) else None
     # 4. fewer CPU workers (a restart each), with the chosen settings.  #1337's rule covers a death during a
     # measurement too: an engine that exits mid-rate is that candidate losing; the measurements so far stay.
     if d_workers and len(worker_candidates(d_workers, extra_workers)) > 1:
-        tuned = apply(base_args, settings)
+        tuned = with_arg(with_arg(base_args, "--pcie-frac", f"{chosen[0]:.2f}"), "--spec-min-p", f"{chosen[1]:.2f}")
         by_workers = {}
         workers = worker_candidates(d_workers, extra_workers)
         _progress(progress, "cpu_workers", 0, len(workers))
@@ -488,7 +382,6 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
         elif by_workers.get(d_workers):
             base_rate = statistics.median(by_workers[d_workers])
     else:
-        _progress(progress, "cpu_workers", 0, 1)
         _progress(progress, "cpu_workers", 1, 1)
     # 5. the adaptive expert tier (a restart each), with everything chosen so far.  A candidate whose engine dies
     # during its own measurement is dropped like a failed start (#1337); the other candidates and every earlier
@@ -517,8 +410,14 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     # 6. HIP: the shared-expert stream fork (a restart each), with everything chosen so far.  Both values are set
     # explicitly, so a value the config carried before does not decide the baseline.
     env = {}
-    if hip:
-        tuned = apply(base_args, settings)
+    tuned = apply(base_args, settings)
+    if hip and fork_is_unsafe(tuned):
+        # #3895: one Windows RX 6000 PC faulted the engine on the first request with the fork and KV streaming together. The fork is off by
+        # default on AMD, so skipping the measurement changes nothing; whoever wants it sets the variable by hand.
+        say("  Not measuring the shared expert on its own stream: on Windows with KV streaming (--kv-resident) it made the engine fail on the first "
+            f"request on one PC (#3895). To try it anyway, put {SH_STREAM}=1 in the config's env.")
+        report["sh_stream_skipped"] = "windows with --kv-resident"
+    elif hip:
         by_fork = {}
         for v in ("0", "1"):
             _check_cancel(cancel_event)
@@ -532,22 +431,6 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
             base_rate = statistics.median(by_fork["1"])
         elif by_fork.get("0"):
             base_rate = statistics.median(by_fork["0"])
-    if dflash2 and not hip and long_prompt is not None and not split:
-        from calibrate_dflash2 import measure_profiles
-        profile_settings, profile_report = measure_profiles(
-            base_args, settings, ids_list, long_prompt, start_engine,
-            say=say, progress=progress, cancel_event=cancel_event, baseline_args=original_args, calibration=sys.modules[__name__])
-        report["dflash2_profiles"] = profile_report
-        if profile_settings:
-            settings = profile_settings
-            # The earlier short-decode rate describes different allocations/settings.
-            base_rate = None
-        elif not profile_report.get("skipped"):
-            # A failed fresh-request confirmation must not replace the user's
-            # previous balanced profile with the short-decode proposal.
-            settings = {flag: value for flag in (*DEFAULTS, "--dflash-block")
-                        if (value := arg_value(original_args, flag)) is not None}
-            base_rate = None
     report["seconds"] = round(time.time() - t0)
     report["tok_s"] = round(base_rate, 1) if base_rate else None
     _check_cancel(cancel_event)
@@ -556,6 +439,11 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
 
 def first_line(exc: Exception) -> str:
     return str(exc).strip().splitlines()[0][:300] if str(exc).strip() else type(exc).__name__
+
+def fork_is_unsafe(args) -> bool:
+    """The shared-expert fork (STRATA_SH_STREAM) with KV streaming on Windows: the one combination that has made an engine fail on its first
+    request (#3895, an RX 6900 XT). Not measured there; a person can still set the variable."""
+    return sys.platform == "win32" and arg_value(args, "--kv-resident") is not None
 
 
 def restart(start_engine, args, what, say, report):
@@ -607,7 +495,6 @@ def close(eng):
         proc.wait(60)
     except Exception:
         proc.kill()
-        proc.wait(timeout=10)  # reap it and release VRAM before a subsequent measurement starts
 
 
 DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None,   # None: the engine's own choice
@@ -616,21 +503,11 @@ DEFAULTS = {"--pcie-frac": None, "--spec-min-p": "0.5", "--pool-workers": None, 
 
 def apply(args: list[str], settings: dict) -> list[str]:
     """`args` with the calibrated settings; a setting the calibration did not change goes back to the product
-    default (setup's --spec-min-p 0.5, the engine's own PCIe share and worker count) only where the config
-    carried the flag already, so an older calibration's values never linger - and a hand-written config is
-    never given an argument the calibration did not actually choose (the 2026-10 report: an unchosen
-    --spec-min-p 0.5 read as a decision)."""
+    default (setup's --spec-min-p 0.5, the engine's own PCIe share and worker count), so an older calibration's
+    values never linger."""
     out = list(args)
-    defaults = dict(DEFAULTS)
-    if "--dflash" in args:
-        defaults["--dflash-block"] = None
-    for flag, default in defaults.items():
-        if flag not in out and flag not in settings:
-            continue
+    for flag, default in DEFAULTS.items():
         out = with_arg(out, flag, settings.get(flag, default))
-    for flag in ("--prefill", "--short-read", "--vram-reserve-mib", "--expert-cache"):
-        if flag in settings:
-            out = with_arg(out, flag, settings[flag])
     return out
 
 

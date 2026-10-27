@@ -18,7 +18,7 @@ One GPU: add `"parallel": 2` to the model's config (`strata-<model>.json`) and r
 `--parallel 2`. Setup recommends it only where it does not cost speed (below); any number you ask for is kept as
 asked, with a note when it is more than setup would recommend.
 
-```json
+```
 "parallel": 2
 ```
 
@@ -80,7 +80,7 @@ of the same arm.
 
 With a layer split, the engine options go into the config's `args`:
 
-```json
+```
 "args": [ ..., "--batch", "8", "--batch-groups", "4", "--trim-stage-weights" ],
 "layer_split": "12,24,36"
 ```
@@ -144,8 +144,7 @@ where the experts do not all fit, 16 slots cost the single-user speed (see docs 
 
 Every slot's session takes VRAM that the expert cache would otherwise hold: 0.56 GiB at a 32K context with 8-bit
 KV, more with a longer context unless the KV cache streams (`--kv-resident`: then only the attention's 32K window
-stays in VRAM, and each slot's whole KV cache takes pinned RAM - 1.6 GB at 128K - unless `--kv-pool-tokens` makes the
-sessions share one pool, below). On a card whose experts mostly run
+stays in VRAM, and each slot's whole KV cache takes pinned RAM - 1.6 GB at 128K). On a card whose experts mostly run
 on the CPU, a batch also reads about as many distinct experts as the requests one by one (different conversations
 route to different experts), so the gain is in **latency** (nobody waits for a whole answer), and a request alone
 runs slower (the smaller expert cache): 11-24 % on a 12 GB card, see the measurements below.
@@ -156,147 +155,6 @@ slots, and the slots may take at most a fifth of it, up to 4 slots. With Q2_0 at
 card, 4 from 32 GB or on a split such as 2 x 16 GB; IQ3_S needs 32 GB or a split. Everywhere else (any 12 or 16 GB
 card alone) it stays at one at a time and setup says: "parallel N reduces waiting for several users but costs
 about 10-25% speed per request on this card". `--parallel N` is honoured as asked either way.
-
-### One pinned KV pool for the lanes (`--kv-pool-tokens`)
-
-With KV streaming (`--kv-resident`) the whole KV cache of every session lives in pinned RAM, so the main session and
-each slot pin the **full** `--max-context` even when their conversations are short: at 262,144 cells and 8-bit KV that is
-about 3.1 GiB each, 15.5 GiB for four slots and the main session. `--kv-pool-tokens N` pins N cells per QSA layer
-**once** (about 12.7 KB a cell with `--kv int8`: 524,288 cells are 6.2 GiB), and a session holds only the 4,096-cell
-chunks its conversation has reached.
-
-```
-"args": [ ..., "--batch", "4", "--max-context", "262144", "--kv", "int8", "--kv-resident", "32768",
-           "--kv-pool-tokens", "524288" ]
-```
-
-- N must hold one whole context (`--max-context`) and needs `--kv-resident` with a context longer than the resident
-  cells; the engine refuses it otherwise at start. It works on one GPU and across the cards of a layer split: each
-  card pins its own QSA layers' share of the pool, and a conversation's chunks are the same on every card.
-- A conversation moves between the main session and a slot (a request admitted into a slot, a slot handing its
-  conversation back to the solo path) by **exchanging chunks**, not copying them: 52-79 ms for 140-151K tokens
-  against ~1.0-1.1 s copied (PR #1011, single RTX 4090); the pool never holds a conversation twice. A prompt read that
-  gives way to a short request (`BYIELD`) still copies.
-  The conversation's **checkpoint chain** (root, periodic and last-turn checkpoints) moves with its chunks, since a
-  checkpoint is only usable beside the K/V below it: a slot that takes a conversation keeps all of them, and a
-  conversation handed back to the solo path brings them along. Without that, a client that changes its last
-  question (or re-renders its history) in a later turn finds no checkpoint below the change and reads everything again.
-  What a changed last question needs, measured with two lanes on 2 x RTX 3080 20 GB: it resumes from the deepest
-  **periodic** checkpoint (one every `--prompt-cache-every` read tokens, 16,384 by default) below the change, so an edit
-  below the first periodic checkpoint reuses nothing (a 30k-token prompt: 0 on both lanes; a 60k one: 31,232), and the
-  idle lane's parked image has to fit `--conversation-cache-mib`. At about 133k tokens per lane the default 4096 is
-  enough: both lanes reuse 118,784 tokens and the first token comes after 24.5 s and 13.3 s instead of 142 s and 53 s
-  (engine 0.1.44.1 plus the pool and the separately proposed slot choice that counts a prompt sharing three quarters of
-  a slot's tokens as that conversation's next turn; without that rule the changed request can take the other lane's slot
-  and these figures do not apply).
-  At 256k per lane both lanes reuse (225,792 tokens; the same older setup, not re-measured on 0.2.0-beta) only with
-  `--conversation-cache-mib` of at least 4528 (one parked
-  image with its 6 checkpoints; 4608 tested); at 4096 one lane reads its 256k again. Each cached slot now keeps up to
-  `--prompt-cache` (6) checkpoints, about 0.7 GB of host RAM per slot; they are moved from the main session, not
-  copied. A turn that only appends to the history needs none of this (133k per lane: 133,287 and 133,306 tokens
-  reused).
-- **When the pool is full**, in this order: an idle slot's cached conversation gives its K/V back (a slot holding
-  nothing worth keeping first, then the one used longest ago, a prompt read that gave way last - and nobody at all when
-  every idle slot together would not cover what is needed); then a **new request is refused** (`ERR KV pool full`:
-  the server answers **503 with `Retry-After: 10`**, `error.code: "kv_pool_full"`; in a stream the error event carries
-  that code, and on `/v1/messages` it is an `overloaded_error`, which Anthropic's clients retry); and a **decoding lane
-  that cannot grow ends** with `finish_reason: "length"` and `"truncated": true` (llama.cpp's field).
-- `GET /metrics` shows the pool as `live.kv_pool`: `cells` in all, `free`, `main` (cells the main session holds) and
-  `slots` (one count per slot), updated whenever a chunk moves. A request refused for a full pool is not in a slot:
-  it did not start.
-- The slot sessions borrow the main session's RoPE table (64 MiB each at 262K) with or without the pool.
-- The MTP drafter's K/V ring (the solo drafter's, and each `--batch-mtp` slot drafter's on a layer split) is not in the
-  pool: it keeps its own pinned-RAM copy, as without the pool.
-- Without `--kv-pool-tokens` nothing changes: each session pins its own copy, as before.
-- The conversation cache (`--conversation-cache-mib`, parked conversations in ordinary RAM) and the session files
-  (`SAVE`/`RESTORE`, single-session only) read and write the K/V through the same chunk tables; a restore reserves its
-  chunks first and is refused (retryable) when the lanes hold the pool.
-
-Measured on 2 x RTX 3080 20 GB (PCIe 3.0, no NVLink), a layer split, UD-Q4_K_XL, with
-`--max-context 262144 --kv int8 --kv-resident 32768 --kv-pool-tokens 524288`.
-
-On 0.2.0-beta (upstream main `e88ee39d` = `v0.2.0-beta-12`, engine 0.1.45.3; binary `strata-w14` = branch
-`pr/kv-pool-144` up to commit `eeaf7b3c`, the same binary in every arm, only `--kv-pool-tokens 524288` present or
-removed; `"parallel": 2`, `--batch-mtp` with `STRATA_BATCH_MTP_SERIAL=1`, a 90 GiB container, 0.2.0 defaults left on in
-all arms; 3 restarts with the pool, 3 without for the memory and short-context rows). The serve layer in these runs had
-no `pick_slot` rule beyond main's own turn-start rule (#2518): every appended turn is a request whose prefix is exactly
-one lane's history, so no run here depends on it. The branch's last commit (`9a5dcb4b`) adds a guard that matters only
-with `STRATA_SLOT_CKPT_MOVE=1` and a pool; that variable was not set and the guard was not exercised.
-
-Two lanes of about 256k tokens (245k-token needle prompts, 256,09x tokens each), then an appended turn on both lanes at
-once (300 tokens out), then a short appended question on each lane:
-
-| | with the pool | without the pool |
-|---|---|---|
-| Moving a ~256k conversation between its parked place and a slot | 0.36-0.5 s (`moved`, a chunk-table swap) | 3.5-5.2 s (`copied`) |
-| First token of the appended short question (both lanes) | 1.1-1.2 s | 2.3-6.7 s |
-| Both lanes decoding an appended turn (aggregate) | 59.1 and 61.5 tok/s | 25.5 and 37.7 tok/s |
-| Host memory guard (stops the engine below 1.5 GiB host `MemAvailable`) | never fired | stopped the engine twice |
-| Same at ~133k per lane: move time | 0.1-0.25 s | 0.9-2.0 s (one start) |
-
-Every request reused 256,098-256,434 tokens and read 28-31 in both arms; the difference is the cost of moving the
-conversation. All needle checks of the requests that completed were correct. The pool arms are two starts; of the three
-no-pool starts one completed the 256k run, one was stopped by the host guard during the appended turn, and one completed
-the first read, the appended turn and the first short question and was stopped during the second: **the no-pool 256k
-timings are one full run and two partial ones**, and they were taken while the host had 1.1-1.8 GiB available and no
-free swap, which may add to the copy times (pool arms: host minimum 2.0-5.6 GiB). The two guard stops were a stop by the
-guard, not the kernel's out-of-memory killer, and both happened without the pool. The 133k follow-up runs of those two
-starts therefore have no data.
-
-| Memory, two lanes, idle after load (3 starts each) | with the pool | without the pool |
-|---|---|---|
-| `MemAvailable` (mean) | 14.5 GiB | 11.4 GiB (3.2 GiB less) |
-| Lowest `MemAvailable` during the run (mean) | 10.4 GiB | 7.6 GiB |
-| Pinned shared memory | 71.8 GiB | 74.9 GiB (3.06 GiB more; 5 comparable starts) |
-
-The pool is 6.24 GiB for 524,288 cells whatever the number of lanes (start log: `KV pool: 524288 cells shared by the
-sessions and the stages of the layer split, 6.24 GiB of pinned RAM`). Speed on short context did not change: one
-stream 84.5 tok/s with the pool against 81.9 (means of the medians of three starts each), two streams 93.7 against 89.8,
-prompt reads at 25k / 51k / 104k within 1-3%. The +3-4% is smaller than the round-to-round spread (58-103 tok/s), so
-there is no speed claim: the pool is a memory and long-context lane-handling feature, not a decode-speed one.
-
-Three lanes with the pool (`"parallel": 3`, three conversations of about 104k tokens, 312K tokens in the 524,288-cell
-pool, two starts): all started, every needle was right, 13.1-13.2 GiB `MemAvailable` idle, 8.3-8.6 GiB at the run
-minimum, slot moves 89-326 ms, 72.4 and 69.7 tok/s aggregate for the appended turn on three lanes. Three lanes without
-the pool were **not run** (the two-lane no-pool run was already at 7.4-7.9 GiB minimum `MemAvailable`; about 3.1 GiB more
-per slot would have reached the 4 GiB abort line), so this shows that a third lane fits with the pool, not that it fails
-without it. All on one box (2 x RTX 3080 20 GB, 220 W). The move-time ratio was about 8x at 133k per lane and about
-10x at 256k, so the gain is a long-context one (the no-pool side at 133k is one start).
-
-Older measurement, engine 0.1.41: pool against per-session buffers, the same binary with and without
-`--kv-pool-tokens` (our patches including the pool; `"parallel": 2`, `--batch-mtp`, a 90 GiB container; 3 restarts
-with the pool, 2 without, each restart measured separately):
-
-| | with the pool | without the pool |
-|---|---|---|
-| Pinned shared memory while serving | 72.0-72.2 GiB | 75.1 GiB (3.1 GiB more) |
-| Lowest `MemAvailable` | 11.1-12.2 GiB | 8.0 GiB |
-| Two streams decoding together (aggregate, median) | 89.2 tok/s (n=60) | 87.7 tok/s (n=40) |
-| One stream decoding (median) | 81.7 tok/s (n=72) | 82.5 tok/s (n=48) |
-| Prompt read at 25k / 51k / 104k tokens (the last pool restart against both restarts without) | 2048 / 2200 / 2638 tok/s | 2050 and 1980 / 2169 and 2202 / 2661 and 2655 tok/s |
-
-The engine accepted both layouts without a warning, and the expert caches came out the same size to within a few
-slots (4,209-4,211 on the second card; 4,136 in one restart with the pool). The two-stream
-difference is 1.7% (95% interval 0% to 3.6%) in favour of the pool and lies within the 2-3% spread of the same
-configuration across restarts: no change in speed was measured, in either direction. The 3.1 GiB is what the arithmetic
-gives for two slots and the main session: three sessions of 262,144 cells are 1.5 times the pool's 524,288 cells
-(6.24 GiB). Each further slot adds about that much without the pool and nothing with it (arithmetic; the 0.2.0-beta
-runs above ran three slots with the pool only, none without it).
-
-Pool behaviour, measured earlier on engine 0.1.40.3 plus the pool (one run each):
-
-| | |
-|---|---|
-| Pinned for the pool | 6.24 GiB for 524,288 cells (both stages together) |
-| Two lanes (`"parallel": 2`), each up to 262,144 tokens | share the one pool |
-| Four lanes (`"parallel": 4`), four concurrent 133,865-token prompts (556K tokens against the 524K pool, a 233K conversation already held) | all answered 200, each lane returned its own needle; the "KV pool full: slot N gives back its cached conversation" path ran |
-| A 134K-token conversation moved between the main session and a slot | about 0.2 s (chunk-table swap, no copy) |
-
-Not measured: on engine 0.1.41 the move time and the pool-full paths (the comparison above did not exercise them); on
-0.2.0-beta the pool-full paths (no run filled the pool: no `kv_pool_full` line in the logs), three or more slots
-without the pool, two lanes beyond 256k, four or more lanes, a single 512K conversation (it needs
-`--rope-scaling yarn --rope-scale 2`), HIP, SYCL, three or more cards, and `STRATA_SLOT_CKPT_MOVE=1` or
-`STRATA_SLOT_COPY_DIRECT` end to end.
 
 ## How the server uses the slots
 
@@ -322,18 +180,47 @@ without the pool, two lanes beyond 256k, four or more lanes, a single 512K conve
   half as long is waiting, the server sends `BYIELD`; at its next chunk boundary the long read stops, the part read
   so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the
   same chunks (at most twice per request).
-- **Each slot is a conversation cache.** A finished slot keeps what it holds (the prompt, the answer, and its
-  checkpoints: all of its chain with `--kv-pool-tokens`, otherwise the one at the prompt's last turn boundary); the
-  next turn of that conversation goes to that slot and the engine copies its state back (50-60 ms for a short
-  conversation) instead of reading the history again - also for
+- **Each slot is a conversation cache.** A finished slot keeps what it holds (the prompt, the answer, and the
+  checkpoint at the prompt's last turn boundary); the next turn of that conversation goes to that slot and the
+  engine copies its state back (50-60 ms for a short conversation) instead of reading the history again - also for
   a client that drops the reply's thinking from the history (the checkpoint matches up to the new turn). A new
-  conversation takes an empty slot, else the one used longest ago. With `STRATA_SLOT_EXPIRE_S` set to some seconds
-  (the run config's `"env"` block or the server's environment; off unless set, 600 suits coding agents), it takes the
-  one whose conversation is cheapest to lose instead: an expired one (idle that long), then the one holding the
-  shortest history (the one used longest ago among equals), so a short side request (a title, a summary) does not take
-  the slot of a long conversation that is still going.
-- Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`). Inside a group a request fills a hole below its last busy slot first: the pipelined window spans the slots up to that one, so a leading hole cost a whole row per window (0.1.41, #793). With `STRATA_SLOT_CACHE_AFFINITY=1`, assignment is by the conversations the slots hold (below).
+  conversation takes an empty slot, else the one used longest ago.
+- Slots are assigned so that consecutive requests land in different pipeline groups (`--batch-groups`).
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
+
+### Long prompts that move from solo to a batch slot
+
+The handoff above needs prompt-cache state. With `--prompt-cache 0`, moving a long request from the solo path into
+a slot can read the whole prompt again. This minimal example enables handoff reuse without parking completed
+conversations. Set these options in the model config's `args`, keeping the other arguments unchanged:
+
+```
+"args": [ ..., "--prompt-cache", "1", "--prompt-cache-every", "0",
+          "--prompt-cache-root", "0", "--conversation-cache-mib", "0" ]
+```
+
+`--prompt-cache 1` keeps the latest turn-boundary checkpoint so the `GEN` to `BGEN` handoff can reuse the live
+prefix. `--prompt-cache-every 0` disables periodic checkpoints and `--prompt-cache-root 0` disables an extra root
+checkpoint. The limit is per cache set: a slot can keep its own live state, so it is not one checkpoint shared by
+every slot. `--conversation-cache-mib 0` still disables parking independent completed conversations in RAM; it does
+not remove the prompt checkpoint or the state held by an active slot.
+If conversation parking is already enabled, keep its existing budget instead of setting it to zero: that budget is
+independent of the handoff configuration.
+
+This setting has RAM costs. The checkpoint and every slot's normal context state still consume memory, even with the
+conversation cache off. Check the engine's free-memory report and the slot count that it actually accepts before
+raising the context length or `"parallel"` value.
+
+It does not make independent cold prompts prefill in parallel. The server admits them one at a time; a running value
+of four can mean four requests are in flight, not four slots decoding together. A slot already decoding may make
+progress while the next prompt is read, but long independent prompts can finish before enough admissions overlap to
+fill every configured slot.
+
+After changing the setting, send a long request alone and add a second request while it is decoding. In the engine
+log, the first request's `GEN` to `BGEN` transfer should report a large reused prefix and only the new token(s) read.
+Then check `/metrics` for the slots that were actually reading or decoding, and `/v1/status` for the effective
+serving count. Treat this as handoff evidence only: it does not prove that every configured slot can stay resident or
+that cold prompts have concurrent prefill.
 
 ## Reading a prompt beside pipelined groups (experimental, opt-in)
 
@@ -364,10 +251,8 @@ so the slots never wait for the read and the read is one run with no drain insid
 - Off, said once, where the read's thread would allocate or free (`STRATA_PREFILL_HELP=1`, `STRATA_SPLIT_MTP_BATCH=1`),
   where serving a doorbell makes a CUDA call (`--pcie-mode dma`, `STRATA_FS_SLOTS`, the helper caches
   `--expert-cache-device1..3`), and with an expert source that hands out buffers it recycles (the GGUF in place, an
-  unbuffered source, `STRATA_IO_PREFETCH`): the experts come from the RAM arena or the mapped file.
-- A prompt with pictures is read this way too. Its picture rows go up through the same pinned slots, in runs of at most
-  4 MiB, and the slots are grown to that before the read. It does not give way to a shorter request (as before), so a
-  `BYIELD` does not stop its run. `STRATA_PIPED_CONCURRENT_PICTURES=0` reads it the usual way.
+  unbuffered source, `STRATA_IO_PREFETCH`): the experts come from the RAM arena or the mapped file. A prompt with
+  pictures is read the usual way.
 
 One log line per read (`strata batch: read N tokens on a thread of its own in X ms (concurrent, to Q of T); the slots
 decoded R rows meanwhile (S rows/s; stage k: W windows, H ms host each)`). Built for CUDA and HIP (HIP keeps the default
@@ -501,219 +386,6 @@ one cold 64K prompt joining four streams: `STRATA_BATCH_DECODE_SHARE=2.0` 2.4 s 
 s and 13.8 s. Pieces of one chunk (`PIECE=8192`) cost the long prompt the most. Not measured: other GPU pairs, three or
 more stages, HIP and SYCL (built for CUDA only), sampled decoding, prompts with pictures.
 
-## Keeping conversations in pipelined slots (opt-in)
-
-With a layer split, `--batch` runs the slots in pipeline groups (`--batch-groups`). A group's batch window spans its
-slots up to its last active one, and an idle slot below an active one runs as a pad row that writes its state. So in
-a pipelined group a finished slot is not a reliable conversation cache, and the server places requests by the groups
-alone. Agent clients (Claude Code, Codex) send long conversations - tens of thousands of tokens - in many short turns,
-with short side requests in between, and whatever is lost between two turns is read again.
-
-What that cost on one machine: the engine log of 3 x RTX A4000 16 GB (layer split, `--batch` 3-6 in 3 groups,
-Qwen3.8-Flash-Next IQ3_S, 200K context), two people working with Claude Code and Codex, 2026-10-09 to 2026-10-14.
-Of 3,027 prompts of 8K tokens or more, 538 reused less than half of their previous turn, and 40.7M prompt tokens
-were read again. By prompt lengths (the log has no content, so this is a heuristic):
-
-| Why the previous turn was gone | Prompts | Tokens read again |
-| --- | ---: | ---: |
-| it was in a batch slot that another conversation took | 170 | 16.4M |
-| it ran on the solo path, and the next request (often a short side request) replaced the main session | 244 | 15.0M |
-| the client changed the history (not addressed here) | 63 | 6.1M |
-| no earlier turn (a first turn, or a restart) | 66 | 3.1M |
-
-At this machine's ~2,900 tok/s for long prompts, the first two rows are about three hours of prompt reading in six
-days. What follows addresses them: the engine keeps idle slots and parks the solo path's conversation, the server
-places requests by what the slots hold, and a placement policy (`serve/slot_policy.py`) decides which history to give
-up. Each part is opt-in.
-
-### Engine: only the active slots in a window (`STRATA_PIPELINE_ACTIVE_ROWS=1`)
-
-With `STRATA_PIPELINE_ACTIVE_ROWS=1` (a layer split with `--batch` and more than one group), a group's window lists
-only its active slots (`include/strata/program/pipeline_rows.hpp`, `Verifier::batch_launch_rows`): there is no pad
-row, an idle slot keeps its conversation, and `INFO` says `slot_padding_safe=1`. After restoring a prompt's prefix the
-engine says where it came from: `CACHE_SOURCE <slot> <tokens>` (-1: the main session, a checkpoint or the
-conversation cache).
-
-Measured on the machine above (the same binary with the variable off / on, `tools/serve_load.py`, 6 clients x 2048
-tokens at temperature 0, one run each): 177.4 / 173.5 tok/s in total (-2.2%), first token p50 2.4 / 3.7 s; one client
-67.3 / 66.7 tok/s. With all six slots busy the windows hold the same rows either way; runs of this configuration with
-other builds measured 173.9-178.2 tok/s, so this is close to the spread between runs, but it was not repeated.
-
-### Engine: keep the solo path's conversation (`park=B`)
-
-A request alone runs on the solo path, whose state is the engine's main session, not a slot. When the next request is
-another conversation - an agent's short side request between two turns of a long one - the main session is
-overwritten. With `STRATA_PIPELINE_ACTIVE_ROWS=1` the engine takes `park=B` on `GEN` / `BGEN` (`INFO slot_park=1`):
-when the prompt is another conversation (it does not share what the main session holds up to its last turn - the
-last `<|im_start|>`, where its latest reply begins), it first copies the main session's conversation (and its last
-checkpoint) into idle slot B - never the slot it restores from or is admitted to - and says
-`PARKED B <tokens>`. Copying 36-37K tokens took 414-451 ms (five runs, the machine above).
-
-### Engine: more than one checkpoint per slot (`STRATA_SLOT_CHECKPOINTS=N`)
-
-A slot that receives the main session's conversation (`park=B`, an admission that continues in its slot) keeps one
-checkpoint of it: the deepest. A client that rewrites the end of its history every time leaves that one behind:
-Claude Code's safety classifier inserts each query's new tool calls before the closing text of its transcript, so
-the next query branches a few dozen tokens before the end, and its whole prompt was read again (42-74K tokens,
-15.6-27.4 s per query on the machine above). The two switches are apart:
-
-- `STRATA_BRANCH_CHECKPOINT` (below) alone decides whether the slot keeps the deepest branch checkpoint of that
-  conversation, where the next query of such a client resumes.
-- `STRATA_SLOT_CHECKPOINTS=N` (unset: 1, as before) alone decides how many it keeps of the others, one per length:
-  the deepest, then the deepest others, the branch one counted in N.
-
-| | without `STRATA_BRANCH_CHECKPOINT` | with it |
-| --- | --- | --- |
-| N = 1 | the deepest (the turn checkpoint), as before | the turn and the branch one (one when there is none yet) |
-| N = 2 | the two deepest (the second the turn before or a periodic one) | two: the turn and the branch one, or else the next deepest |
-
-A restore from a slot checkpoint brings the slot's shallower ones back with it, and the engine logs `slot 2 keeps 2
-checkpoints (at 43340 43372; 227.5 MiB)` (each is a whole running state, about 114 MiB on Qwen3.8-Flash-Next). Without a
-branch checkpoint such a query resumes at the last periodic checkpoint (`--prompt-cache-every`, up to 16K tokens before
-the branch).
-
-N = 2 helps where there is no branch checkpoint: an ordinary chat, and the first query of a classifier transcript
-(nothing to branch from yet), whose next query then resumes at the periodic checkpoint instead of reading the whole
-transcript again when the main session has moved on. It costs one more running state per slot, none with the move
-below (it leaves the main session's chain).
-
-With `STRATA_SLOT_CKPT_MOVE=1` an admission moves them all into the slot instead of copying them (`, all moved` at the
-end of that line), except the chain's root and a pinned prefix, which every new conversation of the client starts
-from. A copy would buy no second chance: the main session keeps only checkpoints of the conversation it holds, so it
-drops them at the next request of another conversation - and a request of another conversation is what takes the slot.
-While the main session still holds their tokens (the conversation's next query comes first) it restores one from the
-slot as from its own chain. A slot that gives back all it holds (the request continues its whole conversation)
-gives back these checkpoints with it, moved, so the admission that follows keeps them again: they are the only ones
-(without this the main session lost them there, and a next turn sent back without its thinking read its prompt
-again: 19,342 tokens in 8.5 s against 154 in 0.66 s). Without the switch they are copied, into dropped checkpoints'
-storage with `STRATA_CKPT_POOL=1`; a slot that gives back all it holds then copies them back only when it keeps more
-than one (N above 1 or `STRATA_BRANCH_CHECKPOINT`), or moves them when the request continues in that slot.
-
-### Engine: a checkpoint where the prompt branches (`STRATA_BRANCH_CHECKPOINT=<margin>`)
-
-Before reading, the engine measures how far the prompt runs along each conversation it holds - the main session's
-and every idle slot's - before leaving it. When the deepest such point is at least `<margin>` tokens past where the
-read starts and before the turn boundary, the read stops there for one more checkpoint (as at the root and turn
-boundaries; on a layer split too, and without `--batch`), logged as `branch checkpoint at 43340: the prompt leaves
-slot 2's conversation there (read from 32768)`. The next query, which leaves this one later, resumes there. Measured
-on the machine above (`--batch 6`; a 43-45K-token classifier transcript growing by about 250 tokens per query, an
-agent conversation taking the main session between the queries), without and with `STRATA_BRANCH_CHECKPOINT=1024`
-(the slot keeping the turn and the branch checkpoint):
-
-| Query | without: reused + read, ms | with: reused + read, ms |
-| --- | ---: | ---: |
-| 1 | 0 + 43,379, 14,146 | 0 + 43,379, 14,255 |
-| 2 | 0 + 43,624, 14,112 | 32,768 + 10,856, 7,577 (checkpoint at 43,340) |
-| 3 | 0 + 43,874, 14,277 | 43,340 + 534, 1,253 |
-| 4 | 0 + 44,134, 14,399 | 43,340 + 794, 1,430 |
-| 5 | 0 + 44,400, 14,535 | 43,340 + 1,060, 1,652 |
-| 6 | 0 + 44,669, 14,596 | 43,340 + 1,329, 1,818 |
-
-The extra part costs 0.8-0.9 s (the same 11,110 tokens from 32,768: 5.9 s straight, 6.8 s with the cut; alone, 6.5 /
-7.3 s). For a transcript growing by g tokens per query, a margin M costs about 0.9 s x g / M per query in cuts and
-M / 2 tokens more per read (0.7 ms each): g = 250-500 puts the best M at 800-1,100. Single user 63.7 / 63.9 tok/s,
-6 concurrent x 2048 tokens 178.7 / 179.3 tok/s without / with both (`tools/serve_load.py`).
-
-The restored state is the one the read had at that point, but the cut changes the chunks of the read after it (as
-`pin=` or a resume from an earlier turn checkpoint does), so a prompt read through a branch checkpoint can round
-differently from one read without it. With the exactness settings below, 160-token greedy answers: 11 of 12 equal;
-the twelfth differed from its first token, and the same way for a read that only stopped there (no restore).
-
-### Server: placement by what the slots hold (`STRATA_SLOT_CACHE_AFFINITY=1`)
-
-With `"env": {"STRATA_SLOT_CACHE_AFFINITY": "1"}` in the server config and pipelined groups, `pick_slot` asks the
-placement policy in `serve/slot_policy.py` instead of placing by the groups alone. The server side is the same for any
-policy:
-
-- The policy gets each slot's state: busy, the tokens it holds, when it was last used (counted from the request's real
-  end, `BDONE`), whether its state is intact, the spreading order, the group size, the observed prompt rate and
-  whether the engine runs active slots only (`slot_padding_safe=1`). Without that engine capability the server tracks
-  from the `BADM` / `BT` / `BDONE` lines which idle slot a later window of its group has padded over, and marks it.
-- With `INFO slot_park=1` the server tracks what the main session holds; when a request is another conversation (as
-  the engine decides it, with `INFO turn_token`), it asks the policy for a slot and sends `park=B`; `PARKED` updates that slot's state. A claim
-  the engine did not use is released.
-
-The policy's interface is `place`, `park_destination`, `cache_state`, `superseded_slots`, `reliable_flags`,
-`configure` / `settings` (their docstrings say what they answer). The policy is described below.
-
-`/metrics` shows what happened: `live.cache_events` (the last 96: allocation, admission with the tokens reused and
-read, resume and cache source, park claims and `parked`, expiries), each request's key, client
-address, slot and cache source in `requests[]`, `live.peer_ip` and `live.solo_*` (the request on the solo path and
-where its cache came from), and for slots the client of the conversation each one holds; with
-`STRATA_SLOT_CACHE_AFFINITY=1` also each idle slot's protection and scores and `live.slot_policy`; with
-`STRATA_CACHE_TRACE=1` each request's snapshot of how long a start every slot shared with its prompt (lengths only,
-`serve/cache_trace.py`). The client address is the socket's (behind a reverse proxy, the proxy's); `X-Forwarded-For`
-and request fields are not used. No prompt text or token ids are recorded.
-
-### The placement policy (`serve/slot_policy.py`)
-
-Rules alone cannot tell which history to give up when a new conversation needs a slot and none is free of value: the
-one used longest ago may be a 90K-token conversation whose user is reading the answer, the newest a side request's 300
-tokens. The policy weighs length and age, and every threshold is a parameter:
-
-- **Protection grows with length**: 0.1 s at 500 tokens, 2 s at 2K, 10 s at 8K, 45 s at 32K, 65 s at 50K, 90 s at
-  100K, 120 s at 262144 (piecewise linear; `STRATA_SLOT_TTL_MAX_S`, default 120, scales the whole curve). A side
-  request's history is free again almost at once; a long conversation outlasts the time its user reads and types.
-- **Retention score** = (n / 50000)^0.7 x (n / (n + 2000))^2 x (0.25 + 0.75 x freshness), freshness = 1 - age / TTL,
-  and 0 once expired; overwrite score = 1 / (1 + retention). A fresh 50K history is worth about 1, a 500-token one
-  0.002; a fresh 50K history outweighs a 150K one about to expire.
-- **Blank slots** - empty, known invalid, or a superseded copy (its history is the start of another idle slot's: the
-  conversation went on there) - count as expired and worth nothing.
-- **A continued conversation** (an idle slot's whole history is the start of the prompt; matches within 2% of the
-  longest, one second of the prompt rate and 4096 tokens count too) runs in its slot or in a blank slot of a less
-  loaded group - the engine copies it there, so moving costs nothing - and **never in a slot that holds another
-  conversation**, expired or not. On the machine above an earlier version that put group balance first moved two Claude
-  Code conversations, idle for minutes between turns, into each other's slot on every turn, and each turn read 60-100K
-  tokens from token 0.
-- **An expired history is not deleted**: it still matches until it is overwritten. A new conversation takes a blank
-  expired or blank slot: first one not worth keeping (blank, or its score at freshness 0 below
-  `STRATA_SLOT_EXPIRED_KEEP_SCORE`, default 0.01 - about 2.5K tokens), then by group load, a blank slot before a
-  history, and the lowest score.
-- **An older version of the same conversation** - an idle history that shares at least
-  `STRATA_SLOT_SIBLING_SHARE` (default 98%; 0: off) of its own length with the prompt but is not its start (the client
-  rewrote its end) - is replaced in place, protected or not, when no slot's history continues the prompt. Claude
-  Code's safety classifier inserts each query's new tool calls before the closing text of its transcript, so no
-  query continues the previous one; kept side by side, the versions took 4-5 of the 6 slots on the machine above and
-  pushed the other conversations out.
-- **No wait**: when every idle history is still protected, the request overwrites the one that loses least at once
-  (losses within 10% go by group load). An earlier version waited up to 5 s first, once per request; with more
-  requests than slots each wait ran its full 5 s, the slot idle meanwhile, and ended in the same overwrite (7 of 7 in
-  a 15-minute test on the machine above), so it was removed.
-- **Expired value decays**: after its protection an expired history is worth its score at freshness 0 times
-  `1 - x^2`, where x runs from 0 at the end of its protection to 1 at a total idle age of
-  `STRATA_SLOT_IDLE_VALUE_ZERO_S` (default 1800 s; 0 disables decay). Reclaiming and parking use this value; it never
-  changes whether a history can match.
-- **Park** (with `slot_padding_safe=1`): not when the main session's conversation's value at its idle age is below
-  `STRATA_SLOT_PARK_MIN_VALUE` (default 0.01, about 2.6K tokens at expiry; no separate length cut-off), or when a slot
-  holds `STRATA_SLOT_PARK_KEPT_SHARE` (default 98%) of it already. Then its own older copy, else an older version of
-  it (`STRATA_SLOT_SIBLING_SHARE` above, protected or not; the most shared first), else an idle expired slot
-  in the reclaim order above (not worth keeping first, then group load, then the lowest value); a history worth
-  keeping is taken only when the main session's conversation is worth at least `STRATA_SLOT_PARK_VALUE_RATIO` (default
-  2) times more. Never another conversation's protected slot. The parked copy keeps the main session's last-use time.
-- A busy slot is never matched or overwritten. On an engine without `slot_padding_safe=1`, a slot that would pad
-  over a protected idle history below it costs that history's retention too.
-
-Measured on the machine above (0.1.44.1, `--batch 6` in 3 groups, `STRATA_PIPELINE_ACTIVE_ROWS=1`):
-
-- Park: a 37,359-token conversation, a short side request, then its next turn. Without `park=`: 0 tokens reused, the
-  turn took 14 s; with it: 37,352 reused, about 1 s, and the same greedy output (temperature 0) as before the side
-  request.
-- Retention under load: conversation A (37K tokens) parked, two clients generating 1,500-token answers in a loop (so
-  batch mode stays on), conversations B (9K) and C (7.9K) taking turns about every 30 s - past their protection of
-  about 11 and 10 s. Tokens reused on turns 1-3:
-
-| Ordering of expired histories | B | C |
-| --- | --- | --- |
-| by group load first (an earlier version) | 0 every turn | 0 every turn |
-| + one still worth keeping goes last (this policy) | all but the ~20 new | 0 every turn |
-| + wait for a cheaper slot about to leave its protection (removed) | all but the ~20 new | all but the ~20 new |
-
-In the first row a new turn took the other conversation's expired slot for group balance, so B and C overwrote each
-other; in the second, C went to a side request that arrived a second after another one finished, while that one's
-1.5K-token history was about to leave its protection. The third row waited for that protection to end, under the
-same one-per-request wait as above; it went with that wait. The policy accepts this case: a protected history is
-not overwritten while an expired one can be.
-
 ## The VRAM expert tier keeps adapting in batch windows
 
 Batch windows count which experts they route to, and every `--adapt-every` windows (default 4) the engine swaps the
@@ -725,7 +397,32 @@ between decoding windows (the prompt may hold a loan of cache slots). The `strat
 GPU-reach wait and pool time, and how many routed entries the VRAM tier, the PCIe share and the CPU served per window.
 Swaps move experts between the GPU and the CPU, which round differently, so greedy outputs can differ from run to run;
 `--adapt-every 1000000` keeps the tier fixed (as in the exactness settings below). The pipelined `--batch-groups` path
-does not adapt.
+does not adapt by default: its windows count the routing, but no round starts while groups are in flight, so the tier
+moves only when the slots go back to the solo path.
+
+`STRATA_PIPE_ADAPT_EVERY=N` (opt-in; unset or 0 keeps the old behaviour) lets the pipelined path adapt: after N group
+windows it starts no new group, lets the groups in flight finish, runs one round as the serial batch loop does (nothing
+in flight reads a cache slot, and the swapped-in experts land before the next launch), and goes on. It stands still while
+a prompt is read beside the slots, and does nothing with `--adapt-async 1`. The engine says so at start, and the
+`strata batch (pipelined ...)` line adds the rounds, the experts swapped in and the time spent. Measured on 2x RTX 5090
+(layer split 25, Swift-Qwen3.8-Flash-Next IQ3_S, `--batch 6 --batch-groups 2`, resident experts, a profile-filled cache,
+`--adapt-every 16`), six streams of 1,024 greedy tokens from `tools/serve_load.py`, the engine's rows/s of eight bursts
+right after start, two fresh engines per setting:
+
+| `STRATA_PIPE_ADAPT_EVERY` | bursts 1-8, rows/s | mean | experts swapped before burst 8 |
+| --- | --- | ---: | ---: |
+| unset (stock 0.2.4.1) | 246, 257, 291, 292, 335, 338, 356, 355 | 309 | 287 |
+| unset (this branch) | 249, 242, 297, 296, 333, 336, 372, 362 | 311 | 288 |
+| 128 | 363, 415, 414, 420, 420, 411, 415, 420 | 410 | 6,181 |
+| 128 | 359, 407, 416, 422, 419, 417, 404, 411 | 407 | 6,294 |
+| 32 | 375, 405, 408, 405, 409, 390, 405, 409 | 402 | 5,957 |
+| 32 | 384, 414, 404, 402, 401, 412, 406, 401 | 403 | 5,678 |
+
+Without it the tier swaps 96 experts every burst or two (only when a burst ends) and the engine was still speeding up
+after eight bursts; with 128 it reached about 415 rows/s from the second burst, the speed an engine without the switch
+showed only after thousands of swaps had come from other traffic. 32 empties the pipeline four times as often and ends a
+little lower. One machine, one model and one configuration; not measured on one GPU (no pipelined path there) or with
+more than two stages.
 
 With `--adapt-async 1` (needs the resident RAM mode) the round does not hold a window up: each batch window moves the
 round on one step (table changes and uploads on the main thread, the copies on a helper thread and the cards' refill
@@ -751,6 +448,93 @@ compares the tier as a whole, not "batch windows only": the solo decode speed mo
 43.1 tok/s). The prompts are the benchmark's own, eight topics that repeat, which the tier learns quickly, so on a
 more varied workload the gain may be smaller (not measured). Upstream main runs no tier in batch windows, and this
 was not measured against an upstream binary.
+
+## Two NVIDIA cards: the pipelined groups are the default (0.2.7)
+
+With a layer split over exactly two NVIDIA cards, `--batch` and no `--batch-groups`, 0.2.1 to 0.2.6 ran one serial group
+(measured then on two RTX A4000, IQ3_XXS: +12 to 16% against the pipelined groups). From 0.2.7 the default is the pipelined
+groups, like on three or more cards. `STRATA_BATCH_GROUPS_NV_SERIAL=1` or `STRATA_DEFAULTS=026` gives the serial group back;
+`--batch-groups 1` asks for one group, `--batch-groups auto` or a number asks for the pipeline, and an explicit
+`STRATA_BATCH_GROUPS_NV_SERIAL=0` wins over `STRATA_DEFAULTS=026`.
+
+Why: with the 0.2.7 code the pipelined groups were faster at two and four streams on every box and quant measured
+(`tools/serve_load.py`, `--batch 4`, 256 tokens per request, interleaved pairs, total tokens per second, pipelined / serial):
+
+| box, model | experts in VRAM | 1 stream | 2 streams | 4 streams |
+| --- | --- | ---: | ---: | ---: |
+| 2x RTX A6000 48 GB, IQ3_S | all | 101.7 / 101.7 | 125.7 / 107.4 (+17%) | 171.4 / 141.0 (+22%) |
+| 2x RTX A4000 16 GB, Q2_0 | 17037 of 24576 pairs | 63.6-68.7 / 68.2-70.3 | 80.2-82.5 / 75.0-75.5 (+7 to 9%) | 110.8-111.5 / 94.8-95.3 (+17%) |
+| 2x RTX A4000 16 GB, IQ3_XXS | 13056 of 24576 pairs | 58.4-60.5 / 60.7-62.6 | 73.2-73.7 / 65.8-66.5 (+12%) | 100.5-100.7 / 82.9-83.6 (+20%) |
+
+The pipelined side was faster in every pair at two and four streams (3 pairs on the A6000, repeated in 3 more with the v0.2.6 binary; 4 clean pairs on the A4000
+with Q2_0, 3 on the A4000 with IQ3_XXS). The v0.2.6 binary measured the same on the A6000 (serial default 104.9 and 137.2
+tok/s at 2 and 4 streams, `--batch-groups auto` 124.6 and 169.6). A single stream runs on the solo path in both; on the A4000s
+the serial setting was about 4% faster for it (3 of 3 pairs with IQ3_XXS), on the A6000s it was equal. The 0.2.1 result
+(serial faster) did not repeat. Every slot's tokens equal its solo decode with the default (4 and 2 slots, greedy and seeded
+sampled streams, finishing slots, a cancelled slot).
+
+## MTP drafts in the pipelined groups (`STRATA_PIPED_MTP`, opt-in)
+
+The pipelined groups run no drafts. `--batch-mtp` with serial windows (`--batch-groups 1`) keeps one card busy at a
+time. `STRATA_PIPED_MTP=N` together with `--batch-mtp` gives both: the pipeline stays, and each slot drafts in it.
+Off by default. Without the variable nothing changes.
+
+How it works. A group's window carries, for each of its slots, the slot's token and up to N MTP proposals (at most
+`--spec` - 1; the first always, each further one while the draft layer was at least `--spec-min-p` sure of the one
+before). The last stage judges each slot's proposals on their own. How many rows to keep is known only then, and by
+then the earlier stages already run other groups' windows, which reuse the scratch the commit replays from. So a
+small save graph copies those rows right behind each window (`Verifier::batch_launch_rows`), and after the verdict every
+stage queues the commit of the kept rows (`Verifier::batch_commit_rows`). The slot's drafter catches up on its own rows
+and drafts the next proposals as an asynchronous chain (`MtpDrafter::chain_launch`). A group whose chain has not landed
+lets another group start first. Anything that reads a slot's state (an admission, a parked conversation, the solo path
+taking a slot back) first drains the pipeline, which also waits for the queued commits.
+
+It needs a layer split with two or more groups, any number of slots per group (as long as a group's window,
+slots x (1 + N), is at most 8 rows). When it cannot run, the engine says why and goes on without it: fewer than two
+groups left, `STRATA_BATCH_SELF_COMMIT` on, or a window of more than 8 rows.
+
+Measured on a box with 2x RTX A6000 48 GB (`--layer-split auto`), Qwen3.8-Flash-Next IQ3_S, every expert resident in
+VRAM, `--batch 4 --batch-groups auto` (2 groups of 2 slots), `tools/serve_load.py`, 256 tokens per request, reasoning
+off. Total output tokens per second: the median of the pairs, each pair the median of 3 bursts on a fresh engine start. The base arm
+(pipelined groups, no drafts) and `STRATA_PIPED_MTP=2` were run in 5 interleaved pairs, the other arms in 3 pairs. "Default" is
+`--batch 4` with no `--batch-groups` as it ran in 0.2.1 to 0.2.6 on exactly two NVIDIA cards: one serial group (see the next section):
+
+| streams | pipelined, no drafts | `=1` | `=2` | `=3` | serial `--batch-mtp` (`--batch-groups 1`) | default (no flags) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 (solo path) | 101.7 | 101.4 | 101.5 | 103.0 | 101.5 | 101.7 |
+| 2 | 125.7 | 146.3 (+16.0%) | 145.1 (+15.4%) | 138.4 (+10.0%) | 124.0 (-1.3%) | 107.4 (-14.8%) |
+| 4 | 171.4 | 188.8 (+10.2%) | 179.5 (+4.7%) | 165.6 (-3.4%) | 139.9 (-18.5%) | 141.0 (-17.8%) |
+
+Gains are the median of the per-pair ratios. `=2` was faster than the base in 5 of 5 pairs at 2 and at 4 streams, `=1` in 3 of 3
+pairs at both, `=3` in 3 of 3 at 2 streams and in none at 4. With `--batch 2` (2 groups of 1 slot) and 2 streams `=2` gave 146.8 against 125.7 tok/s (+16.4%, 5 of 5 pairs). One
+stream runs on the solo path in every arm and does not change. About 55% of the checked proposals were kept at `=2`
+and about 67% at `=1`. The acceptance falls as the window grows, which is why `=1` or `=2` is the choice and `=3` is not.
+
+Best setting: `=1`. On the A6000 box `=1` gained the most at four streams and as much as `=2` at two; on the 2x RTX A4000 box
+(Q2_0 pack, the experts do not all fit in VRAM, `--batch 4`, 4 clean pairs, total tok/s, `=1` / `=2` / no drafts) it gave
+2 streams 96.7, 96.5, 96.3, 95.7 / 95.0-95.9 / 80.2-82.5 (+18 to 20%, +17 to 19% for `=2`) and 4 streams 117.8-120.0 / 99.7-105.8 /
+110.8-111.5 (`=1` +6 to 8% in 4 of 4 pairs, `=2` slower than no drafts in 4 of 4). One stream was unchanged. More than four streams was
+not measured, and why four streams gain less than two is not explained. Cost: the slot
+drafters and a save buffer per stage (25.5 MiB at `=1` and 38.2 MiB at `=2` with 4 slots), taken from the expert cache.
+On the A6000 box the cache stayed fully resident. On the A4000 box, where the experts do not all fit, `--batch-mtp` took
+165 of 6959 cache slots on the second card; that changes which experts are in VRAM and so, in the last digits, which tokens come out.
+
+The first version of this was written by wannagoxuf (PR #4121), who measured +39% on 4x RTX 4090 with 4 streams
+(366 to 510 tok/s at `=2`). That is a different rig and not repeated here.
+
+Exact. Checked with the engine's batch protocol (the method of `tools/batch_test.py`: each prompt alone, then the
+prompts together in the slots, token ids compared). On the A6000 box, 4 slots (2 groups of 2) and 2 slots (2 groups of 1)
+with the feature unset and with `=1`, `=2` and `=3` (`=2` only for 2 slots): greedy streams, greedy and seeded sampled streams
+together, slots that finish at different lengths, a slot cancelled in the middle of a draft, and a 3,000-token prompt read beside the
+others. Every slot got the tokens it gets alone, and the same tokens as the build without the feature (a cancelled slot stops one
+or two tokens apart, so its tokens are compared up to the shorter). Through the server the same cases (and two clients on four
+slots) gave the same text as the build without the feature, apart from one or two streams of 19 per run; two runs of the
+build without the feature differ from each other in the same way, so this is not the feature. On a box where the experts
+do not all fit in VRAM the drafters' memory changes which experts are cached, and then the text of a feature run differs from a
+run without it; inside one run every slot still equals its own solo decode.
+
+Not run: AMD (HIP), the draft layer on the first stage, helper expert caches, more than two stages, SYCL (the SYCL
+tree has its own copy of the batch code and does not have this).
 
 ## Exactness
 
@@ -785,14 +569,15 @@ counter-based draw (Philox(seed, position)).
 - By default, batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo
   path keeps its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
 - `--batch-mtp` uses one proposal per slot. With a layer split it needs each stage on its own GPU, does not combine
-  with `--batch-groups` above 1 (pipelined slot groups run no drafts, #1413) and has not been run with helper expert
-  caches.
+  with `--batch-groups` above 1 (pipelined slot groups run no drafts, #1413) unless `STRATA_PIPED_MTP` is set with
+  one slot per group ([above](#mtp-drafts-in-the-pipelined-groups-strata_piped_mtp-opt-in)), and has not been run
+  with helper expert caches.
 - Repetition / frequency / presence penalties are not applied in batch windows.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.
 - Admissions are one at a time: two new long prompts are read one after the other.
 - `--batch-groups` needs every stage on its own GPU. A pipelined slot is a conversation cache again (0.1.41): a request left alone in its slot goes back to the solo path with its drafts, as on one GPU.
-- It does not combine with `--batch-mtp` (0.1.41, #1413): the pipelined path builds one row per slot, so `--batch-mtp`'s per-slot MTP drafts do not run there while their drafters still hold about 0.9 GB of VRAM per slot. The engine says so at start - drop `--batch-mtp`, or use `--batch-groups 1`.
+- The pipelined `--batch-groups` path adapts the VRAM tier only with `STRATA_PIPE_ADAPT_EVERY` (above).
 - The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.
 
 ## Measured
@@ -850,12 +635,6 @@ params, so the graph captured per row layout stays valid):
 
 Both are off by default; off, the engine runs the same launches as before. On, the arithmetic per row is the same:
 4 concurrent prompts at temperature 0 gave the same bytes as without them, with `--batch 4` and `--batch 8`.
-With either one on, the engine log says which at start-up (once per stage of a layer split), and whether the KV
-streams, in which case attention keeps one launch per row and only the GDN switch acts:
-
-```
-strata verify: batch rows in one launch: attention on (STRATA_BATCH_ATTN_ROWS), GDN on (STRATA_BATCH_GDN_GROUPS); the KV streams (--kv-resident), so attention keeps one launch per row
-```
 
 One RTX PRO 6000 Blackwell (96 GB), IQ3_S, all 24,576 experts in VRAM, `--kv int8`, 262144 context, `--mtp`,
 `--spec 4`, through the HTTP server: C different stories sent at once, 1024 tokens each, temperature 0.7, mean of
@@ -881,13 +660,6 @@ several chats that alternate, come back without reading their history again. Mea
 two long conversations alternating through the HTTP server: the first turns took 3.9 s and 5.7 s to the first token
 (their prompts read), the follow-ups 0.53 s and 0.46 s.
 
-With the shared KV pool (`--kv-pool-tokens`) a solo conversation moves into its slot when admitted (the main
-session keeps nothing of it), and a parked conversation's K/V is captured through the pool's chunk table and
-restored through the same table into chunks the returning request has reserved. The K/V a restore kept for the
-next parking belongs to the conversation it came from: when the session gives its conversation up, that retained
-storage is dropped, so a parked image never carries another conversation's bytes. This combination is reviewed
-and CPU-tested (`conversation_cache_test`); it has not yet been measured on GPUs.
-
 ## Testing
 
 Four scripts drive a built engine or a running server; each exits non-zero on a failure. `serve/test_parallel.py`
@@ -902,7 +674,7 @@ tests the server's side with a scripted engine (no GPU).
 
 For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000` (and the scripts set `STRATA_IQ_MT_MIN=1`):
 
-```bash
+```
 python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 8 --n 8 \
     --extra "--layer-split 12,24,36 --trim-stage-weights --batch-groups 4 --pcie-frac 0 --adapt-every 1000000"
 python3 tools/batch_interleave_test.py --exe engine/strata --config strata-<model>.json \
@@ -915,7 +687,7 @@ STRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8080
 For single-GPU `--batch-mtp`, use a model with `rt/draft_vocab.bin` to exercise admission with a
 shared draft-vocabulary head. This compares both slots' output against solo decoding:
 
-```bash
+```
 python3 tools/batch_test.py --exe engine/strata --config strata-<model>.json --batch 2 --n 2 --max-new 64 \
     --extra "--batch-mtp --pcie-frac 0 --adapt-every 1000000"
 ```
@@ -930,21 +702,11 @@ On top of `GEN` / `GENI`:
 | `BGENI <slot> <max_new> [keys] <file> <ids>` | in | the same with images |
 | `BADM <slot> <1/0>` | out | after the admission's `DONE`: 1 = it continues in the slot, 0 = it ended |
 | `BT <slot> <id>` | out | a token of that slot |
-| `BDONE <slot> <generated> <stop/length/cancel> <ms> [<accepted> <offered>]` | out | the slot is free again (it keeps its conversation); optional slot-leg draft counts |
+| `BDONE <slot> <generated> <stop/length/cancel> <ms>` | out | the slot is free again (it keeps its conversation) |
 | `BSTOP <slot>` | in | end that slot at its next window |
 | `BYIELD <slot>` | in | the prompt being read gives way at its next chunk boundary; its part read waits in `<slot>` (the admission's own, or a free slot for a solo request) |
 | `YIELDED <slot> <tokens>` | out | before the `DONE cancel` of a read that gave way: the request is sent again later and goes on from there |
 | `INFO ... batch_slots=N` | out | the slots the engine runs (only with `--batch`) |
-| `INFO ... slot_padding_safe=1` | out | `STRATA_PIPELINE_ACTIVE_ROWS=1`: a pipelined group's window runs its active slots only; an idle slot keeps its conversation; with it `slot_park=1` and `turn_token=<id>` (the token a turn begins with) |
-| `CACHE_SOURCE <slot> <tokens>` | out | `STRATA_PIPELINE_ACTIVE_ROWS=1`, after a prompt's restore: the idle slot its reused prefix came from (-1: the main session, a checkpoint or the conversation cache) and how long it is |
-| `park=B` (a key of `GEN` / `BGEN`) | in | with `INFO slot_park=1`: before a different conversation replaces the main session's, copy that one into idle slot B |
-| `PARKED <slot> <tokens>` | out | `park=` copied that many tokens into the slot (0: the copy failed, the slot holds nothing usable) |
-| `BCHECKS <slot> <tokens> <lengths>` | out | `STRATA_SLOT_CHECKPOINTS` > 1 or `STRATA_BRANCH_CHECKPOINT`: after `PARKED`, `BADM 1` and `BYIELD`, what the slot holds and the lengths of the checkpoints it keeps (the server's placement hint, `/metrics` `checkpoint_tokens`) |
-
-The optional `BDONE` counts cover the slot leg: `offered` counts proposed drafts, and `accepted` counts drafts
-accepted by verification, including any accepted draft not emitted because the request then stops. Without
-`--batch-mtp` the slot counts are `0 0`. Older engines omit them; the server leaves any admission counts unchanged.
-For a request that moves between solo and slot paths, the server adds the reported counts across its legs.
 
 `tools/batch_test.py` drives the engine directly: the same prompts alone, then together, compared token by token,
 and the aggregate rate.

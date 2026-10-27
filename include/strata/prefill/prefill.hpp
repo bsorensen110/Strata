@@ -87,9 +87,6 @@ public:
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
-    /// The unpinned experts lie in resident RAM (the expert arena), so staging them is a plain memcpy:
-    /// the ring keeps its pinned size and the stager gets more threads and buffers (STRATA_STAGE_RESIDENT=0/1 forces).
-    static void set_resident_stage(bool on);
     static double pinned_share();
     /// The chunk size from which a chunk streams every expert the GPU does not hold, routed or not; a smaller one
     /// stages only the experts it routes to.  1024, or STRATA_PREFILL_STREAM_MIN, or the CPU share's limit once that
@@ -133,33 +130,6 @@ public:
     /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
     static void set_ring_budget(int slots, int64_t small_max);
 
-    /// THE PROMPT ROOM (STRATA_MTP_ROOM_MIN): `slots` ring slots ON TOP of the rule above, POINTED AT another device
-    /// user's bytes - the MTP drafter's 512 routed experts, which only the decode reads (MtpDrafter::experts_lend).
-    /// A slot at or past the rule's ring is `base + (i - rule) * max_blob`: nothing is allocated for it, nothing is
-    /// owned and nothing spills, so the room costs no VRAM of its own and `relayout` keeps working.  The layout holds
-    /// them for the instance's life; ONE PROMPT takes them by `set_ring_room_active(true)`, which moves the ring's
-    /// count (the rule's <-> the rule's + the room's) and nothing else.
-    /// Never past ring_cap() (the ring's events are sized for that), never past what `set_ring_room_base` says the
-    /// lender has, and only where the ring is a big one (a chunk at or above stream_all_min(): below it the ring is
-    /// STAGE slots of a different mechanism).  Set before `init`/`relayout`; 0 (the default): the rule's ring exactly,
-    /// as before.
-    void set_ring_room(int slots) { ring_room_ = slots > 0 ? slots : 0; }
-    int ring_room() const { return ring_room_; }
-
-    /// The memory the room's slots are carved from: `bytes` of another device user's, given to this path's ring for
-    /// the length of one prompt (the drafter's expert block).  Null (the default): no room, whatever `slots` says.
-    void set_ring_room_base(void* base, uint64_t bytes) { ring_room_base_ = base; ring_room_bytes_ = bytes; }
-
-    /// While true the room is THIS prompt's: `ring()` (the streamed ring's slot count) counts it too, and an
-    /// `init`/`relayout` after this re-carves with it.  False (the default): the rule's ring, so a slot of the room
-    /// is never staged into and the lender's bytes are left alone.
-    void set_ring_room_active(bool on);
-    bool ring_room_active() const { return ring_room_active_; }
-
-    /// True when every stream of this path has finished.  The room's close needs it: what a prompt staged into those
-    /// slots is written over by the lender's own bytes, and a prompt pass still reading them would take the DMA.
-    bool idle(std::string& err);
-
     /// Device bytes `init` needs for a chunk of `chunk` tokens (what a borrowed region must hold).  `src`: init gets an
     /// ExpertSource (carve picks the fused MoE layout only then).
     static uint64_t bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
@@ -190,25 +160,6 @@ public:
     /// Monitor tab shows the pair the run really got, not what it asked for.
     static int64_t ring_slots_for(int64_t chunk);
 
-    /// The small chunks' staging ring (chunks below stream_all_min_tokens() resolve to it, whatever the budget):
-    /// the constant the advisory planner prices those chunks with.
-    static int64_t ring_stage_slots();
-    /// Minimum staging storage, including the grouped gather.
-    static int64_t staging_min_slots();
-
-    /// The advisory planner's PURE what-if pricing: the same rules priced at an explicit pinned share, in place
-    /// of the measured global (which the planner must neither set nor wait for the runtime to set).  share < 0.9
-    /// prices the unpinned arm (the 96-slot rule), share >= 0.9 the pinned one; nothing else differs.
-    static int64_t ring_slots_at_share(int64_t chunk, double share);
-    static int64_t ring_default_slots_at(double share);
-    static int64_t ring_max_slots_at(double share);
-    static int64_t ring_cap_for_at(int64_t old_chunk, double share);
-    /// The allocation sequence of `init` counted at an explicit pinned share (`owned_pages`: the 2 MiB pages
-    /// and the one-piece ring, as bytes_needed_owned).  The runtime's bytes_needed/bytes_needed_owned price the
-    /// same way at the measured share.
-    static uint64_t bytes_needed_at_share(const core::ModelGeometry& g, const core::SessionState& ss,
-                                          int64_t chunk, double share, bool owned_pages, bool src = true);
-
     /// 0.1.39b (#583, the default): the ring as a byte budget, the loan's corrected count and the auto chunk scan that
     /// keeps the ring full.  STRATA_RING_BYTES=0: 0.1.39's ring, loan and chunk list.
     static bool ring_bytes_enabled();
@@ -233,9 +184,6 @@ public:
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
-    /// SYCL port, --expert-parallel-device: the experts `cache` holds on card `device` are computed there for every
-    /// prompt chunk instead of being streamed to this card.
-    bool set_ep_peer(int device, core::ExpertCache* cache, std::string& err);
 
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
@@ -248,7 +196,6 @@ public:
     void set_taps(const std::vector<int>& layers, int64_t first_pos, int64_t cap_rows) { tap_layers_ = layers; tap_first_ = first_pos; tap_cap_ = cap_rows; }
     void clear_taps();
     std::function<bool(const float* taps, int64_t rows, int64_t pos0, std::string& err)> on_taps;
-
 
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
     /// is still at that chunk's end (its stream synchronized; the last stage calls it just before `on_chunk`).  An
@@ -267,12 +214,15 @@ public:
     /// for its grouping on the host; a policy may count them. Not called on the paths that keep the ids on the GPU.
     std::function<void(int64_t layer, const int32_t* ids, int64_t n)> on_routes;
     int64_t stopped_at() const { return stopped_at_; }
-    /// Grows this stage's (and the later stages') pinned upload slots to what a chunk of `T` tokens uploads - with
-    /// `pictures`, a run of a picture's rows too (prompt_uploads.hpp) - so a run of such chunks allocates no pinned
-    /// memory (STRATA_PIPED_CONCURRENT: an allocation or free on the read's thread takes the driver's lock).  Before
-    /// the run, with nothing of this path in flight.  False: a slot could not be had (it then grows at first use, as
-    /// before).
-    bool reserve_uploads(int64_t T, bool pictures = false);
+    /// KVA: the end of the positions the last run approximated (they are a prefix: chunks from the run's first position
+    /// on), i.e. the first position whose final rows are real; 0 when that run approximated nothing.  Raised chunk by
+    /// chunk, before on_chunk reports the chunk, so the draft layer can skip the chunk's cells.  Reset by every run.
+    int64_t kva_floor() const { return kva_floor_; }
+    /// Grows this stage's (and the later stages') pinned upload slots to what a text chunk of `T` tokens uploads, so
+    /// a run of such chunks allocates no pinned memory (STRATA_PIPED_CONCURRENT: an allocation or free on the read's
+    /// thread takes the driver's lock).  Before the run, with nothing of this path in flight.  False: a slot could
+    /// not be had (it then grows at first use, as before).
+    bool reserve_uploads(int64_t T);
 
     /// The vision path: HOST rows (n_embd floats) indexed by absolute position, read in place of the token
     /// embedding where non-null (an image's <|image_pad|> cells).  Null (default): every position embeds its token.
@@ -296,28 +246,6 @@ public:
     /// run `init`.
     bool set_stage_helper(Prefill* helper, std::string& err);
 
-    /// REMOTE STAGE, the main side: this stage ends before the last layer and the rest of the
-    /// model runs in another process.  Instead of a `next` stage, every chunk's rows (T x hc*n_embd floats, pinned
-    /// host) go to `remote_send` (on a thread, in order: this stage reads chunk c + 1 meanwhile), and on another
-    /// thread, in the same order, `remote_recv` writes the worker's final rows [skip, T) to `rows_out` (pinned
-    /// host); they are uploaded and passed to `on_chunk`.  The worker reads chunk c while chunk c + 1 is on the
-    /// wire.  `flags` bit 0: the prompt is one chunk.  Set both before `init`.
-    std::function<bool(const int64_t* tokens, int64_t T, int64_t pos0, int64_t flags, const float* rows_in,
-                       int64_t skip, std::string& err)> remote_send;
-    /// (empty with remote_send set: a relay worker - the next worker's reply goes back to the main process another
-    /// way, and this stage reports no chunk)
-    std::function<bool(float* rows_out, int64_t T, int64_t skip, std::string& err)> remote_recv;
-    /// REMOTE STAGE: `on_chunk` reads no row before this position (the drafter's window starts later), so the worker
-    /// sends back only the rows from it - `skip` rows fewer for the chunks before it.  Per prompt; default all rows.
-    void set_remote_rows_from(int64_t pos) { remote_rows_from_ = pos; }
-    /// REMOTE STAGE, a relay worker: a wait for its next worker to take a chunk (`remote_send`) gets this allowance
-    /// instead of the watchdog's limit - the link's own timeouts end it and the next worker watches itself.  0: watched.
-    void set_send_allowance(int seconds) { send_allow_s_ = seconds; }
-    /// REMOTE STAGE, the worker's side: this stage does not start at layer 0 and has no previous stage in this
-    /// process - its rows for the next `run` (host, pinned; one chunk) and whether the main prompt is one chunk.
-    void set_hand_in(const float* rows) { hand_in_ = rows; }
-    void set_single_chunk(bool on) { single_chunk_ = on; }
-
     /// The CPU expert pool (decode's, idle while a prompt is read). With STRATA_PREFILL_CPU_SHARE set, a chunk below
     /// stream_all_min() tokens - an agent's tool output - hands it the non-resident experts routed by at most MAXT of
     /// its tokens, fewest first, up to a share of the experts it would stream (`auto`: measured, where both sides end
@@ -333,30 +261,36 @@ public:
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
-    /// STRATA_PREFILL_CPU_SHARE_BATCH=1 (batch slots beside the pool): set before each read - true while a slot decodes
-    /// (its windows use the pool), so no chunk of that read takes the share; false lets the read's chunks take it.
-    static void set_share_blocked(bool blocked);
+
+    /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
+    /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.
+    /// On a layer split it is the last stage's (the one that reports the rows), asked through the first.
+    bool layer_major_mid() const {
+        const Prefill* p = this;
+        while (p->next_ != nullptr) p = p->next_;
+        return p->lm_mid_;
+    }
 
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                      bool owned_pages, bool src, double share);
+                                      bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
-    int ring_room_ = 0;                              ///< set_ring_room (this instance's, and it survives `reset`)
-    void* ring_room_base_ = nullptr;                 ///< set_ring_room_base: the bytes the room's slots are
-    uint64_t ring_room_bytes_ = 0;
-    bool ring_room_active_ = false;                  ///< the room is this prompt's (survives `reset` with it)
+    // Layer-major prefill: the super-chunk's buffers for an n-token prompt (its size, 0 = not this prompt: `why`),
+    // the run, and the buffers given back after it.  `cap` (> 0): at most that many tokens (a layer split's stages
+    // share one size); lm_prepare_chain sizes every stage of a split.
+    int64_t lm_prepare(int64_t n, std::string& why, int64_t cap = 0);
+    int64_t lm_prepare_chain(int64_t n, std::string& why);
+    void lm_release_chain();
+    bool run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    void lm_release();
+    bool lm_mid_ = false;
+    bool lm_by_default_ = false;   ///< the walk is on because nothing was set (a wider VRAM margin, the measured super-chunk size)
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     bool drain_pipeline(std::string& err);
-    // remote-stage: one chunk's reply from the worker, then on_chunk on its rows (runs on the receiving thread)
-    bool remote_tail(int64_t T, int64_t pos0, int64_t skip, int device, std::string& err);
-    std::future<bool> send_run_;        ///< remote-stage: the last chunk's send
-    std::string send_err_, recv_err_;
-    int send_allow_s_ = 0;              ///< set_send_allowance
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
-    int64_t remote_rows_from_ = 0;      ///< set_remote_rows_from
     std::vector<int> tap_layers_;
     int64_t tap_first_ = 0, tap_cap_ = 0;
     float* tap_dev_ = nullptr;
@@ -364,6 +298,7 @@ private:
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
+    int64_t kva_floor_ = 0;             ///< kva_floor()
     bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)
     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
     bool force_single_ = false, force_planned_ = false;

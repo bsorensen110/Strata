@@ -629,6 +629,34 @@ def require_messages(messages: list) -> None:
         raise ValueError("messages must be a non-empty list: send at least one message")
 
 
+def _order_chat_tool_results(messages: list[dict]) -> None:
+    """The template pairs results by position, so restore call order while IDs are still available.
+
+    Only a complete, unambiguous run of results is reordered. Legacy or incomplete histories keep their
+    received order. IDs are private to this conversion and never reach the template.
+    """
+    i = 0
+    while i < len(messages):
+        if messages[i]["role"] != "tool":
+            i += 1
+            continue
+        j = i + 1
+        while j < len(messages) and messages[j]["role"] == "tool":
+            j += 1
+        prev = messages[i - 1] if i else {}
+        calls = [c.get("_call_id") for c in prev.get("tool_calls") or []] if prev.get("role") == "assistant" else []
+        results = [m.get("_call_id") for m in messages[i:j]]
+        if len(calls) == len(results) and all(isinstance(cid, str) and cid for cid in calls + results):
+            if len(set(calls)) == len(calls) and len(set(results)) == len(results) and set(calls) == set(results):
+                rank = {cid: n for n, cid in enumerate(calls)}
+                messages[i:j] = sorted(messages[i:j], key=lambda m: rank[m["_call_id"]])
+        i = j
+    for message in messages:
+        message.pop("_call_id", None)
+        for call in message.get("tool_calls") or []:
+            call.pop("_call_id", None)
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -1005,14 +1033,24 @@ class OutputParser:
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
         self.declared_only = declared_only
-        # PR #3556: the native namespace__member spelling of a declared namespace.member tool is accepted without advertising a
-        # duplicate tool.  Only an unambiguous alias counts (two namespaces can end in the same member), and an exactly declared
+        # A declared namespace.member tool is also accepted as namespace__member (PR #3556),
+        # namespace=member (Qwen writes the <function= tag's equals sign into the name),
+        # namespace_member (one underscore dropped), and the bare member when exactly one
+        # declared tool has it. Only an unambiguous alias counts, and an exactly declared
         # name always wins over an alias.
         aliases = {}
         for name in self.schemas:
             if isinstance(name, str) and "." in name:
                 namespace, member = name.rsplit(".", 1)
-                aliases.setdefault(f"{namespace}__{member}", set()).add(name)
+                for alias in (f"{namespace}__{member}", f"{namespace}={member}",
+                              f"{namespace}_{member}", member):
+                    aliases.setdefault(alias, set()).add(name)
+        # #3796: the same tool written with every `__` collapsed to `_` (`mcp__playwright__browser_navigate` as
+        # `mcp_playwright_browser_navigate`, the way Qwen often flattens a name) is that tool.  Only a spelling of a declared
+        # name: a reordered or renamed tool (`server1_label_values` for `label_values_mcp_server1`) is not guessed.
+        for name in self.schemas:
+            if isinstance(name, str) and "__" in name:
+                aliases.setdefault(name.replace("__", "_"), set()).add(name)
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text

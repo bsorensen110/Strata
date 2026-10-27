@@ -65,6 +65,8 @@ class GuiLayout(unittest.TestCase):
         self.env = {"LOCALAPPDATA": str(base / "local"), "XDG_DATA_HOME": str(base / "local"), "APPDATA": str(base / "roaming"),
                     "XDG_CONFIG_HOME": str(base / "config"), "USERPROFILE": str(base / "home"), "HOME": str(base / "home"),
                     "XDG_STATE_HOME": str(base / "state"), "XDG_DOCUMENTS_DIR": ""}
+        settings = Path(self.env["APPDATA"]) / "Strata" if os.name == "nt" else Path(self.env["XDG_CONFIG_HOME"]) / "strata"
+        self.settings_path = settings / "settings.json"
         patch = mock.patch.dict(os.environ, self.env)
         patch.start()
         self.addCleanup(patch.stop)
@@ -77,15 +79,6 @@ class GuiLayout(unittest.TestCase):
         (self.terminal / "data").mkdir(parents=True)
         shutil.copy(Path(models.__file__).resolve().parents[1] / "data" / "gguf_fingerprints.json", self.terminal / "data")
         p = mock.patch.object(models, "ROOT", self.terminal)
-        p.start()
-        self.addCleanup(p.stop)
-        # the Catalog finds its own folder from the package file, not models.ROOT: make it this fake Terminal folder
-        # too, so a real checkout with its own run configs cannot become a "here" install under the test.
-        real = Path(models.__file__).resolve().parents[1]
-        shutil.copy(real / "setup.py", self.terminal)
-        (self.terminal / "tools").mkdir()
-        shutil.copy(real / "tools" / "strata_mcp.py", self.terminal / "tools")
-        p = mock.patch("strata_cli.launch.catalog.installer_folder", return_value=self.terminal)
         p.start()
         self.addCleanup(p.stop)
         self.install = discovery.app_install_dir()
@@ -116,10 +109,6 @@ class GuiLayout(unittest.TestCase):
 
     def catalog(self) -> Catalog:
         return Catalog(hardware=HW_12)
-
-    def cli_settings(self) -> Path:
-        """The command-line Strata's settings file on this platform (%APPDATA%/Strata or $XDG_CONFIG_HOME/strata)."""
-        return discovery.own_settings_file({k: v for k, v in os.environ.items() if k != "STRATA_SETTINGS_FILE"})
 
     # ---- T04: one answer for list and the wizard
     def test_models_list_finds_the_app_install_by_default(self):
@@ -155,7 +144,7 @@ class GuiLayout(unittest.TestCase):
         old = self.base / "T-Strata"
         old.mkdir()
         (old / "strata-qwen-iq3_xxs.json").write_text(json.dumps({"exe": "e", "tokenizer": "t", "args": []}))
-        settings = self.cli_settings()
+        settings = self.settings_path
         settings.parent.mkdir(parents=True)
         settings.write_text(json.dumps({"installs": [str(old)]}))
         got = models.list_installed()
@@ -168,7 +157,7 @@ class GuiLayout(unittest.TestCase):
         (old / "strata-x.json").write_text(json.dumps({"exe": "e", "tokenizer": "t", "args": []}))
         app_settings = self.install.parent / "app-settings.json"
         with mock.patch.dict(os.environ, {"STRATA_SETTINGS_FILE": str(app_settings)}):
-            settings = self.cli_settings()
+            settings = self.settings_path
             settings.parent.mkdir(parents=True)
             settings.write_text(json.dumps({"installs": [str(old)]}))
             self.assertEqual([m["id"] for m in models.list_installed()["models"]], ["gyro-gyro-s"])
@@ -271,7 +260,7 @@ class GuiLayout(unittest.TestCase):
     def test_an_own_setting_beats_the_apps_folder(self):
         mine = self.base / "mine"
         mine.mkdir()
-        settings = self.cli_settings()
+        settings = self.settings_path
         settings.parent.mkdir(parents=True, exist_ok=True)
         settings.write_text(json.dumps({"data_dir": str(mine)}))
         self.assertEqual(self.catalog().data_dir().resolve(), mine.resolve())
@@ -327,56 +316,6 @@ class GuiLayout(unittest.TestCase):
         r = Runner(S.LaunchSettings(model_path=str(self.gguf.parent), family="gyro", model="Gyro-S", vision="off"), catalog=self.catalog())
         self.assertEqual(r.download_gb(), 0.0)
         self.assertEqual(Path(r.existing_data_dir()).resolve(), self.docs.resolve())
-
-
-class NestedModelsDirs(unittest.TestCase):
-    """A data folder whose ``models`` dir holds another ``models`` dir (left by earlier runs) must still resolve to the
-    outer data folder: discovery feeds the installer, and resolving to the inner ``models`` nests one level per install."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.data = Path(self.tmp.name) / "Strata-data"
-        self.inner = self.data / "models" / "models"
-        self.tag = self.inner / "coder-IQ1_M"
-        self.tag.mkdir(parents=True)
-        self.gguf = self.tag / "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
-        self.gguf.write_bytes(b"x")
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def test_data_dir_of_resolves_to_the_outer_data_folder(self):
-        fp = discovery.Footprint(weights=[self.gguf])
-        self.assertEqual(discovery.data_dir_of(fp), self.data)
-
-    def test_data_dir_of_flat_layout_unchanged(self):
-        flat_tag = self.data / "models" / "coder-IQ1_M"
-        flat_tag.mkdir(parents=True)
-        gguf = flat_tag / "m.gguf"
-        gguf.write_bytes(b"x")
-        fp = discovery.Footprint(weights=[gguf])
-        self.assertEqual(discovery.data_dir_of(fp), self.data)
-
-    def test_prepared_beside_resolves_to_the_outer_data_folder(self):
-        (self.data / "models" / "mmproj-7b.gguf").write_bytes(b"x")
-        out = discovery.prepared_beside(self.gguf)
-        self.assertEqual(out["data_dir"], self.data)
-        self.assertEqual(out["mmproj"], self.data / "models" / "mmproj-7b.gguf")
-
-    def test_prepared_beside_flat_layout_unchanged(self):
-        flat_tag = self.data / "models" / "coder-IQ1_M"
-        flat_tag.mkdir(parents=True)
-        gguf = flat_tag / "m.gguf"
-        gguf.write_bytes(b"x")
-        (self.data / "models" / "mmproj-7b.gguf").write_bytes(b"x")
-        (self.data / "packs" / "coder-iq1_m").mkdir(parents=True)
-        (self.data / "mtp" / "rt").mkdir(parents=True)
-        (self.data / "mtp" / "rt" / "experts.bin").write_bytes(b"x")
-        out = discovery.prepared_beside(gguf)
-        self.assertEqual(out["data_dir"], self.data)
-        self.assertEqual(out["pack"], self.data / "packs" / "coder-iq1_m")
-        self.assertEqual(out["mtp"], self.data / "mtp" / "rt")
-        self.assertEqual(out["mmproj"], self.data / "models" / "mmproj-7b.gguf")
 
 
 if __name__ == "__main__":

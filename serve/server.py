@@ -7252,6 +7252,21 @@ def make_handler(svc: Service):
                     print(f"web search failed: {e.__class__.__name__}: {e}", file=sys.stderr)
                     self._json(502, {"error": {"message": "Web search hit an unexpected error ("
                                             + e.__class__.__name__ + ")"}})
+            if path == "/admin/calib":                     # M3.2: hot calibrator reload (Bearer admin key)
+                key = jev_calib.ADMIN_KEY
+                auth = self.headers.get("Authorization", "")
+                if not key:
+                    # fail-closed like the donor's --admin-key routes: with no key
+                    # configured the admin surface does not exist (404, not 401:
+                    # probing must not learn that it ever could) — Opus G2
+                    self._json(404, {"error": {"message": "not found"}})
+                    return
+                if auth != "Bearer " + key:
+                    self._json(401, {"error": {"message": "admin key required"}})
+                    return
+                jev_calib.swap()
+                self._json(200, jev_calib.state_json())
+                return
             if path in ("/unload", "/load") and not self._control_body():
                 return
             # JSON from Strata's own page only, as /settings: else a plain form POST from any site unloads the model
