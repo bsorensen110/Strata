@@ -96,6 +96,7 @@
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
+#include "strata/spec/dflash_policy.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
@@ -1514,6 +1515,36 @@ void pl_diag_print(std::FILE* f) {
     for (int st = 0; st < 2; ++st)
         for (int par = 0; par < 2; ++par)
             if (d.v[st][par] != nullptr) d.v[st][par]->diag_pipelined(f, names[st][par]);
+}
+
+// Works with Off, MTP and DFlash, in both CLI and server. Capture the target's
+// logits of the kept prefix before commit, excluding rejected speculative rows.
+static bool dflash_target_probe(strata::core::Verifier& ver, int64_t pos, int rows, std::string& err) {
+    static const char* env = std::getenv("STRATA_DF_TARGET_PROBE");
+    static const int64_t wanted = env ? std::atoll(env) : -1;
+    if (!env || wanted < pos || wanted - pos >= rows) return true;
+    std::vector<float> logits((size_t) ver.vocab());
+    if (!ver.copy_logits((int) (wanted - pos), logits.data())) {
+        err = "target probe: copying logits failed";
+        return false;
+    }
+    int best = 0, second = 1;
+    if (logits[second] > logits[best]) std::swap(best, second);
+    for (int i = 2; i < ver.vocab(); ++i) {
+        if (logits[i] > logits[best]) { second = best; best = i; }
+        else if (logits[i] > logits[second]) second = i;
+    }
+    std::fprintf(stderr, "dflash target probe: pos=%lld window_pos=%lld row=%lld top1=%d score=%.9g top2=%d score=%.9g margin=%.9g\n",
+                 (long long) wanted, (long long) pos, (long long) (wanted - pos),
+                 best, logits[best], second, logits[second], logits[best] - logits[second]);
+    if (const char* path = std::getenv("STRATA_DF_TARGET_PROBE_FILE")) {
+        FILE* f = std::fopen(path, "wb");
+        if (!f) { err = "target probe: opening logits file failed"; return false; }
+        const bool written = std::fwrite(logits.data(), sizeof(float), logits.size(), f) == logits.size();
+        const bool closed = std::fclose(f) == 0;
+        if (!written || !closed) { err = "target probe: writing logits failed"; return false; }
+    }
+    return true;
 }
 
 // #1341 #964: CUDA_LAUNCH_BLOCKING=1 in the environment.  A verify window's graph waits on the GPU for flags the host
@@ -6220,7 +6251,7 @@ int main(int argc, char** argv) {
         if (o.draft == "dflash2") {
             const char* why = o.mtp.empty() ? "it needs --mtp (the fallback) and --spec 2 or more"
                               : !native_pack ? "it needs a native pack"
-                              : multi_gpu || o.batch > 0 || o.serve ? "it is for one card and the CLI run (not --serve, --batch or a layer split) in this build"
+                              : multi_gpu || o.batch > 0 ? "it is for one card (not --batch or a layer split)"
                               : o.draft_model.empty() ? "it needs --draft-model PACK (tools/dflash2_pack.py)" : nullptr;
             if (why == nullptr) {
                 if (df2.load(o.draft_model, 0, err)) {
@@ -9316,6 +9347,14 @@ int main(int argc, char** argv) {
                          (long long) xcache.slots(), (long long) (g.n_layers * g.n_expert));
         if (share_pool && stages.empty() && !multi_gpu && share_has_work && !share_default_ok()) share_has_work = false;   // H11
         strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu && share_has_work);
+    static const bool dflash_sampled_fallback = [] {
+        const char* e = std::getenv("STRATA_DFLASH_SAMPLED_FALLBACK");
+        return e && e[0] == '1';
+    }();
+    int dflash_k = use_df2 ? std::min<int>(o.spec - 1, strata::core::Dflash2Drafter::kDrafts) : 0;
+        bool has_dflash = use_df2;   // serve-mode DFlash2 (upstream --draft dflash2); cleared if the bind fails below
+        bool df2_park_ok = false;    // set with the drafter below: park its context with each conversation (STRATA_DF2_CTX=0 disables)
+        bool df_request = false;   // set before prefill; for both greedy and sampled requests
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -10088,6 +10127,9 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+#if defined(STRATA_HAVE_DFLASH2)
+        if (has_dflash) ver.set_taps(df2.tap_layers());
+#endif
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_max_t(), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
@@ -10095,6 +10137,34 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
             return 1;
         }
+#if defined(STRATA_HAVE_DFLASH2)
+        if (has_dflash && !ver.tapping()) {
+            std::fprintf(stderr, "strata serve: --draft dflash2: the verifier keeps no taps here; the MTP drafts instead\n");
+            has_dflash = false;
+        }
+        if (has_dflash && !df2.bind(wt, &native_head, o.mtp_draft_vocab.empty() ? o.mtp + "/draft_vocab.bin" : o.mtp_draft_vocab, err)) {
+            std::fprintf(stderr, "strata serve: --draft dflash2: %s. The MTP drafts instead.\n", err.c_str());
+            has_dflash = false;
+        }
+        if (has_dflash && !df2.prepare(ver.tap_dev(), err)) {
+            std::fprintf(stderr, "strata serve: --draft dflash2: %s. The MTP drafts instead.\n", err.c_str());
+            has_dflash = false;
+        }
+        if (has_dflash) {
+            dflash_k = std::min<int>(o.spec - 1, strata::core::Dflash2Drafter::kDrafts);
+            std::fprintf(stderr, "strata serve: DFlash2 drafter on (%s, graphs captured in %.0f ms), the MTP stays as the fallback\n",
+                         o.draft_model.c_str(), df2.ms_capture);
+        } else {
+            dflash_k = 0;
+        }
+        {   // the drafter's context joins conversation parking (park/restore below); STRATA_DF2_CTX=0 turns it off
+            static const bool df2_ctx_env = [] { const char* e = std::getenv("STRATA_DF2_CTX"); return !(e && e[0] == '0'); }();
+            df2_park_ok = has_dflash && df2_ctx_env && stages.empty();   // the ring is one card's drafter: never a layer split
+            if (has_dflash && df2_park_ok)
+                std::fprintf(stderr, "strata serve: DFlash2 context parks with each conversation (%.1f MiB each)\n",
+                             (double) df2.state_bytes() / (1024.0 * 1024.0));
+        }
+#endif
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
@@ -10344,6 +10414,7 @@ int main(int argc, char** argv) {
                 in.ple = o.ple_gguf;
                 in.pack = o.pack;
                 in.mtp = o.mtp.empty() ? std::string() : o.mtp + "/dense.bin";
+                in.dflash2 = use_df2 ? o.draft_model : std::string();   // session files belong to the drafter pack that parked them
                 if (srcp != nullptr) in.experts = srcp->model_inputs();
                 std::vector<strata::core::SessionModelFile> files = strata::core::session_model_inputs(in);
                 // the pack's other files the loader reads (weights.cpp, expert_layout.cpp)
@@ -10538,6 +10609,9 @@ int main(int argc, char** argv) {
                 err.clear();
             }
             estimate += stage_estimate;
+#if defined(STRATA_HAVE_DFLASH2)
+            if (df2_park_ok && n_st == 0) estimate += df2.state_bytes();   // the drafter's context rides with the image
+#endif
             // A park carrying its own retained K/V replaces memory the cache
             // already held, so capacity is make_room's call - it runs next either
             // way, and put()'s accounting still bounds the budget. The with-reuse
@@ -10622,6 +10696,15 @@ int main(int argc, char** argv) {
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
+#if defined(STRATA_HAVE_DFLASH2)
+                if (df2_park_ok && n_st == 0) {
+                    std::string de;
+                    if (!df2.save_state(image.df2_state, de, (int64_t) src.ids.size())) {
+                        std::fprintf(stderr, "strata serve: conversation cache: DFlash2 context not saved (%s)\n", de.c_str());
+                        image.df2_state.clear();
+                    }
+                }
+#endif
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
@@ -12151,7 +12234,7 @@ int main(int argc, char** argv) {
             std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                        "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
+                        "spec_min_p=%.2f dflash_block=%d dflash_max=%d conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld "
                         "tail_role_token=%lld vram_elastic=%d "
                         "prefill_cap=%lld prefill_stages=%d stream_all_min=%lld prefill_pipe=%g%s engine=" STRATA_VERSION "\n",
@@ -12164,7 +12247,8 @@ int main(int argc, char** argv) {
                         o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
                         (long long) ((o.mmap_experts ? src.resident_bytes() : strata::kernels::cpu::expert_layout().total) >> 20),
                         pool.workers(), o.pcie_frac,
-                        o.spec_min_p, (long long) o.conversation_cache_mib, o.conversation_cache_slots,
+                        o.spec_min_p, dflash_k, 0,
+                        (long long) o.conversation_cache_mib, o.conversation_cache_slots,
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0,
                         // the prompt path: its chunk cap (the VRAM command's relend can lower it later), the stages a
@@ -12249,6 +12333,7 @@ int main(int argc, char** argv) {
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
+        strata::spec::DFlashPolicy df_policy(dflash_k);
         const bool spec_cost = [] { const char* v = std::getenv("STRATA_SPEC_COST"); return v != nullptr && v[0] == '1'; }();   // cost-aware MTP window (A/B arm)
         strata::spec::DraftPolicy::ChainState chain_st;
         int chain_rows = 1;   // the window the cost-aware rule kept in the MTP chain just drafted
@@ -13714,6 +13799,9 @@ int main(int argc, char** argv) {
             // embedding floats, so a picture encoded again with other bits still matches.  Absent: the embeddings' hash.
             std::vector<uint64_t> req_img_keys;
             bool req_pcie_set = false;   // the request names its own share (the measured one holds meanwhile)
+            int req_dflash_k = dflash_k;
+            bool req_dflash_block_set = false, req_dflash_auto = false, bad_dflash_block = false, bad_tune = false;
+            bool req_df2_reference = false, bad_df2_reference = false;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -13752,8 +13840,15 @@ int main(int argc, char** argv) {
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
-                    else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
+                    else if (key == "pcie_frac" || key == "spec_min_p") {
+                        char* tail = nullptr;
+                        const double value = std::strtod(tok.c_str() + eq + 1, &tail);
+                        bad_tune = bad_tune || (has_dflash && (tail == tok.c_str() + eq + 1 || *tail != '\0' ||
+                                   !std::isfinite(value) || value < 0.0 || value > 1.0));
+                        const double tune_value = has_dflash ? value : std::clamp((double) fv, 0.0, 1.0);
+                        if (key == "pcie_frac") { req_pcie_frac = tune_value; req_pcie_set = true; }
+                        else req_spec_min_p = tune_value;
+                    }
                     else if (key == "pipe") req_pipe = std::max(0.0, (double) fv);
                     else if (key == "aux_cpus") req_aux_cpus = std::atoi(tok.c_str() + eq + 1) != 0 ? 1 : 0;
                     else if (key == "img_keys") {
@@ -13768,15 +13863,47 @@ int main(int argc, char** argv) {
                             if (*qe != ',' && *qe != '\0') { req_img_keys.clear(); break; }
                         }
                     }
+                    else if (key == "dflash2_reference") {
+                        const std::string value = tok.substr(eq + 1);
+                        bad_df2_reference = bad_df2_reference || (value != "0" && value != "1");
+                        req_df2_reference = value == "1";
+                    }
+                    else if (key == "dflash_block") {
+                        char* tail = nullptr;
+                        errno = 0;
+                        const long value = std::strtol(tok.c_str() + eq + 1, &tail, 10);
+                        bad_dflash_block = bad_dflash_block || errno == ERANGE || tail == tok.c_str() + eq + 1 ||
+                            *tail != '\0' || value < 1;
+                        if (!bad_dflash_block) req_dflash_k = (int) value;
+                        req_dflash_block_set = true;
+
+                    }
+                    else if (key == "dflash_auto") {
+                        req_dflash_auto = std::atoi(tok.c_str() + eq + 1) != 0;
+                    }
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
             strata::prefill::Prefill::set_pipe_request(req_pipe);   // every request sets it: none carries over
+            if (bad_df2_reference) {
+                std::printf("ERR dflash2_reference requires DFlash2 and a value of 0 or 1\n");
+                continue;
+            }
             std::vector<float> req_bias;
             std::string bias_error;
             if (req_bias_present && (o.batch > 0 ||
                 !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error))) {
                 std::printf("ERR logit_bias: %s\n", o.batch > 0 ? "continuous batching is not supported" : bias_error.c_str());
+                continue;
+            }
+            if (bad_tune) {
+                std::printf("ERR bad request: calibration parameter\n");
+
+                continue;
+            }
+            if (bad_dflash_block) {
+                std::printf("ERR bad request: dflash_block\n");
+
                 continue;
             }
             std::string emb_path;
@@ -13793,6 +13920,13 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            // DFlash proposes point masses (argmax tokens). The verifier samples the target with
+            // this request's chain and position-keyed RNG; exact-match acceptance is valid at any
+            // temperature. Set STRATA_DFLASH_SAMPLED_FALLBACK=1 to force target-only parity mode.
+            const bool req_dflash = has_dflash && (!dflash_sampled_fallback || req_temperature <= 0.0f);
+            df_request = has_dflash;
+            if (has_dflash && !req_dflash)
+                std::fprintf(stderr, "dflash: sampled request uses target-only decoding\n");
             if (req_prefill_only && (geni || o.batch > 0 || n < 2)) {
                 std::printf("ERR prefill=1 needs a text prompt of at least 2 tokens and no --batch\n");
                 continue;
@@ -14099,7 +14233,7 @@ int main(int argc, char** argv) {
             // own next turn (ConversationCache::borrows).  Everything else is taken whole, as before.
             // (a layer split restores whole stage images only, so it never borrows; a batch slot that holds a longer
             // start of this prompt wins as before)
-            bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
+            bool borrow = !has_dflash && stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
             if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
                 incoming.emplace(conversations.take(parked.index));
@@ -14417,6 +14551,26 @@ int main(int argc, char** argv) {
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
                     conversations.retain(std::move(incoming->kv), int64_t(live.size()), std::move(stage_kv), live);
                 }
+#if defined(STRATA_HAVE_DFLASH2)
+                // the drafter's context: reinstall this conversation's ring (the RAM image carries the blob).
+                // `resume`: the checkpoint this request resumed at - cells the park committed past it are
+                // zeroed by restore_state.
+                if (df2_park_ok && !incoming->df2_state.empty()) {
+                    std::string de;
+                    const double df2_mib = (double) incoming->df2_state.size() / (1024.0 * 1024.0);
+                    if (!df2.restore_state(incoming->df2_state, resume, de)) {
+                        std::fprintf(stderr, "strata serve: conversation cache: DFlash2 context NOT restored (%s); "
+                                             "the drafter starts cold\n", de.c_str());
+                        df2.reset();
+                    } else {
+                        std::fprintf(stderr, "strata serve: conversation cache: DFlash2 context restored "
+                                             "(%.1f MiB, %lld tokens)\n", df2_mib, (long long) resume);
+                    }
+                    incoming->df2_state.clear();
+                } else if (has_dflash) {
+                    df2.reset();
+                }
+#endif
                 incoming.reset(); // Running-state/checkpoint copies are no longer needed.
                 lent_slot = -1;   // (the main session holds the parked conversation now)
                 std::fprintf(stderr, "strata serve: conversation cache: restored %lld tokens (%s) in %.1f ms; parked=%zu bytes=%zu\n",
@@ -14539,6 +14693,12 @@ int main(int argc, char** argv) {
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
             if (use_mtp && resume > 0 && reread_to <= 0) mtp.kv_restore(resume);
+#if defined(STRATA_HAVE_DFLASH2)
+            if (has_dflash) {
+                if (resume <= 0 || reread_to > 0) df2.reset();
+                else df2.rewind(resume);
+            }
+#endif
             tr("request", n, geni ? 1 : 0);
             req_times = ReqTimes{};
             if (use_mtp) mtp.set_prompt_len(n);
@@ -14748,6 +14908,16 @@ int main(int argc, char** argv) {
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+#if defined(STRATA_HAVE_DFLASH2)
+                    if (has_dflash) {
+                        const int64_t df_lo = std::max<int64_t>(0, (n - 1) - (df2.attention_window() - 1));
+                        const int64_t t0 = std::min<int64_t>(T, std::max<int64_t>(0, df_lo - q));
+                        if (T - t0 > 0) {
+                            const int64_t tap_stride = (int64_t) df2.tap_layers().size() * df2.n_embd();
+                            if (!df2.context(ver.tap_dev() + (size_t) (t0 * tap_stride), T - t0, q + t0, e)) return false;
+                        }
+                    }
+#endif
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -15581,6 +15751,17 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
+#if defined(STRATA_HAVE_DFLASH2)
+            if (has_dflash && stages.empty() && !multi_gpu && !peer.valid() && !remote_caches && !remote_opt) {
+                const int64_t win = df2.attention_window();
+                const int64_t tap_first = std::max<int64_t>(0, (n - 1) - (win - 1));
+                const int64_t tap_cap = std::max<int64_t>(1, std::min<int64_t>(win, (n - 1) - std::max(read_from, tap_first)));
+                sp.set_taps(df2.tap_layers(), tap_first, tap_cap);
+                sp.on_taps = [&](const float* taps, int64_t rows, int64_t pos0, std::string& e) -> bool {
+                    return df2.context(taps, rows, pos0, e);
+                };
+            }
+#endif
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
@@ -15655,6 +15836,9 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: message boundary checkpoint: %lld tokens, %lld tail\n",
                                  (long long) message_at, (long long) (turn_at - message_at));
             }
+#if defined(STRATA_HAVE_DFLASH2)
+            if (has_dflash) sp.clear_taps();
+#endif
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
@@ -15710,6 +15894,28 @@ int main(int argc, char** argv) {
             strata::core::MtpDrafter::DraftResult generation;
             strata::core::gated::Packet proposal; // immutable through the synchronous verifier call
             bool first_window = true;
+            bool dflash_ready = false;
+            static const bool df_no_auto_gate = std::getenv("STRATA_DFLASH_NO_AUTO_GATE") != nullptr;
+            static const bool df_conf_adapt = std::getenv("STRATA_DFLASH_CONF_ADAPT") != nullptr;
+            static const float df_depth_slope = std::getenv("STRATA_DFLASH_DEPTH_SLOPE")
+                ? std::strtof(std::getenv("STRATA_DFLASH_DEPTH_SLOPE"), nullptr) : 0.0f;
+            static const float df_min_cum_p = std::getenv("STRATA_DFLASH_MIN_CUM_P")
+                ? std::strtof(std::getenv("STRATA_DFLASH_MIN_CUM_P"), nullptr) : 0.0f;
+            const bool df_auto = req_dflash && req_dflash_auto &&
+                                 (!df_no_auto_gate || req_spec_min_p <= 0.0);
+            df_policy.reset();
+            strata::spec::DFlashConfidencePolicy df_conf_policy(
+                1,
+                req_dflash_k > 0 ? req_dflash_k : 3);
+            strata::spec::DFlashTelemetry df_tel;
+            const char* srv_df_trace_path = req_dflash ? std::getenv("STRATA_DF_CYCLES") : nullptr;
+            const auto close_srv_trace = [](FILE* f) { if (f) std::fclose(f); };
+            std::unique_ptr<FILE, decltype(close_srv_trace)> srv_df_trace(
+                srv_df_trace_path ? std::fopen(srv_df_trace_path, "a") : nullptr, close_srv_trace);
+            int df_pending_k = 0;
+            int df_proposed_k = 0;
+            double df_pending_ms = 0;
+            int64_t df_windows[8] = {};
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
@@ -16407,12 +16613,12 @@ int main(int argc, char** argv) {
                 }
             }
             while (!pl_ran && !cancelled && produced_n < max_new) {
-                int T = 1;
+                int T = req_dflash ? (dflash_ready ? df_pending_k + 1 : 1) : use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 policy.set_context(p);
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 bool from_sfx = false;
                 int sfx_match = 0;
-                if (gated_proposal) {
+                if (gated_proposal && !req_dflash) {
                     const int room = (int) std::min<int64_t>(S, o.max_context - p);
                     source_policy.apply_costs(p);   // held round times whose draws are all committed now
                     if (!prepare_gated_window(proposal, generation, sfx, source_policy, o.suffix_draft > 0,
@@ -16423,10 +16629,10 @@ int main(int argc, char** argv) {
                     T = proposal.T; from_sfx = proposal.from_sfx;
                     if (first_window && merge_T > 0) T = merge_T;   // STRATA_ADMIT_MERGE_FIRST: the prompt's last tokens ride in this window
                 } else {
-                    T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
-                    if (use_mtp && spec_cost && !first_window) {
+                    T = req_dflash ? (dflash_ready ? df_pending_k + 1 : 1) : use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
+                    if (!req_dflash && use_mtp && spec_cost && !first_window) {
                         T = std::clamp(chain_rows, 1, S_mtp);
-                    } else if (use_mtp && req_spec_min_p > 0.0) {
+                    } else if (!req_dflash && use_mtp && req_spec_min_p > 0.0) {
                         T = 1;
                         while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                     }
@@ -16438,8 +16644,8 @@ int main(int argc, char** argv) {
                         sfx_match = sfx.last_match();
                         // a probabilistic window must not condition the source on the draw: the policy copy fixed at the request's start
                         // chooses, and the lookup is taken without asking whether the MTP's first guess agrees
-                        const bool probabilistic = use_mtp && mtp.prob();
-                        if (k > 0 && (probabilistic || !use_mtp || sbuf[0] == drafts[0])) {
+                        const bool probabilistic = !req_dflash && use_mtp && mtp.prob();
+                        if (k > 0 && (probabilistic || !((!req_dflash && use_mtp) || (req_dflash && dflash_ready)) || sbuf[0] == drafts[0])) {
                             const strata::spec::DraftPolicy::Pick pk = probabilistic
                                 ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
                             if (pk.lookup) { T = pk.t; from_sfx = true; }
@@ -16649,9 +16855,10 @@ int main(int argc, char** argv) {
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
-                if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
-                else if (use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
-                const auto decode_pool_fn = use_mtp && mtp.prob() ? invariant_win_pool_fn : win_pool_fn;
+                if (gated_proposal && !req_dflash) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
+                else if (!req_dflash && use_mtp && mtp.prob() && !from_sfx && !first_window && T_mtp > 1) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+                const auto decode_pool_fn = !req_dflash && use_mtp && mtp.prob()
+                    ? invariant_win_pool_fn : win_pool_fn;
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -16673,10 +16880,39 @@ int main(int argc, char** argv) {
                 }
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (has_dflash && !merged) {
+                    // Do not cache accepted rows whose outputs were never emitted.
+                    // The last emitted token remains the next request's unconsumed anchor.
+                    a = (int) std::min<int64_t>(a, max_new - produced_n - 1);
+                    for (int i = 0; i < a; ++i)
+                        if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outv[(size_t) i]) != o.eos_ids.end()) {
+                            a = i;
+                            break;
+                        }
+                }
+                if (!dflash_target_probe(ver, p, a + 1, err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
-                if (!from_sfx && !first_window)
+                if (!from_sfx && !first_window) {
                     for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
+                    if (req_dflash) df_tel.record_window(T_mtp - 1, std::min(a, T_mtp - 1));
+                }
+                if (srv_df_trace && !merged) {
+                    std::fprintf(srv_df_trace.get(),
+                                 "{\"anchor_pos\":%lld,\"proposed_K\":%d,\"K\":%d,\"L\":%d,\"bootstrap\":%s,\"correction\":%d,\"emitted\":%lld,\"draft\":[",
+                                 (long long) p, df_proposed_k, T - 1, a, first_window ? "true" : "false", outv[(size_t) a],
+                                 (long long) std::min<int64_t>(a + 1, max_new - produced_n));
+                    for (int i = 1; i < T; ++i) std::fprintf(srv_df_trace.get(), "%s%d", i > 1 ? "," : "", window[(size_t) i]);
+                    std::fprintf(srv_df_trace.get(), "],\"target\":[");
+                    for (int i = 0; i < T; ++i) std::fprintf(srv_df_trace.get(), "%s%d", i ? "," : "", outv[(size_t) i]);
+                    std::fprintf(srv_df_trace.get(), "],\"dprob\":[");
+                    for (int i = 1; i < T; ++i) std::fprintf(srv_df_trace.get(), "%s%.6f", i > 1 ? "," : "", dprob[(size_t) i - 1]);
+                    std::fprintf(srv_df_trace.get(), "]}\n");
+                    std::fflush(srv_df_trace.get());
+                }
                 if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
                     ++t2_rej[a];
                     if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
@@ -16731,13 +16967,76 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw2 = Clock::now();
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
-                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                if (!req_dflash && use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
-                const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
-                const bool drafted = !use_mtp || eos || produced_n >= max_new ||
-                                     mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
-                                               nullptr, gated_proposal ? &generation : nullptr);
+                const GatedDraftLimit draft_limit(mtp, gated_proposal && !req_dflash, S_mtp, p + a + 1, o.max_context);
+                bool drafted = req_dflash || !use_mtp || eos || produced_n >= max_new ||
+                               mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
+                                         nullptr, gated_proposal ? &generation : nullptr);
+                if (has_dflash) {
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    // The next proposal waits on this same stream. Keep an explicit wait when
+                    // there is no proposal or the ungated policy needs the completed context time.
+                    const int max_fit_k = df_conf_adapt ? df_conf_policy.choose() : df_auto ? dflash_k : req_dflash_k;
+                    const auto ctx_done = Clock::now();
+                    if (df_auto && rounds > 1 && !from_sfx) {
+                        const double ms = std::chrono::duration<double, std::milli>(ctx_done - tw0).count();
+                        df_policy.observe(df_proposed_k, a + 1, ms + df_pending_ms);
+                    }
+                    ++df_windows[T - 1];
+                    const int room_k = (int) std::max<int64_t>(0, std::min<int64_t>(max_fit_k, o.max_context - (p + a + 2)));
+                    df_pending_k = std::min(room_k, df_conf_adapt ? df_conf_policy.choose() : df_auto ? df_policy.choose() : req_dflash_k);
+                    // Finish near the context limit with target-only windows rather than
+                    // proposing a block which the next verification window cannot fit.
+                    dflash_ready = false;
+                    if (!eos && produced_n < max_new) {   // the next block, from the committed rows' taps
+                        int32_t dd[strata::core::Dflash2Drafter::kDrafts];
+                        float pp[strata::core::Dflash2Drafter::kDrafts];
+                        // `p` has not been incremented yet (`p += a + 1` is at the end of the loop, as in CLI):
+                        // the `a + 1` committed rows are at positions p .. p + a, and draft() sets the anchor at p + a + 1.
+                        if (!df2.draft(ver.tap_dev(), a + 1, p, outv[(size_t) a], dd, pp, err)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return 1;
+                        }
+                        const int k = req_dflash ? std::min<int>(df_pending_k, strata::core::Dflash2Drafter::kDrafts) : 0;
+                        for (int i = 0; i < k; ++i) { drafts[(size_t) i] = dd[i]; dprob[(size_t) i] = pp[i]; }
+                        dflash_ready = k > 0;
+                        df_proposed_k = k;
+                        df_pending_k = k;
+                    }
+                    const bool proposed = dflash_ready;
+                    df_proposed_k = proposed ? df_pending_k : 0;
+                    const float eff_cum_p = std::max<float>(df_min_cum_p, (float) o.draft_conf);
+                    const bool want_dprob = req_spec_min_p > 0 || df_depth_slope > 0.0f || eff_cum_p > 0.0f ||
+                                            df_conf_adapt || srv_df_trace != nullptr;
+                    (void) want_dprob;
+                    if (dflash_ready && drafted) {
+                        int prefix = df_pending_k;
+                        if (req_spec_min_p > 0 || df_depth_slope > 0.0f || eff_cum_p > 0.0f) {
+                            prefix = strata::spec::dflash_truncate_prefix(
+                                dprob.data(), df_pending_k, (float) req_spec_min_p, df_depth_slope, eff_cum_p);
+                        }
+                        df_tel.record_proposal(df_pending_k, prefix);
+                        if (df_conf_adapt) df_conf_policy.observe(df_pending_k, prefix, dprob.data());
+                        df_pending_k = prefix;
+                        dflash_ready = prefix > 0;
+                        if (ss.ple.ready() && ss.ple.table != nullptr) {
+                            int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
+                            auto pf = [&](int32_t tok) {
+                                uint32_t rows16[strata::kernels::PLE_N_HEADS];
+                                strata::kernels::ngram_rows(&tok, prev, 1, ss.ple.consts, rows16);
+                                prev[0] = prev[1];
+                                prev[1] = tok;
+                                ss.ple.table->prefetch_rows(rows16);
+                            };
+                            pf(outv[(size_t) a]);
+                            for (int i = 0; i < df_pending_k; ++i) pf(drafts[(size_t) i]);
+                        }
+                    }
+                    df_pending_ms = proposed ?
+                        std::chrono::duration<double, std::milli>(Clock::now() - ctx_done).count() : 0;
+                }
                 {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
@@ -16805,6 +17104,24 @@ int main(int argc, char** argv) {
             if (!ver.wait_commit(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
+            }
+            if (df_auto) {
+                std::fprintf(stderr, "dflash: adaptive windows (K:rounds):");
+                for (int k = 0; k <= dflash_k; ++k)
+                    if (df_windows[k] > 0) std::fprintf(stderr, " %d:%lld", k, (long long) df_windows[k]);
+                std::fprintf(stderr, "\n");
+            }
+            if (req_dflash && (df_auto || df_conf_adapt || std::getenv("STRATA_DF_TELEMETRY") != nullptr)) {
+                std::fprintf(stderr, "dflash: telemetry (K:accepted/windows):");
+                for (int k = 0; k <= 7; ++k)
+                    if (df_tel.windows_by_k[(size_t) k] > 0)
+                        std::fprintf(stderr, " %d:%lld/%lld", k,
+                                     (long long) df_tel.accepted_by_k[(size_t) k],
+                                     (long long) df_tel.windows_by_k[(size_t) k]);
+                std::fprintf(stderr, " proposed=%lld gate_truncated=%lld target_only=%lld\n",
+                             (long long) df_tel.proposed_rows,
+                             (long long) df_tel.gate_truncated_rows,
+                             (long long) df_tel.target_only_rounds);
             }
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();

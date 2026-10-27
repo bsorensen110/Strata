@@ -32,7 +32,7 @@
   </nav>
   <span class="st-header__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
-    <span class="st-pill__dot"></span><span id="pill-text" data-i18n="pill.connecting">Connecting&hellip;</span></span>
+    <span class="st-pill__dot"></span><svg class="st-icon st-pill__globe" id="pill-globe" hidden aria-hidden="true"><use href="web/sprite.svg#i-globe"/></svg><span id="pill-text" data-i18n="pill.connecting">Connecting&hellip;</span></span>
   <button class="st-btn st-btn--secondary" id="unload-btn" type="button" title="Waiting for the server" disabled>&hellip;</button>
   <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark" data-i18n-title="theme.title" data-i18n-label="theme.label">
     <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
@@ -61,7 +61,7 @@
         <div class="chat" id="chat">
           <div class="chat-empty" id="chat-empty">
             <div class="chat-empty__title" data-i18n="chat.empty">Ask anything</div>
-            <div class="chat-empty__sub" id="chat-empty-sub">The model runs on this PC. Nothing leaves it.</div>
+            <div class="chat-empty__sub" id="chat-empty-sub">The model runs on this PC. Nothing leaves it.<br>Web search is off by default &ndash; when on, only the search query goes out.</div>
           </div>
         </div>
       </div>
@@ -70,6 +70,8 @@
           <div class="attachments" id="attachments" hidden></div>
           <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message" data-i18n-placeholder="composer.placeholder" data-i18n-label="composer.message"></textarea>
           <div class="st-composer__bar">
+            <button type="button" class="st-btn st-btn--icon" id="websearch-btn" title="Web search: look the question up before answering" aria-label="Web search" aria-pressed="false">
+              <svg class="st-icon"><use href="web/sprite.svg#i-globe"/></svg></button>
             <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file" data-i18n-label="composer.attachLabel">
               <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
             <input type="file" id="file" multiple hidden>
@@ -300,6 +302,40 @@
         <span class="muted small" id="o-busy"></span>
       </div>
     </div>
+
+    <div class="drawer-section">Web search</div>
+    <div class="toggle-row"><span>Web search<br><span class="muted small">look the question up before answering; the composer's globe switches it too</span></span>
+      <button class="st-toggle" id="s-ws" role="switch" aria-checked="false" aria-label="Web search"></button></div>
+    <div class="toggle-row" id="ws-opt-row"><span>Optimize search query<br><span class="muted small" id="ws-opt-note">Refines your question into a focused search query before searching (uses the local model)</span></span>
+      <button class="st-toggle" id="s-ws-opt" role="switch" aria-checked="true" aria-label="Optimize search query"></button></div>
+    <div class="st-field" id="ws-engine-row">
+      <label class="st-label" for="s-ws-engine">Search engine</label>
+      <select class="st-input" id="s-ws-engine">
+        <option value="duckduckgo">DuckDuckGo (anonymous &ndash; no key needed)</option>
+        <option value="searxng">SearXNG (self-hosted)</option>
+        <option value="brave">Brave Search (API key)</option>
+        <option value="tavily">Tavily (API key)</option>
+        <option value="serper">Serper / Google (API key)</option>
+        <option value="exa">Exa (API key)</option>
+        <option value="perplexity">Perplexity (API key)</option>
+      </select>
+    </div>
+    <div class="st-field" id="ws-url-row">
+      <label class="st-label" for="s-ws-url">SearXNG URL</label>
+      <input class="st-input" id="s-ws-url" type="text" placeholder="http://127.0.0.1:8888">
+    </div>
+    <div class="st-field" id="ws-key-row" hidden>
+      <label class="st-label" for="s-ws-key">API key <output>kept in this browser only</output></label>
+      <input class="st-input" id="s-ws-key" type="password" placeholder="the engine's API key">
+    </div>
+    <div class="st-field" id="ws-max-row">
+      <label class="st-label" for="s-ws-max">Max results <output id="o-ws-max"></output></label>
+      <input class="st-input" id="s-ws-max" type="number" min="1" max="20" step="1">
+    </div>
+    <div class="toggle-row" id="ws-read-row"><span>Read result pages<br><span class="muted small">fetches the top pages in full, not just the snippets</span></span>
+      <button class="st-toggle" id="s-ws-read" role="switch" aria-checked="true" aria-label="Read result pages"></button></div>
+    <div class="st-field" id="ws-readmax-row">
+      <label class="st-label" for="s-ws-readmax">Pages to read <output id="o-ws-readmax"></output></label>
 
     <div class="drawer-actions">
       <button class="st-btn st-btn--secondary" id="s-reset" type="button" data-i18n="drawer.reset">Reset</button>

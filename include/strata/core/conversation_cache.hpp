@@ -172,6 +172,9 @@ inline bool conversation_checkpoints_merge(ConversationCheckpointSplit&& split, 
 }
 
 struct SavedConversation {
+    // Experimental approximate ordinary->YaRN history: version, source/target
+    // execution fingerprints, original prefix length. Zero means no migration.
+    std::array<uint64_t, 4> rope_migration{};
     // Runtime compatibility only; NOT a model/weights identity or disk schema.
     std::array<int64_t, 18> geometry{};
     // The session's layer carve the image was captured from ([0, n_layers) on one GPU); restore requires the same.
@@ -179,7 +182,11 @@ struct SavedConversation {
     ConversationCheckpoint live;
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
+    // DFlash2's drafter context (see Dflash2Drafter::save_state): saved at park, reinstalled at
+    // restore. RAM parks hold the blob; disk parks write it into the session file (payload v4).
+    std::vector<uint8_t> df2_state;
     bool cvec = true;
+    bool lora = true;   // the LoRA adapter's setting (--lora; true when none is loaded)
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
     // STRATA_PARK_ASYNC: set while a background copy fills this image's K/V; its deleter waits for that copy, and as
@@ -196,7 +203,7 @@ struct SavedConversation {
 
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
-                   kv.capacity() * sizeof(ConversationKv);
+                   kv.capacity() * sizeof(ConversationKv) + df2_state.capacity();
         for (const auto& s : stage_images) n += s.bytes();
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();
