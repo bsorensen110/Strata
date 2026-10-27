@@ -372,6 +372,7 @@ private:
     std::condition_variable cv_;
     bool quit_ = false, pending_ = false, busy_ = false;
     int64_t layer_ = -1, n_tok_ = 0;
+    const int32_t* host_res_ = nullptr;   // (0.2.6 member, kept for the 0.2.7 submit/predict bodies; the fork's copied-residency design uses res_ below)
     std::vector<int32_t> res_;   ///< the residency rows of the layers predicted, copied at submit (admissions write the table)
     bool has_res_ = false;
     uint64_t sub_gen_ = 0;
