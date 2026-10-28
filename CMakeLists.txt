@@ -811,9 +811,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # + SPLICE_UNSUPPORTED guard fires for unsupported configs).
     add_executable(suffix_reuse_apply_test src/program/suffix_reuse_apply_test.cpp)
     target_include_directories(suffix_reuse_apply_test PRIVATE include)
-    add_executable(suffix_reuse_dense_tail_test src/program/suffix_reuse_dense_tail_test.cpp)
-    target_include_directories(suffix_reuse_dense_tail_test PRIVATE include)
-    add_test(NAME suffix_reuse_dense_tail_test COMMAND suffix_reuse_dense_tail_test)
     add_test(NAME suffix_reuse_apply_test COMMAND suffix_reuse_apply_test)
 
     # Phase 2 hotfix T7: the device-path regression for the 2026-10-12 SIGSEGV.  Pins the
@@ -846,12 +843,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(suffix_reuse_continuation_and_anchor_test PRIVATE include)
     add_test(NAME suffix_reuse_continuation_and_anchor_test COMMAND suffix_reuse_continuation_and_anchor_test)
 
-    # Phase 3b T12-T15: the partial-prefix mount (flag-gated longest-LCP fallback when the strict
-    # mount fails).  Exercises `ConversationCache::best_with_partial` and the pure
-    # `suffix_reuse_partial_apply` helper in suffix_reuse.hpp.  Header-only / CPU - no CUDA.
-    add_executable(suffix_reuse_partial_prefix_test src/program/suffix_reuse_partial_prefix_test.cpp)
-    target_include_directories(suffix_reuse_partial_prefix_test PRIVATE include)
-    add_test(NAME suffix_reuse_partial_prefix_test COMMAND suffix_reuse_partial_prefix_test)
+    # Fork-only partial-prefix mount is not yet ported to the v0.2.7 ConversationCache API
+    # (`Match::partial` / `best_with_partial` are absent); its source stays unregistered until ported.
 
     add_executable(suffix_reuse_dense_tail_test src/program/suffix_reuse_dense_tail_test.cpp)
     target_include_directories(suffix_reuse_dense_tail_test PRIVATE include)
