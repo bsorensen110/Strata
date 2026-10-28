@@ -6,6 +6,7 @@
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/numa_policy.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 
@@ -481,6 +482,74 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     m.available = (uint64_t) pages * (uint64_t) page_bytes;
     return m.available > 0;
 #endif
+}
+
+bool node_claim_fits(uint64_t node_free, uint64_t bytes, uint64_t reserve) {
+    return bytes <= node_free && node_free - bytes >= reserve;
+}
+int numa_node_count() { return (int) numa_node_ids().size(); }
+
+std::vector<int> numa_node_ids() {
+#if defined(__linux__)
+    // The sysfs index IS the node number, so the entries are the nodes that EXIST: firmware PXM ids can leave
+    // holes (a hot-removed or offline node), and then a node number is a set to test membership against, never
+    // the 0..count-1 range its count would suggest.
+    const std::filesystem::path root("/sys/devices/system/node");
+    std::error_code ec;
+    if (!std::filesystem::is_directory(root, ec)) return {};
+    std::vector<int> ids;
+    for (std::filesystem::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.size() <= 4 || name.compare(0, 4, "node") != 0 ||
+            !std::all_of(name.begin() + 4, name.end(), [](char c) { return c >= '0' && c <= '9'; }))
+            continue;
+        errno = 0;
+        const long id = std::strtol(name.c_str() + 4, nullptr, 10);
+        if (errno == ERANGE || id > std::numeric_limits<int>::max()) continue;   // not a node number this host can have
+        ids.push_back((int) id);
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+#else
+    return {};   // no sysfs: the caller skips its range check
+#endif
+}
+bool numa_node_memfree_bytes(int node, uint64_t& bytes) {
+#if defined(__linux__)
+    std::ifstream info("/sys/devices/system/node/node" + std::to_string(node) + "/meminfo");
+    if (!info) return false;
+    std::stringstream text;
+    text << info.rdbuf();
+    return numa_node_memfree_from_text(text.str(), bytes);
+#else
+    (void) node;
+    (void) bytes;
+    return false;
+#endif
+}
+bool try_resident_allocation(const ResidentAttempt& attempt, const std::function<bool(HostMemory&)>& read_memory,
+                             uint64_t headroom, std::string& err) {
+    err.clear();
+    uint64_t failed_bytes = 0;
+    if (attempt(nullptr, failed_bytes, err)) return true;
+    if (failed_bytes == 0 || !read_memory) return false;
+    ResidentRetry retry;
+    if (!read_memory(retry.memory)) return false;
+    retry.limit = clamp_resident_budget(failed_bytes, retry.memory.available, retry.memory.commit, headroom);
+    if (retry.limit == 0 || retry.limit >= failed_bytes) return false;
+
+    const std::string first_error = err;
+    std::fprintf(stderr, "FileExpertSource: initial allocation failed (%s); retrying with at most %.2f GiB "
+                         "(available RAM %.2f GiB, commit %.2f GiB, %.0f GiB headroom)\n",
+                 first_error.c_str(), (double) retry.limit / 1073741824.0,
+                 (double) retry.memory.available / 1073741824.0, (double) retry.memory.commit / 1073741824.0,
+                 (double) headroom / 1073741824.0);
+    std::fflush(stderr);
+    failed_bytes = 0;
+    err.clear();
+    if (attempt(&retry, failed_bytes, err)) return true;
+    err = first_error + "; smaller retry failed: " + err;
+    return false;
 }
 
 }  // namespace detail
@@ -4440,6 +4509,128 @@ bool FileExpertSource::pin_cache_complement_attempt(
 #endif
     std::fflush(stderr);
     return true;
+}
+
+bool FileExpertSource::reserve_resident_arena(uint64_t requested_bytes, uint64_t headroom_bytes, int node,
+                                              std::string& err) {
+    err.clear();
+    if (arena_preclaim_ != nullptr) { err = "a complement arena is already claimed"; return false; }
+    if (base_ == nullptr) { err = "open the mapped experts before claiming the complement's arena"; return false; }
+    if (requested_bytes == 0) { err = "no --resident-budget-gib to size the claim from"; return false; }
+#if !(defined(__linux__) && defined(SYS_mbind) && defined(SYS_set_mempolicy) && defined(SYS_get_mempolicy))
+    (void) headroom_bytes; (void) node;
+    err = "this build has no NUMA placement (mbind/set_mempolicy; Linux only)";
+    return false;
+#else
+    // The complement clamps its own budget from a reading taken LATER (inside pin_cache_complement); the same
+    // clamp on this earlier reading is therefore the upper bound of the bytes it will copy.
+    uint64_t physical = 0, commit = std::numeric_limits<uint64_t>::max();
+    if (!available_memory_bytes(physical, &commit)) {
+        err = "cannot determine the available memory for --numa-hot-node";
+        return false;
+    }
+    const uint64_t bytes = detail::clamp_resident_budget(requested_bytes, physical, commit, headroom_bytes);
+    if (bytes == 0) { err = "no room for the complement's claim after the resident headroom"; return false; }
+    // The clamp above sizes the claim from the WHOLE host's available memory, but the claim itself is placed
+    // STRICTLY on one node (the mbind below, and the fault loop after it: when that node runs out, the kernel's
+    // only answer left is the OOM killer).  So before a page is mapped, ask the node itself: its OWN MemFree -
+    // not the host's MemAvailable, and not the reclaimable cache the readings above lean on, since these pages
+    // are page-locked later - must carry the claim plus the reserve the caller keeps free (the resident headroom,
+    // the same figure the global clamp already withholds; STRATA_RESIDENT_HEADROOM_GIB tunes both).  A node whose
+    // meminfo cannot be read, is memoryless, or cannot carry the claim with that reserve turns the claim down,
+    // and the caller starts as before.
+    uint64_t node_free = 0;
+    if (!detail::numa_node_memfree_bytes(node, node_free)) {
+        err = "cannot read NUMA node " + std::to_string(node) + "'s own free memory (/sys/devices/system/node/node" +
+              std::to_string(node) + "/meminfo)";
+        return false;
+    }
+    if (node_free == 0) {
+        err = "NUMA node " + std::to_string(node) + " is memoryless or has nothing free";
+        return false;
+    }
+    if (!detail::node_claim_fits(node_free, bytes, headroom_bytes)) {
+        char msg[224];
+        std::snprintf(msg, sizeof msg, "the %.2f GiB claim plus %.2f GiB of headroom does not fit node %d's %.2f GiB "
+                      "of free memory",
+                      (double) bytes / 1073741824.0, (double) headroom_bytes / 1073741824.0, node,
+                      (double) node_free / 1073741824.0);
+        err = msg;
+        return false;
+    }
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) { err = "cannot determine the page size for --numa-hot-node"; return false; }
+    void* arena = mmap(nullptr, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (arena == MAP_FAILED) {
+        err = "mmap of " + std::to_string(bytes >> 20) + " MiB failed (" + std::strerror(errno) + ")";
+        return false;
+    }
+    int bind_error = 0;
+    if (!detail::numa_bind_range(arena, bytes, node, bind_error)) {
+        const int failed_errno = bind_error;
+        (void) munmap(arena, (size_t) bytes);
+        err = "cannot bind " + std::to_string(bytes >> 20) + " MiB to NUMA node " + std::to_string(node) +
+              " (mbind: " + std::strerror(failed_errno) + ")";
+        return false;
+    }
+    const auto claim_t0 = std::chrono::steady_clock::now();
+    {
+        // The thread's policy for the touch only, and put back at the end of the scope: a thread left bound to a
+        // node that is full fails its later allocations.  mbind on the arena decides the placement either way.
+        detail::ThreadNodeBinding binding;
+        std::string why;
+        if (!binding.bind(node, why))
+            std::fprintf(stderr, "FileExpertSource: --numa-hot-node %d: %s; the arena's own bind stands\n",
+                         node, why.c_str());
+        // The pages are faulted in HERE, while the node is still empty - which is the whole point of the claim.
+        for (uint64_t at = 0; at < bytes; at += (uint64_t) page) ((volatile uint8_t*) arena)[at] = 0;
+    }
+    arena_preclaim_ = arena;
+    arena_preclaim_bytes_ = bytes;
+    arena_preclaim_node_ = node;
+    std::fprintf(stderr, "FileExpertSource: --numa-hot-node %d: %.2f GiB of the complement's arena claimed on the "
+                         "node in %.1f s, before the expert cache's fill\n",
+                 node, (double) bytes / 1073741824.0,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - claim_t0).count());
+    return true;
+#endif
+}
+void* FileExpertSource::take_reserved_arena(uint64_t bytes, uint64_t& mmap_bytes) {
+    mmap_bytes = 0;
+    if (arena_preclaim_ == nullptr) return nullptr;
+    if (bytes > arena_preclaim_bytes_) {
+        // The complement is sized from a RAM/commit reading taken AFTER the claim's, and it came out larger (the
+        // kernel gave memory back between the two).  Nothing can be placed: hand the claim back and let the
+        // caller allocate as it always did, rather than copy past the arena.
+        std::fprintf(stderr, "FileExpertSource: the complement is %.2f GiB, past the %.2f GiB claimed on node %d: "
+                             "the claim is released and the arena allocated as before\n",
+                     (double) bytes / 1073741824.0, (double) arena_preclaim_bytes_ / 1073741824.0,
+                     arena_preclaim_node_);
+        release_reserved_arena();
+        return nullptr;
+    }
+    uint64_t keep = bytes;
+#if defined(__linux__)
+    const long page = sysconf(_SC_PAGESIZE);
+    if (page > 0) keep = (bytes + (uint64_t) page - 1) / (uint64_t) page * (uint64_t) page;
+    // The claim was sized for the budget's UPPER bound: give the unused tail back (it is mmap'd, so munmap is
+    // the way).  `keep` is page-aligned and rounds `bytes` UP, so a registration of `bytes` stays inside it.
+    if (keep < arena_preclaim_bytes_)
+        (void) munmap((uint8_t*) arena_preclaim_ + keep, (size_t) (arena_preclaim_bytes_ - keep));
+#endif
+    void* arena = arena_preclaim_;
+    mmap_bytes = keep;
+    arena_preclaim_ = nullptr;
+    arena_preclaim_bytes_ = 0;
+    return arena;
+}
+void FileExpertSource::release_reserved_arena() {
+#if defined(__linux__)
+    if (arena_preclaim_ != nullptr) (void) munmap(arena_preclaim_, (size_t) arena_preclaim_bytes_);
+#endif
+    arena_preclaim_ = nullptr;
+    arena_preclaim_bytes_ = 0;
+    arena_preclaim_node_ = -1;
 }
 
 const uint8_t* FileExpertSource::resident_blob(size_t index) const {
