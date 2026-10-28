@@ -2331,7 +2331,7 @@ class StrataEngine:
                                     self._forget_checks(reserved)
                             if reserved is not None:
                                 self._send(f"BYIELD {reserved}")
-                    for x in self._control(cancel, pending.append, stop_when=others, on_quiet=give_way,
+                    for x in self._control(cancel, arrived, stop_when=others, on_quiet=give_way,
                                            want_lp=want_lp):
                         while pending:
                             t = pending.pop(0)
@@ -2491,7 +2491,7 @@ class StrataEngine:
                         if self.progress and live["state"] == "reading":
                             live["prompt_read"] = self.progress[0]
                     try:
-                        for x in self._control(cancel, pending.append, on_quiet=lambda: (ask(), note_progress()),
+                        for x in self._control(cancel, arrived, on_quiet=lambda: (ask(), note_progress()),
                                                want_lp=want_lp):
                             while pending:
                                 t = pending.pop(0)
@@ -7484,8 +7484,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             pics = f", {n_pic} picture{'s' if n_pic != 1 else ''} for the model" if n_pic else ""
             print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters{pics} in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
-            results.append(((r.get("model_content") or r.get("parts") or r["text"]) if svc.vision is not None
-                              else r["text"]))
+            results.append(r.get("model_content") or r.get("parts") or r["text"])
             yield "mcp", {"event": "result", "id": c.id,
                           **({"images": r["images"], "vision": svc.vision is not None} if r.get("images") else {}),
                           **{k: r[k] for k in ("ok", "text", "chars", "truncated", "ms")}}

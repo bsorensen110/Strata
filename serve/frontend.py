@@ -1075,6 +1075,11 @@ class OutputParser:
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._reset_scan()
 
+    def reopen_reasoning(self) -> None:
+        """#1814: the tag the parser took as the end of the thinking was ordinary text the model wrote, not the marker.
+        Go back to reasoning, so what the model writes next is reasoning again (Service.run does this and continues)."""
+        self.state, self.lead = "reasoning", False
+
     @property
     def clean(self) -> bool:
         """Nothing is held back: a clean point to stop the thinking at (a parser that rewrites the model's text, as

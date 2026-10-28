@@ -1486,9 +1486,10 @@ void Verifier::refresh_residency(const VerifyHits& hits) {
     // all, and the doorbell capture has them.  So a residency change has to throw the captured windows away -
     // `capture` rebuilds the next one from the residency as it is now.
     if (all_resident_ != graphs_resident_) {
-        for (cudaGraphExec_t& e : exec_) {
-            if (e != nullptr) { cudaGraphExecDestroy(e); e = nullptr; }
-        }
+        for (auto& row_ : exec_)
+            for (cudaGraphExec_t& e : row_) { if (e != nullptr) { cudaGraphExecDestroy(e); e = nullptr; } }
+        for (auto& row_ : exec_nr_)
+            for (cudaGraphExec_t& e : row_) { if (e != nullptr) { cudaGraphExecDestroy(e); e = nullptr; } }
         graphs_resident_ = all_resident_;
     }
 }

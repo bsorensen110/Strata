@@ -1513,12 +1513,11 @@ bool check_experts_gguf(const std::string& native, const strata::kernels::cpu::E
 /// `unbuffered`: each chunk read past the file cache (Windows); `ready`: layer l is written only once
 /// *ready > l + 1 (an arena that is still being registered).
 /// `pad` (optional): the destination is the page-aligned padded layout (pin by need), see PadMap.
-/// `dst_bias` / `[l0, l1)`: the destination offset that maps to the file's layer 0, and the layer range to load.
-/// Both exist so that one pack can be spread over several allocations (the arena's blocks): a block's first layer
-/// lands at dst[0].  Defaults (0, all layers) are the old single-destination behaviour.  remote-stage's layer
-/// range ([layer_lo, layer_hi) written at dst + blob_offset - dst_off) uses the same parameters (l0, l1, dst_bias).
+/// (fork note: the community line's `dst_bias` / `[l0, l1)` range form -- one pack spread over several arena
+/// blocks, and remote-stage's layer range -- is NOT in this tree's loader; re-graft it with its .cpp body if
+/// remote-stage GGUF loading returns.  `load_experts_ranges` keeps the block-split semantics.)
 LoadStats load_experts_gguf(const std::string& native, uint8_t* dst, const strata::kernels::cpu::ExpertLayout& lay,
                             int threads, bool unbuffered = false, const std::atomic<int>* ready = nullptr,
-                            const PadMap* pad = nullptr, uint64_t dst_bias = 0, int64_t l0 = 0, int64_t l1 = -1);
+                            const PadMap* pad = nullptr);
 
 }  // namespace strata::core
