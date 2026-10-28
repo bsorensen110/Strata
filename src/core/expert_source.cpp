@@ -404,6 +404,10 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
     std::ifstream groups(self_cgroup);
     if (!groups) return false;
     const std::filesystem::path root(cgroup_root);
+    // systemd-hybrid mounts the v1 controllers at cgroup_root and the unified v2 tree under unified/.
+    std::filesystem::path v2_root = root;
+    if (!std::filesystem::is_regular_file(root / "cgroup.controllers") &&
+        std::filesystem::is_regular_file(root / "unified" / "cgroup.controllers")) v2_root /= "unified";
     bool v2 = false;
     std::string v1_path;   // the memory controller's group (cgroup v1), when there is no v2 line
     while (std::getline(groups, line)) {
@@ -417,21 +421,28 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
             continue;
         }
         const std::filesystem::path cgroup_path = std::filesystem::path(line.substr(4)).relative_path();
-        auto path = cgroup_path.empty() ? root : (root / cgroup_path).lexically_normal();
-        // cgroup paths are written with a leading slash, but are relative to the mounted cgroup root.
-        // Resolve `/` to the mount root instead of letting filesystem::operator/ discard the root.
-        const auto below_root = path.lexically_relative(root);
-        if (below_root.empty() && path != root) return false;
+        auto path = cgroup_path.empty() ? v2_root : (v2_root / cgroup_path).lexically_normal();
+        // Cgroup paths are relative to the mounted v2 root even when proc reports an absolute path.
+        const auto below_root = path.lexically_relative(v2_root);
+        if (below_root.empty() && path != v2_root) return false;
         for (const auto& part : below_root) if (part == "..") return false;
-        if (!std::filesystem::is_directory(path)) return false;
+        // A container namespace may expose only an ancestor of the process path. Walk to the deepest
+        // visible group, but never above the mount root; its limits still constrain every descendant.
+        while (!std::filesystem::is_directory(path) && path != v2_root) path = path.parent_path();
+        if (!std::filesystem::is_directory(path)) continue;  // no visible cgroup mount: use host MemAvailable only
+        std::ifstream controllers(v2_root / "cgroup.controllers");
+        bool has_memory_controller = false;
+        for (std::string controller; controllers >> controller;)
+            if (controller == "memory") has_memory_controller = true;
+        if (!has_memory_controller) continue;  // hybrid mount: let the v1 memory controller decide below
         v2 = true;
-        while (path.string().rfind(root.string(), 0) == 0) {
+        while (path.string().rfind(v2_root.string(), 0) == 0) {
             std::ifstream limit_file(path / "memory.max"), current_file(path / "memory.current");
             std::string limit;
             uint64_t current = 0;
             const bool readable = bool(limit_file >> limit) && bool(current_file >> current);
             // The host's root cgroup has no memory.max; ordinary child groups must expose their limits.
-            if (!readable && !(path == root && !std::filesystem::exists(path / "memory.max") &&
+            if (!readable && !(path == v2_root && !std::filesystem::exists(path / "memory.max") &&
                                std::filesystem::exists(path / "cgroup.controllers"))) return false;
             if (readable && limit != "max") {
                 try {
@@ -446,7 +457,7 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
                     m.cgroup_limit = std::min(m.cgroup_limit, cap);
                 } catch (...) { return false; }
             }
-            if (path == root) break;
+            if (path == v2_root) break;
             path = path.parent_path();
         }
     }

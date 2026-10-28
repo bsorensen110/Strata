@@ -40,8 +40,12 @@ int main() {
     check(cudaMalloc(&d, bytes) == cudaSuccess, "device buffer");
     std::vector<char> h(bytes, 7);
 
-    // 0. #2409: what the first copy stream and event of a card cost, on a context that is warm (the buffer above is
-    //    allocated, and a first copy has loaded the copy path's code on a thread that is then discarded)
+    // Warm HIP's lazy copy runtime with the legacy blocking path, without creating or pooling a private copy stream.
+    // The measurement below is for the first private stream/event, not the runtime's one-time memcpy staging setup.
+    check(cudaMemcpy(d, h.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess, "warm the blocking copy path");
+    check(cudaDeviceSynchronize() == cudaSuccess, "synchronize the blocking warm-up");
+
+    // 0. #2409: cost of the first private copy stream + ordering event, with the runtime path already warm.
     {
         bool fresh_ready = true;
         std::thread probe([&] { fresh_ready = copy_stream_ready(0); });
