@@ -1919,7 +1919,9 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
     target_link_libraries(stage_link_test PRIVATE ws2_32)
   endif()
   add_test(NAME stage_link_test COMMAND stage_link_test)
-  set_tests_properties(stage_link_test PROPERTIES TIMEOUT 180)
+  # This loopback protocol test includes a 0.3 s stop-flag timing assertion; do not let
+  # concurrent GPU/CPU CTests starve its wait thread and turn a successful stop into a false timeout.
+  set_tests_properties(stage_link_test PROPERTIES TIMEOUT 180 RUN_SERIAL TRUE)
 
 
   # coupled draft sampling's counter and penalty-ring arithmetic (header-only, CPU)
