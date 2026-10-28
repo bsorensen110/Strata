@@ -148,6 +148,26 @@ std::array<std::pair<uint64_t, uint64_t>, 3> numa_slice_ranges(uint64_t slot_off
     return out;
 }
 
+bool numa_node_memfree_from_text(const std::string& meminfo_text, uint64_t& bytes) {
+    std::istringstream in(meminfo_text);
+    std::string line;
+    while (std::getline(in, line)) {
+        // "Node 1 MemFree: 52428800 kB" - four fields, so a /proc/meminfo line ("MemFree: ... kB", no node
+        // prefix) does not pass for a node's own reading.
+        std::istringstream fields(line);
+        std::string node_word, id, key;
+        uint64_t kb = 0;
+        if (fields >> node_word >> id >> key >> kb && key == "MemFree:") {
+            // A reading past this bound would wrap in the scaling below, and a wrapped figure reads as a nearly
+            // empty node (or a huge one): refuse the line instead, leaving the caller to refuse the claim.
+            if (kb > std::numeric_limits<uint64_t>::max() / 1024) return false;
+            bytes = kb * 1024;
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string page_cache_hint(const std::string& meminfo_text) {
     const uint64_t cache = meminfo_bytes(meminfo_text, "Cached") + meminfo_bytes(meminfo_text, "Buffers");
     if (cache < (1ull << 30)) return "";
@@ -3464,7 +3484,26 @@ bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
     uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank) {
+    const auto attempt = [&](const detail::ResidentRetry* retry, uint64_t& failed_bytes, std::string& reason) {
+        return pin_cache_complement_attempt(cache, reason, pin, additional_gpu_pairs, lend_from_slot,
+                                             headroom_bytes, budget_bytes, rank, retry, failed_bytes);
+    };
+#if defined(_WIN32)
+    return detail::try_resident_allocation(attempt, [](detail::HostMemory& m) { return detail::host_available_memory(m); },
+                                            headroom_bytes, err);
+#else
+    uint64_t failed_bytes = 0;
+    return attempt(nullptr, failed_bytes, err);
+#endif
+}
+
+bool FileExpertSource::pin_cache_complement_attempt(
+    const ExpertCache& cache, std::string& err, bool pin,
+    const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
+    uint64_t headroom_bytes, uint64_t budget_bytes, const std::vector<std::pair<int32_t, int32_t>>* rank,
+    const detail::ResidentRetry* retry, uint64_t& failed_bytes) {
     err.clear();
+    failed_bytes = 0;
     const auto pin_t0 = std::chrono::steady_clock::now();
     if (base_ == nullptr) { err = "FileExpertSource: open the mapped experts before pinning a complement"; return false; }
     if (complement_ready_) { err = "FileExpertSource: the cache complement is already pinned"; return false; }
@@ -3505,7 +3544,7 @@ bool FileExpertSource::pin_cache_complement(
     // counts those file pages in this process's working set, not as available: a 32 GB PC read 0.44 GiB here
     // (20.7 GiB before the start).  Trimmed, they move to the standby list (still cached, counted as available).
     // Resident mode only: nothing else calls this function.  Locked/pinned pages stay; the rest fault back softly.
-    {
+    if (retry == nullptr) {
         uint64_t before = 0, after = 0;
         const bool read_before = available_memory_bytes(before);
         (void) SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T) -1, (SIZE_T) -1);
@@ -3517,20 +3556,21 @@ bool FileExpertSource::pin_cache_complement(
 #endif
     const bool what_fits = budget_bytes == kResidentWhatFits;   // #467: the soft mode's second try
     int64_t budget_lent = 0, budget_lendable = 0;   // the lend region's slots kept by a budget (below), and its size
-    uint64_t budget_physical = 0;   // #403: reuse the memory snapshot a budget was sized from
-    uint64_t budget_commit = std::numeric_limits<uint64_t>::max();
+    uint64_t budget_physical = retry ? retry->memory.available : 0;   // #403: reuse the sizing snapshot
+    const uint64_t budget_commit = retry ? retry->memory.commit : std::numeric_limits<uint64_t>::max();
     if (budget_bytes > 0) {
         // CS-T: a RAM budget.  The complement's experts in `rank` order (the expert profile, hottest first) while
-        // they fit, the rest left on the mapped files; Windows commit capacity also limits the allocation (#730).
-        uint64_t physical = 0;
-        if (!available_memory_bytes(physical, &budget_commit)) {
+        // they fit, the rest left on the mapped files. Commit limits only the retry, so a page file can grow (#730).
+        uint64_t physical = budget_physical;
+        if (retry == nullptr && !available_memory_bytes(physical)) {
             err = "FileExpertSource: cannot determine available memory for --resident-budget-gib";
             return false;
         }
         budget_physical = physical;
         const uint64_t available = std::min(physical, budget_commit);
         const char* limit = budget_commit < physical ? "commit" : "RAM";
-        const uint64_t clamped = detail::clamp_resident_budget(budget_bytes, physical, budget_commit, headroom_bytes);
+        uint64_t clamped = detail::clamp_resident_budget(budget_bytes, physical, budget_commit, headroom_bytes);
+        if (retry != nullptr) clamped = std::min(clamped, retry->limit);
         if (budget_bytes > clamped) {
             // #403: 256 MiB under the room, so the engine's own allocations after this reading still leave the
             // headroom (a budget clamped to exactly the room failed the safety check below on a reading a few MB
@@ -3561,7 +3601,7 @@ bool FileExpertSource::pin_cache_complement(
                 at += b;
                 ++held;
             }
-        if (what_fits && held == 0) {   // #467: nothing to keep - the caller's plain mmap fallback, not an empty copy
+        if (what_fits && held == 0) {   // #467: the soft fallback must retain an expert
             err = "FileExpertSource: available memory cannot hold any expert of the complement";
             return false;
         }
@@ -3609,20 +3649,22 @@ bool FileExpertSource::pin_cache_complement(
         // #403: with a budget, the reading it was sized from - a second reading a few MB lower (the engine's own
         // allocations, the file cache) failed a budget the first one had clamped.  (A budget turns `lend` off.)
         uint64_t physical = budget_physical;
-        uint64_t commit = budget_commit;
-        if (physical == 0 && !available_memory_bytes(physical, &commit)) {
+        const uint64_t commit = budget_commit;
+        if (retry == nullptr && physical == 0 && !available_memory_bytes(physical)) {
             err = "FileExpertSource: cannot determine available memory for the resident-memory safety check";
             return false;
         }
         const uint64_t available = std::min(physical, commit);
         budget = available > headroom_bytes ? available - headroom_bytes : 0;
+        if (retry != nullptr) budget = std::min(budget, retry->limit);
         if (bytes > budget) {
             char message[320];
             std::snprintf(message, sizeof message,
-                          "FileExpertSource: resident complement %.2f GiB exceeds available %s (%.2f GiB) minus the "
-                          "%.0f GiB safety headroom",
-                          (double) bytes / 1073741824.0, commit < physical ? "commit" : "RAM",
-                          (double) available / 1073741824.0, (double) headroom_bytes / 1073741824.0);
+                          "FileExpertSource: resident complement %.2f GiB exceeds the %.2f GiB memory budget "
+                          "(available %s %.2f GiB, %.0f GiB headroom%s)",
+                          (double) bytes / 1073741824.0, (double) budget / 1073741824.0,
+                          commit < physical ? "commit" : "RAM", (double) available / 1073741824.0,
+                          (double) headroom_bytes / 1073741824.0, retry ? ", retry margin included" : "");
             err = message;
 #if defined(__linux__)
             if (std::ifstream mi("/proc/meminfo"); mi) {
@@ -3664,13 +3706,15 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t stage_lent_bytes = 0;
     if (!stage_lend_regions_.empty()) {
         if (budget == std::numeric_limits<uint64_t>::max()) {   // #403: the one reading, taken now
-            uint64_t physical = budget_physical, commit = budget_commit;
-            if (physical == 0 && !available_memory_bytes(physical, &commit)) {
+            uint64_t physical = budget_physical;
+            const uint64_t commit = budget_commit;
+            if (retry == nullptr && physical == 0 && !available_memory_bytes(physical)) {
                 err = "FileExpertSource: cannot determine available memory for the stage lend regions";
                 return false;
             }
             const uint64_t available = std::min(physical, commit);
             budget = available > headroom_bytes ? available - headroom_bytes : 0;
+            if (retry != nullptr) budget = std::min(budget, retry->limit);
         }
         uint64_t cap = budget;   // an explicit --resident-budget-gib caps the whole copy, regions included
         if (budget_bytes > 0 && budget_bytes != kResidentWhatFits && budget_bytes < cap) cap = budget_bytes;
@@ -3681,14 +3725,25 @@ bool FileExpertSource::pin_cache_complement(
         stage_lent_bytes = bytes - before;
     }
 
+    // A retry may consist entirely of stage lend regions; check the completed plan.
+    if (retry != nullptr && bytes == 0) {
+        err = "FileExpertSource: available memory cannot hold any expert on retry";
+        return false;
+    }
+
     void* arena = nullptr;
     const uint8_t* host = nullptr;
     const uint8_t* device = nullptr;
     bool pinned_ok = false;
     bool paced = false;         ///< #1250: the pages are taken in steps and page-locked afterwards
+    bool preclaimed = false;    ///< S1: the arena came from reserve_resident_arena (mmap'd, on --numa-hot-node)
+    uint64_t arena_mmap_bytes = 0;   ///< ... and it is this long: give it back with munmap, not free
     uint64_t locked = 0;
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
+    std::vector<ComplementSlice> slices;   ///< path 2: the registered slices, a prefix of the copy
+    uint64_t slice_pin = 0;     ///< path 2: the bytes they cover (within the copy)
+    bool vmem = false;          ///< path 2 on Windows: the copy is VirtualAlloc'd
     std::string note;
 #if defined(__linux__)
     NumaComplementPlacement numa;   ///< STRATA_NUMA_SPLIT step B; inert unless the live pool split on real nodes
@@ -3697,8 +3752,16 @@ bool FileExpertSource::pin_cache_complement(
         if (arena == nullptr) return;
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
+            for (const ComplementSlice& s : slices) (void) cudaHostUnregister((uint8_t*) arena + s.start);
             if (partial_pin > 0) (void) cudaHostUnregister(arena);
             if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
+#if defined(__linux__)
+            if (arena_mmap_bytes > 0) (void) munmap(arena, (size_t) arena_mmap_bytes);
+            else
+#elif defined(_WIN32)
+            if (vmem) (void) VirtualFree(arena, 0, MEM_RELEASE);
+            else
+#endif
             std::free(arena);
         }
         arena = nullptr;
@@ -3730,6 +3793,13 @@ bool FileExpertSource::pin_cache_complement(
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         log_complement_memory("before complement allocation", bytes);
         std::fflush(stderr);
+        // S1 (--numa-hot-node): when the complement's pages were claimed on the hot node before the expert cache's
+        // fill (reserve_resident_arena), the claim IS the arena.  The driver's cudaHostAlloc cannot be placed after
+        // the fact, and there is nothing left for #1250's pacing to do - the pages are faults of the past.
+        if (arena == nullptr) {
+            arena = take_reserved_arena(bytes, arena_mmap_bytes);
+            preclaimed = arena != nullptr;
+        }
         // #1250: the driver takes page-locked pages in one go and cannot wait for the kernel to reclaim file cache: with
         // the cache of the model files the engine read itself in the way (MemFree low, MemAvailable high) a host was
         // OOM-killed here.  First give those pages back (the engine's own mappings); when what is really free still
@@ -3743,7 +3813,7 @@ bool FileExpertSource::pin_cache_complement(
                                                      : std::max<uint64_t>(headroom_bytes, 2ull << 30);
         }();
 #if defined(__linux__)
-        if (pin) {
+        if (pin && !preclaimed) {   // the claimed pages are already there: the pacing below has nothing to decide
             static const int guard = [] {
                 const char* v = std::getenv("STRATA_PIN_GUARD");
                 return v == nullptr ? 1 : std::atoi(v);
@@ -3788,9 +3858,37 @@ bool FileExpertSource::pin_cache_complement(
                                  "nothing placed\n");
         }
 #endif
-        if (pin && !paced) {
-            const cudaError_t allocated = cudaHostAlloc(&arena, (size_t) bytes,
-                                                         cudaHostAllocMapped | cudaHostAllocPortable);
+        // opt-in (STRATA_PARTIAL_PIN=1): on the RTX 5070 PC the GPU's PCIe share of the misses measured no
+        // faster than the CPU computing them (7.30 / 7.44 tok/s with 24 / 16 GiB registered against 7.05-7.74
+        // unpinned at a 40 GiB budget), and registering adds startup time and driver memory pressure
+        static const bool partial_on = [] {
+            const char* v = std::getenv("STRATA_PARTIAL_PIN");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
+        // at most STRATA_PARTIAL_PIN_GIB (default 24): registering 30 GiB of a 40 GiB arena left the driver
+        // unable to page-lock the prompt path's small buffers afterwards (RTX 5070, WDDM)
+        static const uint64_t pin_cap = [] {
+            const char* v = std::getenv("STRATA_PARTIAL_PIN_GIB");
+            return (uint64_t) ((v != nullptr && std::atof(v) > 0 ? std::atof(v) : 24.0) * 1073741824.0);
+        }();
+        // path 2's cap, STRATA_COMPLEMENT_PIN_GIB: unset or "auto" = below the GPU's shared-memory budget (Windows; see
+        // the slices below), "all" = slices until the driver refuses one, N = at most N GiB, 0 = no slices (path 3)
+        static const double slice_cap_gib = [] {
+            const char* v = std::getenv("STRATA_COMPLEMENT_PIN_GIB");
+            if (v == nullptr || v[0] == '\0' || std::strcmp(v, "auto") == 0) return -1.0;
+            if (std::strcmp(v, "all") == 0) return -2.0;
+            return std::max(0.0, std::atof(v));
+        }();
+        // tests: STRATA_TEST_COMPLEMENT_REFUSE=1 takes the one page-locked allocation as refused, so paths 2 and 3 run
+        // on a PC whose driver grants it
+        static const bool test_refuse = [] {
+            const char* v = std::getenv("STRATA_TEST_COMPLEMENT_REFUSE");
+            return v != nullptr && v[0] == '1';
+        }();
+        if (pin && !paced && !preclaimed) {
+            const cudaError_t allocated = test_refuse ? cudaErrorMemoryAllocation
+                                                      : cudaHostAlloc(&arena, (size_t) bytes,
+                                                                      cudaHostAllocMapped | cudaHostAllocPortable);
             if (allocated == cudaSuccess) {
                 void* alias = nullptr;
                 const cudaError_t aliased = cudaHostGetDevicePointer(&alias, arena, 0);
@@ -3798,6 +3896,8 @@ bool FileExpertSource::pin_cache_complement(
                     device = (const uint8_t*) alias;
                     pinned_ok = true;
                     note = "page-locked and mapped";
+                    std::fprintf(stderr, "FileExpertSource: page-locking path 1 (one page-locked allocation): %.2f of "
+                                         "%.2f GiB pinned\n", (double) bytes / 1073741824.0, (double) bytes / 1073741824.0);
                 } else {
                     note = std::string("no device alias (") + cudaGetErrorString(aliased) + ")";
                     (void) cudaGetLastError();
@@ -3812,59 +3912,203 @@ bool FileExpertSource::pin_cache_complement(
                 arena = nullptr;
             }
         }
-        if (arena == nullptr) {
-            if (!note.empty()) {
-                std::fprintf(stderr, "FileExpertSource: %s; trying pageable memory\n", note.c_str());
-                log_complement_memory("before pageable allocation", bytes);
-                std::fflush(stderr);
-            }
-            errno = 0;
-            if (paced) {   // page-aligned: the steps are registered on page boundaries
+        // path 2: the one page-locked allocation failed (refused, or no device alias) - the same bytes in ordinary
+        // memory, registered slice by slice (as the arena does when its one registration is refused).  The opt-in
+        // capped prefix (a RAM budget with STRATA_PARTIAL_PIN=1) keeps its own registration instead.
+        const bool sliced = pin && !paced && arena == nullptr && !(budget_bytes > 0 && partial_on) && slice_cap_gib != 0.0;
+        // ... and with a claim there is nothing to allocate: the arena exists, and only the driver's registration
+        // and the working-set lock below are left to do (an arena cudaHostAlloc'd above is registered already, so
+        // it skips this).
+        if (arena == nullptr || preclaimed) {
+            if (arena == nullptr) {
+                if (!note.empty()) {
+                    std::fprintf(stderr, "FileExpertSource: %s; trying pageable memory%s\n", note.c_str(),
+                                 sliced ? ", page-locked in slices (path 2)" : "");
+                    log_complement_memory("before pageable allocation", bytes);
+                    std::fflush(stderr);
+                }
+                errno = 0;
+                if (paced) {   // page-aligned: the steps are registered on page boundaries
 #if !defined(_WIN32)
-                void* aligned = nullptr;
-                const uint64_t page = 4096;
-                if (posix_memalign(&aligned, (size_t) page, (size_t) ((bytes + page - 1) / page * page)) == 0) arena = aligned;
+                    void* aligned = nullptr;
+                    const uint64_t page = 4096;
+                    if (posix_memalign(&aligned, (size_t) page, (size_t) ((bytes + page - 1) / page * page)) == 0) arena = aligned;
 #endif
 #if defined(__linux__)
-                // STRATA_NUMA_SPLIT: a 2 MiB huge page would put several slices on its toucher's node, so the arena
-                // takes 4 KiB pages (one call, no VMA split)
-                if (arena != nullptr && numa.place) {
-                    if (madvise(arena, (size_t) ((bytes + page - 1) / page * page), MADV_NOHUGEPAGE) != 0)
-                        std::fprintf(stderr, "FileExpertSource: WARNING: madvise(MADV_NOHUGEPAGE) on the complement "
-                                             "failed (errno %d)\n", errno);
-                }
+                    // STRATA_NUMA_POOL: a 2 MiB huge page would put several slices on its toucher's node, so the arena
+                    // takes 4 KiB pages (one call, no VMA split)
+                    if (arena != nullptr && numa.place) {
+                        if (madvise(arena, (size_t) ((bytes + page - 1) / page * page), MADV_NOHUGEPAGE) != 0)
+                            std::fprintf(stderr, "FileExpertSource: WARNING: madvise(MADV_NOHUGEPAGE) on the complement "
+                                                 "failed (errno %d)\n", errno);
+                    }
 #endif
-            } else {
-                arena = std::malloc((size_t) bytes);
-            }
-            if (arena == nullptr) {
-                const int allocation_errno = errno;
-                err = "FileExpertSource: pageable resident complement allocation failed (malloc errno " +
-                      std::to_string(allocation_errno) + ": " + std::strerror(allocation_errno) + ")";
-                if (!note.empty()) err += "; " + note;
-                log_complement_memory("after pageable allocation failure", bytes);
-                return false;
+                } else if (sliced) {   // page-aligned: the slices are registered on page boundaries, none sharing a page
+                    const uint64_t page = 4096, span = (bytes + page - 1) / page * page;
+#if defined(_WIN32)
+                    arena = VirtualAlloc(nullptr, (SIZE_T) span, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                    if (arena != nullptr) vmem = true;
+                    else errno = ENOMEM;
+#else
+                    void* aligned = nullptr;
+                    if (posix_memalign(&aligned, (size_t) page, (size_t) span) == 0) arena = aligned;
+#endif
+                } else {
+                    arena = std::malloc((size_t) bytes);
+                }
+                if (arena == nullptr) {
+                    const int allocation_errno = errno;
+                    err = "FileExpertSource: pageable resident complement allocation failed (malloc errno " +
+                          std::to_string(allocation_errno) + ": " + std::strerror(allocation_errno) + ")";
+                    if (!note.empty()) err += "; " + note;
+                    log_complement_memory("after pageable allocation failure", bytes);
+                    failed_bytes = bytes;   // #1130: only a host allocation failure (this) permits the smaller retry
+                    return false;
+                }
             }
             if (pin) {
                 // CS-T, a RAM budget: its bytes are in profile order, hottest first, so the driver is asked to
                 // register the largest prefix it takes (from the cap down in 2 GiB steps).  Those experts can be
                 // read by the GPU over PCIe (--pcie-frac) and copied by DMA; only the rest is locked in the working
                 // set (the registered prefix is page-locked by the driver already - locking it twice made the next
-                // device allocation fail).
-                // opt-in (STRATA_PARTIAL_PIN=1): on the RTX 5070 PC the GPU's PCIe share of the misses measured no
-                // faster than the CPU computing them (7.30 / 7.44 tok/s with 24 / 16 GiB registered against 7.05-7.74
-                // unpinned at a 40 GiB budget), and registering adds startup time and driver memory pressure
-                static const bool partial_on = [] {
-                    const char* v = std::getenv("STRATA_PARTIAL_PIN");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
-                // at most STRATA_PARTIAL_PIN_GIB (default 24): registering 30 GiB of a 40 GiB arena left the driver
-                // unable to page-lock the prompt path's small buffers afterwards (RTX 5070, WDDM)
-                static const uint64_t pin_cap = [] {
-                    const char* v = std::getenv("STRATA_PARTIAL_PIN_GIB");
-                    return (uint64_t) ((v != nullptr && std::atof(v) > 0 ? std::atof(v) : 24.0) * 1073741824.0);
-                }();
-                if (paced) {
+                // device allocation fail).  (partial_on and pin_cap are read above.)
+                if (preclaimed) {
+                    // S1: the pages are there already, on the hot node; the driver only page-locks them - nothing
+                    // is allocated - in ONE registration, so a blob never straddles two registrations.
+                    if (cudaHostRegister(arena, (size_t) bytes, cudaHostRegisterMapped | cudaHostRegisterPortable) ==
+                        cudaSuccess) {
+                        void* alias = nullptr;
+                        if (cudaHostGetDevicePointer(&alias, arena, 0) == cudaSuccess && alias != nullptr) {
+                            device = (const uint8_t*) alias;
+                            partial_pin = bytes;
+                        } else {
+                            (void) cudaGetLastError();
+                            (void) cudaHostUnregister(arena);
+                        }
+                    } else {
+                        (void) cudaGetLastError();
+                    }
+                    char msg[220];
+                    if (partial_pin > 0)
+                        std::snprintf(msg, sizeof msg, "%.2f GiB page-locked and mapped, claimed on NUMA node %d",
+                                      (double) partial_pin / 1073741824.0, arena_preclaim_node_);
+                    else {
+                        std::snprintf(msg, sizeof msg, "the driver refused the page-locking; locked in the working "
+                                      "set instead (claimed on NUMA node %d)", arena_preclaim_node_);
+                        std::fprintf(stderr, "FileExpertSource: %s\n", msg);
+                    }
+                    note += std::string(note.empty() ? "" : "; ") + msg;
+                } else if (sliced) {
+                    // Path 2: one registration per slice of about a layer of the pack (the arena's slice), cut at
+                    // expert boundaries - at a page-aligned one where it comes within half a layer more - so each
+                    // slice has its own device alias and an expert inside one slice is read by the GPU over PCIe
+                    // and copied by DMA.  Registered from the start in order, before anything writes the copy
+                    // (WDDM: a region written while cudaHostRegister ran on it came out corrupt, even on large
+                    // pages), stopping at the first refusal: what no slice holds whole is locked pageable memory
+                    // the CPU computes from, as on path 3.  An expert straddling a cut that was not page-aligned is
+                    // in neither slice (the CPU's too).
+                    // By default only up to the GPU's shared-memory budget less a margin (shared_pin_limit_for, the
+                    // arena's #243 cap; STRATA_PIN_MARGIN_GIB, 4 GiB): pinned until the driver refused a slice, the
+                    // copy filled that WDDM segment (99.61 GiB in 40 slices + 1.3 GiB the engine had there, of a
+                    // 101.0 GiB budget), and what needs it afterwards made every GPU phase of the prompt path slower.
+                    // Measured (RTX 5090, 128 GB, a Q8_0 pack's ~100 GiB copy with --resident-experts, a 32K prompt as
+                    // the first request): filled 18.7 / 20.5 s, unpinned 10.9 / 10.3 / 10.5 s, 94.63 GiB (the cap)
+                    // 9.2 / 8.5 s, 54.79 GiB 9.1 s.
+                    constexpr uint64_t kPage = 4096;
+                    const auto reg_t0 = std::chrono::steady_clock::now();
+                    std::vector<uint64_t> starts;
+                    starts.reserve(offsets.size());
+                    for (const uint64_t o : offsets)
+                        if (o != kNoComplement) starts.push_back(o);
+                    std::sort(starts.begin(), starts.end());
+                    uint64_t layer_bytes = 0;
+                    for (const uint64_t b : layer_blob_bytes_) layer_bytes = std::max(layer_bytes, b * (uint64_t) n_expert_);
+                    std::vector<uint64_t> cut{0};
+                    for (const uint64_t o : starts) {
+                        const uint64_t len = o - cut.back();
+                        if (o > cut.back() && len >= layer_bytes && (o % kPage == 0 || len >= layer_bytes + layer_bytes / 2))
+                            cut.push_back(o);
+                    }
+                    const uint64_t span = (bytes + kPage - 1) / kPage * kPage;
+                    uint64_t cap = span;
+                    std::string cap_why = "STRATA_COMPLEMENT_PIN_GIB";
+                    if (slice_cap_gib > 0) {
+                        cap = (uint64_t) (slice_cap_gib * 1073741824.0);
+                    } else if (slice_cap_gib == -1.0) {
+                        // the per-adapter budget (shared_pin_limit_for) of the GPU that reads the copy; a split's other
+                        // stages map the portable slices too and WDDM charges each adapter: the smallest room counts
+                        int cur = 0, n_dev = 1;
+                        if (cudaGetDevice(&cur) != cudaSuccess) { (void) cudaGetLastError(); cur = 0; }
+                        if (additional_gpu_pairs.empty() || cudaGetDeviceCount(&n_dev) != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            n_dev = 1;
+                        }
+                        bool have = false;
+                        for (int k = 0; k < n_dev; ++k) {
+                            const int d = n_dev == 1 ? cur : k;
+                            uint64_t limit = 0;
+                            std::string why;
+                            if (shared_pin_limit_for(d, limit, why) && (!have || limit < cap)) {
+                                cap = limit;
+                                cap_why = why + "; STRATA_COMPLEMENT_PIN_GIB=all pins until the driver refuses";
+                                have = true;
+                            }
+                        }
+                    }
+                    std::string stop;
+                    for (size_t i = 0; i < cut.size(); ++i) {
+                        const uint64_t a = cut[i] / kPage * kPage;
+                        const uint64_t e = i + 1 < cut.size() ? cut[i + 1] / kPage * kPage : span;
+                        if (e <= a) continue;
+                        if (e > cap) { stop = cap_why; break; }
+                        uint8_t* p = (uint8_t*) arena + a;
+                        const cudaError_t r = cudaHostRegister(p, (size_t) (e - a),
+                                                               cudaHostRegisterPortable | cudaHostRegisterMapped);
+                        if (r != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            stop = std::string("refused: ") + cudaGetErrorString(r);
+                            break;
+                        }
+                        void* alias = nullptr;
+                        if (cudaHostGetDevicePointer(&alias, p, 0) != cudaSuccess || alias == nullptr) {
+                            (void) cudaGetLastError();
+                            (void) cudaHostUnregister(p);
+                            stop = "no device alias";
+                            break;
+                        }
+                        slices.push_back({a, e, (const uint8_t*) alias});
+                    }
+                    slice_pin = slices.empty() ? 0 : std::min(slices.back().end, bytes);
+                    lock_off = slices.empty() ? 0 : slices.back().end;
+                    int64_t held = 0, total = 0;   // the experts one slice holds whole
+                    if (!slices.empty())
+                        for (size_t i = 0; i < offsets.size(); ++i) {
+                            if (offsets[i] == kNoComplement) continue;
+                            ++total;
+                            const uint64_t o = offsets[i], b = layer_blob_bytes_[i / (size_t) n_expert_];
+                            auto it = std::upper_bound(slices.begin(), slices.end(), o,
+                                                       [](uint64_t v, const ComplementSlice& sl) { return v < sl.start; });
+                            if (it != slices.begin() && o < (it - 1)->end && b <= (it - 1)->end - o) ++held;
+                        }
+                    const double reg_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - reg_t0).count();
+                    char msg[320];
+                    if (!slices.empty()) {
+                        std::snprintf(msg, sizeof msg, "%zu slices pinned (%.2f GiB) in %.1f s", slices.size(),
+                                      (double) slice_pin / 1073741824.0, reg_s);
+                        std::fprintf(stderr, "FileExpertSource: page-locking path 2 (the one allocation refused: pinned "
+                                             "in slices): %zu of %zu slices pinned, %.2f of %.2f GiB (%lld of %lld "
+                                             "experts; the rest computed by the CPU) in %.1f s%s%s\n",
+                                     slices.size(), cut.size(), (double) slice_pin / 1073741824.0,
+                                     (double) bytes / 1073741824.0, (long long) held, (long long) total, reg_s,
+                                     stop.empty() ? "" : "; stopped: ", stop.c_str());
+                    } else {
+                        std::snprintf(msg, sizeof msg, "no slice could be pinned (%s)", stop.c_str());
+                        std::fprintf(stderr, "FileExpertSource: page-locking path 3 (no slice could be pinned: %s): "
+                                             "pageable memory locked in the working set, 0.00 of %.2f GiB pinned, no "
+                                             "PCIe fetch\n", stop.c_str(), (double) bytes / 1073741824.0);
+                    }
+                    note += std::string(note.empty() ? "" : "; ") + msg;
+                } else if (paced) {
                     // #1250: the pages are taken in 1 GiB steps by ordinary page faults (which reclaim file cache as
                     // they need to), each only while the RAM available (the cgroup's room included) stays above the
                     // reserve; then the pages that are there are page-locked in ONE registration (nothing is
@@ -3960,13 +4204,20 @@ bool FileExpertSource::pin_cache_complement(
                                   (double) partial_pin / 1073741824.0);
                     note += std::string("; ") + msg;
                 }
-                if (!paced) lock_off = partial_pin;
-                // (paced: lock_off was set above)
+                if (!paced && !sliced) lock_off = partial_pin;
+                // (paced, sliced: lock_off was set above)
                 const strata::platform::LockResult lr =
                     lock_off < bytes ? strata::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off)
                                      : strata::platform::LockResult{true, 0, ""};
                 locked = lr.locked_bytes;
                 note += (note.empty() ? "" : "; ") + lr.note;
+                if (!paced && !sliced)   // path 1 failed and no slices were tried
+                    std::fprintf(stderr, "FileExpertSource: page-locking path 3 (%s): pageable memory locked in the "
+                                         "working set, %.2f of %.2f GiB pinned%s\n",
+                                 budget_bytes > 0 && partial_on ? "STRATA_PARTIAL_PIN: a registered prefix instead of slices"
+                                                                : "STRATA_COMPLEMENT_PIN_GIB=0: no slices",
+                                 (double) partial_pin / 1073741824.0, (double) bytes / 1073741824.0,
+                                 partial_pin > 0 ? "" : ", no PCIe fetch");
             }
         }
         host = (const uint8_t*) arena;
@@ -4112,15 +4363,18 @@ bool FileExpertSource::pin_cache_complement(
     }
 
     complement_arena_ = arena;
+    complement_arena_mmap_bytes_ = arena_mmap_bytes;
     complement_host_ = host;
     complement_device_ = device;
     complement_bytes_ = bytes;
     complement_offsets_ = std::move(offsets);
-    complement_pinned_ = (pinned_ok || partial_pin > 0) && bytes > 0;
-    complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
-    complement_registered_ = !pinned_ok && partial_pin > 0;
-    // a paced registration that covers the whole arena is as good as a cudaHostAlloc'd one
-    complement_partial_ = complement_registered_ && !(paced && partial_pin >= bytes);
+    complement_pinned_ = (pinned_ok || partial_pin > 0 || !slices.empty()) && bytes > 0;
+    complement_pin_limit_ = pinned_ok ? bytes : !slices.empty() ? slice_pin : partial_pin;
+    complement_registered_ = !pinned_ok && (partial_pin > 0 || !slices.empty());
+    complement_slices_ = std::move(slices);   // path 2: pinned() and device_alias() look the slice up
+    complement_vmem_ = vmem;
+    // a paced (or claimed) registration that covers the whole arena is as good as a cudaHostAlloc'd one
+    complement_partial_ = complement_registered_ && !((paced || preclaimed) && partial_pin >= bytes);
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : budget_lent;   // a budget keeps its own tail of the region
@@ -4162,6 +4416,28 @@ bool FileExpertSource::pin_cache_complement(
         std::fprintf(stderr, "FileExpertSource: %zu verified additional-GPU experts remain on the mmap fallback\n",
                      additional_gpu_pairs.size());
     }
+#if defined(STRATA_HYBRID)
+    if (complement_pinned_ && complement_pin_limit_ > 0 && complement_host_ != nullptr) {
+        void* devs[kHybridHip] = {};
+        const int rc = strata_hip_map_host((void*) complement_host_, (size_t) complement_pin_limit_, devs, kHybridHip);
+        int mapped = 0;
+        if (rc == 0) {
+            for (int i = 0; i < kHybridHip; ++i) {
+                complement_apu_[i] = (const uint8_t*) devs[i];
+                if (devs[i] != nullptr) ++mapped;
+            }
+        }
+        if (mapped > 0) {
+            std::fprintf(stderr, "FileExpertSource: the HIP helper reads the pinned experts in place (%.2f GiB)\n",
+                         (double) complement_pin_limit_ / 1073741824.0);
+        } else {
+            for (const uint8_t*& slot : complement_apu_) slot = nullptr;
+            std::fprintf(stderr,
+                         "FileExpertSource: the pinned experts stay on the CPU (the HIP helper could not map them, %d)\n",
+                         rc);
+        }
+    }
+#endif
     std::fflush(stderr);
     return true;
 }
