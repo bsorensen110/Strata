@@ -5435,7 +5435,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
 }
 
 bool Verifier::pl_graph_launch(std::string& err) {
-    const cudaError_t le = cudaGraphLaunch(exec_[fl_T_], cs_);
+    const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[sel_long_][fl_T_] : exec_[sel_long_][fl_T_], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
