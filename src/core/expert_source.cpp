@@ -416,8 +416,14 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo, const std:
                 if (c == "memory") v1_path = line.substr(c2 + 1);
             continue;
         }
-        auto path = (root / line.substr(4)).lexically_normal();
-        if (path.string().rfind(root.string(), 0) != 0 || !std::filesystem::is_directory(path)) return false;
+        const std::filesystem::path cgroup_path = std::filesystem::path(line.substr(4)).relative_path();
+        auto path = cgroup_path.empty() ? root : (root / cgroup_path).lexically_normal();
+        // cgroup paths are written with a leading slash, but are relative to the mounted cgroup root.
+        // Resolve `/` to the mount root instead of letting filesystem::operator/ discard the root.
+        const auto below_root = path.lexically_relative(root);
+        if (below_root.empty() && path != root) return false;
+        for (const auto& part : below_root) if (part == "..") return false;
+        if (!std::filesystem::is_directory(path)) return false;
         v2 = true;
         while (path.string().rfind(root.string(), 0) == 0) {
             std::ifstream limit_file(path / "memory.max"), current_file(path / "memory.current");

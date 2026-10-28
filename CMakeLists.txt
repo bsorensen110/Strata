@@ -697,7 +697,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/remote_expert_opt.cu
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp src/core/dflash2.cpp
     src/core/conversation_snapshot.cpp src/core/conversation_state.cpp src/core/conversation_memory.cpp src/core/peer_experts.cpp src/core/peer_link.cpp
-    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp)
+    src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
+    # fork: the merge's one-sided hunk dropped this tail; rope_cache_migration_test calls migrate_rope_cache_to_yarn4
+    src/core/rope_cache_migration.cpp src/core/kv_chunks.cpp src/core/kv_pool.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA AND NOT STRATA_HIP_GFX906)
@@ -1113,6 +1115,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       add_executable(hip_multigpu_prefill_dispatch tests/hip/multigpu_prefill_dispatch.cpp)
       target_link_libraries(hip_multigpu_prefill_dispatch PRIVATE strata_prefill strata_hip_runtime)
       add_test(NAME hip_multigpu_prefill_dispatch COMMAND hip_multigpu_prefill_dispatch gfx103x)
+      set_tests_properties(hip_multigpu_prefill_dispatch PROPERTIES SKIP_RETURN_CODE 77)
       list(APPEND _strata_hip_tests hip_multigpu_prefill_dispatch)
     endif()
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/multigpu_prefill_gemm_dispatch.cpp")
@@ -1130,6 +1133,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                COMMAND hip_multigpu_prefill_gemm_dispatch 10 --reference-only)
       add_test(NAME hip_multigpu_prefill_gemm_dispatch_all_f16_reference
                COMMAND hip_multigpu_prefill_gemm_dispatch all --reference-only)
+      set_tests_properties(hip_multigpu_prefill_gemm_dispatch hip_multigpu_prefill_gemm_dispatch_reverse
+        hip_multigpu_prefill_gemm_dispatch_bf16_reference
+        hip_multigpu_prefill_gemm_dispatch_legacy_f16_reference
+        hip_multigpu_prefill_gemm_dispatch_legacy_prefix_reference
+        hip_multigpu_prefill_gemm_dispatch_all_f16_reference PROPERTIES SKIP_RETURN_CODE 77)
       list(APPEND _strata_hip_tests hip_multigpu_prefill_gemm_dispatch hip_multigpu_prefill_gemm_dispatch_reverse
            hip_multigpu_prefill_gemm_dispatch_bf16_reference hip_multigpu_prefill_gemm_dispatch_legacy_f16_reference
            hip_multigpu_prefill_gemm_dispatch_legacy_prefix_reference
@@ -1752,6 +1760,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(platform_memory_test src/platform/memory_test.cpp)
   target_link_libraries(platform_memory_test PRIVATE strata_core ${_strata_gpu_runtime_target})
   add_test(NAME platform_memory_test COMMAND platform_memory_test)
+  set_tests_properties(platform_memory_test PROPERTIES SKIP_RETURN_CODE 77)
 
   # The pinned-memory headroom (pin_budget.hpp) against a simulated ceiling; skips without a GPU.
   add_executable(pin_budget_test src/core/pin_budget_test.cpp)
@@ -1763,7 +1772,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(conversation_copy_streams_test PRIVATE include)
   target_link_libraries(conversation_copy_streams_test PRIVATE strata_core ${_strata_gpu_runtime_target})
   add_test(NAME conversation_copy_streams_test COMMAND conversation_copy_streams_test)
-  set_tests_properties(conversation_copy_streams_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  set_tests_properties(conversation_copy_streams_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
 
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
@@ -2811,6 +2820,36 @@ if(STRATA_BUILD_TESTS)
     target_include_directories(direct_file_async_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
     target_link_libraries(direct_file_async_test PRIVATE Threads::Threads)
     add_test(NAME direct_file_async_test COMMAND direct_file_async_test)
+    # fork: deferred DFlash (v1) registrations the v0.2.7 merge dropped with the STRATA_ENABLE_DFLASH2 gate.
+    # Re-registered here: these compile against the merged headers (probed); the GPU-side ones gate on the toolkit targets.
+    add_executable(dflash_policy_test src/spec/dflash_policy_test.cpp)
+    target_link_libraries(dflash_policy_test PRIVATE strata_spec)
+    add_test(NAME dflash_policy_test COMMAND dflash_policy_test)
+    set_tests_properties(dflash_policy_test PROPERTIES TIMEOUT 60)
+    if(TARGET strata_kernels)
+      add_executable(dflash_taps_test src/kernels/dflash_taps_test.cpp)
+      target_include_directories(dflash_taps_test PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(dflash_taps_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+      add_test(NAME dflash_taps_test COMMAND dflash_taps_test)
+      set_tests_properties(dflash_taps_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+      add_executable(dflash_rope_parity src/kernels/dflash_rope_parity.cpp)
+      target_include_directories(dflash_rope_parity PRIVATE ${_strata_gpu_include_directories})
+      target_link_libraries(dflash_rope_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+      add_test(NAME dflash_rope_parity COMMAND dflash_rope_parity)
+      set_tests_properties(dflash_rope_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endif()
+    if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+      # The parser fixtures are host-only; dflash.cpp shares a TU with the GPU drafter, so link its symbols.
+      add_executable(dflash_load_test src/core/dflash_load_test.cpp src/core/dflash.cpp)
+      target_include_directories(dflash_load_test PRIVATE include ${CMAKE_CURRENT_SOURCE_DIR}/tests/core ${_strata_gpu_include_directories})
+      target_link_libraries(dflash_load_test PRIVATE strata_engine strata_kernels strata_kernels_cpu strata_artifact ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME dflash_load_test COMMAND dflash_load_test)
+      set_tests_properties(dflash_load_test PROPERTIES TIMEOUT 120)
+    endif()
+    if(TARGET file_expert_source_test)
+      add_test(NAME file_expert_source_retry_test COMMAND file_expert_source_test --resident-retry-gpu)
+      set_tests_properties(file_expert_source_retry_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    endif()
     # fork: ple_reader lifecycle harness (submit-failure + reopen paths)
     # Reader initialization failures must return without draining reads that were never submitted.
     add_executable(ple_reader_lifecycle_test tests/platform/ple_reader_lifecycle.cpp

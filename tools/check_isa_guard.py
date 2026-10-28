@@ -34,7 +34,7 @@ WIDE_PUBLIC = {
     "act_quant_q8_1", "q2_0_gguf_rows_multi", "s2_expert_vnni", "s2_expert_vnni_q", "s2_expert_gu_rows",
     "s2_expert_down_rows", "s2_expert_gu_rows_multi", "s2_expert_down_rows_multi", "s2_expert_vnni_multi",
     "s2_expert_scalar", "iq512_gu_rows", "iq512_rows", "iq256_gu_rows", "iq256_rows", "iq256_gu_rows_v",
-    "iq256_rows_v", "iq4nl256_down_rows", "iq4nl256_down_rows_v", "q2_0_gguf_rows_multi_avx2",
+    "iq256_rows_v", "iq512_reference_gu_rows", "iq512x_rows", "iq4nl256_down_rows", "iq4nl256_down_rows_v", "q2_0_gguf_rows_multi_avx2",
     "q2_0_gguf_rows_multi_avx2_v", "q2_0_gguf_rows_multi_avx2_legacy", "q2_0_gguf_rows_multi_avx2_bitplane",
     "act_quant_q8_1_avx2", "q8k_quant_avx2", "kq256_gu_rows", "kq256_rows", "bf16_rows_dot_multi",
     "tq_rows_avx512",                        # trellis rows (tq_cpu.cpp: behind cpu_avx512_ok())

@@ -1261,7 +1261,7 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
         if (kbx < blocks_per_row) {
 #pragma unroll
             for (int i = 0; i < ROWS; ++i)
-                if (row0 + i < n_out) w0[i] = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                if (row0 + i < n_out) w0[i] = F::load(w + std::size_t(INDEXED ? row_ids[row0 + i] : row0 + i) * blocks_per_row + kbx, kqs);
         }
         pdl_trigger();
         pdl_wait();
@@ -1284,7 +1284,7 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
 #pragma unroll
         for (int i = 0; i < ROWS; ++i) {
             if (row0 + i < n_out) {
-                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                const std::size_t block = std::size_t(INDEXED ? row_ids[row0 + i] : row0 + i) * blocks_per_row + kbx;
                 const typename F::W wv = F::load(w + block, kqs);      // once per (row, block)
 #pragma unroll
                 for (int j = 0; j < NCOLS; ++j)                         // then per column
@@ -1569,6 +1569,37 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     const unsigned blocks = unsigned((std::size_t(n_out) + ROWS - 1) / ROWS);
     if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
     else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, false, false>, dim3(blocks), threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2);
+}
+
+// fork: the indexed row path (native_mmvq_indexed below). Two rows per block, the same reduction as
+// the dense two-row launch, so an indexed output matches the dense output bit for bit for that row.
+template<typename F, int NC>
+void launch_indexed_n(const void* weights, const void* x, float* y, int ni, int nr, const int32_t* ids, cudaStream_t stream) {
+    const dim3 threads(WARP, WARPS);
+    native_mmvq_multi_kernel<F, NC, WARPS, 2, false, false, true><<<unsigned((nr + 1) / 2), threads, 0, stream>>>(
+        (const typename F::Block*) weights, (const Q81Block*) x, y, ni, nr, nullptr, nullptr, ids);
+}
+
+template<typename F>
+void launch_indexed_cuda(const void* weights, const void* x, float* y, int ni, int nr, int nc, const int32_t* ids, cudaStream_t stream) {
+    switch (nc) {
+        case 1: launch_indexed_n<F, 1>(weights, x, y, ni, nr, ids, stream); break;
+        case 2: launch_indexed_n<F, 2>(weights, x, y, ni, nr, ids, stream); break;
+        case 3: launch_indexed_n<F, 3>(weights, x, y, ni, nr, ids, stream); break;
+        case 4: launch_indexed_n<F, 4>(weights, x, y, ni, nr, ids, stream); break;
+        case 5: launch_indexed_n<F, 5>(weights, x, y, ni, nr, ids, stream); break;
+        case 6: launch_indexed_n<F, 6>(weights, x, y, ni, nr, ids, stream); break;
+        case 7: launch_indexed_n<F, 7>(weights, x, y, ni, nr, ids, stream); break;
+        case 8: launch_indexed_n<F, 8>(weights, x, y, ni, nr, ids, stream); break;
+    }
+}
+
+// The fork's gfx906 wave path had an INDEXED instantiation too; the merged wave kernels do not, so on
+// that arch the indexed call uses the multi kernel above (measured on gfx1201/gfx11; gfx906 untested).
+template<typename F>
+void launch_indexed(const void* weights, const void* x, float* y, int ni, int nr, int nc,
+                    const int32_t* ids, cudaStream_t stream) {
+    launch_indexed_cuda<F>(weights, x, y, ni, nr, nc, ids, stream);
 }
 
 template<typename F>
@@ -3472,6 +3503,28 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
         throw std::length_error("native MMVQ weight byte count overflows size_t");
     }
     return row_bytes * std::size_t(n_out);
+}
+
+void native_mmvq_indexed(int type, const void* weights, const void* x, float* y, int ni, int nr, int nc,
+                         const int32_t* ids, void* stream) {
+    validate_shape(ni, nc, type == 2 || type == 6 || type == 8 || type == 20 ? 32 : type == 42 ? 64 : 256);
+    if (nr <= 0) throw std::invalid_argument("native indexed MMVQ requires rows > 0");
+    validate_pointer(weights); validate_pointer(x); validate_pointer(y); validate_pointer(ids); validate_stream(stream);
+    const auto st = static_cast<cudaStream_t>(stream);
+    switch (type) {
+    case 2: launch_indexed<SmallTraits<Q40Block, 4>>(weights, x, y, ni, nr, nc, ids, st); break;
+    case 6: launch_indexed<SmallTraits<Q50Block, 4>>(weights, x, y, ni, nr, nc, ids, st); break;
+    case 8: launch_indexed<SmallTraits<Q80Block, 8>>(weights, x, y, ni, nr, nc, ids, st); break;
+    case 11: launch_indexed<Q3KTraits>(weights, x, y, ni, nr, nc, ids, st); break;
+    case 12: launch_indexed<Q4KTraits>(weights, x, y, ni, nr, nc, ids, st); break;
+    case 13: launch_indexed<Q5KTraits>(weights, x, y, ni, nr, nc, ids, st); break;
+    case 14: launch_indexed<Q6KTraits>(weights, x, y, ni, nr, nc, ids, st); break;
+    case 20: launch_indexed<SmallTraits<IQ4NLBlock, 4>>(weights, x, y, ni, nr, nc, ids, st); break;
+    case 23: launch_indexed<IQ4XSTraits>(weights, x, y, ni, nr, nc, ids, st); break;
+    case 42: launch_indexed<Q20Traits>(weights, x, y, ni, nr, nc, ids, st); break;
+    default: throw std::invalid_argument("native indexed MMVQ: unsupported type");
+    }
+    launch_check();
 }
 
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,

@@ -110,6 +110,14 @@ int main() {
     const strata::platform::LockResult r = strata::platform::lock_resident(p, bytes);
     std::printf("lock_resident: ok=%d locked=%llu MiB (%s)\n", (int) r.ok, (unsigned long long) (r.locked_bytes >> 20),
                 r.note.c_str());
+#if defined(__linux__)
+    if (!r.ok && std::strstr(r.note.c_str(), "raise ulimit -l") != nullptr) {
+        std::puts("platform_memory_test: SKIP (RLIMIT_MEMLOCK is below the 256 MiB probe size)");
+        strata::platform::unlock_resident(p, bytes);
+        std::free(p);
+        return 77;
+    }
+#endif
     int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps;
 #if defined(_WIN32)
     PROCESS_MEMORY_COUNTERS pmc{};
