@@ -262,9 +262,19 @@ service. Post-promotion verification:
   final answer; the explicit arithmetic request above subsequently completed normally.
 
 Current prod = v0.2.6 + two defect fixes, build hash above. Rollback artifacts retained; the
-service has not restarted unexpectedly. Remaining QA not done: full serve/ pytest suite and
-ctest (`STRATA_BUILD_TESTS=OFF` in the build); these were not required for the focused fix/build/
-recall/deploy gate.
+service has not restarted unexpectedly. Prod config (2026-10-28): env aligned to upstream gfx12 defaults
+(see `~/Strata-ab/gfx12align-batch-20261028/METHOD.md` — four 0.2.7 decode-half switches set explicitly
+because 0.1.51 predates their auto-enable; fork-era ATTN_PRE75/PA_FAST/DENSE_MMQ and dead HIP_MMVQ_IL
+removed). IQ_STAGE_TABLES is OFF after neutral speed A/B. Current serving uses MTP (`--mtp --spec 8`)
+with batch on (`"parallel": 4` + `--batch-mtp`), no DFlash2.
+
+Batch decision: the first comparison was confounded because batch disables DFlash2. Controlled MTP-only
+A/B with same four prompts and `--batch-mtp` on batch arm: four-way aggregate 166.46 vs 140.85 tok/s
+(+18.2%); single-request median 165.95 vs 169.40 tok/s (-2.0%). User approved enabling `parallel: 4`
+plus `--batch-mtp`. Live engine cmdline verified `--batch 4`, `--batch-mtp`, `--mtp` (no DFlash2); the
+engine allocated 4 slot drafters (51 MiB each). The service is active, NRestarts=0, authenticated
+`/v1/models` HTTP 200. Remaining QA not done: full serve/pytest suite and ctest
+(`STRATA_BUILD_TESTS=OFF` in the build); these were not required for focused QA.
 
 ## Upstream main merged (5e8a4cca, v0.2.7) — 2026-10-28
 
@@ -350,8 +360,11 @@ link-breakers; keep it ON for merge work):
 - Cherry-picked test: `serve/test_responses.py` = 43 passed, 1 skipped, 3 subtests. Full serve suite from
   before these picks had 5 `serve/test_jev_calib.py` failures (404s); isolated pre-merge `test_jev_calib.py`
   also fails `OpusPrereviewFixes.test_g3_log_flush_splits_by_tuple` (5 rows vs 3), so there is a pre-existing
-  test-state problem. A full baseline comparison is running; do not attribute those failures to #4210 yet.
-  `serve/test_web_history.js` passed 17 cases on the final merge tip; the cherry-picks do not touch it.
+  test-state problem. Full-suite baseline on rollback `aae61677` completed: it has the same five
+  `SystemOneCalibrated` failures as the pre-pick tip (11 failed, 1,645 passed, 18 skipped, 11,176 subtests
+  versus 5 failed, 1,747 passed, 20 skipped, 11,274 subtests). The five JEV 404s therefore predate #4210;
+  the rollback run also had six other failures (one lifeline and five literal-think-guard cases), which remain
+  separately unresolved. `serve/test_web_history.js` passed 17 cases on the final merge tip; the cherry-picks do not touch it.
 - Prod after the full gate: active, authenticated `/v1/models` HTTP 200, NRestarts=0. **The merge binary
   was NOT promoted.**
 
@@ -416,14 +429,32 @@ handoff exists to protect; and most body numbers are author-only (per-expert 618
 `nvfp4_modelopt_{avx512,avx2,pool}` CPU set as an opt-in unit **with a parity test we write**, and
 `safetensors_reader.hpp` as tooling.
 
-Best speedup leads found (these are gaps/opens **in our tree**, not PR code to copy — measure before coding):
-1. `native_mmvq_il` (multi-token GEMV: weights read once per verify batch) is compiled out on HIP
-   (`native_mmvq.cu:3554` `#if !defined(__HIPCC__)`, `:3952` `return false`) and its type list omits IQ3_S(21)
-   /IQ3_XXS(18); `docs/MMVQ_IL_TABLE.md` records -45% at 5 tokens for the same mechanism on a 110-SM card.
-   `mmvq_il_parity --bench --emit-table` answers viability on the R9700 in one run; bit-parity by construction.
-2. `STRATA_IQ_STAGE_TABLES=1` already stages IQ3 codebooks in shared ("bitwise the same either way",
-   `iq_kernels.cu:3403-3426`) but measured negative on other cards — flip it on gfx1201 before writing new
-   kernels; `ds4_iq.cu:1344` (`kCanStage = TAB == 0`) disables activation staging for i-quants outright.
+Best speedup leads and gfx1201 measurements (IL enablement + gfx12 key/table fix **committed on the integ
+branch as `4c9980cb`**, 2026-10-28):
+1. `native_mmvq_il` (multi-token GEMV: weights read once per verify batch) was compiled out on HIP and its type list
+   omits IQ3_S(21)/IQ3_XXS(18); `docs/MMVQ_IL_TABLE.md` records -45% at 5 tokens for the same mechanism on a 110-SM
+   card. Claude Code widened the existing non-PF IL kernels/entry points to HIP, added the HIP bench target, and ran
+   `mmvq_il_parity --bench --emit-table` twice on the R9700. Both runs had 240 `BENCH` lines, zero `FAIL`, and ended
+   `mmvq_il_parity: OK` (bitwise parity across T=1..8 and rows 1/2/4). First-run table has nonzero cells in 65/75
+   (2-4 columns), 98/100 (5-8), and 10/25 (one-column); repeat counts are 65/75, 97/100, and 11/25, with two
+   on/off flips (Q3_K 5-8 cell 7; Q5_K one-column cell 4), attributable to small-shape timing noise.
+   Example: Q5_K LM head at T=4 is 1,713.2 → 878.6 µs (-48.7%); T=5 is 1,967.6 → 1,164.2 µs (-40.8%). Full
+   measurements and emitted table: `~/Strata-ab/ilbench-20261028/jobC-report.md` and `bench-full*.log`.
+   **Arch-key collision resolved in `4c9980cb`:** `il_cc()` now gives every 12.0 AMD card its own key **1202**, and
+   `kIlRows_1202`/`kIlRows58_1202`/`kIl1Rows_1202` carry this card's cells — kept only where the two bench runs
+   agree, else 0 (the kIlRows_89 method; 20 flips zeroed). `mmvq_il_parity check_tables()` spot-checks 1202.
+   Post-install parity on the card: OK (T 1-8, rows 1/2/4 and the table, bitwise). Still pending: the bench's
+   types do **not** include IQ3_S(21)/IQ3_XXS(18), and the turbo-brilliance dense side is all IQ3_S, so the IL
+   path does nothing for our model yet; the IQ3 IL extension (bitwise parity vs `iq_mmvq`) is running as job D
+   (`~/Strata-ab/ilbench-20261028/jobD-brief.md`); model/decode A/B follows once iq3 table cells are installed.
+2. `STRATA_IQ_STAGE_TABLES` stages IQ3 codebooks in shared ("bitwise the same either way",
+   `iq_kernels.cu:3403-3426`) but measured negative on other cards. **Ran the model-level A/B (2026-10-28):
+   decode 97.2 (ON) vs 94.8 (OFF) tok/s, +2.5% but within noise (Welch t=0.47), medians identical 98.2/98.7 —
+   neutral, matching upstream (P100 0.97-1.03x noise, 3090 Ti forced-on 3-13% slower). Left OFF (upstream
+   default); unit file keeps `STRATA_IQ_STAGE_TABLES=0` (explicit) with an inline A/B comment.** Method and
+   raw data: `~/Strata-ab/gfx12align-batch-20261028/` (`iqstage_ab.py`, `iqstage-{ON,OFF}.json`).
+   The IL benchmark does not read/use this flag—it routes none of its types through `iq_mmvq`.
+   `ds4_iq.cu:1344` (`kCanStage = TAB == 0`) disables activation staging for i-quants outright.
 3. IQ3 decode's byte dot is already one instruction on this card (`__dp4a` -> `v_dot4_i32_iu8` for gfx1201,
    `hip_compat/intrinsics.hpp:19-25`) — no port needed, do not spend effort there.
 4. The int8 wave32 WMMA already default-on for IQ3_S **prefill** (`moe_fused_iq.cu` `nw_wmma`) could be moved
