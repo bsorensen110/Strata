@@ -341,21 +341,39 @@ link-breakers; keep it ON for merge work):
       --setenv=HIP_PATH=/opt/rocm --working-directory=/home/soren/Strata-integ \
       -- cmake --build build-hip -j 20
 
-- Build: **exit 0** (log `~/Strata-ab/swap-20261027/build-hip32.log`, full tree + tests +
-  `strata`). Earlier passes `build-hip13..31` are the repair history.
-- CTest: `~/Strata-ab/swap-20261027/final-gate.sh` (stops `strata.service` to free the GPU,
-  runs `ctest-gate.sh`, restarts prod and polls authenticated `/v1/models`). Result:
-  **225 registered, 6 excluded, 219 run → 204 passed, 15 skipped, 0 failed** in 188.3 s
-  (`ctest-merge-027.log` / `.xml`, `final-gate-conv.log`). Excluded (no developer fixture
-  packs here): `expert_cache_segmented_test`, `ple_parity`, `expert_parity`, `pool_test`
-  (also drops `numa_pool_test`), `shared_expert_parity`. The 15 skips are device/arch/rlimit
-  gates, all listed with names in `final-gate-conv.log`.
-- serve pytest + `serve/test_web_history.js`: green on the merged tree in the earlier pass
-  (110 py + 4 js, "suite run 3"). A re-run against the final tip is in flight; logs
-  `pytest-final.log` / `webhistory-final.log` (result appended to MERGE-027.md Round 6 when it
-  lands). The last three commits are C++/CMake only, no `serve/` changes.
-- Prod: the gate stopped and restored it; verified active, authenticated `/v1/models` HTTP
-  200, NRestarts=0. **The merge binary was NOT promoted.**
+- Build after the PR cherry-picks: **exit 0** (`~/Strata-ab/cherry-20261028/build-hip33.log`).
+- CTest after picks: 226 registered, 6 fixture exclusions, **220 run: 205 passed, 15 skipped, 0 failed**
+  (`ctest-merge-027.xml`, 219.45 s). `q2g_rows_bench_validate` passed (bit-exact sweep).
+  One earlier parallel run flaked `stage_link_test`'s 0.3 s stop-flag assertion under `-j8`; isolated run
+  passed. Set `RUN_SERIAL TRUE` (`70bbacce`) and reran the complete gate green. The 15 skips are listed in
+  `~/Strata-ab/cherry-20261028/gate-cherry-serial.log`.
+- Cherry-picked test: `serve/test_responses.py` = 43 passed, 1 skipped, 3 subtests. Full serve suite from
+  before these picks had 5 `serve/test_jev_calib.py` failures (404s); isolated pre-merge `test_jev_calib.py`
+  also fails `OpusPrereviewFixes.test_g3_log_flush_splits_by_tuple` (5 rows vs 3), so there is a pre-existing
+  test-state problem. A full baseline comparison is running; do not attribute those failures to #4210 yet.
+  `serve/test_web_history.js` passed 17 cases on the final merge tip; the cherry-picks do not touch it.
+- Prod after the full gate: active, authenticated `/v1/models` HTTP 200, NRestarts=0. **The merge binary
+  was NOT promoted.**
+
+### Upstream PRs cherry-picked after the v0.2.7 merge (2026-10-28)
+
+| PR | Upstream commit(s) | Local commit(s) | Summary |
+|---|---|---|---|
+| #3946 | `16c857f0`, `635dc657`, `3b46bce7`, `0e217b6b` | `9c69f7f5`, `da1f4fd8`, `a2ec84d0`, `edbd4b53` | bit-exact AVX-512 Q2_0 CPU expert rows, benchmark + CTest + recorded Ryzen results |
+| #4152 | `05768037` | `ded9c429` | check both HIP/CUDA f16-range reset symbol writes |
+| #4210 | `a00a4be7` | `0dd6a5cc` | accept Codex `agent_message` items in `/v1/responses` |
+| #4258 | `e09a687a` | `ff71203c` | opt-in `--drop-file-cache` after startup reads |
+
+PR #3946 is a **CPU-side** Q2_0 kernel, not the GPU IQ3_S/IQ3_XXS decode path. The current Ryzen 9 9950X
+has AVX-512; the PR's `q2g_rows_bench_validate` ran and passed its seeded memcmp sweep. The benchmark
+numbers committed by upstream are from a Ryzen 7 9800X3D, not this R9700; no local speedup measurement
+was made. #4258's flag is off by default, and the call site refuses to drop the cache when any expert
+still reads from files; current production config has no full complementary RAM-resident mode, so we did
+not enable it.
+
+Cherry-pick ledger + reasoning: `~/Strata-ab/cherry-20261028/CHERRY-4X.md`. Full `git cherry-pick -x`
+provenance is preserved in the commits. Worktree is expected to be ahead of `fork/integ/community-2026-10`
+until the user asks to push this follow-up batch.
 
 ### Still owed before promotion / open fork-only work
 
