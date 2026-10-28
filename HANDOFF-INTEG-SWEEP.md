@@ -398,3 +398,35 @@ until the user asks to push this follow-up batch.
 6. Older queues still open: wave 24's parked **#2240** (Remote stage worker, 211 conflicts)
    and the 0.2.4 follow-ups (Metal `--dflash` side, dead fork dflash sources, the dead
    `if (has_dflash)` blocks in `generate.cpp`).
+
+## PR #4114 review (2026-10-28, read-only; nothing applied)
+
+Two Claude Code reviews of upstream draft PR #4114 (`Native RDNA4 gfx1201 NVFP4 engine`, head `b5e1887e`,
+base v0.2.6). Full reports + probe dumps: `~/Strata-ab/pr-4114/jobA/report.md` (IQ3_S/IQ3_XXS optimization
+mining, findings F1-F18, decline list N1-N13, measurement plan) and `jobB/report.md` (merge-candidate review).
+
+Verdict: **do not merge as-is.** Ungated CPU/spec sources and an unconditional `-mavx512bf16` land in every
+build; the `generate.cpp` argv hook re-routes `--model/--native/--pack` at any safetensors dir into the new
+engine on HIP builds; `serve/server.py` gains an ungated, untested prefix-reuse memo that bypasses our `#567`
+shared-prefix encoder; the 1.16 MB / 102-kernel embedded hsaco blob has no source for 71 kernels and its
+generator hardcodes a private desktop path (not reproducible); the `gfx120` arch-prefix gate accepts
+gfx1200/1250 and then `std::exit(1)`s at module load; the two CMake conflicts land exactly on the seams this
+handoff exists to protect; and most body numbers are author-only (per-expert 618,240 B contradicts the PR's own
+2,764,800 B stride). Only cleanly-takeable pieces: the `check_isa_guard.py` registration hunk, the
+`nvfp4_modelopt_{avx512,avx2,pool}` CPU set as an opt-in unit **with a parity test we write**, and
+`safetensors_reader.hpp` as tooling.
+
+Best speedup leads found (these are gaps/opens **in our tree**, not PR code to copy — measure before coding):
+1. `native_mmvq_il` (multi-token GEMV: weights read once per verify batch) is compiled out on HIP
+   (`native_mmvq.cu:3554` `#if !defined(__HIPCC__)`, `:3952` `return false`) and its type list omits IQ3_S(21)
+   /IQ3_XXS(18); `docs/MMVQ_IL_TABLE.md` records -45% at 5 tokens for the same mechanism on a 110-SM card.
+   `mmvq_il_parity --bench --emit-table` answers viability on the R9700 in one run; bit-parity by construction.
+2. `STRATA_IQ_STAGE_TABLES=1` already stages IQ3 codebooks in shared ("bitwise the same either way",
+   `iq_kernels.cu:3403-3426`) but measured negative on other cards — flip it on gfx1201 before writing new
+   kernels; `ds4_iq.cu:1344` (`kCanStage = TAB == 0`) disables activation staging for i-quants outright.
+3. IQ3 decode's byte dot is already one instruction on this card (`__dp4a` -> `v_dot4_i32_iu8` for gfx1201,
+   `hip_compat/intrinsics.hpp:19-25`) — no port needed, do not spend effort there.
+4. The int8 wave32 WMMA already default-on for IQ3_S **prefill** (`moe_fused_iq.cu` `nw_wmma`) could be moved
+   to decode shapes (M=2..8 rows per weight read) — rounding-changing (int8 activations), so opt-in gate.
+5. Drafter-cost cuts that are parity-safe under greedy acceptance: pruned draft vocab (`native_mmvq_indexed`
+   already exists), sink+window bounded draft attention, draft-expert truncation.
