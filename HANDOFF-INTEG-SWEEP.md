@@ -265,3 +265,118 @@ Current prod = v0.2.6 + two defect fixes, build hash above. Rollback artifacts r
 service has not restarted unexpectedly. Remaining QA not done: full serve/ pytest suite and
 ctest (`STRATA_BUILD_TESTS=OFF` in the build); these were not required for the focused fix/build/
 recall/deploy gate.
+
+## Upstream main merged (5e8a4cca, v0.2.7) — 2026-10-28
+
+Merge commit `377bd6aa` (parents `aae61677` ours, `5e8a4cca` = tag v0.2.7; **367 upstream
+commits**, 477 files, +44,936 / −21,684) into `integ/community-2026-10`.
+**Rollback ref: branch `integ/pre-upstream-0.2.7` = `aae61677`** (pushed to `fork`, so the
+0.2.6 line is recoverable server-side too). 32 repair commits sit on top of the merge;
+tip at write time is `529bec00` (`git log --oneline 377bd6aa..HEAD`).
+
+### The failure mode that dominated this merge: one-sided hunks
+
+The merge's CMakeLists.txt hunks applied **without conflict** and silently deleted fork-only
+lines (fork `CMakeLists.txt:639` source tail vs merged `:701`). A HIP-only configure
+(`STRATA_BUILD_CONVERSATION_TESTS=OFF`) hides most of the fallout, so the first build looks
+fine and the link errors show up weeks later. What was lost and had to be re-grafted:
+- `src/core/rope_cache_migration.cpp`, `kv_chunks.cpp`, `kv_pool.cpp` dropped from
+  `strata_engine`'s source list while `rope_cache_migration_test` still registered and called
+  `migrate_rope_cache_to_yarn4` — the exact same trio the 0.2.4 merge had to add back
+  (see the 0.2.4 notes). **This is a recurring upstream-side gap; check it every merge.**
+- `native_mmvq_indexed`: the header declaration and both call sites survived, the definition
+  and the `launch_indexed` chain did not; `native_mmvq_multi_kernel` also lost its `INDEXED`
+  template axis and `row_ids` argument. Restored as `INDEXED=false` default, which folds the
+  row index back to `row0 + i` so the dense (production decode) instantiations compile
+  unchanged.
+- Fork CMake test/target registrations: the HIP ctest family, `ple_reader_*` lifecycle
+  harness, PeerLink/`numa_policy` targets, the dflash2 family, the fork's Usage-panel web
+  slice, `expert_source.hpp` as a 3-way union (fork dst2 DMA fields + upstream `stage_ev_`).
+
+Method that worked (reuse it next merge): census the **whole tree** — function definitions and
+the CMake source/test lists — and diff those sets against `git show <rollback-ref>:...`,
+instead of chasing link errors one at a time. Anchor grep/replace regexes at **column 0**;
+unanchored patterns matched indented call sites and corrupted argument lists.
+
+### Repairs worth remembering
+
+- `launch_pdl` forwards **every** kernel parameter explicitly, so a defaulted trailing kernel
+  parameter still needs an argument at each `launch_pdl` site. Five dense sites now pass
+  `(const int32_t*) nullptr` (`d0c833d8`). Forgetting this is a build break, not a warning.
+- cgroup v2 parsing (`src/core/expert_source.cpp`, `679c077f`): `/proc` limit lines carry an
+  **absolute** path relative to the mount root, so `root / path` threw the root away. Hybrid
+  hosts mount v2 under `<mount>/unified`; some ancestors are not visible from this namespace.
+  Resolve as `relative_path()` + `lexically_normal()`, reject `..`, walk to the deepest
+  **visible** ancestor (ancestor limits still constrain descendants), and if no mount is
+  visible at all, `continue` and use host `MemAvailable`. `file_expert_source_test` now
+  exercises namespace/hybrid/partial-path/no-mount/traversal cases.
+- `conversation_copy_streams_test` (#2409): HIP's lazy memcpy staging path is initialised by
+  the **first** async copy, so the first private stream/event measurement saw 148 MiB of
+  runtime init. Warm the runtime with a blocking `cudaMemcpy` + sync before the measured
+  section, and keep the test `RUN_SERIAL` — it races other GPU tests at `-j 8`.
+- Environment-gated tests now exit **77** (ctest SKIP) rather than fail: `hip_multigpu_*`
+  (one R9700 here), `platform_memory_test` (`ulimit -l` = 8192 KB vs a 256 MiB
+  lock_resident probe). Enforced both in CMake and in-code.
+- `prefill_mmq_parity` dereferenced a null `from_float_ref` for quant types this ggml has no
+  host reference quantizer for — prints and skips the type now. `check_isa_guard.py` needed
+  the `iq512_reference_gu_rows` AVX-512 allowlist entry.
+- Optional `STRATA_BUILD_CONVERSATION_TESTS=ON` exposed two more seams (`529bec00`): a
+  duplicated `suffix_reuse_dense_tail_test` registration (removed) and the fork's
+  `suffix_reuse_partial_prefix_test`, which needs the removed v0.2.7
+  `ConversationCache::Match::partial` / `best_with_partial` API — left unregistered until
+  ported. `conversation_validation_test.cpp`'s fork-added no-draft/explicit-length
+  assertions also target absent APIs; the fixture follows upstream now.
+
+### Verification (all on this box, gfx1201)
+
+Configure (note `STRATA_BUILD_CONVERSATION_TESTS=ON` — that is what surfaces the census
+link-breakers; keep it ON for merge work):
+
+    cmake -S . -B build-hip -DSTRATA_ENABLE_HIP=ON -DSTRATA_BUILD_TESTS=ON \
+      -DSTRATA_BUILD_CONVERSATION_TESTS=ON -DSTRATA_Q6K_EXPERTS=ON \
+      -DCMAKE_BUILD_TYPE=Release -DCMAKE_HIP_ARCHITECTURES=gfx1201\;gfx1200 \
+      -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++
+    systemd-run --user --collect --scope --property=MemoryMax=24G \
+      --setenv=PATH=/usr/sbin:/usr/bin:/bin:/opt/rocm/bin --setenv=ROCM_PATH=/opt/rocm \
+      --setenv=HIP_PATH=/opt/rocm --working-directory=/home/soren/Strata-integ \
+      -- cmake --build build-hip -j 20
+
+- Build: **exit 0** (log `~/Strata-ab/swap-20261027/build-hip32.log`, full tree + tests +
+  `strata`). Earlier passes `build-hip13..31` are the repair history.
+- CTest: `~/Strata-ab/swap-20261027/final-gate.sh` (stops `strata.service` to free the GPU,
+  runs `ctest-gate.sh`, restarts prod and polls authenticated `/v1/models`). Result:
+  **225 registered, 6 excluded, 219 run → 204 passed, 15 skipped, 0 failed** in 188.3 s
+  (`ctest-merge-027.log` / `.xml`, `final-gate-conv.log`). Excluded (no developer fixture
+  packs here): `expert_cache_segmented_test`, `ple_parity`, `expert_parity`, `pool_test`
+  (also drops `numa_pool_test`), `shared_expert_parity`. The 15 skips are device/arch/rlimit
+  gates, all listed with names in `final-gate-conv.log`.
+- serve pytest + `serve/test_web_history.js`: green on the merged tree in the earlier pass
+  (110 py + 4 js, "suite run 3"). A re-run against the final tip is in flight; logs
+  `pytest-final.log` / `webhistory-final.log` (result appended to MERGE-027.md Round 6 when it
+  lands). The last three commits are C++/CMake only, no `serve/` changes.
+- Prod: the gate stopped and restored it; verified active, authenticated `/v1/models` HTTP
+  200, NRestarts=0. **The merge binary was NOT promoted.**
+
+### Still owed before promotion / open fork-only work
+
+1. **Promotion.** Prod is still the v0.2.6 engine (`md5 21739e622be44f82651855bf62e7053b`)
+   now serving the **Turbo-Brilliance** pack (`model_name turbo-brilliance-iq3_s`, 12 parked
+   slots, kv int8, 262144 ctx, bound to 192.168.1.156:8086). Before promoting a v0.2.7 build,
+   run the 8-depth (5/15/25/35/50/65/80/95) needle gate on it; release baseline is 8/8.
+   `~/promote-integ.sh` + `.bak`/tgz rollback artifacts are the established path.
+2. `STRATA_HYBRID` and `cmake/hybrid.cmake` are unwired at top level. Half-restoring the
+   fork's 4 gates against the merged file's 14 `if(STRATA_ENABLE_HIP)` gates is guesswork and
+   this box has no CUDA toolkit — needs a CUDA+HIP host to configure and test.
+3. DFlash v1 drafter (`src/core/dflash_runtime.cpp`) does not compile against the merged tree:
+   the merge dropped the fork's BF16 opt-in in `NativeHead::load`; same root cause orphans
+   `tests/core/dflash_owned_kv_test.cpp` and `dflash_head_bf16_test.cpp`. Upstream dflash2
+   (`STRATA_HAVE_DFLASH2`) is not a replacement. Probe detail:
+   `~/Strata-ab/merge-repair/job1/report.md`. Docs still tell users to pass the retired
+   `-DSTRATA_ENABLE_DFLASH2` option.
+4. Fork-only partial-prefix suffix reuse and the explicit-length / no-draft snapshot
+   behaviour need a deliberate port to the v0.2.7 conversation/snapshot APIs.
+5. gfx906's specialized INDEXED wave-kernel path is not restored (generic INDEXED MMVQ builds
+   and passes on gfx1201; the gfx906 path is untested here).
+6. Older queues still open: wave 24's parked **#2240** (Remote stage worker, 211 conflicts)
+   and the 0.2.4 follow-ups (Metal `--dflash` side, dead fork dflash sources, the dead
+   `if (has_dflash)` blocks in `generate.cpp`).
