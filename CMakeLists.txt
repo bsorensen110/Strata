@@ -155,6 +155,11 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(session_save_reclaim_test src/core/session_save_reclaim_test.cpp src/core/conversation_file.cpp)
   target_include_directories(session_save_reclaim_test PRIVATE include)
   add_test(NAME session_save_reclaim_test COMMAND session_save_reclaim_test)
+  # RAM pressure on the parked conversations (conversation_pressure.hpp): fake readings, and a real release
+  add_executable(conversation_pressure_test src/core/conversation_pressure_test.cpp)
+  target_include_directories(conversation_pressure_test PRIVATE include)
+  add_test(NAME conversation_pressure_test COMMAND conversation_pressure_test)
+
 endif()
 
 if(STRATA_HIP_GFX906)
@@ -301,6 +306,10 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  add_executable(nv_defaults_test src/core/nv_defaults_test.cpp src/core/nv_defaults.cpp)
+  target_include_directories(nv_defaults_test PRIVATE include)
+  add_test(NAME nv_defaults_test COMMAND nv_defaults_test)
+
   add_executable(batch_telemetry_test src/core/batch_telemetry_test.cpp)
   target_include_directories(batch_telemetry_test PRIVATE include)
   add_test(NAME batch_telemetry_test COMMAND batch_telemetry_test)
@@ -311,6 +320,16 @@ if(STRATA_BUILD_TESTS)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
   add_test(NAME gguf_reader_test COMMAND gguf_reader_test)
+  # Exercise the CLI's return codes on synthetic GGUFs, including wrapped offsets and tensor sizes.
+  add_executable(gguf_cli_test tests/core/gguf_cli_test.cpp)
+  target_link_libraries(gguf_cli_test PRIVATE strata_artifact)
+  add_test(NAME gguf_cli_test COMMAND gguf_cli_test)
+    add_executable(kv_chunks_test tests/core/kv_chunks_test.cpp src/core/kv_chunks.cpp)
+    target_include_directories(kv_chunks_test PRIVATE include)
+    add_test(NAME kv_chunks_test COMMAND kv_chunks_test)
+    set_tests_properties(kv_chunks_test PROPERTIES TIMEOUT 60)
+
+
   # a split model's shards and their joint view: missing shard, split keys, duplicates, truncation (synthetic)
   add_executable(gguf_split_test tests/core/gguf_split_test.cpp)
   target_link_libraries(gguf_split_test PRIVATE strata_artifact)
@@ -323,6 +342,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(batch_read_test tests/program/batch_read_test.cpp)
   target_include_directories(batch_read_test PRIVATE include)
   add_test(NAME batch_read_test COMMAND batch_read_test)
+  add_executable(resident_decode_prefetch_test tests/core/resident_decode_prefetch_test.cpp)
+  target_include_directories(resident_decode_prefetch_test PRIVATE include)
+  add_test(NAME resident_decode_prefetch_test COMMAND resident_decode_prefetch_test)
+
   # the model's geometry from its metadata, and the check against the kernels' compiled shape (synthetic)
   add_executable(gguf_geometry_test tests/core/gguf_geometry_test.cpp)
   target_link_libraries(gguf_geometry_test PRIVATE strata_artifact)
@@ -469,6 +492,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/qsa_pattn.cu
                           src/kernels/cuda/verify_kernels.cu
                           src/kernels/cuda/dflash2.cu
+                          src/kernels/cuda/lora.cu
                           src/kernels/cuda/iq_kernels.cu
                           src/kernels/ngram.cpp
                           src/ngram/ple_reader.cpp
@@ -485,6 +509,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(qsa_scores_gfx1100_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(qsa_scores_gfx1100_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     enable_testing()
+    add_executable(vram_plan_test tests/core/vram_plan_test.cpp src/prefill/vram_plan.cpp)
+    target_include_directories(vram_plan_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    add_test(NAME vram_plan_test COMMAND vram_plan_test)
+    set_tests_properties(vram_plan_test PROPERTIES TIMEOUT 60)
+
     add_test(NAME qsa_scores_gfx1100_parity COMMAND qsa_scores_gfx1100_parity --full)
     set_tests_properties(qsa_scores_gfx1100_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180
       ENVIRONMENT "STRATA_SCORES_THREAD=1;STRATA_SCORES_THREAD_TRACE=1")
@@ -534,6 +563,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
     set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_executable(qsa_topk_active_parity src/kernels/qsa_topk_active_parity.cpp)
+    target_include_directories(qsa_topk_active_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
+    set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
     # STRATA_QSA_SLOTS: a batch window's scores, top-k and attention as one launch over rows of different slots
     # against one call per row, bitwise (synthetic, no model)
     add_executable(qsa_slots_parity src/kernels/qsa_slots_parity.cpp)
@@ -543,6 +578,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME qsa_slots_parity_lanecell COMMAND qsa_slots_parity)
     set_tests_properties(qsa_slots_parity qsa_slots_parity_lanecell PROPERTIES SKIP_RETURN_CODE 77)
     set_tests_properties(qsa_slots_parity_lanecell PROPERTIES ENVIRONMENT "STRATA_ATTN_LANECELL=1")
+    # the prompt path's block scores on the thread-per-head kernel (Turing) against the warp kernel, bitwise
+    add_executable(qsa_scores_parity src/kernels/qsa_scores_parity.cpp)
+    target_include_directories(qsa_scores_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+    target_link_libraries(qsa_scores_parity PRIVATE strata_kernels CUDA::cudart)
+    add_test(NAME qsa_scores_parity COMMAND qsa_scores_parity)
+    set_tests_properties(qsa_scores_parity PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "STRATA_SCORES_THREAD=1")
+
     # fork: the Daily's decode attention (STRATA_ATTN_DAILY=1: PR #540's chunk kernel on every card and the bounded
     # merge) against upstream's kernels, bitwise; the production entries checked with the variable off and on
     add_executable(qsa_merge_daily_parity src/kernels/qsa_merge_daily_parity.cpp)
@@ -753,10 +795,80 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(expert_cache_slot_guard_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   endif()
   if(STRATA_BUILD_CONVERSATION_TESTS)
+    add_executable(suffix_reuse_test src/program/suffix_reuse_test.cpp)
+    target_include_directories(suffix_reuse_test PRIVATE include)
+    add_test(NAME suffix_reuse_test COMMAND suffix_reuse_test)
+    # A2.3: flag-off parity is a ctest, not a grep.  CPU-only; gate on the same flag as
+    # suffix_reuse_test so it can opt in alongside the conversation tests.
+    add_executable(suffix_reuse_off_parity_test src/program/suffix_reuse_off_parity_test.cpp)
+    target_include_directories(suffix_reuse_off_parity_test PRIVATE include)
+    add_test(NAME suffix_reuse_off_parity_test COMMAND suffix_reuse_off_parity_test)
+
+    # Phase 2 Task 3 T6: the splice-wiring test (synthesises QsaState, hand-crafts K rows,
+    # runs rotate_qsa_tail_inplace, asserts K matches fresh rotation to 1e-6 + V byte-identical
+    # + SPLICE_UNSUPPORTED guard fires for unsupported configs).
+    add_executable(suffix_reuse_apply_test src/program/suffix_reuse_apply_test.cpp)
+    target_include_directories(suffix_reuse_apply_test PRIVATE include)
+    add_executable(suffix_reuse_dense_tail_test src/program/suffix_reuse_dense_tail_test.cpp)
+    target_include_directories(suffix_reuse_dense_tail_test PRIVATE include)
+    add_test(NAME suffix_reuse_dense_tail_test COMMAND suffix_reuse_dense_tail_test)
+    add_test(NAME suffix_reuse_apply_test COMMAND suffix_reuse_apply_test)
+
+    # Phase 2 hotfix T7: the device-path regression for the 2026-10-12 SIGSEGV.  Pins the
+    # LIVE failing inputs (edit_pos=3239, old_suffix_len=1, uniform delta=+54) plus the
+    # non-uniform path and the null-deltas guard, all on a PROT_NONE "device" region
+    # (PROT_NONE faults on any host deref, exactly as a discrete-GPU address would).
+    # CPU-only: the test supplies a fake-cuda API in its own TU; no <cuda_runtime.h>.
+    # RED->GREEN: removing the transport from kv_splice_transport.hpp makes this SEGV.
+    add_executable(suffix_reuse_device_test src/program/suffix_reuse_device_test.cpp)
+    target_include_directories(suffix_reuse_device_test PRIVATE include)
+    target_compile_definitions(suffix_reuse_device_test PRIVATE
+      STRATA_SPLICE_TRANSPORT=1 STRATA_SPLICE_FAKE_CUDA=1)
+    add_test(NAME suffix_reuse_device_test COMMAND suffix_reuse_device_test)
+
+    # Phase 3 T11: the INT8 KV splice (dequant -> rotate -> requant).  Exercises
+    # kv_splice_apply_int8.hpp + kv_q8_quant.hpp on a synthesised int8 QsaState;
+    # mirrors the writer's quant math (src/kernels/cuda/kv_q8.cu:47-67) so a
+    # requant(dequant(block)) is BIT-IDENTICAL and the rotated cell is bounded by
+    # the writer's per-group half-step.  Header-only / CPU.
+    add_executable(suffix_reuse_int8_test src/program/suffix_reuse_int8_test.cpp)
+    target_include_directories(suffix_reuse_int8_test PRIVATE include)
+    add_test(NAME suffix_reuse_int8_test COMMAND suffix_reuse_int8_test)
+
+    # Phase 3a T9+T10: continuation-mount parity (the 0% vs 98% off-arm regression - the
+    # splice hook's suffix walk mis-IDs a pure continuation as a 1-token edit and destroys
+    # the mount) + anchor-splice engagement (the splice's K rotation is wasted because the
+    # chunk loop re-reads [anchor, n) instead of [edit, n) - the gap-read is the splice's
+    # saved work).  CPU-only header test on the pure helpers in suffix_reuse.hpp.
+    add_executable(suffix_reuse_continuation_and_anchor_test src/program/suffix_reuse_continuation_and_anchor_test.cpp)
+    target_include_directories(suffix_reuse_continuation_and_anchor_test PRIVATE include)
+    add_test(NAME suffix_reuse_continuation_and_anchor_test COMMAND suffix_reuse_continuation_and_anchor_test)
+
+    # Phase 3b T12-T15: the partial-prefix mount (flag-gated longest-LCP fallback when the strict
+    # mount fails).  Exercises `ConversationCache::best_with_partial` and the pure
+    # `suffix_reuse_partial_apply` helper in suffix_reuse.hpp.  Header-only / CPU - no CUDA.
+    add_executable(suffix_reuse_partial_prefix_test src/program/suffix_reuse_partial_prefix_test.cpp)
+    target_include_directories(suffix_reuse_partial_prefix_test PRIVATE include)
+    add_test(NAME suffix_reuse_partial_prefix_test COMMAND suffix_reuse_partial_prefix_test)
+
+    add_executable(suffix_reuse_dense_tail_test src/program/suffix_reuse_dense_tail_test.cpp)
+    target_include_directories(suffix_reuse_dense_tail_test PRIVATE include)
+    add_test(NAME suffix_reuse_dense_tail_test COMMAND suffix_reuse_dense_tail_test)
+
+    add_executable(suffix_reuse_resume_narrowing_test src/program/suffix_reuse_resume_narrowing_test.cpp)
+    target_include_directories(suffix_reuse_resume_narrowing_test PRIVATE include)
+    add_test(NAME suffix_reuse_resume_narrowing_test COMMAND suffix_reuse_resume_narrowing_test)
+
+
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
     target_link_libraries(conversation_snapshot_test PRIVATE strata_engine)
     add_test(NAME conversation_snapshot_test COMMAND conversation_snapshot_test)
     set_tests_properties(conversation_snapshot_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    add_executable(rope_cache_migration_test src/core/rope_cache_migration_test.cpp)
+    target_link_libraries(rope_cache_migration_test PRIVATE strata_engine)
+    add_test(NAME rope_cache_migration_test COMMAND rope_cache_migration_test)
+    set_tests_properties(rope_cache_migration_test PROPERTIES ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1" TIMEOUT 120)
+
     # the same test with a GDN state over 1 MiB and the opt-in background checkpoint copy (STRATA_CKPT_ASYNC=1), alone and with
     # recent states kept in VRAM (STRATA_CKPT_VRAM_SLOTS): every checkpoint, capture and restore must give the same bytes
     add_test(NAME conversation_snapshot_test_ckpt_async COMMAND conversation_snapshot_test)
@@ -1614,6 +1726,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(cvec_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(cvec_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME cvec_parity COMMAND cvec_parity)
+  # the LoRA adapter's kernels vs double precision, the request switch through a captured graph (GPU, synthetic)
+  add_executable(lora_parity src/kernels/lora_parity.cpp)
+  target_include_directories(lora_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(lora_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME lora_parity COMMAND lora_parity)
+
 
   # The rewritten per-hit and grouped expert kernels vs the previous ones, bitwise (GPU, synthetic, no model).
   # `--bench` adds previous/new timings on engine-like shapes.
@@ -1743,6 +1861,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(uma_cache_test src/core/uma_cache_test.cpp)
   target_include_directories(uma_cache_test PRIVATE include)
   add_test(NAME uma_cache_test COMMAND uma_cache_test)
+  add_executable(grid_pad_test src/kernels/grid_pad_test.cpp)
+  target_include_directories(grid_pad_test PRIVATE include)
+  add_test(NAME grid_pad_test COMMAND grid_pad_test)
+
   add_executable(suffix_drafter_test src/spec/suffix_drafter_test.cpp)
   target_link_libraries(suffix_drafter_test PRIVATE strata_spec)
   add_test(NAME suffix_drafter_test COMMAND suffix_drafter_test)
@@ -1760,6 +1882,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(message_boundary_test src/program/message_boundary_test.cpp)
   target_include_directories(message_boundary_test PRIVATE include)
   add_test(NAME message_boundary_test COMMAND message_boundary_test)
+  add_executable(slot_checkpoints_test src/program/slot_checkpoints_test.cpp)
+  target_include_directories(slot_checkpoints_test PRIVATE include)
+  add_test(NAME slot_checkpoints_test COMMAND slot_checkpoints_test)
+
   # a layer split's ring override and the lend slots sized with it: the RAM copy must keep every borrowed slot (CPU)
   add_executable(split_ring_test src/program/split_ring_test.cpp)
   target_include_directories(split_ring_test PRIVATE include)
@@ -1780,6 +1906,20 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(draft_kv_plan_test src/program/draft_kv_plan_test.cpp)
   target_include_directories(draft_kv_plan_test PRIVATE include)
   add_test(NAME draft_kv_plan_test COMMAND draft_kv_plan_test)
+  # remote stage: the worker's store of conversation checkpoint parts (header-only, CPU) and the link over loopback
+  add_executable(stage_ckpt_store_test src/net/stage_ckpt_store_test.cpp)
+  target_include_directories(stage_ckpt_store_test PRIVATE include)
+  add_test(NAME stage_ckpt_store_test COMMAND stage_ckpt_store_test)
+  add_executable(stage_link_test src/net/stage_link_test.cpp src/net/stage_link.cpp)
+  target_include_directories(stage_link_test PRIVATE include)
+  target_link_libraries(stage_link_test PRIVATE Threads::Threads)
+  if(WIN32)
+    target_link_libraries(stage_link_test PRIVATE ws2_32)
+  endif()
+  add_test(NAME stage_link_test COMMAND stage_link_test)
+  set_tests_properties(stage_link_test PROPERTIES TIMEOUT 180)
+
+
   # coupled draft sampling's counter and penalty-ring arithmetic (header-only, CPU)
   add_executable(coupled_draft_test src/core/coupled_draft_test.cpp)
   target_include_directories(coupled_draft_test PRIVATE include)
@@ -1807,6 +1947,12 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(bf16_bits_test src/kernels/bf16_bits_test.cpp)
   target_include_directories(bf16_bits_test PRIVATE include)
   add_test(NAME bf16_bits_test COMMAND bf16_bits_test)
+  if(STRATA_ENABLE_CUDA)   # verify.hpp pulls cuda_runtime.h and verify.cpp pulls the kernels: CUDA builds only
+    add_executable(verify_brow_test src/core/verify_brow_test.cpp)
+    target_link_libraries(verify_brow_test PRIVATE strata_engine)
+    add_test(NAME verify_brow_test COMMAND verify_brow_test)
+  endif()
+
   # the batch window's row layout (a slot's group of proposed rows, the layer split's hand-off capacity; header-only, CPU)
   add_executable(batch_rows_test tests/core/batch_rows_test.cpp)
   target_include_directories(batch_rows_test PRIVATE include)
@@ -1815,6 +1961,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(batch_groups_test src/program/batch_groups_test.cpp)
   target_include_directories(batch_groups_test PRIVATE include)
   add_test(NAME batch_groups_test COMMAND batch_groups_test)
+  add_executable(pipeline_rows_test tests/core/pipeline_rows_test.cpp)
+  target_include_directories(pipeline_rows_test PRIVATE include)
+  add_test(NAME pipeline_rows_test COMMAND pipeline_rows_test)
+
 endif()
 
 if(STRATA_CPU_X86)
