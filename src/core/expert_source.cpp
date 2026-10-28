@@ -4633,6 +4633,29 @@ void FileExpertSource::release_reserved_arena() {
     arena_preclaim_node_ = -1;
 }
 
+
+
+const FileExpertSource::ComplementSlice* FileExpertSource::complement_slice(uint64_t offset, uint64_t bytes) const {
+    auto it = std::upper_bound(complement_slices_.begin(), complement_slices_.end(), offset,
+                               [](uint64_t v, const ComplementSlice& s) { return v < s.start; });
+    if (it == complement_slices_.begin()) return nullptr;
+    --it;
+    return offset < it->end && bytes <= it->end - offset ? &*it : nullptr;
+}
+
+#if defined(STRATA_HYBRID)
+const uint8_t* FileExpertSource::apu_blob(int hip_index, int64_t layer, int64_t expert) const {
+    if (hip_index < 0 || hip_index >= kHybridHip) return nullptr;
+    const uint8_t* base = complement_apu_[hip_index];
+    if (base == nullptr || !pinned(layer, expert)) return nullptr;
+    const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    // An exchange lives outside the mapped pin. The CPU keeps that row.
+    if (exchange_storage_.active()) return nullptr;
+    if (!soft_in_.empty() && soft_in_[index] != SIZE_MAX) return nullptr;
+    return base + (size_t) complement_offsets_[index];
+}
+#endif  // STRATA_HYBRID
+
 const uint8_t* FileExpertSource::resident_blob(size_t index) const {
     if (exchange_storage_.active()) return exchange_storage_.resident(index).host;
     return detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
@@ -6584,6 +6607,23 @@ bool ArenaExpertSource::pcie_layer(int64_t layer) const {
     return layer >= 0 && (size_t) layer < layer_pcie_.size() && layer_pcie_[(size_t) layer] != 0;
 }
 
+// arena-skip: see header.  The tail block is one large-page allocation, so MEM_RELEASE frees all of it (a partial
+// free of a large-page region is not supported by Windows, which is the whole reason the tail is its own block).
+uint64_t ArenaExpertSource::release_tail() {
+    if (arena1_ == nullptr) return 0;
+    PinnedArena* b = (PinnedArena*) arena1_;
+    const uint64_t bytes = (uint64_t) b->capacity;
+    delete b;                 // PinnedArena's destructor: VirtualFree(MEM_RELEASE) / munmap
+    arena1_ = nullptr;
+    base1_ = nullptr;
+    return bytes;
+}
+
+bool ArenaExpertSource::host_copy(int64_t layer, int64_t expert) const {
+    if (map_ != nullptr || base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
+    const int64_t idx = layer * n_expert_ + expert;
+    return idx >= 0 && idx < blobs_;
+}
 bool ArenaExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (base_ == nullptr || layer < 0 || expert < 0 || expert >= n_expert_) return false;
     const auto& lay = strata::kernels::cpu::expert_layout();
