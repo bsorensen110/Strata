@@ -2,7 +2,10 @@
 #include "strata/core/session_save_reclaim.hpp"
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <new>
+#include <string>
+#include <vector>
 
 static bool deny_alloc = false;
 void* operator new(std::size_t n) {
@@ -110,6 +113,26 @@ int main() {
         ConversationCache cache(0, 0);
         auto r = session_save_reclaim(chain, cache, live, floor, [] { return std::optional<uint64_t>(0); });
         check(!r.bytes && !r.checkpoints && !r.parked, "empty chain and disabled cache");
+    }
+    {   // disk mode (1aa35f01): a parked entry is a slim index plus its file, and RAM reclaim frees neither - it leaves
+        // the entry and its file alone; the RAM-mode control of the same pressure evicts the entry
+        const std::string probe = (std::filesystem::temp_directory_path() / "srr_disk_probe.sess").string();
+        if (std::FILE* f = std::fopen(probe.c_str(), "w")) { std::fputs("x", f); std::fclose(f); }
+        ConversationCache disk(1u << 20, 10);
+        disk.enable_disk();
+        SavedConversation d; d.live = checkpoint(10); d.live.gdn.clear(); d.live.ids[0] = 10;
+        check(disk.put_disk(std::move(d), probe, 1000), "disk fixture parked");
+        std::vector<ConversationCheckpoint> chain{checkpoint(100), checkpoint(300)};
+        auto r = session_save_reclaim(chain, disk, live, floor, [] { return std::optional<uint64_t>(0); });
+        check(r.parked == 0 && disk.size() == 1 && std::filesystem::exists(probe),
+              "disk-mode entry and its file survive RAM reclaim");
+        std::filesystem::remove(probe);
+        ConversationCache ram(1u << 20, 10);
+        SavedConversation e; e.live = checkpoint(10); e.live.gdn.clear(); e.live.ids[0] = 10;
+        check(ram.put(std::move(e)), "RAM control parked");
+        std::vector<ConversationCheckpoint> chain2{checkpoint(100), checkpoint(300)};
+        auto r2 = session_save_reclaim(chain2, ram, live, floor, [] { return std::optional<uint64_t>(0); });
+        check(r2.parked == 1 && ram.size() == 0, "RAM control: the same pressure evicts the parked entry");
     }
     std::printf("session_save_reclaim: %d checks passed\n", checks_run);
 }
