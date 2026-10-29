@@ -507,3 +507,8 @@ branch as `4c9980cb`**, 2026-10-28):
 - Removed worktrees `Strata-port-kv` and `Strata-port-disk`, and branches `port/kv-pool-tokens` and `port/disk-cache`. The six pre-squash `port/disk-cache` commits are represented in HEAD.
 - Deleted gpu-window scratch: four candidate configs holding the API key, `restore_prod.sh` (old chained restart), scratch session files.
 - Pruned 10 engine binaries dated 2026-10-20 to 10-24 (~245 MB) from `~/Strata/engine`.
+
+### Web page stuck on "Connecting…" (2026-10-29, fixed)
+- Cause: `serve/web/app.js` assigns handlers to the web-search drawer controls at startup (`$("s-ws-readmax").oninput = ...`). `index.html` had lost those controls (input, reader select, Jina note, page-limit switch, characters input) in the re-apply of the web-search slice (`a46b6a97`): the label and the JS arrived, the inputs did not. `$()` returned null, startup threw before the first metrics poll, and the header pill stayed on "Connecting…".
+- Fix: the markup was restored from the pre-promotion prod `index.html` (same ids). Regression test `serve/test_web_element_ids.py` fails on the broken page (10 ids named) and passes on the fixed one. Run: `python3 serve/test_web_element_ids.py`.
+- Verified in a browser on prod: no JS errors. Without a key the pill reads "API key needed" (prod requires a key; enter it under About > Settings). With a key: Idle, and a chat message returned 200 with the expected reply.
