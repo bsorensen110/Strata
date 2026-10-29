@@ -55,6 +55,10 @@ bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, i
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error);
+// The same with `draft == nullptr`: a session without --mtp, whose files hold the QSA layers' K/V only.
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
+                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      std::string& error);
 
 struct ConversationStateSizes {
     size_t gdn = 0, ple = 0, tail = 0, dead = 0, block_pos = 0;
@@ -139,6 +143,10 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+// The same with `draft == nullptr`: no draft layer's source (a session without --mtp).
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 /// #2409: true when a restore (or a copy) on CUDA device `device` from the calling thread creates no copy stream: this
