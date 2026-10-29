@@ -461,3 +461,49 @@ branch as `4c9980cb`**, 2026-10-28):
    to decode shapes (M=2..8 rows per weight read) — rounding-changing (int8 activations), so opt-in gate.
 5. Drafter-cost cuts that are parity-safe under greedy acceptance: pruned draft vocab (`native_mmvq_indexed`
    already exists), sink+window bounded draft attention, draft-expert truncation.
+
+## Promotion 0.1.52 to production, cache limits, RAM read, DFlash2 state (2026-10-29)
+
+### What is live
+- Engine: `strata 0.1.52`, md5 `203258b8…`, built clean in `build-verify` from integ `dd84b2a5` (+ this docs commit). Options copied from `build-hip`, the tree the GPU CTest gate ran on: `STRATA_PREFILL_MMQ=ON`, `gfx1201;gfx1200`, tests ON. 0 build errors. Host subset 8/8 (`fork_runtime_options`, `conversation_*`, `kv_chunks_test`).
+- Promotion: `~/promote-integ.sh`. 5K needle gate 8/8, smoke ok, config diff none. Record: `~/Strata-ab/promotion-20261029-001958.json`.
+- Rollback set: `~/Strata/engine/strata.pre-promote-20261029-001958.bak` (0.1.51), `~/Strata/strata-swift-iq3_s.json.pre-promote-20261029-001958.bak`, `~/Strata-backup-python-20261029-001958.tgz`. Note: the rollback restores binary and Python layer, not config. The new args are accepted by 0.1.51 (checked with `--help`).
+- Python layer synced from integ (`serve`, `strata_control`, `strata_cli`, `tools`, `chat.py`). Prod's web UI is now integ's version. Prod-only `serve/test_chat_sidebar.{py,js}` remain. The chat UI itself is not browser-tested; `/` returns 200.
+- Restore after restart, prod: A (464-token transcript) parked to disk; `systemctl --user restart`; take-back of 464 tokens in 104 ms; 415 of 453 prompt tokens reused; `PELICAN-42` returned. Script: `~/.hermes/cache/scratch/gpu-window/prod_restart_test.py`.
+- No like-for-like throughput benchmark against 0.1.51 was run. The promotion gate was needle plus smoke.
+
+### Cache files from 0.1.51 were removed at first start, by design
+- `session identity = model + config fingerprint`, and the config fingerprint includes `STRATA_VERSION` (`c.engine_version`). A version bump makes every 0.1.51 file "foreign"; `conversation_cache_index` deletes foreign files at startup. The log says `0 conversation(s) kept from earlier runs`.
+- Backup: `/home/soren/Strata-data/conv-cache-backup-0.1.51-20261029` (8 files, 8,650,109,916 bytes, including 3.1 GB and 3.3 GB conversations). Usable only by 0.1.51.
+
+### Prod cache settings (config changed 2026-10-29)
+- `--conversation-cache-min-tokens 256` (was unset = 0). Basis, from logs: park 97-127 ms per file; take-back 104-280 ms warm and about 1.0 s cold right after restart; prefill 80-125 tok/s warm. Recompute at 256 tokens costs about 2-3 s, so 256 keeps short side requests off disk. Each park writes 240 MB or more. Not an A/B.
+- `--conversation-cache-slots 12` to `2147483647` (count cap removed).
+- `--conversation-cache-disk-mib 402429` to `1073741824` (1 PiB; size cap removed).
+- `--conversation-cache-days 7` now explicit (default 7; the only eviction left).
+- Guards that remain: `--session-min-free-mib` default 4096 (parks keep at least 8 GiB free on the cache disk); `--conversation-cache-min-free-mib` default 2560 (RAM floor).
+- Park size fit from logs: bytes ~= 236 MB + 15.3 KB x tokens (4,421 tokens = 303.7 MB; 464 = 243.2 MB). A 200K-token conversation is ~3.3 GB.
+- Prod config file mode is now 600 (it holds the API key). Pre-change backup: `strata-swift-iq3_s.json.pre-limits-20261029.bak`.
+
+### Why the restore reads the conversation into RAM (open, not fixed)
+- The disk take-back calls `session_file_read` (`src/program/generate.cpp` ~14733). The whole session file, K/V included, is parsed into host RAM before upload. Parks also build the whole image in host RAM first; `SavedConversation` holds the K/V vectors.
+- The streamed two-pass reader is in `src/core/conversation_file.cpp` (`session_file_read_streamed`, `session_file_apply_streamed_df2`, `SessionKvBlock` in `conversation_file.hpp`). Nothing calls it. It is upstream `d438ca51`, fork `69fb7912` (8 files, +561/-50). The `generate.cpp` glue must refill each layer's KV residency (`kv_stream_reset` / `kv_ring_restore`) under `--kv-resident`.
+- Upstream measured a 3.05 GiB restore in 3.4-3.5 s, with the next turn 99.99% reused.
+- Effect today: the 2.5 GiB RAM floor refuses restores and parks that do not fit. Under prod's load (MemAvailable about 5.6 GB while running), conversations above about 3 GB (about 200K tokens) cannot be restored and recompute instead. Not tested at that size.
+- Plan: wire streamed apply into the take-back and RESTORE paths, streamed write into park. Verify on GPU: bit-exact versus whole-file restore with `--kv-resident` and `--kv-pool-tokens`, then a multi-GB conversation.
+
+### DFlash2 drafter context persistence: state
+- Already in HEAD: `Dflash2Drafter::save_state/restore_state` (`src/core/dflash2.cpp`), payload v4 tail (`kVersionDf2`, `conversation_file.cpp`), park hook (`generate.cpp` ~11006), restore hook (~15106).
+- Not verified on GPU in this tree. `dflash2_state_test` is `EXCLUDE_FROM_ALL` and not in CTest. Prod does not enable DFlash2.
+- Before enabling: build and run `dflash2_state_test`; run a GPU park/restore round trip with DFlash2 on; check whether the superseded-leak fix from `8b14892c` is present (not compared line by line).
+
+### Still open
+- `--kv-pool-tokens` with a layer split: the refusal was removed in the port and the path is untested. Prod is single-GPU, so it does not affect prod.
+- CTest: `ple_parity`, `expert_parity`, `pool_test` fail on missing local fixture files. Not yet confirmed against the pre-port tree.
+- `dflash_head_bf16_test` and `dflash_owned_kv_test` are not registered. `suffix_reuse_partial_prefix_test` does not compile (pre-existing).
+- `~/.hermes/cache/scratch/strata-test-4972d47c` worktree has uncommitted changes; left alone.
+
+### Housekeeping done (2026-10-29)
+- Removed worktrees `Strata-port-kv` and `Strata-port-disk`, and branches `port/kv-pool-tokens` and `port/disk-cache`. The six pre-squash `port/disk-cache` commits are represented in HEAD.
+- Deleted gpu-window scratch: four candidate configs holding the API key, `restore_prod.sh` (old chained restart), scratch session files.
+- Pruned 10 engine binaries dated 2026-10-20 to 10-24 (~245 MB) from `~/Strata/engine`.
