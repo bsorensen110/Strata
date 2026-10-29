@@ -3387,6 +3387,19 @@ int main(int argc, char** argv) {
         }
         }
     }
+    // --kv-pool-tokens: checked right after the arguments, before any device is probed or the tokens are required
+    // (the same messages and order of tests as the fork: the value first, then the streaming and the context)
+    if (o.kv_pool_tokens != 0) {
+        const char* bad = o.kv_pool_tokens < 0 ? "must be >= 0"
+                        : o.kv_resident <= 0 || o.max_context <= std::max(o.kv_resident, strata::core::qsa_kv_resident_min())
+                            ? "needs --kv-resident streaming (a context longer than the resident cells)"
+                        : o.kv_pool_tokens < o.max_context ? "must hold one whole context (--max-context)" : nullptr;
+        if (bad != nullptr) {
+            std::fprintf(stderr, "strata generate: --kv-pool-tokens %s\n", bad);
+            return 2;
+        }
+        strata::core::qsa_set_kv_shared_host(true);
+    }
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
@@ -3796,17 +3809,6 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
-    if (o.kv_pool_tokens != 0) {
-        const char* bad = o.kv_pool_tokens < 0 ? "must be >= 0"
-                        : o.kv_resident <= 0 || o.max_context <= std::max(o.kv_resident, strata::core::qsa_kv_resident_min())
-                            ? "needs --kv-resident streaming (a context longer than the resident cells)"
-                        : o.kv_pool_tokens < o.max_context ? "must hold one whole context (--max-context)" : nullptr;
-        if (bad != nullptr) {
-            std::fprintf(stderr, "strata generate: --kv-pool-tokens %s\n", bad);
-            return 2;
-        }
-        strata::core::qsa_set_kv_shared_host(true);
-    }
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
