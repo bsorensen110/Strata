@@ -1,0 +1,27 @@
+loading the model (the first start takes a minute or two) ...
+[strata] starting the engine: reading the model's weights ...
+Traceback (most recent call last):
+  File "<frozen runpy>", line 203, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/soren/Strata/serve/server.py", line 11225, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/home/soren/Strata/serve/server.py", line 10841, in main
+    engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                          env=env, lazy=lazy)
+  File "/home/soren/Strata/serve/server.py", line 1365, in __init__
+    raise EngineDied(why + (f" (see {log})" if log else "") + note +
+                     start_failure_hint(log, log_start) + tail)
+EngineDied: the engine exited before it was ready (see /home/soren/Strata-ab/il-decode-ab-20261028/engine-K1.log)
+the engine process ended: exit code 1
+the engine log's last lines:
+  [strata] 2026-10-28 20:02:57 engine started: /home/soren/Strata-integ/build-hip/strata --serve --pack /home/soren/Strata-data/packs/turbo-brilliance --native /home/soren/LocalAI/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf --ple-gguf /home/soren/LocalAI/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf --expert-profile /home/soren/Strata/data/expert-profile-turbo.bin --expert-cache auto --expert-cache-per-layer --prefill auto --spec 8 --spec-min-p 0.5 --max-context 262144 --kv int8 --adapt-async 1 --conversation-cache-mib 0 --mtp /home/soren/Strata-data/mtp/turbo-brilliance/rt --kv-resident 32768 --mtp-q4 all --mtp-max-t 5 --expert-profile-save /home/soren/Strata/data/expert-profile-turbo.bin --conversation-cache-slots 12 --batch-mtp --mmap-experts --batch 4
+  strata generate: opened 2 GPU queues in a fixed order (STRATA_HIP_QUEUE_PRIME=0 turns it off)
+  strata: gfx12 (RDNA4): 5 exact speed switches on by default (STRATA_GFX12_DEFAULTS=0 turns them off; a switch you set is kept): GDN_HEAD GDN_PP GDN_CONVL2 GDN_NOY CVEC_FUSE
+  strata generate: gfx12: --prefill auto may take chunks up to 16384 (STRATA_GFX12_CHUNK=0 keeps 8192)
+  strata generate: memory guard: limit 62.4 GiB (source: meminfo), current 24.1 GiB, reclaimable cache credited 0.0 GiB; available 38.3 GiB (MemAvailable 38.3 GiB), floor 2560 MiB
+  strata generate: PCIe probe: 55.6 GB/s host->device (best of 53.8 55.6 55.2 55.2) -> pcie_frac 0.15 (default 0.15)
+  strata generate: native pack: /home/soren/Strata-data/packs/turbo-brilliance experts (largest blob 2.66 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.2 s)
+  strata: gfx12 (RDNA4): the hyper-connection projections are read as Q8_0 (quantized at load, decode faster, answers differ slightly); STRATA_HC_Q8=0 keeps the bf16 read
+  strata generate: 266 MiB of weights loaded from /home/soren/Strata-data/packs/turbo-brilliance in 1.2 s (494 canonical tensors skipped: served natively)
+  strata generate: native dense projections: native dense upload blk.7.attn_q.weight: out of memory
