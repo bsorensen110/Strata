@@ -957,6 +957,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_options(strata PRIVATE "LINKER:/DELAYLOAD:hipblas.dll" "LINKER:/DELAYLOAD:libhipblaslt.dll" "LINKER:/DELAYLOAD:rocblas.dll")
   endif()
 
+  # Fork-only runtime options that the production config passes (--kv-pool-tokens, --conversation-cache-disk-mib,
+  # --conversation-cache-dir): the engine must accept them and reject bad values. Acceptance script:
+  # tests/runtime_options_test.cmake. It runs the built binary's argument parser, not a GPU workload.
+  if(STRATA_BUILD_TESTS)
+    add_test(NAME fork_runtime_options
+      COMMAND ${CMAKE_COMMAND} -DSTRATA_BIN=$<TARGET_FILE:strata>
+              -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_options_test.cmake)
+  endif()
+
   # NEW-MODELS-PLAN.md T1: Qwen3.6-35B-A3B's reference path (one GPU, the model resident, plain kernels), checked
   # against llama.cpp by tools/qwen35/; the engine itself does not run the family yet
   add_executable(strata-q36ref src/qwen35/q36ref.cu)
