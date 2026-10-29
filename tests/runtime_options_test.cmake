@@ -40,4 +40,6 @@ expect_rejected_value("negative shared KV pool size" "--kv-pool-tokens must be >
 expect_accepted("disk conversation-cache budget" --conversation-cache-disk-mib 402429)
 expect_rejected_value("negative disk conversation-cache budget" "--conversation-cache-disk-mib needs a nonnegative integer" --conversation-cache-disk-mib -1)
 expect_accepted("disk conversation-cache directory" --conversation-cache-dir /tmp/strata-cache-test)
+expect_accepted("disk conversation-cache retention" --conversation-cache-days 7)
+expect_rejected_value("negative disk conversation-cache retention" "--conversation-cache-days needs a nonnegative integer" --conversation-cache-days -1)
 message(STATUS "fork runtime option regression tests passed")

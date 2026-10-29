@@ -958,7 +958,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   endif()
 
   # Fork-only runtime options that the production config passes (--kv-pool-tokens, --conversation-cache-disk-mib,
-  # --conversation-cache-dir): the engine must accept them and reject bad values. Acceptance script:
+  # --conversation-cache-dir, --conversation-cache-days): the engine must accept them and reject bad values. Acceptance script:
   # tests/runtime_options_test.cmake. It runs the built binary's argument parser, not a GPU workload.
   if(STRATA_BUILD_TESTS)
     add_test(NAME fork_runtime_options
