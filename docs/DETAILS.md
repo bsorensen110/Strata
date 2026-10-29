@@ -700,6 +700,9 @@ system prompt with a billing header that changes on every request; the server pi
 | `--conversation-cache-min-tokens N` | Park only conversations of at least N tokens, so short side requests do not evict a long conversation. Default `0` (park all). |
 | `--conversation-cache-park-gain N` (opt-in) | Park a conversation again only after it advanced N tokens past the copy it would replace. |
 | `--conversation-cache-min-free-mib N` | RAM floor, default 2560. Parking and session files are skipped when less than the snapshot plus the floor is available. |
+| `--conversation-cache-disk-mib N` (opt-in) | Park switched-away conversations in session files on disk instead of host RAM. N MiB is the budget across the files, and `--conversation-cache-mib` is ignored while it is on. Needs `--prompt-cache`; refused with `--layer-split` or more than one GPU. See below. |
+| `--conversation-cache-dir DIR` | The folder for the disk cache's session files. Default: `conversation_cache` next to the pack. |
+| `--conversation-cache-days N` | Disk cache: the age a file is kept (default 7). The folder is scanned at start; `0` empties it. |
 | `--memory-limit-mib N` (or `STRATA_MEMORY_LIMIT_MIB`) | Total RAM this engine's container may use, for when a container cannot see its own limit. Config `args`: `"--memory-limit-mib", "102400"`. `0` = none. |
 
 The RAM figure the floor is checked against is the smallest of `MemAvailable`, the room under each cgroup limit visible to
@@ -711,9 +714,26 @@ Snapshots hold running state, checkpoints, used K/V pages and draft-layer K/V. T
 are evicted first. A new conversation that starts at a checkpoint inside a parked one (sub-agents that share a system prompt)
 restores that prefix and leaves the parked conversation in place (the log says "borrowed"). Oversized snapshots or host
 allocation failures fall back to ordinary prompt processing. With `--layer-split` a parked conversation holds one image per
-stage. Parked snapshots are not kept across restarts; session files are. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables K/V
-retention for diagnostics. The Monitor tab's **Conversation cache** card shows parked, restored and evicted counts and the
+stage. Parked snapshots are not kept across restarts unless `--conversation-cache-disk-mib` is on (then they are session files,
+see below); session files are. `STRATA_SNAPSHOT_FULL_CAPTURE=1` disables K/V retention for diagnostics. The Monitor tab's **Conversation cache** card shows parked, restored and evicted counts and the
 prompt tokens the cache gave back; `/metrics` has the same under `"conversation_cache"`.
+
+With `--conversation-cache-disk-mib N` (opt-in) the parked conversations are session files instead: N MiB is the budget
+across the files, and RAM keeps only each parked conversation's token and checkpoint index. A park writes the running
+state, the deepest checkpoint and every layer's K/V (the draft included, when there is one) to a new `conv-*.sess` file in
+`--conversation-cache-dir`, streamed from the engine's pools, so no host copy of the session is made. The write needs disk
+room for the whole file plus the larger of `--session-min-free-mib` and 8 GiB, and it passes the RAM admission gate; when
+either refuses, the park is skipped and the conversation is simply not parked. A snapshot bigger than the whole budget is
+skipped before anything is written. A returning conversation is read back under the same bounded read and RAM admission as
+`RESTORE`, so a read costs a transient host-RAM spike about the size of the file. A read that fails in the file itself
+(parse, checksum, I/O) drops the entry and its file, and the prompt is read from scratch; a RAM refusal or a failed
+allocation keeps the file for the next start. The folder is scanned at startup: files for another model or configuration,
+files unused for `--conversation-cache-days` (default 7), and any file that is not a `conv-*.sess` are removed, and the
+rest are indexed oldest first. A new conversation that starts inside a disk-cached one does not borrow from it: the file
+is read whole. No K/V is retained in RAM after a restore. On a clean exit (QUIT or stdin end) the live conversation is
+parked to disk, so the next start can resume it. A write is never left half-done: the file goes under a temporary name
+and is renamed once complete. Batch slots park to the same folder. With `--layer-split` or more than one GPU the disk
+cache turns off and says so; RAM parking continues under `--conversation-cache-mib`.
 
 ### Session files (disk)
 
