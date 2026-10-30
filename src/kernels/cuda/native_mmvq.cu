@@ -1227,14 +1227,27 @@ struct SmallTraits<IQ4NLBlock, 4> {
 // llama.cpp's generic multi-column table (ncols 2-4: 4 warps; 5-8: 2 warps; always 2 rows per block): faster,
 // equal to ncols = 1 only to float rounding (the cross-warp reduction groups partial sums differently).
 bool g_multi_exact = true;   // until the upstream layout is timed on an idle GPU (plan rule: default only what is measured)
-// B6 STRATA_B6_MMVQ_ROWS (lab, default 0 = off): see native_mmvq_set_b6_rows
+// B6 STRATA_B6_MMVQ_ROWS (-1 = auto: per-format/shape table on gfx12, off elsewhere; 0 = off; 1/2/4/8 = explicit):
 // read at first use (not at load): a per-architecture default set at start (nv_defaults.hpp) must be seen
+bool g_b6_rows_set = false;
 int g_b6_rows = -1;
-int b6_rows_mode() { if (g_b6_rows < 0) { const char* v = std::getenv("STRATA_B6_MMVQ_ROWS"); g_b6_rows = v ? std::atoi(v) : 0; } return g_b6_rows; }
+int b6_rows_mode() {
+    if (g_b6_rows_set) return g_b6_rows;
+    const char* v = std::getenv("STRATA_B6_MMVQ_ROWS");
+    return v && *v ? std::atoi(v) : -1;
+}
 
 // S26 STRATA_TSUM=1 (TS): warp 0's NCOLS x ROWS sums as one transposed butterfly (s26_tsum.cuh), bitwise the same
+int dev_class();
 static bool s26_tsum_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+    static const bool on = [] {
+        if (dev_class() == 1) {
+            const char* v = std::getenv("STRATA_MMVQ_TSUM");
+            return v && v[0] == '1';
+        }
+        const char* v = std::getenv("STRATA_TSUM");
+        return v && v[0] == '1';
+    }();
     return on;
 }
 
@@ -1606,13 +1619,42 @@ __global__ void b6_mmvq_rows_kernel(const typename F::Block* __restrict__ w, con
 
 // the B6 launch for a format that has a B6X: true when it ran.  g_b6_rows: 1 = 2 rows per block (the fastest on both
 // cards in b6_mmvq_bench), else 2 / 4 / 8 rows.
+// gfx12 AMD (dev_class 1): auto rows (mode -1) read this per-format/shape table; measured on the R9700 with
+// b6_mmvq_bench. 0 = the plain multi kernel for that shape.
+template<typename F, int NCOLS>
+int b6_default_rows_gfx12(int n_out) {
+    if constexpr (std::is_same_v<F, Q4KTraits> || std::is_same_v<F, Q5KTraits>) {
+        return n_out >= 6144 ? 4 : 2;
+    } else if constexpr (std::is_same_v<F, Q6KTraits>) {
+        if (n_out >= 32768) return 4;
+        if (n_out >= 6144) return (NCOLS >= 4 && n_out >= 10240) ? 4 : 2;
+        return NCOLS >= 5 ? 2 : 0;
+    } else if constexpr (std::is_same_v<F, IQ4XSTraits>) {
+        if (NCOLS < 3) return 0;
+        return (n_out >= 6144 && NCOLS <= 4) ? 4 : 2;
+    } else if constexpr (std::is_same_v<F, SmallTraits<IQ4NLBlock, 4>>) {
+        return NCOLS <= 3 ? 2 : 0;
+    } else {
+        return 0;
+    }
+}
+
 template<typename F, int NCOLS>
 bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in, int n_out, cudaStream_t s) {
     if constexpr (!B6X<F>::ok) {
         return false;
     } else {
-        if (b6_rows_mode() <= 0 || !g_multi_exact || s26_tsum_on() || n_in / F::DIV < 1) return false;
-        const int rows = b6_rows_mode() == 1 ? 2 : b6_rows_mode();
+        const int mode = b6_rows_mode();
+        if (mode == 0 || !g_multi_exact || s26_tsum_on() || n_in / F::DIV < 1) return false;
+        int rows = 0;
+        if (mode < 0) {
+            if (dev_class() == 1) rows = b6_default_rows_gfx12<F, NCOLS>(n_out);
+        } else if (mode == 1) {
+            rows = 2;   // preserve the original explicit setting
+        } else {
+            rows = mode;
+        }
+        if (rows <= 0) return false;
         const dim3 threads(WARP, WARPS);
         if (rows == 2)
             b6_mmvq_rows_kernel<F, NCOLS, 2><<<unsigned((n_out + 1) / 2), threads, 0, s>>>(w, x, y, n_in, n_out);
@@ -3297,7 +3339,7 @@ void native_q6_k_unpack(const void* weights) {
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
 bool native_mmvq_multi_exact() { return g_multi_exact; }
-void native_mmvq_set_b6_rows(int mode) { g_b6_rows = mode; }
+void native_mmvq_set_b6_rows(int mode) { g_b6_rows_set = true; g_b6_rows = mode; }
 int native_mmvq_b6_rows() { return b6_rows_mode(); }
 
 std::size_t native_q8_1_bytes(int n_in, int ncols) {

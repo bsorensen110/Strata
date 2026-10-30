@@ -112,7 +112,7 @@ class ExactArch(unittest.TestCase):
 # gfx1151 arch defaults that setup does not copy to gfx1103 / gfx1150: HCD_EXACT copies the gfx1151 hipBLASLt table's
 # solutions, TOPK_REG_MIN_BLOCKS (#1943: the top-k register-kernel line at 4096 blocks, the crossover with the
 # cooperative scan) was measured on gfx1151 only
-_NOT_COPIED = ("STRATA_HCD_EXACT", "STRATA_TOPK_REG_MIN_BLOCKS")
+_NOT_COPIED = ("STRATA_HCD_EXACT", "STRATA_TOPK_REG_MIN_BLOCKS", "STRATA_EXPERT_V2K")
 
 
 
@@ -150,6 +150,19 @@ class Gfx1150Switches(unittest.TestCase):
             self.assertIn(k, setup.SETUP_ENV)
         self.assertIn('arch_default_env("gfx1150").empty()',
                       (ROOT / "src/core/arch_defaults_test.cpp").read_text(encoding="utf-8"))
+
+
+class Gfx12Switches(unittest.TestCase):
+    def test_gfx12_switches_in_setup_env_and_scoped_tsum(self):
+        self.assertEqual(setup.GFX12_SWITCHES["STRATA_GR_TSUM"], "1")
+        self.assertEqual(setup.GFX12_SWITCHES["STRATA_TSUM"], "0")
+        self.assertEqual(setup.GFX12_SWITCHES["STRATA_SELECT_WMMA"], "1")
+        self.assertEqual(setup.GFX12_SWITCHES["STRATA_PF_FUSED"], "1")
+        self.assertEqual(setup.GFX12_SWITCHES["STRATA_ATTN_LANECELL"], "1")
+        self.assertEqual(setup.GFX12_SWITCHES["STRATA_ATTN_MERGE_V2"], "1")
+        self.assertEqual(setup.GFX12_SWITCHES["STRATA_EXPDEC"], "1")
+        for k in setup.GFX12_SWITCHES:
+            self.assertIn(k, setup.SETUP_ENV)
 
 
 class PciIds(unittest.TestCase):
