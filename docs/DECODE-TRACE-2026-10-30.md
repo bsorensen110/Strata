@@ -118,3 +118,53 @@ SH
 python3 tools/ab/decode_window_profile.py decode3/prof/trace_kernel_trace.csv decode3/windows.json
 python3 tools/ab/decode_gap_profile.py  decode3/prof/trace_kernel_trace.csv decode3/windows.json
 ```
+
+## Follow-up (same day): long-stall attribution and the production split
+
+### Item 3: what precedes the long host stalls
+
+From the same decode3 trace: 85 gaps of at least 100 µs inside the decode windows, 286.7 ms total
+(`tools/ab/long_stall_attribution.py`).
+
+- 80 gaps (240.5 ms, 84% of the long-gap time, about 3.0 ms each): `mtp_select_kernel` followed by
+  `copy_i32_from_mapped_kernel`. The MTP selection result goes to the host through a mapped copy, so each
+  speculative round has a host round trip.
+- 1 gap (44.2 ms): `native_q8_1_interleave_kernel` then the IlQ6K GEMV.
+- 2 gaps (1.7 ms): `kv_append_q8_kernel<true>` then the mapped copy.
+- 2 gaps (0.3 ms): `copy_indexed_kernel` then a runtime copy.
+
+Consequence for recommendation 3: the target is the MTP select to host copy round trip, not launch count.
+A device-side handoff for the next draft, with the host reading ids only when PLE or the n-gram table needs
+them, would remove most of the 240 ms. This is unmeasured until implemented.
+
+Correction to recommendation 2b: `wait_flag_ge_kernel` is a one-thread spin on a flag the host writes
+(`src/kernels/cuda/verify_kernels.cu`). It makes the GPU wait for the CPU expert pool. Merging it is a
+pipeline change, not a fusion. The sub-agent's item (b) is scoped to that.
+
+### Item 1: the untraced production split
+
+The `--serve` batch path already prints a host-side split in its `strata batch:` line. It appears when a
+concurrent burst goes idle, and it needs at least two concurrent requests. A single request did not print
+it in my runs.
+
+Measured on the production-equivalent config, four concurrent 256-token requests, no tracer, timed burst:
+
+- 161 windows, 6.32 rows per window, 44.07 ms per window.
+- Run 37.84 ms = GPU-reach wait 32.59 ms (74% of the window) + CPU experts 2.57 ms (overlapped).
+- Commit 3.07 ms, emit 2.93 ms, adapt wait 0.23 ms.
+- MTP proposals accepted: 391 of 627 (62.4%).
+- Warm burst for comparison: 48.06 ms per window, GPU wait 30.01 ms, CPU experts 8.63 ms, MTP 61.0%.
+
+Reading: the host is blocked on the GPU for about three quarters of each window, so the window is
+GPU-bound from the host's side. The GPU-reach wait is an upper bound on GPU busy time inside the window,
+because the GPU can spin on pool flags within it. It is not the same measure as the trace's busy share.
+A per-kernel busy measure without the tracer still needs event timing inside `batch_step`, which runs on
+several streams.
+
+### Event-timer attempt: reverted
+
+I added hipEvent GPU-span timers (`STRATA_STEP_TIMING=1`) to the generate loop and the speculative loop.
+The flag reached the engine (checked in `/proc/<pid>/environ`), but no timing lines printed in either the
+batch configuration or a solo configuration (`--batch` and `--batch-mtp` removed). Serve decode does not
+run those loops. I reverted the change, so `integ/community-2026-10` carries no timer. Open item:
+instrument `batch_step` if a true GPU span is needed.
