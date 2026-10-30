@@ -709,3 +709,55 @@ first pass:
 - C1 A/B: `--batch-suffix-draft 3` on vs off on a copy-heavy workload.
 - C2 GPU A/B: the ring-comparison dump (confirm or refute H3).
 - A2 sweeps: one-variable `--spec-min-p` and `STRATA_DFLASH_DEPTH_SLOPE` (short, isolated).
+
+## PR #1097 decode operator fusions in the HIP build (2026-10-29, IMPLEMENTED)
+
+Work done in the **`/home/soren/Strata-integ`** worktree (branch `integ/community-2026-10`),
+commit `31be5813`, pushed to `fork`. The goal was "fuse more like the Paiton kernels."
+
+### Finding
+
+Paiton's `pass_config` has `fuse_norm_quant: true, fuse_act_quant: true` — vLLM fuses the
+RMSNorm+quantization and activation+quantization into single kernels. Strata already has the
+equivalent fused kernels from PR #1097 ("V100: operator fusions for the decode GEMV / MoE
+paths, bitwise"):
+
+- **`quantize_act_images`** — every activation image of x (block_q8_0 + block_q8_K + bf16) in
+  **one pass**, was 2–3 separate kernels.
+- **`project_bf16_pair`** — two BF16 projections of the same x (ssm_alpha/ssm_beta,
+  indexer.q/indexer.k) in **one kernel**, was two launches.
+- **`s_gemv_pair_silu`** — gate/up dual GEMV + SwiGLU in one kernel (already active in
+  `shared_expert`, not gated).
+
+The first two are **compiled into the HIP build** (`quantize_act.cu` / `bf16_gemv.cu` have no
+SM60-specific intrinsics) but their **call sites were gated on `STRATA_EXPERIMENTAL_SM60`**
+(the Pascal/Volta build), so the production HIP engine ran the unfused sequences.
+
+### Change
+
+- Opened the 7 call-site gates in `src/core/layer.cpp` to `STRATA_USE_HIP` as well:
+  `#if defined(STRATA_EXPERIMENTAL_SM60) || defined(STRATA_USE_HIP)`.
+- The fusion is still **opt-in at runtime** via `STRATA_FUSE_DECODE=1` (`fuse_decode()`);
+  without the env var the unfused path is unchanged.
+- Added `STRATA_FUSE_DECODE: "1"` to the production config's `env`
+  (`/home/soren/Strata/strata-swift-iq3_s.json`).
+
+### Verification (this session, no GPU)
+
+- `src/core/layer.cpp` compiles clean (`-fsyntax-only`, production-matched HIP flags).
+- `strata_engine` target built (HIP).
+- `quantize_act_parity --selftest`: **0 failures** over 5 Q8_0 + 4 Q8_K distributions.
+- The kernels are **bitwise** what the unfused sequences produce (`fusions_parity`,
+  `quantize_act_parity`), so there is no quality risk.
+
+### Measured (PR #1097, V100, n_embd 2560 / FF 640)
+
+- Activation images (q8_0+q8_K+bf16): 46.2 → 30.4 µs
+- BF16 pair (alpha,beta): 24.2 → 14.4 µs
+- Gate/up + SwiGLU: 30.4 → 14.8 µs (already active)
+
+### Still owed (needs a GPU window)
+
+- GPU A/B: `STRATA_FUSE_DECODE=1` on vs off on the production model (measure tok/s and
+  confirm bitwise parity on the RDNA4 card). The V100 numbers are from PR #1097; the RDNA4
+  speedup is not yet measured.
