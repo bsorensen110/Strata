@@ -667,9 +667,11 @@ adding the MTP token closes the gap).
 
 ### Still owed (needs a GPU window)
 
-- E1 A/B: `--batch-mtp --draft dflash2` on vs `--draft dflash2` alone (measure the acceptance
-  lift and the throughput vs plain batch / batch MTP). The co-draft is opt-in (requires
-  `--batch-mtp` + `--draft dflash2`) and changes nothing about which tokens the target emits.
+- E1 A/B: **BLOCKED (2026-10-30).** The engine refuses DFlash2 whenever `--batch-mtp` is set
+  (`generate.cpp:6379`, "`--batch-mtp` takes the slot's second row for its own drafter"), so the
+  co-draft path cannot run under that flag pair. Lifting the guard is a row-layout decision. See
+  `docs/AB-FUSED-DECODE-E1-2026-10-30.md`. Batch DFlash2 alone was measured: 94.1 vs 118.1 tok/s
+  batch MTP at 4-way (−20%), acceptance 52.8% vs 78.0%.
 
 ## Strata vs Paiton — speed review (2026-10-29, second pass; CORRECTED)
 
@@ -711,6 +713,11 @@ first pass:
 - A2 sweeps: one-variable `--spec-min-p` and `STRATA_DFLASH_DEPTH_SLOPE` (short, isolated).
 
 ## PR #1097 decode operator fusions in the HIP build (2026-10-29, IMPLEMENTED)
+
+> **SUPERSEDED (2026-10-30 A/B, `docs/AB-FUSED-DECODE-E1-2026-10-30.md`).** The fused branches only fire for
+> non-native projections. The production native pack never dispatches `quantize_images_kernel` or
+> `bf16_gemv_pair_warp_kernel` (0 of 12,181 dispatches). A/B shows no change (−0.6% single, −0.7% 4-way, noise).
+> `fusions_parity` was not built or run; the bitwise claim rests on `quantize_act_parity` and the singles A/B.
 
 Work done in the **`/home/soren/Strata-integ`** worktree (branch `integ/community-2026-10`),
 commit `31be5813`, pushed to `fork`. The goal was "fuse more like the Paiton kernels."
