@@ -109,7 +109,7 @@ void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weight
     else if (split) bf16_gemv_split(x_bf16, weights, out, n_in, n_out, TPR, stream);
     else bf16_gemv(x_bf16, weights, out, n_in, n_out, stream);
 }
-#if defined(STRATA_EXPERIMENTAL_SM60)
+#if defined(STRATA_EXPERIMENTAL_SM60) || defined(STRATA_USE_HIP)
 // TWO BF16 projections of the SAME x in ONE kernel (`ssm_alpha`/`ssm_beta`, `indexer.q`/`indexer.k`).
 // `bf16_gemv_pair` reproduces the warp-per-row accumulation, which is what `bf16_gemv_split` at TPR 32
 // always runs and what plain `bf16_gemv` runs at n_out >= 64 - below that the plain entry uses the naive
@@ -264,7 +264,7 @@ const float* conv_kernel = (const float*) w_conv->data;    const float* ssm_norm
 st_begin(layer, 8, stream);
     // Plan v0.3 P3: the canonical activation images only when a canonical projection reads them.
     if (!w_qkv->native_data || !w_gate->native_data) {
-#if defined(STRATA_EXPERIMENTAL_SM60)
+#if defined(STRATA_EXPERIMENTAL_SM60) || defined(STRATA_USE_HIP)
     if (strata::kernels::fuse_decode()) {
         quantize_act_images(mixed, g.n_embd, b.x_q8_0, b.x_q8k, nullptr, stream);   // ONE pass, was two kernels
     } else
@@ -326,7 +326,7 @@ st_begin(layer, 12, stream);
                      (int) g.n_embd, (int) g.ssm_v_heads, stream);
     } else {
     if (!native_bf16_projections) f32_to_bf16_bulk(mixed, b.x_bf16, g.n_embd, stream);
-#if defined(STRATA_EXPERIMENTAL_SM60)
+#if defined(STRATA_EXPERIMENTAL_SM60) || defined(STRATA_USE_HIP)
     if (strata::kernels::fuse_decode()) {
     project_bf16_pair(mixed, b.x_bf16, (const uint16_t*) w_alpha->data, b.alpha, g.ssm_v_heads,
                       (const uint16_t*) w_beta->data, b.beta, g.ssm_v_heads, g.n_embd, true, stream);
@@ -374,7 +374,7 @@ st_end(layer, 14, stream);
 // ---- 8. out = ssm_out @ y, whose activation is whatever THIS layer's `ssm_out` asks for
 st_begin(layer, 15, stream);
     if (!w_out->native_data) {
-#if defined(STRATA_EXPERIMENTAL_SM60)
+#if defined(STRATA_EXPERIMENTAL_SM60) || defined(STRATA_USE_HIP)
     if (strata::kernels::fuse_decode()) {
         quantize_act_images(b.y, g.ssm_value_dim, b.y_q8_0, b.y_q8k, nullptr, stream);   // ONE pass, was two
     } else
@@ -487,7 +487,7 @@ if (w_ginp->kind != WeightKind::Bf16InF32) {        err = v.name("ffn_gate_inp_s
 // ONE pass over `x` produces the bf16 image and both quantized images (was three kernels): which quantized
 // one is wanted is a property of the TENSOR and the pack mixes them by layer, so both are produced.
     if (!w_sgate->native_data || !w_sup->native_data) {
-#if defined(STRATA_EXPERIMENTAL_SM60)
+#if defined(STRATA_EXPERIMENTAL_SM60) || defined(STRATA_USE_HIP)
     if (strata::kernels::fuse_decode()) {
         quantize_act_images(x, g.n_embd, b.x_q8_0, b.x_q8k, b.x_bf16, stream);   // ONE pass, was three kernels
     } else
@@ -1241,7 +1241,7 @@ struct Req { const char* suf; };    const WeightRef* w_idxk = v.get("indexer.k_p
 if (w_idxk->kind != WeightKind::Bf16InF32 || w_idxq->kind != WeightKind::Bf16InF32) {        err = v.name("indexer.*_proj.weight") + " must be engine form 1 (bf16); they are " +              std::to_string((int) w_idxk->kind) + " and " + std::to_string((int) w_idxq->kind);        return false;    }
 // ---- 1. the three activation formats, once each
 bool images_fused = false;
-#if defined(STRATA_EXPERIMENTAL_SM60)
+#if defined(STRATA_EXPERIMENTAL_SM60) || defined(STRATA_USE_HIP)
 if (strata::kernels::fuse_decode() && (!w_attnk->native_data || !w_attnv->native_data || !w_attnq->native_data)) {
     quantize_act_images(x, g.n_embd, b.x_q8_0, b.x_q8k,
                         native_bf16_projections ? nullptr : b.x_bf16, stream);   // ONE pass, was two or three
@@ -1273,7 +1273,7 @@ if (!images_fused) {
         if (cudaMemcpyAsync(st.step, st.host_step, qsa_step_bytes(), cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess ||            cudaMemcpyAsync(st.pos_dev, st.host_pos, (size_t) g.n_head * 4, cudaMemcpyHostToDevice,                            (cudaStream_t) stream) != cudaSuccess) {            err = "qsa_layer: the step-state upload failed";            return false;        }    }
 // ---- 3. the indexer's RAW key (and, with the V100 switch, its QUERY in the same kernel; was two launches)
 bool idx_pair = false;
-#if defined(STRATA_EXPERIMENTAL_SM60)
+#if defined(STRATA_EXPERIMENTAL_SM60) || defined(STRATA_USE_HIP)
 if (strata::kernels::fuse_decode()) {
     // two BF16 projections of the same x in ONE kernel: the query is needed only at step 7 and nothing in between
     // touches it, so computing it here changes no order that matters; `idx_raw` is still appended at step 5.
