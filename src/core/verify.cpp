@@ -508,6 +508,26 @@ bool fuse_rows_on() {
     return on;
 #endif
 }
+// (c) quantize + interleave in one launch (native_quantize_q8_1_il: the same q8_1 bytes and the same interleaved copy as
+// native_quantize_q8_1 followed by native_q8_1_interleave), for a projection input of 2-4 columns.  CUDA: the Turing
+// default (device_is_sm75).  HIP: on for gfx12 (RDNA4), where il_arch_ok() already routes the projections to the
+// interleaved kernels, so the copy is read.  STRATA_QIL=0 / 1 forces it off / on on either.
+bool qil_on() {
+    static const int env = [] { const char* v = std::getenv("STRATA_QIL"); return v != nullptr ? std::atoi(v) : -1; }();
+    if (env >= 0) return env != 0;
+#if defined(STRATA_USE_HIP)
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        cudaDeviceProp p;
+        per_dev[dev] = cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#else
+    return device_is_sm75();
+#endif
+}
 // (b) the PCIe share's wait (m_flagB_) folded into its staging copy (fetch_blobs_after), pcie_mode 2 (the default): the
 // copy is the first reader of the host-written blobs, so the spin moves into it and one kernel node per layer and group
 // goes.  Same reads after the same flag, same copy.  HIP: follows fuse_wait_on (gfx12 on); CUDA: off unless
@@ -1853,15 +1873,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // bytes): Turing default (+0.5..+1 % decode, two launches fewer per GDN layer and per QSA layer); STRATA_QIL=0 / 1
         // forces it off / on
         auto quant_in = [&](const float* x, int n_in) {
-#if !defined(STRATA_USE_HIP)
-            static const int qil_env = [] { const char* v = std::getenv("STRATA_QIL"); return v != nullptr ? std::atoi(v) : -1; }();
-            const bool qil = qil_env >= 0 ? qil_env != 0 : device_is_sm75();
-            if (qil && n >= 2 && n <= 4 && g_mmvq_il()) {
+            if (qil_on() && n >= 2 && n <= 4 && g_mmvq_il()) {   // (c): the plain blocks and their interleaved copy, one launch
                 strata::kernels::native_quantize_q8_1_il(x, xq_, xil_, n_in, n, cs);
                 il_ready = true;
                 return;
             }
-#endif
             native_quantize_q8_1(x, xq_, n_in, n, cs);
             il_ready = false;
         };
