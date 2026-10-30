@@ -508,6 +508,22 @@ bool fuse_rows_on() {
     return on;
 #endif
 }
+// (b) the PCIe share's wait (m_flagB_) folded into its staging copy (fetch_blobs_after), pcie_mode 2 (the default): the
+// copy is the first reader of the host-written blobs, so the spin moves into it and one kernel node per layer and group
+// goes.  Same reads after the same flag, same copy.  HIP: follows fuse_wait_on (gfx12 on); CUDA: off unless
+// STRATA_FUSE_PCIE_WAIT=1.  STRATA_FUSE_PCIE_WAIT=0 / 1 forces it off / on.
+bool fuse_pcie_wait_on() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_FUSE_PCIE_WAIT");
+        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+    }();
+    if (env >= 0) return env != 0;
+#if defined(STRATA_USE_HIP)
+    return fuse_wait_on();
+#else
+    return false;
+#endif
+}
 
 // 143-amdk: STRATA_FUSE_CONVAB=1 - the GDN conv and the a/b projections in one launch.  Opt-in: measured -0.3% on gfx1201 (the a/b dot chain is the longer one).
 bool fuse_convab_on() {
@@ -2608,15 +2624,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
-            if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
-            else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
-                wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
-            else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
+            // (b) pcie_mode 2 with fuse_pcie_wait_on: the wait is the staging copy's own (fetch_blobs_after), no launch here
+            const bool fold_pcie_wait = sink_.pcie_mode == 2 && fuse_pcie_wait_on() && !device_plan_ && m_bal_ == nullptr;
+            if (!fold_pcie_wait) {
+                if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+                else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
+                    wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
+                else wait_flag_ge(m_flagB_, ring, cs);             // the PCIe share is in staging (DMA) or mapped
+            }
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
                 uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                 const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH
-                fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
+                if (fold_pcie_wait)
+                    fetch_blobs_after(m_flagB_, ring, p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
+                else
+                    fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
                 rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs, p_dst2);
             }
             stamp(l, 21, grp);

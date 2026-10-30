@@ -646,8 +646,10 @@ __global__ void copy_indexed_kernel(float* __restrict__ dst, const float* __rest
         dst[i] = src[(size_t) idx * stride + i];
 }
 
-__global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
-                                   uint4* __restrict__ dst, long long per, const unsigned long long* __restrict__ dst2) {
+// the copy body of fetch_blobs_kernel / fetch_blobs_after_kernel (the same loop, the same reads and writes)
+__device__ __forceinline__ void fetch_blobs_copy(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                                 uint4* __restrict__ dst, long long per,
+                                                 const unsigned long long* __restrict__ dst2) {
     const long long total = (long long) *n * per;
     long long kd = -1;
     uint4* d = nullptr;
@@ -660,6 +662,24 @@ __global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, c
         }
         d[off] = ((const uint4*) src[k])[off];
     }
+}
+
+__global__ void fetch_blobs_kernel(const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                   uint4* __restrict__ dst, long long per, const unsigned long long* __restrict__ dst2) {
+    fetch_blobs_copy(src, n, dst, per, dst2);
+}
+
+// fetch_blobs with the wait for a host flag first (143-amdk style, see fetch_blobs_after in verify_kernels.hpp): every
+// block's thread 0 spins on *flag >= value, fences the system, and only then does the block read the mapped blobs.
+__global__ void fetch_blobs_after_kernel(const volatile uint32_t* __restrict__ flag, uint32_t value,
+                                         const unsigned long long* __restrict__ src, const int32_t* __restrict__ n,
+                                         uint4* __restrict__ dst, long long per, const unsigned long long* __restrict__ dst2) {
+    if (threadIdx.x == 0) {
+        while (*flag < value) strata_spin_pause();
+        __threadfence_system();
+    }
+    __syncthreads();
+    fetch_blobs_copy(src, n, dst, per, dst2);
 }
 
 __global__ void res_patch_kernel(int32_t* __restrict__ table, const volatile int32_t* pairs, int n) {
@@ -765,6 +785,17 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
 }
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream) {
     fetch_blobs(src, n, dst, blob_bytes, cap, stream, nullptr);
+}
+void fetch_blobs_after(const uint32_t* flag, uint32_t value, const unsigned long long* src, const int32_t* n, uint8_t* dst,
+                       int64_t blob_bytes, int cap, void* stream, const unsigned long long* dst2) {
+    if (cap <= 0) {   // fetch_blobs copies nothing here: the wait alone, as before
+        wait_flag_ge(flag, value, stream);
+        return;
+    }
+    if (blob_bytes % 16 != 0) { std::fprintf(stderr, "fetch_blobs_after: blob size must be a multiple of 16\n"); std::exit(1); }
+    fetch_blobs_after_kernel<<<48 * 8, 256, 0, (cudaStream_t) stream>>>(flag, value, src, n, (uint4*) dst,
+                                                                       (long long) (blob_bytes / 16), dst2);
+    check("fetch_blobs_after");
 }
 
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream) {
