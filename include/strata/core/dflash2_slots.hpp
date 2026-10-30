@@ -96,4 +96,14 @@ inline constexpr bool df2_graphs_valid_for(const float* captured, const float* t
 /// Whether `i` is a valid active slot of a drafter holding `n` slots.
 inline constexpr bool df2_slot_ok(int i, int n) { return i >= 0 && i < n; }
 
+/// Exact device bytes Dflash2Drafter::bind() allocates: with a pruned draft vocabulary (`n_dvocab > 0`), the gathered
+/// head rows (`n_dvocab * head_row_bytes`), the int32 index map (`n_dvocab * 4`), and `k_drafts` float logit rows over
+/// `n_dvocab`; without one (`n_dvocab <= 0`), the full head stays in place and only `k_drafts * n_vocab * 4` is allocated.
+inline constexpr uint64_t df2_bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, int64_t n_dvocab, int k_drafts) {
+    if (n_dvocab > 0)
+        return (uint64_t) n_dvocab * head_row_bytes + (uint64_t) n_dvocab * 4ull +
+               (uint64_t) k_drafts * (uint64_t) n_dvocab * 4ull;
+    return n_vocab > 0 ? (uint64_t) k_drafts * (uint64_t) n_vocab * 4ull : 0ull;
+}
+
 }  // namespace strata::core

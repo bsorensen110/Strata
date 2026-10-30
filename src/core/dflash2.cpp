@@ -405,6 +405,19 @@ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, 
     return true;
 }
 
+uint64_t Dflash2Drafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file) const {
+    int64_t n_dv = 0;
+    if (!vocab_file.empty()) {
+        if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
+            std::fseek(vf, 0, SEEK_END);
+            const long size = std::ftell(vf);
+            std::fclose(vf);
+            if (size >= 4 && size % 4 == 0) n_dv = (int64_t) (size / 4);
+        }
+    }
+    return df2_bind_bytes(head_row_bytes, n_vocab, n_dv, kDrafts);
+}
+
 bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err) {
     const OnDevice on_device(device_);
     if (head == nullptr || !head->loaded()) { err = "dflash2: the drafter needs the native head (--native)"; return false; }

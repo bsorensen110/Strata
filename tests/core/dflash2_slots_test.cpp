@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <string>
 
+using strata::core::df2_bind_bytes;
 using strata::core::df2_graphs_valid_for;
 using strata::core::df2_ring_bytes;
 using strata::core::df2_ring_mirror_entries;
@@ -184,6 +185,18 @@ int main() {
     check(!df2_slot_ok(8, 8), "slot 8 is out of range for 8 slots");
     check(!df2_slot_ok(0, 0), "no slot is valid in 0 slots");
     check(!df2_slot_ok(-1, 0), "slot -1 in 0 slots is out of range");
+
+    // the bind sizing law the engine budgets with, before it allocates the draft head
+    check(df2_bind_bytes(0, 0, 0, 7) == 0ull, "no head and no vocabulary: no device bytes claimed");
+    check(df2_bind_bytes(1024, 151936, 0, 7) == 151936ull * 4ull * 7ull,
+          "an unpruned head stays where it is: only the draft's logit rows are new");
+    {
+        const uint64_t row = 1024, n_dv = 32768;
+        check(df2_bind_bytes(row, 151936, (int64_t) n_dv, 7) == n_dv * row + n_dv * 4ull + 7ull * n_dv * 4ull,
+              "a pruned vocabulary: the gathered head rows, the index map and the logit rows, all over the pruned size");
+        check(df2_bind_bytes(0, 151936, (int64_t) n_dv, 7) < df2_bind_bytes(0, 151936, 0, 7),
+              "a pruned vocabulary shrinks the draft's logit rows, which is what leaves room for the batch slots");
+    }
 
     std::printf("dflash2_slots_test: %ld checks, %s\n", g_checks, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
