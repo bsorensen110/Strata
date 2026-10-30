@@ -12898,7 +12898,7 @@ int main(int argc, char** argv) {
             // (edits, refactors, repeated code) the continuation is usually exact and a verify pass accepts many
             // tokens at once.  It is primed at admission with the slot's prompt tokens and appended with every
             // committed token; the batch loop checks it before falling back to the DFlash2 draft.
-            strata::spec::SuffixDrafter sfx;
+            strata::spec::SuffixDrafter sfx{};  // direct-list initialize its explicit constructor
             // E1: the slot's MTP co-draft proposal (one token, drafted in parallel with the DFlash2 block).
             // When --batch-mtp is enabled with --draft dflash2, the slot's group carries both the DFlash2
             // proposals and the MTP proposal, so the window verifies a mix of block-drafter and chain-drafter
