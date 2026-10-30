@@ -34,6 +34,9 @@ void check(bool ok, const char* what) {
 
 constexpr int kCap = strata::kernels::kVerifyDefaultMaxT;  // preserved default runtime window: 8 rows
 constexpr int kStorageCap = strata::kernels::kVerifyMaxT;  // output arrays and opt-in wide window: 16 rows
+// The wide window is a build option (-DSTRATA_WINDOW_MAX_T=16; the HIP engine builds it by default).  In a narrow
+// build storage is 8 rows, so a cap-16 plan clamps to 8 and the wide checks below do not apply.
+constexpr bool kWideWindow = strata::kernels::kVerifyMaxT >= 16;
 
 bool is_eos(int32_t y, const std::vector<int32_t>& eos_ids) {
     for (int32_t e : eos_ids)
@@ -237,7 +240,7 @@ int main() {
     }
 
     // ---- the 16-row window is fully usable; only capacities above storage clamp to 16 ----
-    {
+    if (kWideWindow) {
         int rows[kStorageCap], ntok[kStorageCap];
         for (int i = 0; i < kStorageCap; ++i) rows[i] = ntok[i] = -7;
         const int S = strata::core::batch_spec_rows(kStorageCap, 5, 7, rows, ntok);
@@ -272,6 +275,7 @@ int main() {
             if (wide_n[a] != ntok[a]) same = false;
         check(same, "cap above storage clamps to the supported 16-row window");
     }
+    else { std::fputs("skip: the cap-16 window plan checks needs a wide build (kVerifyMaxT == 16)\n", stderr); }
     {   // More selected slots than the supplied cap is refused without touching either output.
         int rows[kStorageCap], ntok[kStorageCap];
         for (int i = 0; i < kStorageCap; ++i) rows[i] = ntok[i] = -7;

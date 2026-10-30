@@ -33,6 +33,9 @@ void check(bool ok, const char* what) {
 
 constexpr int kCap = strata::kernels::kVerifyDefaultMaxT;  // the preserved runtime window default
 constexpr int kStorageCap = strata::kernels::kVerifyMaxT;  // all host arrays cover the 16-row hard ceiling
+// The 16-row window only exists in a wide build (-DSTRATA_WINDOW_MAX_T=16; the HIP engine builds it by default).
+// A narrow build has 8-row storage, so the 16-row plans below clamp to 8 and their checks are skipped, not passed.
+constexpr bool kWideWindow = strata::kernels::kVerifyMaxT >= 16;
 
 // The positions a window gives the rows: each slot's group at consecutive positions of its own, every slot starting
 // somewhere different so a mix-up of the slots shows up (as in tests/core/batch_spec_test.cpp).
@@ -400,7 +403,7 @@ int main() {
     }
 
     // ---- the opt-in 16-row DFlash window (RED until the verifier capacity is raised) ----
-    {
+    if (kWideWindow) {
         using strata::core::df2_window_plan;
         constexpr int wide_cap = 16;
         int rows[wide_cap] = {}, ntok[wide_cap] = {};
@@ -414,6 +417,7 @@ int main() {
         for (int i = 0; i < 4; ++i) full = full && ntok[i] == 4;
         check(full, "the opt-in 16-row window stores four rows per selected slot");
     }
+    else { std::fputs("skip: the opt-in 16-row DFlash window plan needs a wide build (kVerifyMaxT == 16)\n", stderr); }
 
     // ---- default DFlash windows remain 8 rows after the verifier storage ceiling grows to 16 ----
     {
@@ -433,16 +437,20 @@ int main() {
         bool ready[6] = {true, true, true, true, true, true};
         int selected[16] = {}, rows[16] = {}, ntok[16] = {};
         auto p = df2_piped_group_rows(16, 6, active, ready, 7, 3, 4, selected, rows, ntok);
-        check(p.n_sel == 4 && p.depth == 3 && p.rows == 16 && p.next == 2,
-              "piped row planner fits four 3-proposal groups and advances the rotation");
-        const int want_sel[4] = {4, 5, 0, 1};
-        bool shape_ok = true;
-        for (int i = 0; i < 4; ++i) shape_ok = shape_ok && selected[i] == want_sel[i] && ntok[i] == 4;
-        for (int r = 0; r < 16; ++r) shape_ok = shape_ok && rows[r] == want_sel[r / 4];
-        check(shape_ok, "piped rows stay contiguous and map back to the rotating group-local slots");
-        p = df2_piped_group_rows(16, 6, active, ready, 7, 3, p.next, selected, rows, ntok);
-        check(p.n_sel == 4 && selected[0] == 2 && selected[1] == 3 && selected[2] == 4 && selected[3] == 5,
-              "piped row rotation gives waiting slots their turn");
+        if (kWideWindow) {
+            check(p.n_sel == 4 && p.depth == 3 && p.rows == 16 && p.next == 2,
+                  "piped row planner fits four 3-proposal groups and advances the rotation");
+            const int want_sel[4] = {4, 5, 0, 1};
+            bool shape_ok = true;
+            for (int i = 0; i < 4; ++i) shape_ok = shape_ok && selected[i] == want_sel[i] && ntok[i] == 4;
+            for (int r = 0; r < 16; ++r) shape_ok = shape_ok && rows[r] == want_sel[r / 4];
+            check(shape_ok, "piped rows stay contiguous and map back to the rotating group-local slots");
+            p = df2_piped_group_rows(16, 6, active, ready, 7, 3, p.next, selected, rows, ntok);
+            check(p.n_sel == 4 && selected[0] == 2 && selected[1] == 3 && selected[2] == 4 && selected[3] == 5,
+                  "piped row rotation gives waiting slots their turn");
+        } else {
+            std::fputs("skip: the 16-row pipelined DFlash2 group contract needs a wide build (kVerifyMaxT == 16)\n", stderr);
+        }
 
         bool cold[4] = {true, true, true, true};
         bool has_draft[4] = {true, false, true, false};
