@@ -530,19 +530,16 @@ bool qil_on() {
 }
 // (b) the PCIe share's wait (m_flagB_) folded into its staging copy (fetch_blobs_after), pcie_mode 2 (the default): the
 // copy is the first reader of the host-written blobs, so the spin moves into it and one kernel node per layer and group
-// goes.  Same reads after the same flag, same copy.  HIP: follows fuse_wait_on (gfx12 on); CUDA: off unless
-// STRATA_FUSE_PCIE_WAIT=1.  STRATA_FUSE_PCIE_WAIT=0 / 1 forces it off / on.
+// goes.  Same reads after the same flag, same copy.  Off by default on every backend: on gfx1201 (R9700) the folded
+// copy measured 3-4% slower at 4 concurrent requests (2026-10-30 A/B: 95.5 vs 99.9 tok/s both-on vs baseline; fold-off
+// arm 99.2), so the unfolded wait stays the default.  STRATA_FUSE_PCIE_WAIT=1 forces it on, =0 forces it off.
 bool fuse_pcie_wait_on() {
     static const int env = [] {
         const char* v = std::getenv("STRATA_FUSE_PCIE_WAIT");
         return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
     }();
     if (env >= 0) return env != 0;
-#if defined(STRATA_USE_HIP)
-    return fuse_wait_on();
-#else
     return false;
-#endif
 }
 
 // 143-amdk: STRATA_FUSE_CONVAB=1 - the GDN conv and the a/b projections in one launch.  Opt-in: measured -0.3% on gfx1201 (the a/b dot chain is the longer one).
