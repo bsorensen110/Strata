@@ -12899,6 +12899,13 @@ int main(int argc, char** argv) {
             // tokens at once.  It is primed at admission with the slot's prompt tokens and appended with every
             // committed token; the batch loop checks it before falling back to the DFlash2 draft.
             strata::spec::SuffixDrafter sfx;
+            // E1: the slot's MTP co-draft proposal (one token, drafted in parallel with the DFlash2 block).
+            // When --batch-mtp is enabled with --draft dflash2, the slot's group carries both the DFlash2
+            // proposals and the MTP proposal, so the window verifies a mix of block-drafter and chain-drafter
+            // tokens.  The MTP token is drafted from the committed rows' residuals (ver.final_R_all()), the same
+            // source the --batch-mtp path uses, and is stored here (separate from the DFlash2 `draft[]`).
+            int32_t mtp_draft = 0;
+            bool mtp_draft_ready = false;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // timing of the batch windows since the slots were last all idle (one stderr line then)
@@ -13630,6 +13637,28 @@ int main(int argc, char** argv) {
                             if (++df2_warn <= 5)
                                 std::fprintf(stderr, "strata batch: DFlash2 slot %d proposes nothing next window (%s)\n",
                                              b, de.c_str());
+                        }
+                    }
+                    // E1: the MTP co-draft.  If --batch-mtp is enabled, the slot's group also carries the MTP
+                    // chain-drafter's first token, drafted from the committed rows' residuals (ver.final_R_all()),
+                    // in parallel with the DFlash2 block.  The MTP token is stored in sl.draft[sl.n_drafts]
+                    // (the next slot in the DFlash2 draft array) and sl.n_drafts is incremented, so the window
+                    // builder and the accept rule treat it as a regular proposal.  A proposal the target did not
+                    // pick is never emitted, so the co-draft can only raise the acceptance.  It changes nothing
+                    // about which tokens the target emits.
+                    if (batch_mtp && sl.active && slot_mtp[(size_t) b] && sl.n_drafts < strata::core::Dflash2Drafter::kDrafts) {
+                        const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
+                        const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                        // The MTP drafter reads the committed rows' residuals from ver.final_R_all() (the final
+                        // residuals of the last stage), the same source the --batch-mtp path uses.  The copy is
+                        // queued on the drafter's own stream after the window's host sync, so the draft graph reads it.
+                        if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
+                                            ver.final_R_all() + (size_t) first[t] * stride,
+                                            2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                            slot_mtp[(size_t) b]->stream()) == cudaSuccess &&
+                            slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                                                       &sl.draft[(size_t) sl.n_drafts], err)) {
+                            ++sl.n_drafts;
                         }
                     }
                 }
