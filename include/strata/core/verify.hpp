@@ -28,6 +28,7 @@
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -482,6 +483,7 @@ private:
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[strata::kernels::kVerifyMaxT] = {};  ///< row t is slot brow_[t]; one slot may own several draft rows
+                                                   ///< (kVerifyMaxT = the fork's 16-row DFlash2 batch ceiling >= kWindowMaxT)
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
@@ -621,7 +623,7 @@ private:
     unsigned* qcnt_ = nullptr;             ///< S26 STRATA_QFUSE: the HC read's q8_1 group counters (n_embd / 32)
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
-    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyMaxT)
+    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyNarrowT)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
     uint32_t* hflag_in_h_ = nullptr;     ///< set_handoff_flags: the incoming hand-off's ready word (host / device)
@@ -665,7 +667,7 @@ private:
     std::vector<unsigned long long> prof_h_;
     double prof_sum_[2][kProfPer] = {};   // [GDN / QSA layers][stage]
     int64_t prof_windows_ = 0;
-    double prof_t_sum_[9][2][kProfPer] = {};   // the same per window size T (1..8), for profile_by_t_report
+    double prof_t_sum_[9][2][kProfPer] = {};   // the same per window size T (1..8: wider windows are not profiled), for profile_by_t_report
     int64_t prof_t_win_[9] = {};
     bool rs_on_ = false;                      // STRATA_ROUTE_STATS
     unsigned long long* rs_dev_ = nullptr;    // [9 T][n_layers][8 rows]: experts of row r that no earlier row of the window routed to
@@ -694,9 +696,10 @@ private:
     cudaEvent_t df_join_[2] = {};
     // [sel_long_][T]: 1 is the long-context QSA select (STRATA_SELECT_LONG=1: multi-CTA top-k, shuffle-free decode
     // scores; see run()); without it only [0] is ever captured
-    cudaGraphExec_t exec_[2][9] = {};
-    cudaGraphExec_t exec_nr_[2][9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
-    bool launched_[2][9] = {}, launched_nr_[2][9] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
+    // (per window size T = 1..kWindowMaxT: a solo window is at most 8 rows, but a merge window of a wide batch is not)
+    cudaGraphExec_t exec_[2][strata::kernels::kWindowMaxT + 1] = {};
+    cudaGraphExec_t exec_nr_[2][strata::kernels::kWindowMaxT + 1] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    bool launched_[2][strata::kernels::kWindowMaxT + 1] = {}, launched_nr_[2][strata::kernels::kWindowMaxT + 1] = {};   ///< this graph has been launched once (early_ple_flag: a cold first launch raises the PLE flag first)
     int sel_long_ = 0;
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
@@ -768,7 +771,7 @@ private:
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
-    int groups_[9] = {};
+    int groups_[strata::kernels::kWindowMaxT + 1] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
     // STRATA_VERIFY_DEFER_CPU=1 (opt-in, changes the output): a decode window's layer l adds the CPU's expert rows to the
     // residual before layer l+1's FFN-side read instead of waiting for them in its own combine (record_window)
