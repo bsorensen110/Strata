@@ -120,9 +120,9 @@ over all slots' rows, which needs a kernel change. Ceiling about 2 ms per window
 ### "CPU share off" for identical replies: not available in this configuration
 
 - The prefill CPU share is already off on this build: `generate.cpp` enables it only on CUDA builds with one GPU and no
-  batch slots. `STRATA_PREFILL_CPU_SHARE=0` changes nothing here (the runs were identical in the first place).
-- The CPU share that does exist is the decode expert pool. The serve log reports 27% of routed experts computed on the
-  CPU (the VRAM tier holds 11184 experts, 21.3 GiB of 46.8 GiB).
+  batch slots. `STRATA_PREFILL_CPU_SHARE=0` changes nothing here.
+- The CPU share that does exist is the decode expert pool. The serve log: 46.8 GiB of experts, 21.3 GiB in the GPU
+  cache (11184 experts), 30.8 GiB in the RAM copy. The batch line shows CPU experts at about 6.3 ms of each window.
 - `--no-pool` (the GPU-only floor) does not start: verify needs the profile-filled VRAM expert tier (`hits.d_res`), and
   that tier is only built with the pool on. Without the pool, the uncached experts would contribute nothing, so the
   model would not be computed. Speculative decoding cannot run with the pool off.
