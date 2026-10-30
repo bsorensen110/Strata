@@ -635,3 +635,38 @@ Full write-up: `docs/C2-BATCH-PENALTY-DIAGNOSIS.md`.
 - C1 A/B: `--batch-suffix-draft 3` on vs off on a copy-heavy workload (measure acceptance lift).
 - C2 GPU A/B: the ring-comparison dump above (confirm or refute H3).
 - A2 sweeps: one-variable `--spec-min-p` and `STRATA_DFLASH_DEPTH_SLOPE` (short, isolated).
+
+## E1 — MTP co-draft for batch windows (2026-10-29, IMPLEMENTED)
+
+Work done in the **`/home/soren/Strata-integ`** worktree (branch `integ/community-2026-10`),
+commit `3e6908f4`, pushed to `fork`. The MTP co-draft (the paiton `Flash-Next/README.md`
+recommendation) combines `--draft dflash2` and `--batch-mtp` in the batch path: each slot's
+group carries both the DFlash2 block-drafter's proposals and the MTP chain-drafter's first
+token, so the window verifies a mix of block-drafter and chain-drafter tokens. This directly
+addresses the batch penalty (4 slots × 3 DFlash2 proposals = 12 proposals underutilized;
+adding the MTP token closes the gap).
+
+### Changes
+
+- `BSlot` gains `int32_t mtp_draft` + `bool mtp_draft_ready` (the slot's MTP proposal,
+  separate from the DFlash2 `draft[]`).
+- In the `df2_win` next-draft block (`generate.cpp` ~13640), after the DFlash2/n-gram draft,
+  if `batch_mtp` is enabled, the slot's MTP drafter runs on the committed rows' residuals
+  (`ver.final_R_all()`, the same source the `--batch-mtp` path uses). The first MTP token is
+  stored in `sl.draft[sl.n_drafts]` with `sl.n_drafts` incremented, so the window builder and
+  the accept rule treat it as a regular proposal. The MTP drafter's `max_drafts` is 1 (the
+  serial windows verify one proposal per slot), so the token is always the first MTP
+  proposal. A proposal the target did not pick is never emitted, so the co-draft can only
+  raise the acceptance; it changes nothing about which tokens the target emits.
+
+### Verification (this session, no GPU)
+
+- `generate.cpp` compiles clean (`-fsyntax-only`, 0 errors) with the production-matched HIP flags.
+- CPU CTest subset: `batch_spec_test`, `batch_spec_slots_test`, `dflash2_slots_test`,
+  `dflash2_tap_test`, `suffix_drafter_test` — **5/5 passed** (no regressions).
+
+### Still owed (needs a GPU window)
+
+- E1 A/B: `--batch-mtp --draft dflash2` on vs `--draft dflash2` alone (measure the acceptance
+  lift and the throughput vs plain batch / batch MTP). The co-draft is opt-in (requires
+  `--batch-mtp` + `--draft dflash2`) and changes nothing about which tokens the target emits.
