@@ -160,6 +160,11 @@ void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, 
 /// (STRATA_ADAPT_FETCH: a VRAM cache slot).  A separate overload, so the SYCL copy keeps the one above.
 void fetch_blobs(const unsigned long long* src, const int32_t* n, uint8_t* dst, int64_t blob_bytes, int cap, void* stream,
                  const unsigned long long* dst2);
+/// fetch_blobs with the wait for a host flag folded in: every block's thread 0 spins on *flag >= value (a mapped host
+/// flag, as wait_flag_ge does) and fences before it reads the blobs, so the PCIe share's wait and its copy are one
+/// launch.  The same reads and writes as fetch_blobs after the flag.  cap <= 0: the wait alone (wait_flag_ge).
+void fetch_blobs_after(const uint32_t* flag, uint32_t value, const unsigned long long* src, const int32_t* n, uint8_t* dst,
+                       int64_t blob_bytes, int cap, void* stream, const unsigned long long* dst2);
 /// table[pairs[2k]] = pairs[2k + 1] for k < n, `pairs` in mapped host memory: a residency table's changed entries,
 /// stream-ordered before the window that reads it, without the copy engine (where the tier's swaps may queue).
 void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream);
