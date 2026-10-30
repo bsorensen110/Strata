@@ -104,8 +104,8 @@ Resolution policy that worked, reuse it:
 Follow-ups owed:
 - #3662: `constexpr int NEXP = 512` in `metal/src/engine/window.cpp` needs the runtime
   `n_expert_` port before 256-expert Coder models work on Metal.
-- `metal/CMakeLists.txt` carries a stray `>` line (pre-existing integ artifact; Metal is
-  not build-gated on Linux).
+- `metal/CMakeLists.txt` carried a stray `>` line (pre-existing integ artifact; removed in
+  the v0.2.8 merge, 56d8bd79).
 
 Linux build gate (the Windows `build-cu130.bat` recipe does not run here):
 `cmake -B build-verify -S . -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON
@@ -768,3 +768,109 @@ SM60-specific intrinsics) but their **call sites were gated on `STRATA_EXPERIMEN
 - GPU A/B: `STRATA_FUSE_DECODE=1` on vs off on the production model (measure tok/s and
   confirm bitwise parity on the RDNA4 card). The V100 numbers are from PR #1097; the RDNA4
   speedup is not yet measured.
+
+---
+
+## Upstream main merged (870aedd9, v0.2.8) — 2026-10-24
+
+`git merge --no-ff upstream/main` (tip **870aedd9**, project version 0.1.54) into
+`integ/community-2026-10`; rollback ref `integ/pre-upstream-0.2.8` = **4bb2bba0**.
+Merge commit **56d8bd79**, build fixes **b1e0783b**. 20 conflicted files, all resolved by
+hand (policies below), then a CPU-only MSVC Release build to green.
+
+### Policy applied (unchanged)
+
+Upstream wins its refactors; the fork keeps its live grafts (RDNA4/gfx12, the DFlash2
+batch line, the disk-backed conversation cache, the launch-reduction speed work); union
+where both sides add distinct features.
+
+### The v0.2.8 window-limits refactor (upstream wins)
+
+`include/strata/kernels/window_limits.hpp` is the new source of the window constants:
+`STRATA_VERIFY_MAX_T` (macro, default 8; CMake `STRATA_WINDOW_MAX_T` = auto/8/16 sets it),
+`kVerifyNarrowT = 8`, `kWindowMaxT = STRATA_VERIFY_MAX_T`; in `verify_kernels.hpp`
+`kVerifyMaxT = kWindowMaxT`, `kVerifyDefaultMaxT = kVerifyNarrowT`; in `fused_gr.hpp`
+`kFusedGrWideT = kWindowMaxT` and `kFusedGrMaxT = 8` stays the tile cap.  The fork's
+`kVerifyGroupRows = 8` is kept.  `generate.cpp` needed the mechanical rename
+`kVerifyDefaultMaxT` → `kVerifyNarrowT` at every site whose semantics are unchanged (MTP
+and piped-MTP windows, the draft clamps, the handoff buffers, `chain_n`).
+
+### Per-file resolutions
+
+- **native_mmvq.cu** — upstream's dense `MAX_NCOLS` (`STRATA_VERIFY_MAX_T > 8 ? 16 : 8`)
+  and its recursive `native_mmvq`; the fork's `native_mmvq_indexed`/`_indexed_chunk` kept,
+  but its tiling rebound from `MAX_NCOLS` to **`native_mmvq_kernel_max_cols` (= 8)**:
+  `launch_indexed_cuda` only instantiates nc 1..8, so a wide build would have requested
+  tiles with no kernel.  Upstream's `native_mmvq` is the single version (the fork's
+  lambda variant is gone).
+- **fused_gr.cu** — upstream: `fused_gr_read_multi_slice` + the slice loop over
+  `kFusedGrWideT`.  The fork's `fused_gr_read_multi_tile` is dropped;
+  `kFusedGrMaxWindowT` has no remaining references.
+- **s2_expert_grouped.cu** — union: `GMAX = kVerifyGroupRows` (fork) with upstream's
+  `kGroupPasses` tiling, kernels merged to `template <int SKIP, int MAX_E = GMAX>`; the
+  launcher keeps the fork's `single_entry` fast path (`<0, 1>`, cap_entries <= 16) **and**
+  upstream's SKIP=GMAX second pass under `if constexpr (kWide)`.
+- **verify_kernels.cu** — upstream wins the resident plan outright: per-window-class block
+  sizes `kResidentPlanNarrow = 128` / `kResidentPlanMax` (256 on wide builds), kernel
+  `template <int NT>`, `NW = NT/32`.  The auto-merged launch sites already called both
+  instantiations, so the fork's fixed 256-thread plan had to go.  No `kResidentPlanWarps`
+  references remain.
+- **shared_expert.cu**, **sycl/src/core/verify.cpp**, **src/core/verify.cpp** — upstream
+  (the self_commit rework uses `self_commit_off_`, present in `core/verify.hpp`; the
+  `done()` rewrite adds exception handling around `dpct::sycl_event_query`).
+- **generate.cpp** (14 markers) — renames above, plus two unions: the batch window plan
+  keeps the fork's `#if defined(STRATA_HAVE_DFLASH2)` `use_df2`/`batch_draft_window`
+  request beside upstream's narrow/maxT body, and the disk conversation cache keeps the
+  fork's `!conv_disk` gate around upstream's #4518 PLE-lock giveback.  The fork's
+  `df2_win` window-plan block is kept verbatim (upstream only renamed its loop bound to
+  `win_cap`).
+- **metal/CMakeLists.txt**, **mtl_rt.h**, **mtl_rt.mm** — unions: the fork's
+  `host_sampler_parity`/`session_limits_test` targets and `STRATA_DFLASH`/`STRATA_DFLASH_LLAMA`
+  block ahead of upstream's DS4 block (the fork block's missing `endif()` added);
+  `Buffer::starts` + upstream's `Buffer::bias`; `max_threadgroup_memory()` + upstream's
+  keepalive/`zc_map`/`pipeline_uncached` declarations.  In `mtl_rt.mm`: `BO()` looks up
+  `starts` on both the DS4 and non-DS4 paths with upstream's `bias` on the DS4 path;
+  `Context::alloc` keeps upstream's DS4 pool drain under `#if STRATA_DS4_RUNTIME` with the
+  fork's `@autoreleasepool` in the non-DS4 branch; the fork's `wrap_ranges` (with an
+  `@autoreleasepool` per chunk) and upstream's rewritten `wrap` are two separate functions.
+  The stray `>` line at line 159 (noted in "Known landmines" above) is **removed**.
+
+### Census of the auto-merged seams
+
+Checked against `git show 4bb2bba0:CMakeLists.txt`: only the version bump and upstream's
+`STRATA_PORTABLE`/arm64 rework were removed; **no fork source or target was dropped**
+(`peer_link.cpp`, `kv_pool.cpp`, `kv_chunks.cpp`, `rope_cache_migration.cpp` in
+`strata_engine`, the dflash2 family, the HIP ctest family, the ple_reader harness, the
+conversation-cache tests), and `stage_link_test`'s `ws2_32` link is still under a plain
+`if(WIN32)` (not the `WIN32 AND STRATA_ENABLE_HIP` form the landmine warns about).
+`sycl/CMakeLists.txt` and `metal/CMakeLists.txt` lost only lines upstream itself rewrote.
+`tools/sweep/dup_audit.py` over every hand-resolved file: clean.
+
+**Silent one-sided hunks found in the root CMakeLists.txt** (auto-merge unions, configure
+errors): verbatim-duplicate `qsa_topk_active_parity` and `qsa_scores_parity` blocks, and
+the fork's `nv_defaults_test` registration left beside upstream's relocated copy.  All
+three removed in b1e0783b (upstream's placement wins).  Remaining same-name pairs
+(`ds4_gg_bench`, `hip_router_fast`, `qsa_select_bench`, `pool_affinity_test`,
+`isa_guard_check`, `native_expert_parity_${_name}`) sit in mutually exclusive
+if/elseif branches (CUDA vs HIP, WIN32 vs Linux, MSVC vs else) — not collisions.
+
+### Build verification (this box, SorenDesk, no GPU run)
+
+`cmake -B build-mergecheck -G "Visual Studio 18 2026" -A x64 -DCMAKE_BUILD_TYPE=Release
+-DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF -DSTRATA_BUILD_TESTS=ON
+-DSTRATA_BUILD_CONVERSATION_TESTS=ON` then `cmake --build build-mergecheck --config
+Release -j 12`: **green, 0 errors** (CPU-only; CUDA/HIP kernels not compiled here).
+Two MSVC portability fixes in test sources: `conversation_file_test.cpp` called raw
+`setenv`/`unsetenv` in the Metal-MTP fingerprint block (routed through the file's
+`set_env()` helper), and `native_hadamard_test.cpp` used `__builtin_popcount`
+(→ `std::popcount`, C++20).  The Strata service was **not** run.
+
+### Still owed
+
+- CUDA/HIP builds of the merged tree (`build-cu130.bat` on the CUDA box; the Linux
+  gfx1201 gate above) — this box has no CUDA Toolkit and no ROCm, so the .cu files
+  resolved here (native_mmvq, fused_gr, s2_expert_grouped, verify_kernels, native_bf16)
+  have only been compiled in spirit, not by a device compiler.
+- ctest on a GPU window (the dflash2 family, the qsa parity tests, resident-plan shapes).
+- Wide-build check: `-DSTRATA_WINDOW_MAX_T=16` compile, which is where the
+  `native_mmvq_kernel_max_cols` rebinding and the `kGroupPasses` second pass matter.
