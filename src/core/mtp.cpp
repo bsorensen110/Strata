@@ -152,6 +152,9 @@ MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
+    for (auto& e : group_exec_) if (e) cudaGraphExecDestroy(e);
+    if (grp_out_h_) cudaFreeHost(grp_out_h_);
+    if (grp_ev_) cudaEventDestroy(grp_ev_);
     if (pf_dev_) cudaFree(pf_dev_);
     if (dense4_) cudaFree(dense4_);
     for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
@@ -1198,7 +1201,22 @@ bool MtpDrafter::record_front(int T, int row0, cudaStream_t cs, std::string& err
             fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
         }
         // stored in the state's own format (#293 appended rotated INT8 K/V as Q4_0, into pools INT8 never has)
-        if (!no_batch_kv && st_.kv_q4)
+        if (seg_ != nullptr) {   // a group: each item's rows into that item's own state, one row at a time
+            for (int k = 0; k < seg_n_; ++k) {
+                QsaState& sst = *seg_[k].st;
+                for (int t = seg_[k].row0; t < seg_[k].row0 + seg_[k].rows; ++t) {
+                    if (sst.kv_q4)
+                        kv_append_q4_step(sst.k_q4, sst.v_q4, sst.page_table, step + t * 4, kcur_ + t * NKV * HD,
+                                          vcur_ + t * NKV * HD, s, cs, &sst.host);
+                    else if (sst.kv_int8)
+                        kv_append_q8_step(sst.k_q, sst.v_q, sst.k_scale, sst.v_scale, sst.page_table, step + t * 4,
+                                          kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &sst.host);
+                    else
+                        kv_append_step(sst.k_pool, sst.v_pool, sst.page_table, step + t * 4, kcur_ + t * NKV * HD,
+                                       vcur_ + t * NKV * HD, s, cs, &sst.host);
+                }
+            }
+        } else if (!no_batch_kv && st_.kv_q4)
             kv_append_q4_steps(st_.k_q4, st_.v_q4, st_.page_table, step, 4, T, kcur_, vcur_, s, cs, &st_.host);
         else if (!no_batch_kv && st_.kv_int8)
             kv_append_q8_steps(st_.k_q, st_.v_q, st_.k_scale, st_.v_scale, st_.page_table, step, 4, kcur_, vcur_,
@@ -1236,7 +1254,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
     if (!decode_ready(err)) return false;   // this is the 512 experts' only reader
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
-    const int T = 1;
+    const int T = rest_T_;
     const int64_t N = g.n_embd, HC = g.hc, K = ss.k, NH = g.n_head, HD = g.head_dim;
     const QsaShapes s = shapes_of(g);
     const GrShapes gs{g.n_embd, g.hc, g.hc_lr};
@@ -1270,8 +1288,14 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         else if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
         // STRATA_QSA_SPLIT_ATTN=1: the draft layer's attention over its window, split the same way
         static const bool split_attn = [] { const char* v = std::getenv("STRATA_QSA_SPLIT_ATTN"); return v != nullptr && std::atoi(v) != 0; }();
-        if (!(split_attn && qsa_decode_attn_split(qcur_, pools, ident_, step, cap_, s, attn_scratch_, (uint64_t) attn_scratch_floats_, attn_, T, cs)))
-        qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+        if (seg_ != nullptr) {   // a group: each item's rows attend over that item's own cells
+            for (int k = 0; k < seg_n_; ++k) {
+                const QsaAttnPools pk = qsa_attn_pools(*seg_[k].st);
+                qsa_decode_attn_batch(qcur_ + (size_t) seg_[k].row0 * NH * HD, pk, ident_, step + seg_[k].row0 * 4, cap_, s,
+                                      attn_scratch_, attn_ + (size_t) seg_[k].row0 * NH * HD, seg_[k].rows, cs);
+            }
+        } else if (!(split_attn && qsa_decode_attn_split(qcur_, pools, ident_, step, cap_, s, attn_scratch_, (uint64_t) attn_scratch_floats_, attn_, T, cs)))
+            qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
         if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
         g_mp.stamp(6, cs);
         native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
@@ -1891,6 +1915,10 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (probs) probs[last] = ((volatile float*) h_prob_)[last];
         prefetch_ple(drafts[last]);
         n = max_steps;
+        if (g_mp.on) {   // the fast path (the co-draft): the same per-stage profile as the slow path below
+            g_mp.collect(n);
+            if (g_mp.n[0] % 300 == 0) g_mp.report();
+        }
     } else if (max_steps > 0) {
         g_dt.init();
         const bool dt = g_dt.on;
@@ -2074,6 +2102,102 @@ bool MtpDrafter::draft_end(int32_t* drafts, std::string& err) {
         n = max_steps;
     }
     for (int j = n; j < max_t_ - 1; ++j) drafts[j] = 0;
+    ++rounds;
+    return true;
+}
+
+// ---- the batch co-draft for several slots in one round (mtp.hpp: GroupItem)
+bool MtpDrafter::group_applies(const GroupItem* it, int S) const {
+    if (S < 1 || 2 * S > max_t_ || chain_rule_ || coupled_active_ || chain_live_ || pend_ || !strata::kernels::argmax_rows_wanted()) return false;
+    std::string e;
+    if (!decode_ready(e)) return false;
+    for (int i = 0; i < S; ++i) {
+        const MtpDrafter& d = *it[i].d;
+        if (d.pend_ || d.coupled_active_ || d.chain_rule_ || d.chain_live_) return false;
+        const int64_t ms = std::min<int64_t>(std::min<int64_t>(d.max_t_ - 1, d.max_drafts_), d.st_.max_cells - (it[i].p + it[i].a));
+        if (ms != 1) return false;   // a single step: the round only
+        if (it[i].a < 0 || it[i].a > 1 || it[i].p < 0 || it[i].p + 2 > d.st_.max_cells) return false;
+        if (it[i].R == nullptr || it[i].tokens == nullptr || it[i].drafts == nullptr) return false;
+    }
+    return true;
+}
+
+bool MtpDrafter::capture_group(int key, GroupSeg* segs, int S, std::string& err) {
+    using namespace strata::kernels;
+    const int R2 = 2 * S;
+    const int64_t NH = g_->n_head;
+    cudaGraphExec_t& exec = group_exec_[(size_t) key];
+    seg_ = segs;
+    seg_n_ = S;
+    rest_T_ = R2;
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        seg_ = nullptr; seg_n_ = 0; rest_T_ = 1;
+        err = "mtp group: begin capture";
+        return false;
+    }
+    const MappedCopy in[3] = {{tok_, m_tok_, R2}, {step_, m_step_, (int64_t) R2 * 4}, {pos_, m_pos_, (int64_t) R2 * NH}};
+    copy_from_mapped_multi(in, 3, cs_);
+    bool ok = record_front(R2, 0, cs_, err);
+    if (ok) ok = record_rest(0, cs_, err);
+    seg_ = nullptr; seg_n_ = 0; rest_T_ = 1;
+    return finish_capture(cs_, ok, exec, "group", err);
+}
+
+bool MtpDrafter::draft_group(const GroupItem* it, int S, int key, std::string& err) {
+    if (!group_applies(it, S)) { err = "mtp group: the items do not apply"; return false; }
+    if (key < 0 || key >= 256) { err = "mtp group: key out of range"; return false; }
+    if (!decode_ready(err)) return false;
+    const OnDevice on_device(device_);
+    if (group_exec_.size() < 256) group_exec_.resize(256, nullptr);
+    if (grp_ev_ == nullptr && cudaEventCreateWithFlags(&grp_ev_, cudaEventDisableTiming) != cudaSuccess) {
+        err = "mtp group: event create"; return false;
+    }
+    if (grp_out_h_ == nullptr && cudaMallocHost((void**) &grp_out_h_, (size_t) (max_t_ + 8) * sizeof(int32_t)) != cudaSuccess) {
+        err = "mtp group: pinned ids"; return false;
+    }
+    const int64_t HCN = g_->hc * g_->n_embd, NH = g_->n_head;
+    const int R2 = 2 * S;
+    auto put = [&](int row, int64_t cell) {
+        h_step_[row * 4 + 0] = (int32_t) cell;
+        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+    };
+    for (int i = 0; i < S; ++i)
+        for (int t = 0; t < 2; ++t) {
+            h_tok_[2 * i + t] = it[i].tokens[t];
+            put(2 * i + t, it[i].p + t);
+        }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    // each item's two residual rows: after the stream that wrote them
+    for (int i = 0; i < S; ++i) {
+        if (cudaEventRecord(grp_ev_, it[i].src) != cudaSuccess || cudaStreamWaitEvent(cs_, grp_ev_, 0) != cudaSuccess ||
+            cudaMemcpyAsync((void*) (Rin_ + (size_t) (2 * i) * (size_t) HCN), it[i].R, (size_t) 2 * (size_t) HCN * sizeof(float),
+                            cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+            err = "mtp group: staging the residual rows failed";
+            return false;
+        }
+    }
+    if (group_exec_[(size_t) key] == nullptr) {
+        std::vector<GroupSeg> segs((size_t) S);
+        for (int i = 0; i < S; ++i) segs[(size_t) i] = GroupSeg{&it[i].d->st_, 2 * i, 2};
+        if (!capture_group(key, segs.data(), S, err)) return false;
+    }
+    if (cudaGraphLaunch(group_exec_[(size_t) key], cs_) != cudaSuccess) {
+        err = std::string("mtp group: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    if (cudaMemcpyAsync(grp_out_h_, out_ids_, (size_t) R2 * sizeof(int32_t), cudaMemcpyDeviceToHost, cs_) != cudaSuccess ||
+        cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("mtp group: ids: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    for (int i = 0; i < S; ++i) {
+        it[i].drafts[0] = grp_out_h_[2 * i + it[i].a];
+        for (int j = 1; j < max_t_ - 1; ++j) it[i].drafts[j] = 0;
+        ++it[i].d->rounds;
+    }
     ++rounds;
     return true;
 }

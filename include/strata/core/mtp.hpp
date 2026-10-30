@@ -148,6 +148,23 @@ public:
     bool draft_begin(int T, const int32_t* tokens, int64_t p, int a, std::string& err);
     bool draft_end(int32_t* drafts, std::string& err);
 
+    /// The batch co-draft for several slots in one round (STRATA_BATCH_DRAFT_GROUP).  Each item is one slot's
+    /// draft(2, tokens, p, a) with a single step (max_drafts 1).  This drafter (the owner) stages item i's two rows at
+    /// rows 2i, 2i+1 of its own buffers; the front appends each item's K/V into that item's own state; the rest attends
+    /// each row over its own item's cells; one head pass gives every item's draft (its row a).  `key` (one bit per slot)
+    /// names the item set: one captured graph per key.  `group_applies` checks everything without side effects.
+    struct GroupItem {
+        MtpDrafter* d = nullptr;           ///< the item's slot drafter (its state and draft limits)
+        const float* R = nullptr;          ///< its two residual rows (device)
+        cudaStream_t src = nullptr;        ///< the stream that wrote R
+        const int32_t* tokens = nullptr;   ///< its two window tokens
+        int64_t p = 0;                     ///< the first cell of its window
+        int a = 0;                         ///< its accepted row (0 or 1)
+        int32_t* drafts = nullptr;         ///< receives its draft (one token, then zeros as draft() writes)
+    };
+    bool group_applies(const GroupItem* it, int S) const;
+    bool draft_group(const GroupItem* it, int S, int key, std::string& err);
+
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     /// STRATA_SPEC_COST: called after each draft step with (index, probability) instead of the `min_p` test; false ends the chain.
     /// Also called once for the last step of a chain that reached its length (so the rule sees every draft). Empty: min_p decides.
@@ -297,6 +314,14 @@ private:
     // --pipeline-windows 2 (chain_launch)
     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
     bool force_on_ = false, chain_live_ = false;
+    struct GroupSeg { QsaState* st = nullptr; int row0 = 0; int rows = 0; };
+    const GroupSeg* seg_ = nullptr;    ///< non-null while a group graph is recorded: per-item K/V and attention
+    int seg_n_ = 0;
+    int rest_T_ = 1;                   ///< the rest's rows: 1 for the round, 2 per item for a group
+    std::vector<cudaGraphExec_t> group_exec_;   ///< by item-set key
+    int32_t* grp_out_h_ = nullptr;     ///< pinned: the group's draft ids
+    cudaEvent_t grp_ev_ = nullptr;
+    bool capture_group(int key, GroupSeg* segs, int S, std::string& err);
     bool pend_ = false;                 // a draft_begin awaits its draft_end
     int pend_max_steps_ = 0;
     bool pend_do_ple_ = false;

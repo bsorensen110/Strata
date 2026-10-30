@@ -114,3 +114,69 @@ over all slots' rows, which needs a kernel change. Ceiling about 2 ms per window
 ### Tooling
 
 `tools/ab/batch_burst_bench.py --same-prompts` sends the same first prompts every round (determinism checks).
+
+## Follow-up 3: CPU share off, the profile, and the batched co-draft (`STRATA_BATCH_DRAFT_GROUP=1`, default off)
+
+### "CPU share off" for identical replies: not available in this configuration
+
+- The prefill CPU share is already off on this build: `generate.cpp` enables it only on CUDA builds with one GPU and no
+  batch slots. `STRATA_PREFILL_CPU_SHARE=0` changes nothing here (the runs were identical in the first place).
+- The CPU share that does exist is the decode expert pool. The serve log reports 27% of routed experts computed on the
+  CPU (the VRAM tier holds 11184 experts, 21.3 GiB of 46.8 GiB).
+- `--no-pool` (the GPU-only floor) does not start: verify needs the profile-filled VRAM expert tier (`hits.d_res`), and
+  that tier is only built with the pool on. Without the pool, the uncached experts would contribute nothing, so the
+  model would not be computed. Speculative decoding cannot run with the pool off.
+- `--pool-workers 1` (one CPU worker, `pw1a`/`pw1b`): single-request replies still differ (`3dd488f5…` vs `c6bc3155…`).
+  Pool worker order is not the cause.
+- `--adapt-async 1` is production (the help text says it is not bit-exact run to run). `--adapt-async 0` (`detA`) still
+  differed.
+- Status: identical replies across fresh launches are NOT reproduced. The open suspect is the CPU/GPU routing of
+  individual experts (cache hits vs CPU vs PCIe), which varies with timing. Fixing it means changing the engine's
+  expert-routing decision, not a flag.
+
+### Profile of one co-draft (the batched draft's target)
+
+`STRATA_MTP_PROFILE=1` (the fast path now records too; before this only the slow path did), 4-way burst, ms per round
+graph over 300 rounds: total 0.768 ms. Head GEMV 0.234 (30%), q+norm-rope 0.079, gate+o_proj 0.050, experts 0.046,
+hc-read attn 0.043, k/v+append 0.034, attention 0.035, and the other stages 0.009–0.037 each. Stage costs are
+launch-chain sized, so batching the rows across slots pays off.
+
+### The batched co-draft (`STRATA_BATCH_DRAFT_GROUP=1`)
+
+- What it does: one round for all active slots, from one captured graph per active-slot set (bitmask key). Item i's
+  two rows sit at rows 2i, 2i+1 of the owner's buffers. The front appends each item's K/V into that item's own state,
+  the rest attends each row over its own cells, and one head pass gives each item's draft. Applies only to serial
+  single-step co-drafts (max_drafts 1, greedy); anything else falls back to per-slot drafts.
+- Code: `MtpDrafter::GroupItem`, `group_applies`, `draft_group`, `capture_group` (`mtp.hpp`, `mtp.cpp`); the batch loop
+  in `generate.cpp` collects items, runs the group after the emit loop, and reuses the check mode (serial re-draft per
+  slot, token compare).
+- Results (`burst2/` arms, 4 concurrent, 2 rounds):
+
+| arm | draft ms/window | MTP acceptance | tok/s | draft tokens differing from serial |
+|---|---|---|---|---|
+| base (serial co-draft) | 2.13–2.19 | 70.2% | 96–98 | - |
+| group, default rest kernels (`grp_multi_time`) | 1.30–1.39 | 68.3% | 98.4–98.6 | 25 of 420 and 0 of 440 (check mode) |
+| group + `STRATA_NO_MULTI_GR=1` (`gN_time`, `gA_nomulti`) | 1.26–1.34 | **0.0%** | 66–67 | 2 of 755 and 0 of 705 |
+
+- The group saves about 0.8 ms per window (about 2% of a 40 ms window). That is within noise for throughput, and the
+  drafts differ in bits, so the arm is opt-in only. Not promoted.
+- Where the bits differ: the group runs the rest on 2 rows per item with the multi-row kernels (router GEMV and top-10,
+  MoE combine, residual write, head-mix). Serial runs them on one row. Each of those multi-row kernels is a candidate;
+  `STRATA_NO_MULTI_GR=1` changes the single-row residual write as well, and that breaks the drafter for serial too
+  (0% acceptance with and without the group). Do not use that switch on this build.
+- A bit-exact group needs every rest kernel run one row at a time, which removes most of the saving. Not built.
+- Check mode (`STRATA_BATCH_DRAFT_CHECK=1`) hides the state difference: its serial re-draft rewrites the same K/V after
+  each group, so acceptance looks normal (67.9%) there. Use the non-check arm to judge the group.
+- Pitfall found on the way: `batch_burst_bench.py` reads the port from the config's `port` field (default 8091), not
+  from the server command line. An arm whose server listens on another port fails with "connection refused".
+
+### Repro
+
+```
+cd ~/Strata-integ/build-hip && make strata -j32
+# arms (cand.json per arm, env as listed): base=d1 (STRATA_BATCH_DRAFT_TIMING=1),
+#   group=d1 + STRATA_BATCH_DRAFT_GROUP=1, check=group + STRATA_BATCH_DRAFT_CHECK=1
+python3 tools/ab/batch_burst_bench.py <cand.json> <out.json> --rounds 2 --max-tokens 256 --conc 4
+grep -h "MTP proposals accepted" <engine.log> | tail -1
+grep -h "strata batch draft:" <engine.log>
+```

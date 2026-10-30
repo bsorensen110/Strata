@@ -12918,6 +12918,8 @@ int main(int argc, char** argv) {
         const bool draft_two_phase = draft_check || std::getenv("STRATA_BATCH_DRAFT_TWOPHASE") != nullptr;
         int64_t bt_chk_n = 0, bt_chk_bad = 0;
         struct DraftWait { int b; int row; int a; int64_t p; };
+        // STRATA_BATCH_DRAFT_GROUP=1: every active slot's round in one group (one graph per active set, one sync)
+        const bool draft_group_on = std::getenv("STRATA_BATCH_DRAFT_GROUP") != nullptr;
         double bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
@@ -13543,6 +13545,8 @@ int main(int argc, char** argv) {
                 bt_accepted += keep[active[a]] - 1;
             }
             std::vector<DraftWait> draft_wait;   // the two-phase co-drafts in flight in this window
+            std::vector<strata::core::MtpDrafter::GroupItem> group_items;   // STRATA_BATCH_DRAFT_GROUP: this window's rounds
+            std::vector<int> group_slots;
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
@@ -13595,7 +13599,18 @@ int main(int argc, char** argv) {
                         std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
                         return false;
                     }
-                    if (draft_two_phase && slot_mtp[(size_t) b]->fast_draft_ok()) {
+                    if (draft_group_on) {
+                        strata::core::MtpDrafter::GroupItem gi;   // the round runs after the loop, for every slot together
+                        gi.d = slot_mtp[(size_t) b].get();
+                        gi.R = slot_mtp_rows[(size_t) b].get();
+                        gi.src = slot_mtp[(size_t) b]->stream();
+                        gi.tokens = outb + first[t];
+                        gi.p = pos[first[t]];
+                        gi.a = keep[b] - 1;
+                        gi.drafts = sl.draft.data();
+                        group_items.push_back(gi);
+                        group_slots.push_back(b);
+                    } else if (draft_two_phase && slot_mtp[(size_t) b]->fast_draft_ok()) {
                         // the round is in flight; its tokens are read after this loop (draft_end)
                         if (!slot_mtp[(size_t) b]->draft_begin(2, outb + first[t], pos[first[t]], keep[b] - 1, err)) {
                             std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
@@ -13687,6 +13702,42 @@ int main(int argc, char** argv) {
                     }
                 }
 #endif
+            }
+            if (!group_items.empty()) {   // STRATA_BATCH_DRAFT_GROUP: the co-drafts of every active slot in one round
+                const Clock::time_point wg = Clock::now();
+                const int S = (int) group_items.size();
+                int key = 0;
+                for (int b : group_slots) key |= 1 << b;
+                auto* owner = slot_mtp[0].get();   // the group's buffers: any drafter's (every one has max_t rows)
+                if (owner->group_applies(group_items.data(), S)) {
+                    if (!owner->draft_group(group_items.data(), S, key, err)) {
+                        std::printf("ERR batch MTP group: %s\n", err.c_str());
+                        return false;
+                    }
+                } else {   // the group does not apply to these items: one serial draft per slot
+                    for (const auto& gi : group_items) {
+                        if (!gi.d->draft(2, gi.tokens, gi.p, gi.a, gi.drafts, err)) {
+                            std::printf("ERR batch MTP serial fallback: %s\n", err.c_str());
+                            return false;
+                        }
+                    }
+                }
+                for (int b : group_slots) bs[(size_t) b].draft_ready = true;
+                if (draft_check) {   // the same drafts again, one serial draft() per slot: they must match token for token
+                    for (size_t i = 0; i < group_items.size(); ++i) {
+                        const auto& gi = group_items[i];
+                        int32_t chk[strata::core::Dflash2Drafter::kDrafts] = {};
+                        int nchk = 0;
+                        if (!gi.d->draft(2, gi.tokens, gi.p, gi.a, chk, err, nullptr, 0.0f, &nchk)) {
+                            std::printf("ERR batch MTP check slot %d: %s\n", group_slots[i], err.c_str());
+                            return false;
+                        }
+                        for (int j = 0; j < nchk; ++j) bt_chk_bad += chk[j] != gi.drafts[j];
+                        bt_chk_n += nchk;
+                    }
+                }
+                bt_draft += msd(wg, Clock::now());
+                bt_draft_n += S;
             }
             // the two-phase co-drafts: wait for every round in flight, one synchronisation each
             for (const DraftWait& dw : draft_wait) {
@@ -13799,7 +13850,7 @@ int main(int argc, char** argv) {
                 if (batch_mtp && std::getenv("STRATA_BATCH_DRAFT_TIMING") != nullptr)
                     std::fprintf(stderr, "strata batch draft: %.2f ms/window in %.2f co-draft calls/window (%s)\n",
                                  bt_draft / w, (double) bt_draft_n / w,
-                                 draft_two_phase ? "two-phase: begin + end" : "serial, each syncs");
+                                 draft_group_on ? "one group round per window" : draft_two_phase ? "two-phase: begin + end" : "serial, each syncs");
                 if (batch_mtp && draft_check)
                     std::fprintf(stderr, "strata batch draft check: %lld of %lld drafted tokens differ from a serial draft\n",
                                  (long long) bt_chk_bad, (long long) bt_chk_n);
