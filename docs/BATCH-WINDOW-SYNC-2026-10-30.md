@@ -62,3 +62,55 @@ next window's MTP co-draft.
 `burst/{base,async,base2,async2}/result.json` and `batch_lines.txt` in the scratch directory
 `~/.hermes/cache/scratch/ab-fused-e1-20261029/burst/`. Each arm's reply hashes and the per-window `strata batch:`
 lines are there.
+
+## Follow-up 2: co-draft timing, determinism, and the two-phase co-draft
+
+### D1: the emit bucket is the serial co-draft
+
+`STRATA_BATCH_DRAFT_TIMING=1` (default off) adds one stderr line per idle print with the co-draft host wall.
+Four-way burst on the base build: co-draft 2.22 and 2.19 ms per window in 2.92 and 2.87 calls per window.
+Emit was 2.20 ms in the same windows. The emit bucket is the serial co-drafts, about 0.75 ms each.
+
+### Determinism: open, and not the co-draft
+
+Greedy single-request replies differ between fresh launches of the same code, and the runs below all used one
+request per launch with no prompt reuse:
+
+- `--adapt-async 0`, base-equivalent gates, two launches: `d1bcd4790d66…` and `84369e232433…` (differ).
+- `--spec 2` with no MTP and no batch-MTP (adaptation off), two launches: `1b23d9cca325…` and `394ef5aa2527…` (differ).
+
+The speculation-off config is not runnable: the native pack needs `--spec T` with T ≥ 2 and refuses to start
+otherwise. So the co-draft is ruled out by the `--spec 2` run, and asynchronous adaptation by the
+`--adapt-async 0` run. Untested suspects: timing-dependent expert placement (VRAM / PCIe / CPU split of routed
+experts) and the reduction order of the CPU expert pool. Consequence: an engine-level bit-parity claim needs
+this fixed first. Kernel-level parity tests (below) do not depend on it.
+
+### D2: two-phase co-draft (`STRATA_BATCH_DRAFT_TWOPHASE=1`, default off)
+
+Implemented as `MtpDrafter::draft_begin` / `draft_end` (the fast path of `draft()` split at its wait). The batch
+loop launches every active slot's round, then waits for all of them once.
+
+- Check mode (`STRATA_BATCH_DRAFT_CHECK=1`, implies two-phase): each drafted token is re-drafted serially and
+  compared. Two concurrent bursts: 0 of 447 and 0 of 417 drafted tokens differ.
+- Timing: two-phase co-draft wall 2.05 and 2.53 ms per window, against 2.2 ms serial. Emit 2.54 ms against
+  2.20 ms. No reduction.
+- Begin and end were not timed separately. So it is not yet established whether the four graphs serialize on
+  the GPU or the host setup dominates.
+
+Conclusion: one sync per window does not remove the co-draft cost. The next lever is a single MTP draft graph
+over all slots' rows, which needs a kernel change. Ceiling about 2 ms per window (about 5%), unmeasured. Not started.
+
+### Launch-reduction branch (`perf/launch-reduction`, sub-agent)
+
+- `quantize_il_parity` (the test commit `d9fcdd38`): all 45 cases pass on gfx1201 (5 shapes × 3 column counts ×
+  3 seeds, byte for byte against the pair). This is the first run of that test.
+- The fused quantize-plus-interleave (`585ff5f5`) is on by default on gfx12. Its engine-level effect is not
+  measured: burst tok/s stayed within run-to-run noise (93–99) across the arms.
+- The PCIe-wait fold (`055025ed`) has no kernel-level parity test yet. The launch count it claims (one fewer
+  node per layer per group) is unverified in a trace.
+- The branch was cut from `d043ccfd`, two commits behind `integ/community-2026-10`. A plain merge would
+  delete the two docs commits. Rebase first.
+
+### Tooling
+
+`tools/ab/batch_burst_bench.py --same-prompts` sends the same first prompts every round (determinism checks).

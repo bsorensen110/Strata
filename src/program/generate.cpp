@@ -12910,6 +12910,14 @@ int main(int argc, char** argv) {
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
+        double bt_draft = 0;   // STRATA_BATCH_DRAFT_TIMING: host wall of the per-slot co-draft calls
+        int64_t bt_draft_n = 0;
+        // STRATA_BATCH_DRAFT_TWOPHASE=1: every slot's co-draft round is launched first, then all are waited for (one sync
+        // each).  STRATA_BATCH_DRAFT_CHECK=1 (implies it): each drafted token is re-drafted serially and compared.
+        const bool draft_check = std::getenv("STRATA_BATCH_DRAFT_CHECK") != nullptr;
+        const bool draft_two_phase = draft_check || std::getenv("STRATA_BATCH_DRAFT_TWOPHASE") != nullptr;
+        int64_t bt_chk_n = 0, bt_chk_bad = 0;
+        struct DraftWait { int b; int row; int a; int64_t p; };
         double bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
@@ -13534,6 +13542,7 @@ int main(int argc, char** argv) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
             }
+            std::vector<DraftWait> draft_wait;   // the two-phase co-drafts in flight in this window
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
@@ -13578,16 +13587,31 @@ int main(int argc, char** argv) {
                     // queued on the drafter's own stream after the window's host sync, so the draft graph reads it.
                     const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
                     const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                    const Clock::time_point wd = Clock::now();
                     if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
                                         ver.final_R_all() + (size_t) first[t] * stride,
                                         2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
-                                        slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
-                        !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
-                                                    sl.draft.data(), err)) {
+                                        slot_mtp[(size_t) b]->stream()) != cudaSuccess) {
                         std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
                         return false;
                     }
-                    sl.draft_ready = true;
+                    if (draft_two_phase && slot_mtp[(size_t) b]->fast_draft_ok()) {
+                        // the round is in flight; its tokens are read after this loop (draft_end)
+                        if (!slot_mtp[(size_t) b]->draft_begin(2, outb + first[t], pos[first[t]], keep[b] - 1, err)) {
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                            return false;
+                        }
+                        draft_wait.push_back({b, first[t], keep[b] - 1, pos[first[t]]});
+                    } else {
+                        if (!slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                                                        sl.draft.data(), err)) {
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                            return false;
+                        }
+                        sl.draft_ready = true;
+                    }
+                    bt_draft += msd(wd, Clock::now());
+                    ++bt_draft_n;
                 }
 #if defined(STRATA_HAVE_DFLASH2)
                 else if (df2_win && sl.active) {
@@ -13663,6 +13687,27 @@ int main(int argc, char** argv) {
                     }
                 }
 #endif
+            }
+            // the two-phase co-drafts: wait for every round in flight, one synchronisation each
+            for (const DraftWait& dw : draft_wait) {
+                BSlot& sd = bs[(size_t) dw.b];
+                const Clock::time_point we0 = Clock::now();
+                if (!slot_mtp[(size_t) dw.b]->draft_end(sd.draft.data(), err)) {
+                    std::printf("ERR batch MTP slot %d: %s\n", dw.b, err.c_str());
+                    return false;
+                }
+                sd.draft_ready = true;
+                bt_draft += msd(we0, Clock::now());
+                if (draft_check) {   // the same round again, serially: the drafts must match token for token
+                    int32_t chk[strata::core::Dflash2Drafter::kDrafts] = {};
+                    int nchk = 0;
+                    if (!slot_mtp[(size_t) dw.b]->draft(2, outb + dw.row, dw.p, dw.a, chk, err, nullptr, 0.0f, &nchk)) {
+                        std::printf("ERR batch MTP check slot %d: %s\n", dw.b, err.c_str());
+                        return false;
+                    }
+                    for (int j = 0; j < nchk; ++j) bt_chk_bad += chk[j] != sd.draft[(size_t) j];
+                    bt_chk_n += nchk;
+                }
             }
             pool_report();
             std::fflush(stdout);
@@ -13751,7 +13796,17 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata batch: %s proposals accepted %lld of %lld (%.1f%%)\n", "MTP",
                                  (long long) bt_accepted, (long long) (bt_rows - bt_accepted),
                                  100.0 * (double) bt_accepted / (double) std::max<int64_t>(bt_rows - bt_accepted, 1));
+                if (batch_mtp && std::getenv("STRATA_BATCH_DRAFT_TIMING") != nullptr)
+                    std::fprintf(stderr, "strata batch draft: %.2f ms/window in %.2f co-draft calls/window (%s)\n",
+                                 bt_draft / w, (double) bt_draft_n / w,
+                                 draft_two_phase ? "two-phase: begin + end" : "serial, each syncs");
+                if (batch_mtp && draft_check)
+                    std::fprintf(stderr, "strata batch draft check: %lld of %lld drafted tokens differ from a serial draft\n",
+                                 (long long) bt_chk_bad, (long long) bt_chk_n);
                 bt_run = bt_commit = bt_emit = bt_adapt_wait = 0;
+                bt_draft = 0;
+                bt_draft_n = 0;
+                bt_chk_n = bt_chk_bad = 0;
                 bt_windows = bt_rows = bt_tokens = bt_accepted = bt_adapt_rounds = bt_adapt_swaps = 0;
             }
             return true;

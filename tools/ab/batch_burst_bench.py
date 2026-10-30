@@ -42,13 +42,18 @@ def main():
     ap.add_argument("--rounds", type=int, default=2)
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--conc", type=int, default=4)
+    ap.add_argument("--same-prompts", action="store_true",
+                    help="send the same first --conc prompts every round (determinism checks)")
     a = ap.parse_args()
     cfg = json.load(open(a.config))
     out = {"rounds": []}
     for r in range(a.rounds):
-        prompts = PROMPTS[(r * a.conc) % len(PROMPTS):][:a.conc]
-        if len(prompts) < a.conc:
-            prompts = (prompts + PROMPTS)[:a.conc]
+        if a.same_prompts:
+            prompts = PROMPTS[:a.conc]
+        else:
+            prompts = PROMPTS[(r * a.conc) % len(PROMPTS):][:a.conc]
+            if len(prompts) < a.conc:
+                prompts = (prompts + PROMPTS)[:a.conc]
         t0 = time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(max_workers=a.conc) as ex:
             res = list(ex.map(lambda p: one(cfg, p, a.max_tokens), prompts))

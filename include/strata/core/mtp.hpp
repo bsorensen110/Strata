@@ -140,6 +140,14 @@ public:
     bool draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
                float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr, DraftResult* result = nullptr);
 
+    /// The fast path of draft() split at its wait (the batch co-draft, STRATA_BATCH_DRAFT_TWOPHASE): draft_begin enqueues
+    /// this drafter's round and step graphs and returns; draft_end waits for its tokens and synchronises its stream once.
+    /// The same tokens and cells as draft() with min_p 0 and no chain rule (`fast_draft_ok()`).  One draft_end per
+    /// draft_begin; draft() refuses while one is pending.
+    bool fast_draft_ok() const { return !chain_rule_; }
+    bool draft_begin(int T, const int32_t* tokens, int64_t p, int a, std::string& err);
+    bool draft_end(int32_t* drafts, std::string& err);
+
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     /// STRATA_SPEC_COST: called after each draft step with (index, probability) instead of the `min_p` test; false ends the chain.
     /// Also called once for the last step of a chain that reached its length (so the rule sees every draft). Empty: min_p decides.
@@ -289,6 +297,10 @@ private:
     // --pipeline-windows 2 (chain_launch)
     bool stage_source_R(int T, std::string& err);   ///< set_source_R's rows into the bound buffer
     bool force_on_ = false, chain_live_ = false;
+    bool pend_ = false;                 // a draft_begin awaits its draft_end
+    int pend_max_steps_ = 0;
+    bool pend_do_ple_ = false;
+    int32_t pend_ple_prev_[2] = {0, 0};
     const float* src_R_ = nullptr;
     int32_t *h_force_ = nullptr, *m_force_ = nullptr;   ///< the forced tokens (mapped), -1 = the step's own pick
     cudaEvent_t ev_chain_ = nullptr;
