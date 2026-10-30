@@ -670,3 +670,42 @@ adding the MTP token closes the gap).
 - E1 A/B: `--batch-mtp --draft dflash2` on vs `--draft dflash2` alone (measure the acceptance
   lift and the throughput vs plain batch / batch MTP). The co-draft is opt-in (requires
   `--batch-mtp` + `--draft dflash2`) and changes nothing about which tokens the target emits.
+
+## Strata vs Paiton — speed review (2026-10-29, second pass; CORRECTED)
+
+Full write-up: **`~/Strata-dflash-research/STRATA-VS-PAITON-SPEED-REVIEW.md`** (per-item
+evidence, config values + source file:line, priority table, caveats). Two corrections to the
+first pass:
+
+1. **Graph capture of the main decode loop is ALREADY implemented in Strata** (my first-pass
+   claim that "Strata's main loop is eager" was wrong). The production hot path (native-pack
+   verify windows) is graph-captured: `src/core/verify.cpp` captures a `window graph`
+   (line 3067), a `commit graph` (line 3281), and a `batch graph` (line 4275), all
+   `cudaGraphInstantiate`. The non-native-pack token graph is captured at
+   `src/program/generate.cpp:8485` ("token graph captured (48 layers, one launch per token)").
+   So "graph capture of the main decode loop" is **not** a lever.
+
+2. **The REAL "batched requests slow" gap:** the production config
+   (`~/Strata/strata-swift-iq3_s.json`) has `--batch-mtp` but **no `--batch N`**. Without
+   `--batch N` (`o.batch == 0`), the batch slots are never created
+   (`src/program/generate.cpp:6214`, `if (o.batch > 0) { bslot_ss.resize ... }`), so there is
+   **no true concurrent decode**. Concurrent requests are handled by the **conversation
+   cache**: the active conversation is **parked** (K/V saved) and the new one **loaded** — a
+   **context switch**, not concurrency. Paiton (`--max-num-seqs 8`) decodes 8 sequences
+   together; Strata production effectively serializes them.
+
+   **Fix (config-only, zero code):** add `--batch 4` (or 8) to the production config's `args`.
+   This creates the batch slots and enables true concurrent decode; the `--batch-mtp` flag
+   already present then becomes active (each slot verifies an MTP proposal — the E1 work).
+   Caveats: VRAM grows per slot (re-check `--vram-reserve-mib 704` at 4–8 slots); I **cannot
+   deploy or test this** in this session (GPU occupied by Paiton; constraint: no live Strata
+   service), so it is a **recommendation**, not a verified change.
+
+### Still owed (needs a GPU window)
+
+- **`--batch N` A/B** (the dominant "batched requests" lever): `--batch 4` on vs off on a
+  4-concurrent-request workload (measure per-request reply latency + total throughput).
+- E1 A/B: `--batch-mtp --draft dflash2` on vs `--draft dflash2` alone.
+- C1 A/B: `--batch-suffix-draft 3` on vs off on a copy-heavy workload.
+- C2 GPU A/B: the ring-comparison dump (confirm or refute H3).
+- A2 sweeps: one-variable `--spec-min-p` and `STRATA_DFLASH_DEPTH_SLOPE` (short, isolated).
