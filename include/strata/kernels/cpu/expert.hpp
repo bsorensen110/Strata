@@ -135,12 +135,9 @@ void s2_expert_vnni(const uint8_t* blob, const float* x, float* out, ExpertScrat
 /// is the entry point that matches it.
 void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws);
 
-/// Plan v0.3 P6: ONE expert applied to up to MAXT tokens that were all routed to it (a speculative verify
-/// window routes ~1.5 tokens to each distinct expert). The 1.38 MB blob is read and its 2-bit codes unpacked
-/// ONCE per block for all tokens; only the VNNI dot and the accumulation run per token. Every token's output
-/// is bitwise equal to `s2_expert_vnni_q` on that token (same operation order per token). Legacy activation
-/// contract only; with `expert_set_oracle_q8_0(true)` it falls back to one `s2_expert_vnni_q` per token.
-inline constexpr int MAXT = 8;
+/// Plan v0.3 P6: ONE expert applied to up to 16 verify tokens. Keep this workspace ceiling aligned with
+/// kVerifyMaxT; the AVX2 Q/K dot kernel still internally chunks work in groups of 8.
+inline constexpr int MAXT = 16;
 /// Plan v0.3 P4: the expert in row ranges, so several threads can share one expert.  `s2_expert_gu_rows` writes
 /// ff[r] = silu(gate_r . x) * (up_r . x) for r in [r0, r1) (of FF); `s2_expert_down_rows` writes out[r] for r in
 /// [r0, r1) (of H) from the intermediate's quantized image.  Together with `act_quant_q8_1(ff, FF, a2)` in

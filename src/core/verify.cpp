@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
+#include "strata/core/dflash2_tap.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -953,7 +954,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
-        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, (int) T)));   // 147-verify: 5-8 columns too
+        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(
+            max_in, std::min(strata::kernels::native_mmvq_kernel_max_cols, std::max(4, (int) T))));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -2333,7 +2335,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
-        if (tap_on_ && !batch_rec_ && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
+        if (dflash2_tap_capture(tap_on_, batch_rec_, l, tap_slot_)) {   // batch rows too: the tap_dev_ rows are row-major (include/strata/core/dflash2_tap.hpp)
             // the layer's completed output: R with this FFN half's write applied (the next layer's read would fold it), the mean of
             // the hc streams, all rows of the group in one launch
             const int64_t nt = (int64_t) tap_layers_.size();
@@ -4547,10 +4549,15 @@ bool Verifier::sample_rows(int S, std::string& err) {
 }
 
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
-    const OnDevice on_device(device_);
-    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     int rows[strata::kernels::kVerifyMaxT] = {};
     for (int t = 0; t < S && t < strata::kernels::kVerifyMaxT; ++t) rows[t] = base + t;
+    return batch_launch_rows(base, S, rows, tokens, pos, err);
+}
+
+bool Verifier::batch_launch_rows(int base, int S, const int* rows, const int32_t* tokens,
+                                 const int64_t* pos, std::string& err) {
+    const OnDevice on_device(device_);
+    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);

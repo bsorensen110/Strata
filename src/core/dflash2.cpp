@@ -11,6 +11,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -42,11 +43,9 @@ Dflash2Drafter::~Dflash2Drafter() {
     prof_free();
     const OnDevice on_device(device_);
     if (cs_) cudaStreamSynchronize(cs_);
-    for (cudaGraphExec_t& e : exec_)
-        if (e) cudaGraphExecDestroy(e);
+    for (auto& sl : slots_) free_slot(*sl);   // every conversation's graphs and rings, slot 0 first
     auto fr = [](void* p) { if (p) cudaFree(p); };
     fr(blob_); fr(d_meta_); fr(xq_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rt_blk_);
-    for (int l = 0; l < 8; ++l) { fr(kring_[l]); fr(vring_[l]); }
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
     fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
     fr(dvocab_); fr(dhead_);
@@ -168,6 +167,25 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
         err = "dflash2: the pack's shape is not the Flash-Next drafter this engine was written for";
         return false;
     }
+    if (window_ < 1 || window_ > kMaxWindow) {
+        err = "dflash2: pack attention window " + std::to_string(window_) + " is outside the supported 1.." + std::to_string(kMaxWindow) + " range";
+        return false;
+    }
+    ring_slots_ = window_ + kRingSlack;
+    // every slot's host mirror is ring_slots entries - the same df2_ring_mirror_entries sizing set_n_slots()
+    // applies to slots added after this load, so neither path can drift from the other
+    for (auto& sl : slots_) { sl->ring_pos_.assign((size_t) df2_ring_mirror_entries(ring_slots_), -1); sl->have_ctx_ = 0; }
+    // The pack's identity for save_state/restore_state: a parked conversation's blob is only
+    // restorable into a drafter built from this same pack (path hash, size, mtime).
+    pack_path_ = path;
+    {
+        std::error_code ec;
+        const std::filesystem::path p(path);
+        pack_size_ = (uint64_t) std::filesystem::file_size(p, ec);
+        if (ec) pack_size_ = 0;
+        const auto wt = std::filesystem::last_write_time(p, ec);
+        pack_mtime_ = ec ? 0 : (int64_t) wt.time_since_epoch().count();
+    }
     if (cudaMalloc((void**) &blob_, total) != cudaSuccess) { err = "dflash2: the pack does not fit in VRAM (" + std::to_string(total >> 20) + " MiB)"; return false; }
     vram_ += total;
     uint64_t max_bytes = 0;
@@ -238,7 +256,8 @@ bool Dflash2Drafter::alloc(std::string& err) {
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
               dev(&part_, (size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) && dev(&fn_, B * N_) && dev(&topval_, kDrafts * 16) && dev(&toptok_, kDrafts * 16) &&
               dev(&hsel_, kDrafts * rank_) && dev(&topscratch_, (size_t) kDrafts * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
-    for (int l = 0; ok && l < L_; ++l) ok = dev(&kring_[l], (size_t) kRing * NKV_ * HD_) && dev(&vring_[l], (size_t) kRing * NKV_ * HD_);
+    for (auto& sl : slots_)
+        if (ok && !alloc_slot_rings(*sl)) ok = false;   // every slot the drafter was grown to before load()
     if (!ok) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
     void* hd = nullptr;
     void* dd = nullptr;
@@ -254,8 +273,117 @@ bool Dflash2Drafter::alloc(std::string& err) {
     cudaMemset(xdp_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
     cudaMemset(xqc_, 0, (size_t) 5 * N_ * 8 + 4096);
     cudaMemset(xdc_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
-    for (int l = 0; l < L_; ++l) { cudaMemset(kring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); cudaMemset(vring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); }
     return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+// One conversation slot's K/V rings (the ring is the slot's only device memory; the pack, the head and the block
+// scratch stay shared on the drafter).  Allocates and zeroes on the already-open device_ and tracks vram_, so
+// vram_bytes() covers every slot's rings; a failed allocation unwinds what it made, and the caller drops the slot.
+// The per-plane byte count is recorded in the slot (df2_ring_plane_bytes) so free_slot subtracts exactly the
+// bytes this allocation added: a set_fp16_ring or a second load() between allocate and free would otherwise
+// make vram_ drift, or underflow it (uint64_t) when the recompute comes out bigger.
+bool Dflash2Drafter::alloc_slot_rings(Slot& sl) {
+    const size_t ring_bytes = (size_t) df2_ring_plane_bytes(ring_slots_, NKV_, HD_, (int) ring_elem_bytes());
+    sl.ring_plane_bytes_ = ring_bytes;   // set before the first cudaMalloc: the unwind below subtracts with it too
+    for (int l = 0; l < L_; ++l) {
+        if (cudaMalloc((void**) &sl.kring_[l], ring_bytes) == cudaSuccess) vram_ += ring_bytes; else break;
+        if (cudaMalloc((void**) &sl.vring_[l], ring_bytes) == cudaSuccess) vram_ += ring_bytes; else break;
+    }
+    for (int l = 0; l < L_; ++l)
+        if (sl.kring_[l] == nullptr || sl.vring_[l] == nullptr) { free_slot(sl); return false; }
+    for (int l = 0; l < L_; ++l) { cudaMemset(sl.kring_[l], 0, ring_bytes); cudaMemset(sl.vring_[l], 0, ring_bytes); }
+    return true;
+}
+
+void Dflash2Drafter::free_slot(Slot& sl) {
+    for (cudaGraphExec_t& e : sl.exec_)
+        if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    // the bytes this slot's planes were cudaMalloc'd with, not a recompute from the current geometry.
+    // up to 8, not L_: a half-loaded drafter can hold rings for layers it never validated
+    const size_t ring_bytes = sl.ring_plane_bytes_;
+    for (int l = 0; l < 8; ++l) {
+        if (sl.kring_[l]) { cudaFree(sl.kring_[l]); sl.kring_[l] = nullptr; vram_ -= ring_bytes; }
+        if (sl.vring_[l]) { cudaFree(sl.vring_[l]); sl.vring_[l] = nullptr; vram_ -= ring_bytes; }
+    }
+    sl.ring_plane_bytes_ = 0;
+}
+
+// One indexed write to the host ring-position mirror.  The mirror has ring_slots entries wherever a slot comes
+// to exist (load(), set_n_slots(); df2_ring_mirror_entries sizes both paths), and df2_ring_mirror_index is the
+// pos % ring_slots the kv_ring kernels use, so the assert only fires if that sizing ever regresses - finding 1's
+// overrun was silent heap corruption under an 8k-window pack, not a visible failure.
+int32_t& Dflash2Drafter::mirror_cell(Slot& sl, int64_t pos) {
+    const size_t i = (size_t) df2_ring_mirror_index(pos, ring_slots_);
+    assert(i < sl.ring_pos_.size());
+    return sl.ring_pos_[i];
+}
+
+// Grow-only up to kDf2MaxSlots.  Extra slots are free until a round runs on them; after that their rings hold a
+// conversation and shrinking would silently drop it, so it is refused.  Rings for a slot added after load() are
+// allocated on the open device here; a slot added before load() gets its rings from alloc().
+bool Dflash2Drafter::set_n_slots(int n, std::string& err) {
+    if (n < 1 || n > kDf2MaxSlots) {
+        err = "dflash2: slot count " + std::to_string(n) + " is outside 1.." + std::to_string(kDf2MaxSlots);
+        return false;
+    }
+    const int have = (int) slots_.size();
+    if (n == have) return true;
+    if (n > have) {
+        if (device_ >= 0) {
+            const OnDevice on_device(device_);
+            while ((int) slots_.size() < n) {
+                auto sl = std::make_unique<Slot>();
+                // a slot added after load() needs the same ring_slots_-sized host mirror load() gives every
+                // slot: an 8k-window pack (ring 8208) overruns any other size, silently, in context()/draft()/
+                // save_state() (dflash2_slots_test.cpp pins the sizing and the index bounds)
+                sl->ring_pos_.assign((size_t) df2_ring_mirror_entries(ring_slots_), -1);
+                if (!alloc_slot_rings(*sl)) {
+                    err = "dflash2: the extra slot's rings do not fit in VRAM";
+                    // all-or-nothing: the slots this call pushed (alloc_slot_rings already unwound the one it
+                    // failed on) have run no round, so free and drop them too - a failed growth leaves
+                    // n_slots() and vram_bytes() describing the drafter that served its slots before the call
+                    for (size_t i = (size_t) have; i < slots_.size(); ++i) free_slot(*slots_[(size_t) i]);
+                    slots_.resize((size_t) df2_slots_after_failed_grow(have, (int) slots_.size() - have));
+                    return false;
+                }
+                slots_.push_back(std::move(sl));
+            }
+        } else {
+            while ((int) slots_.size() < n) {
+                auto sl = std::make_unique<Slot>();
+                sl->ring_pos_.assign((size_t) df2_ring_mirror_entries(ring_slots_), -1);   // load() resizes it to the pack's ring
+                slots_.push_back(std::move(sl));
+            }
+        }
+        return true;
+    }
+    if (cur_ >= n) { err = "dflash2: cannot drop the active slot " + std::to_string(cur_); return false; }
+    for (int i = n; i < have; ++i) {
+        // "used" means a round ran on the slot: context()/draft() moved have_ctx_, or a capture ran the ring
+        // kernels against the ring even if the round afterwards failed (exec_ non-null).
+        const Slot& sl = *slots_[(size_t) i];
+        bool captured = false;
+        for (cudaGraphExec_t e : sl.exec_) captured = captured || e != nullptr;
+        if (sl.have_ctx_ != 0 || captured) {
+            err = "dflash2: slot " + std::to_string(i) + " has run a round; its ring holds a conversation";
+            return false;
+        }
+    }
+    if (device_ >= 0) {
+        const OnDevice on_device(device_);
+        for (int i = have - 1; i >= n; --i) free_slot(*slots_[(size_t) i]);
+    }
+    slots_.resize((size_t) n);
+    return true;
+}
+
+bool Dflash2Drafter::set_slot(int i, std::string& err) {
+    if (!df2_slot_ok(i, (int) slots_.size())) {
+        err = "dflash2: slot " + std::to_string(i) + " is outside 0.." + std::to_string((int) slots_.size() - 1);
+        return false;
+    }
+    cur_ = i;
+    return true;
 }
 
 bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err) {
@@ -346,6 +474,7 @@ void Dflash2Drafter::gemm(std::initializer_list<const char*> names, std::initial
 bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, std::string& err) {
     using namespace kernels;
     if (skip_part("ctx")) return true;
+    Slot& sl = cur();   // the context update writes the active conversation's ring
     try {
         const int tap_n = (int) taps_.size() * N_;
         df2_rope_table(d_meta_ + 0, n, theta_, rt_ctx_, cs);
@@ -361,7 +490,10 @@ bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, s
             const std::string kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
             gemm({kp.c_str(), vp.c_str()}, {kc_, vc_}, n, cs, xqc_, xdc_);
             stamp("gemm:kp");
-            df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), d_meta_ + 0, rt_ctx_, kring_[l], vring_[l], kRing, n, NKV_, eps_, cs);
+            if (fp16_ring_)
+                df2_kv_ring_f16(kc_, vc_, f32(p + "self_attn.k_norm.weight"), d_meta_ + 0, rt_ctx_, sl.kring_[l], sl.vring_[l], ring_slots_, n, NKV_, eps_, cs);
+            else
+                df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), d_meta_ + 0, rt_ctx_, sl.kring_[l], sl.vring_[l], ring_slots_, n, NKV_, eps_, cs);
             stamp("df2_kv_ring");
             if (fork_) cudaEventRecord(ev_ctx_[l], cs);   // layer l's keys and values are in the ring
         }
@@ -374,6 +506,7 @@ bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, s
 
 bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
     using namespace kernels;
+    Slot& sl = cur();   // the block attends over the active conversation's ring
     try {
         const int B = kRows;
         df2_rope_table(d_meta_ + 8, B, theta_, rt_blk_, cs);
@@ -398,7 +531,12 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             if (!skip_part("small")) df2_norm_rope_qk(q_, k_, f32(p + "self_attn.q_norm.weight"), f32(p + "self_attn.k_norm.weight"), rt_blk_, qn_, kblk_, B, NH_, NKV_, eps_, cs);
             stamp("df2_norm_rope_qk");
             if (fork_) cudaStreamWaitEvent(cs, ev_ctx_[l], 0);   // the context update has written this layer's ring
-            if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs);
+            if (!skip_part("attn")) {
+                if (fp16_ring_)
+                    df2_attention_f16(qn_, sl.kring_[l], sl.vring_[l], kblk_, v_, d_meta_ + 17, ring_slots_, window_, part_, xqp_, xdp_, cs);
+                else
+                    df2_attention(qn_, sl.kring_[l], sl.vring_[l], kblk_, v_, d_meta_ + 17, ring_slots_, window_, part_, xqp_, xdp_, cs);
+            }
             stamp("df2_attention");
             if (!skip_part("qkvo")) gemm({(p + "self_attn.o_proj.weight").c_str()}, {o_}, B, cs, xqp_, xdp_);
             stamp("gemm:o_proj");
@@ -437,8 +575,15 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
     return true;
 }
 
+// Captures against the active slot: the graph bakes this slot's ring pointers and the taps staging pointer,
+// which it records in this slot's taps_, so a captured graph belongs to the slot it was captured on and to the
+// one shared taps buffer every slot drafts into.  A slot that was never prepared captures lazily on its first
+// draft(); one whose graphs live on another taps buffer captures nothing new (mixing graph sets across buffers
+// would launch a graph that reads the old buffer's rows).
 bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
-    if (exec_[n]) return true;
+    Slot& sl = cur();
+    if (sl.exec_[n]) return true;
+    if (!df2_graphs_valid_for(sl.taps_, taps)) { err = "dflash2: capture: this slot's graphs are captured on another taps buffer"; return false; }
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin capture"; return false; }
     kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
     // the context update (fc, the keys and values) and the block's front run side by side: they meet before each layer's attention
@@ -462,14 +607,15 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&exec_[n], graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess || cudaGraphInstantiate(&sl.exec_[n], graph, 0) != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("dflash2: capture: ") + cudaGetErrorString(ce);
         return false;
     }
     cudaGraphDestroy(graph);
-    cudaGraphUpload(exec_[n], cs_);
+    cudaGraphUpload(sl.exec_[n], cs_);
     cudaStreamSynchronize(cs_);
+    sl.taps_ = taps;   // this slot's graphs now read `taps`; draft() checks it against this slot's pointer
     return true;
 }
 
@@ -481,23 +627,24 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     for (int i = 0; i < 8; ++i) h_meta_[i] = i;
     for (int n = 1; n <= kRows; ++n)
         if (!capture(n, taps, err)) return false;
-    graph_taps_ = taps;
     ms_capture = ms_since(t0);
     return true;
 }
 
 bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
+    Slot& sl = cur();
     const int tap_n = (int) taps_.size() * N_;
     for (int64_t r0 = 0; r0 < n; r0 += kRows) {
         const int m = (int) std::min<int64_t>(kRows, n - r0);
         for (int i = 0; i < m; ++i) h_meta_[i] = (int32_t) (pos0 + r0 + i);
+        for (int i = 0; i < m; ++i) mirror_cell(sl, pos0 + r0 + i) = (int32_t) (pos0 + r0 + i);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
         if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, cs_, err)) return false;
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     }
-    have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
+    sl.have_ctx_ = std::max<int64_t>(sl.have_ctx_, pos0 + n);
     return true;
 }
 
@@ -505,16 +652,20 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     if (!bound_) { err = "dflash2: not bound"; return false; }
     if (n_new < 1 || n_new > kRows) { err = "dflash2: draft rows out of range"; return false; }
     const OnDevice on_device(device_);
+    Slot& sl = cur();
     const Clock::time_point t0 = Clock::now();
-    if (graph_taps_ != nullptr && graph_taps_ != taps) { err = "dflash2: the taps buffer moved after capture"; return false; }
-    if (!prof_ && !exec_[n_new]) {
-        // the staging must hold valid positions while the capture runs the (empty) kernels' parameter checks
+    // the guard is this slot's: its graphs read the buffer this slot captured on (Slot::taps_), so a
+    // prepare() on another slot cannot move it out from under them (df2_graphs_valid_for)
+    if (!df2_graphs_valid_for(sl.taps_, taps)) { err = "dflash2: the taps buffer moved after capture"; return false; }
+    if (!prof_ && !sl.exec_[n_new]) {
+        // the staging must hold valid positions while the capture runs the (empty) kernels' parameter checks;
+        // an extra slot reaches here on its first draft() and captures its graphs against its own rings
         for (int i = 0; i < 8; ++i) h_meta_[i] = (int32_t) (pos0 + i);
-        if (!capture(n_new, taps, err)) return false;
-        graph_taps_ = taps;
+        if (!capture(n_new, taps, err)) return false;   // capture() records this slot's taps_ on success
     }
     const int64_t s = pos0 + n_new;
     for (int i = 0; i < 8; ++i) { h_meta_[i] = (int32_t) (pos0 + std::min(i, n_new - 1)); h_meta_[8 + i] = (int32_t) (s + i); }
+    for (int i = 0; i < n_new; ++i) mirror_cell(sl, pos0 + i) = (int32_t) (pos0 + i);
     h_meta_[16] = anchor;
     h_meta_[17] = (int32_t) s;
     h_meta_[24] = anchor;
@@ -532,7 +683,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
         if (!record_context(taps, n_new, cs_, err) || !record_block(cs_, err)) return false;
         prof_collect();
     } else
-    if (cudaGraphLaunch(exec_[n_new], cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    if (cudaGraphLaunch(sl.exec_[n_new], cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     if (timing_) cudaEventRecord(ev_b_, cs_);
     (void) cudaStreamQuery(cs_);
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
@@ -544,7 +695,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
         float ms = 0;
         if (cudaEventElapsedTime(&ms, ev_a_, ev_b_) == cudaSuccess) ms_gpu += ms;
     }
-    have_ctx_ = std::max<int64_t>(have_ctx_, s);
+    sl.have_ctx_ = std::max<int64_t>(sl.have_ctx_, s);
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
@@ -554,6 +705,195 @@ bool Dflash2Drafter::debug_rows(std::vector<float>& rows, std::string& err) {
     rows.resize((size_t) kRows * (size_t) N_);
     if (cudaMemcpy(rows.data(), fn_, rows.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) { err = "dflash2: debug copy"; return false; }
     return true;
+}
+
+// ---- the drafter's context: park/restore ----------------------------------------------------------
+// The blob: a 128-byte self-describing header, the kRing slot positions, then L layers of planar K/V
+// in the device's own layout. Everything a restore needs to refuse a foreign drafter: geometry ints,
+// the pack's path hash / size / mtime, and the slot table that makes a resumed checkpoint's rewind
+// safe (cells written past the resumed prefix are zeroed, the drafter keeps the cells below it).
+namespace {
+#pragma pack(push, 1)
+struct Df2StateHeader {
+    uint32_t magic, version;
+    int64_t L, NKV, HD, ring, window, N, NH;
+    int64_t have;             // last committed position (exclusive) at save time
+    int64_t prefix;           // conversation length the blob was parked at
+    uint32_t theta_bits, eps_bits;
+    uint64_t pack_size;
+    int64_t pack_mtime;
+    uint64_t pack_path_hash;
+    uint64_t ring_bytes;      // L * 2 * ring * NKV * HD * 4
+    uint8_t reserved[8];
+};
+#pragma pack(pop)
+static_assert(sizeof(Df2StateHeader) == 128, "df2 state header is the blob's fixed contract");
+
+uint64_t df2_path_hash(const std::string& s) {   // FNV-1a-64
+    uint64_t h = 1469598103934665603ull;
+    for (unsigned char c : s) { h ^= c; h *= 1099511628211ull; }
+    return h;
+}
+}  // namespace
+
+// save/restore always mean the active slot: the blob format (kStateVersion 1) describes one conversation's rings,
+// and a parked conversation restores into the slot the engine is about to serve.
+bool Dflash2Drafter::save_state(std::vector<uint8_t>& out, std::string& err, int64_t conversation_len) {
+    Slot& sl = cur();
+    if (blob_ == nullptr || sl.kring_[0] == nullptr) { err = "dflash2: save_state on an un-loaded drafter"; return false; }
+    const OnDevice on_device(device_);
+    const size_t elem_bytes = ring_elem_bytes();
+    const size_t slice = (size_t) ring_slots_ * NKV_ * HD_ * elem_bytes;
+    const size_t rings = (size_t) L_ * 2 * slice;
+    out.clear();
+    try { out.resize(128 + (size_t) ring_slots_ * 4 + rings); }
+    catch (const std::bad_alloc&) { err = "dflash2: save_state out of host memory"; return false; }
+    Df2StateHeader h{};
+    h.magic = kStateMagic; h.version = kStateVersion;
+    h.L = L_; h.NKV = NKV_; h.HD = HD_; h.ring = ring_slots_; h.window = window_; h.N = N_; h.NH = NH_;
+    h.have = sl.have_ctx_;
+    h.prefix = conversation_len < 0 ? sl.have_ctx_ : conversation_len;
+    // No equality check against have_ctx_: in serve mode the drafter's context is rebuilt per request
+    // from the cache-NEW rows only (the ring holds the window around the tail at absolute positions),
+    // so the conversation is always longer than the rows this drafter has seen. restore_state() zeroes
+    // slots at positions >= the resumed checkpoint, which is what makes a rewound branch correct.
+    std::memcpy(&h.theta_bits, &theta_, 4);
+    std::memcpy(&h.eps_bits, &eps_, 4);
+    h.pack_size = pack_size_; h.pack_mtime = pack_mtime_; h.pack_path_hash = df2_path_hash(pack_path_);
+    h.ring_bytes = rings;
+    std::memcpy(out.data(), &h, 128);
+    assert(sl.ring_pos_.size() >= (size_t) ring_slots_);   // the mirror is ring_slots entries (df2_ring_mirror_entries); copying more would overrun it
+    std::memcpy(out.data() + 128, sl.ring_pos_.data(), (size_t) ring_slots_ * 4);
+    uint8_t* p = out.data() + 128 + (size_t) ring_slots_ * 4;
+    if (cs_ != nullptr && cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("dflash2: save_state stream: ") + cudaGetErrorString(cudaGetLastError());
+        out.clear();
+        return false;
+    }
+    for (int l = 0; l < L_; ++l)
+        for (int kv = 0; kv < 2; ++kv) {
+            const void* src = kv ? sl.vring_[l] : sl.kring_[l];
+            if (cudaMemcpy(p, src, slice, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                err = std::string("dflash2: save_state ring copy: ") + cudaGetErrorString(cudaGetLastError());
+                out.clear();
+                return false;
+            }
+            p += slice;
+        }
+    return true;
+}
+
+bool Dflash2Drafter::restore_state(const std::vector<uint8_t>& in, int64_t prefix_len, std::string& err) {
+    const auto refuse = [&](const char* why) { err = std::string("dflash2: restore_state: ") + why; return false; };
+    Slot& sl = cur();
+    if (blob_ == nullptr || sl.kring_[0] == nullptr) return refuse("the drafter is not loaded");
+    if (in.size() < 128 + (size_t) ring_slots_ * 4) return refuse("the blob is short");
+    Df2StateHeader h;
+    std::memcpy(&h, in.data(), 128);
+    if (h.magic != kStateMagic) return refuse("not a DFlash2 context blob");
+    if (h.version != kStateVersion) return refuse("blob version is not this engine's");
+    if (h.L != L_ || h.NKV != NKV_ || h.HD != HD_ || h.ring != ring_slots_ || h.window != window_ ||
+        h.N != N_ || h.NH != NH_) return refuse("the drafter's geometry changed");
+    float ts = 0, es = 0;
+    std::memcpy(&ts, &h.theta_bits, 4); std::memcpy(&es, &h.eps_bits, 4);
+    if (ts != theta_ || es != eps_) return refuse("the drafter's RoPE/eps changed");
+    std::error_code ec;
+    const std::filesystem::path p(pack_path_);
+    const uint64_t size_now = (uint64_t) std::filesystem::file_size(p, ec);
+    if (ec || size_now != h.pack_size) return refuse("the drafter pack changed size");
+    const auto wt = std::filesystem::last_write_time(p, ec);
+    if (ec || (int64_t) wt.time_since_epoch().count() != h.pack_mtime) return refuse("the drafter pack changed");
+    if (h.pack_path_hash != df2_path_hash(pack_path_)) return refuse("the drafter pack moved");
+    const size_t elem_bytes = ring_elem_bytes();
+    const size_t slice = (size_t) ring_slots_ * NKV_ * HD_ * elem_bytes;
+    const size_t rings = (size_t) L_ * 2 * slice;
+    if (h.ring_bytes != rings) return refuse("the blob's ring size disagrees with the header");
+    if (in.size() != 128 + (size_t) ring_slots_ * 4 + rings) return refuse("the blob's size disagrees with the header");
+    if (h.have < 0 || h.prefix < h.have || prefix_len < 0 || prefix_len > h.prefix)
+        return refuse("the saved/resumed positions are out of range");
+    // Serve parks stamp h.prefix with the CONVERSATION length while the drafter has seen only the
+    // cache-new rows of the request that parked it (have << prefix), and the ring slots hold
+    // absolute conversation positions. Every range check therefore goes against h.prefix.
+    if (sl.ring_pos_.size() < (size_t) ring_slots_) return refuse("the drafter's host ring mirror is not sized for its ring");
+    const int32_t* table = reinterpret_cast<const int32_t*>(in.data() + 128);
+    for (int s = 0; s < ring_slots_; ++s)
+        if (table[s] < -1 || table[s] >= h.prefix || (table[s] >= 0 && table[s] % ring_slots_ != s))
+            return refuse("the ring slot table is invalid");
+    // Rewind: cells this park committed past the resumed checkpoint go; the drafter must not draft
+    // from tokens of a branch the conversation did not take.
+    const uint8_t* src = in.data() + 128 + (size_t) ring_slots_ * 4;
+    std::vector<uint8_t> staging;
+    try { staging.resize(slice); }
+    catch (const std::bad_alloc&) { return refuse("out of host memory"); }
+    const OnDevice on_device(device_);
+    for (int l = 0; l < L_; ++l)
+        for (int kv = 0; kv < 2; ++kv) {
+            const uint8_t* slab = src + ((size_t) l * 2 + kv) * slice;
+            std::memcpy(staging.data(), slab, slice);
+            // The ring is head-major ([NKV][kRing][HD], see kv_ring_kernel): zero every head's cell for
+            // slots that were never written or were written at positions >= prefix_len.
+            for (int s = 0; s < ring_slots_; ++s)
+                if (table[s] < 0 || table[s] >= prefix_len)
+                    for (int hk = 0; hk < NKV_; ++hk)
+                        std::memset(staging.data() + ((size_t) hk * ring_slots_ + s) * (size_t) HD_ * elem_bytes, 0, (size_t) HD_ * elem_bytes);
+            void* dst = kv ? sl.vring_[l] : sl.kring_[l];
+            if (cudaMemcpy(dst, staging.data(), slice, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = std::string("dflash2: restore_state ring copy: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+        }
+    for (int s = 0; s < ring_slots_; ++s) sl.ring_pos_[(size_t) s] = (table[s] >= 0 && table[s] < prefix_len) ? table[s] : -1;
+    sl.have_ctx_ = prefix_len;
+    err.clear();
+    return true;
+}
+
+void Dflash2Drafter::reset() {
+    Slot& sl = cur();   // a new request on the active slot; the other slots keep their conversations
+    sl.have_ctx_ = 0;
+    for (int32_t& p : sl.ring_pos_) p = -1;
+    if (device_ >= 0 && sl.kring_[0] != nullptr) {
+        const OnDevice on_device(device_);
+        const size_t bytes = (size_t) ring_slots_ * NKV_ * HD_ * ring_elem_bytes();
+        for (int l = 0; l < L_; ++l) {
+            cudaMemsetAsync(sl.kring_[l], 0, bytes, cs_);
+            cudaMemsetAsync(sl.vring_[l], 0, bytes, cs_);
+        }
+        if (cs_) cudaStreamSynchronize(cs_);
+    }
+}
+
+void Dflash2Drafter::rewind(int64_t prefix_len) {
+    if (prefix_len <= 0) { reset(); return; }
+    Slot& sl = cur();
+    if (device_ >= 0 && sl.kring_[0] != nullptr) {
+        const OnDevice on_device(device_);
+        assert(sl.ring_pos_.size() >= (size_t) ring_slots_);   // the scan below reads ring_slots entries
+        const size_t elem_bytes = ring_elem_bytes();
+        bool any = false;
+        for (int s0 = 0; s0 < ring_slots_;) {
+            if (sl.ring_pos_[(size_t) s0] < prefix_len) { ++s0; continue; }
+            int s1 = s0;
+            while (s1 < ring_slots_ && sl.ring_pos_[(size_t) s1] >= prefix_len) {
+                sl.ring_pos_[(size_t) s1] = -1;
+                ++s1;
+            }
+            const size_t span_bytes = (size_t) (s1 - s0) * (size_t) HD_ * elem_bytes;
+            for (int l = 0; l < L_; ++l)
+                for (int hk = 0; hk < NKV_; ++hk) {
+                    const size_t off_bytes = ((size_t) hk * ring_slots_ + s0) * (size_t) HD_ * elem_bytes;
+                    cudaMemsetAsync(reinterpret_cast<uint8_t*>(sl.kring_[l]) + off_bytes, 0, span_bytes, cs_);
+                    cudaMemsetAsync(reinterpret_cast<uint8_t*>(sl.vring_[l]) + off_bytes, 0, span_bytes, cs_);
+                }
+            any = true;
+            s0 = s1;
+        }
+        if (any && cs_) cudaStreamSynchronize(cs_);
+    } else {
+        for (int32_t& p : sl.ring_pos_)
+            if (p >= prefix_len) p = -1;
+    }
+    if (sl.have_ctx_ > prefix_len) sl.have_ctx_ = prefix_len;
 }
 
 }  // namespace strata::core
