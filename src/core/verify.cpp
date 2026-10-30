@@ -4853,6 +4853,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         !evict_batch_graph(key, evicted, err))
         return false;
     bm_used_[key] = ++bm_tick_;
+    if (commit_pending_ && !wait_commit(err)) return false;
     // (a pipelined window that commits after the verdict has its own commit graph: capture_deferred)
     if (!capture_batch(rows, S, hbase, err) || (!staging_deferred_ && !capture_commit_batch(rows, S, hbase, err)))
         return false;
@@ -5052,8 +5053,19 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
-        const cudaError_t se = cudaStreamSynchronize(cs_);
-        if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+        static const bool wait_commit_env = [] {
+            const char* e = std::getenv("STRATA_DF2_WAITCOMMIT");
+            return e && e[0] == '1';
+        }();
+        if (!g_commit_async || next_ != nullptr || wait_commit_env) {
+            const cudaError_t se = cudaStreamSynchronize(cs_);
+            if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
+        } else {
+            const cudaError_t re = cudaEventRecord(commit_done_, cs_);
+            if (re != cudaSuccess) { err = std::string("verify: batch commit event: ") + cudaGetErrorString(re); return false; }
+            (void) cudaStreamQuery(cs_);
+            commit_pending_ = true;
+        }
     }
     if (ple_stage())
         for (int t = 0; t < S;) {

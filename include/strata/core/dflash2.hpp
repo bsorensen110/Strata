@@ -56,6 +56,8 @@ public:
     bool load(const std::string& pack_path, int device, std::string& err);
     /// The target's embedding and head (and the draft vocabulary file, "" or missing: the whole head).
     bool bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err);
+    /// Device bytes bind() will allocate for the draft head subset, index map, and logits buffer.
+    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file) const;
     /// Tests: an embedding callback and a head given as raw rows of `head_type` (a native_mmvq type).
     using EmbedFn = std::function<void(const int32_t* tokens_dev, int n, float* out, cudaStream_t)>;
     bool bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err);

@@ -2322,7 +2322,9 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
     // kernel (254/256 queries the same), so the default keeps the warp kernel; every other target keeps it too (false)
     static const bool wmma_on = [] {
         const char* v = std::getenv("STRATA_SELECT_WMMA");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
+        if (v != nullptr && v[0] != '\0') return v[0] != '0';
+        const char* d = std::getenv("STRATA_DEFAULTS");
+        return sel_gfx12_device() && !(d != nullptr && d[0] == '0' && d[1] == '2' && d[2] == '6');
     }();
     // any HIP card: the FP32 tiled scorer, opt-in as on CUDA (STRATA_SELECT_SIMT=1; another summation order than the
     // warp kernel, so the default keeps the warp kernel).  RX 6900 XT, 256 queries at 128K: 2.71 -> 0.587 ms

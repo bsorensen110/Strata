@@ -41,8 +41,8 @@ int main(int argc, char** argv) {
     cudaMemcpy(pos, hpos, 64, cudaMemcpyHostToDevice);
     cudaMemset(tok, 0, 7 * 16 * 4);
     uint16_t* cb;
-    cudaMalloc((void**) &cb, (size_t) 1000 * 256 * 2);
-    cudaMemset(cb, 0, (size_t) 1000 * 256 * 2);
+    cudaMalloc((void**) &cb, (size_t) 106299 * 256 * 2);
+    cudaMemset(cb, 0, (size_t) 106299 * 256 * 2);
     float* part;
     cudaMalloc((void**) &part, (size_t) kDf2MaxChunks * 8 * 32 * 130 * 4);
     cudaMemset(part, 0, (size_t) kDf2MaxChunks * 8 * 32 * 130 * 4);

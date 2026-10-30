@@ -3435,6 +3435,21 @@ int main(int argc, char** argv) {
         }
         }
     }
+    if (o.draft == "dflash2") {
+        if (o.mtp_draft_vocab.empty() && !o.mtp.empty()) {
+            std::error_code ec;
+            const auto p = std::filesystem::path(o.mtp) / "draft_vocab.bin";
+            if (std::filesystem::exists(p, ec)) o.mtp_draft_vocab = p.string();
+        }
+        if (o.mtp_draft_vocab.empty() && !o.draft_model.empty()) {
+            std::error_code ec;
+            const auto dp = std::filesystem::path(o.draft_model).parent_path();
+            for (const auto& cand : {dp / "draft_vocab.bin", dp.parent_path() / "mtp" / "rt" / "draft_vocab.bin",
+                                     dp.parent_path() / "mtp" / "draft_vocab.bin"}) {
+                if (std::filesystem::exists(cand, ec)) { o.mtp_draft_vocab = cand.string(); break; }
+            }
+        }
+    }
     if (o.dflash_no_mtp) {
         if (o.draft != "dflash2") { std::fprintf(stderr, "strata generate: --dflash-no-mtp needs --draft dflash2\n"); return 2; }
         o.mtp.clear();   // DFlash2 drafts alone: the MTP layer is never loaded (use_mtp is false everywhere)
@@ -6384,8 +6399,6 @@ int main(int argc, char** argv) {
         // the next window's drafts), and the round/step graphs carry the forcing kernel
         const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyNarrowT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
-        mtp.set_ple_session(&ss);
 #if defined(STRATA_HAVE_DFLASH2)
         if (o.draft == "dflash2") {
             // Single-card --batch N is served (the batch windows give each slot its own proposals, the target verifies
@@ -6402,6 +6415,18 @@ int main(int argc, char** argv) {
             if (why == nullptr) {
                 if (df2.load(o.draft_model, 0, err)) {
                     use_df2 = true;
+                    static const bool keep_mtp = [] {
+                        const char* e = std::getenv("STRATA_DFLASH2_KEEP_MTP");
+                        return e && e[0] == '1';
+                    }();
+                    if (!batch_mtp && !keep_mtp) {
+                        if (o.mtp_draft_vocab.empty() && !o.mtp.empty()) {
+                            std::error_code ec;
+                            const auto p = std::filesystem::path(o.mtp) / "draft_vocab.bin";
+                            if (std::filesystem::exists(p, ec)) o.mtp_draft_vocab = p.string();
+                        }
+                        o.mtp.clear();   // DFlash2 loaded: do not keep the full MTP image in VRAM
+                    }
                     // Per card class, from the measured A/Bs (notes-dflash2-p1.md): on Strix Halo a window of 5 is the agent-safe pick (cap 6 ties on
                     // agent prompts); a 12 GB NVIDIA card is slower with DFlash2 than with the MTP at every cap but code, which only the user can know.
                     // Recommend, never force: the window is capped for the card unless --draft-cap says otherwise, and a small NVIDIA card gets one plain line.
@@ -6439,6 +6464,8 @@ int main(int argc, char** argv) {
             }
         }
 #endif
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        mtp.set_ple_session(&ss);
         if (batch_mtp) {
             // Slot b's drafter lives where the solo drafter does (the guard above: the last stage's GPU), carved from the
             // LAST stage's slot-b session (bslot_ss.back(): stage 0's on one GPU): it borrows that session's context
@@ -6786,7 +6813,10 @@ int main(int argc, char** argv) {
                         int64_t mtp_b = (!o.mtp.empty() && native_head.loaded())
                                             ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
 #if defined(STRATA_HAVE_DFLASH2)
-                        if (use_df2 && native_head.loaded()) mtp_b += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits
+                        if (use_df2 && native_head.loaded()) {
+                            const int64_t extra_slots = o.batch > 1 ? std::min<int>(o.batch, strata::core::kDf2MaxSlots) - 1 : 0;
+                            mtp_b += (int64_t) df2.bind_bytes(native_head.row_bytes(), n_vocab, o.mtp_draft_vocab) + ((48 + extra_slots * 44) << 20);   // DFlash2's own draft head, logits, and extra batch slot rings/graphs
+                        }
 #endif
                         if (stages.empty())
                             for (const auto& d : slot_mtp) mtp_b += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
@@ -7033,7 +7063,10 @@ int main(int argc, char** argv) {
             for (const auto& d : slot_mtp)
                 mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
 #if defined(STRATA_HAVE_DFLASH2)
-        if (use_df2 && native_head.loaded()) mtp_bind += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits, bound after this
+        if (use_df2 && native_head.loaded()) {
+            const int64_t extra_slots = o.batch > 1 ? std::min<int>(o.batch, strata::core::kDf2MaxSlots) - 1 : 0;
+            mtp_bind += (int64_t) df2.bind_bytes(native_head.row_bytes(), n_vocab, o.mtp_draft_vocab) + ((48 + extra_slots * 44) << 20);   // DFlash2's own draft head, logits, and extra batch slot rings/graphs, bound after this
+        }
 #endif
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
@@ -13635,7 +13668,10 @@ int main(int argc, char** argv) {
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                         sl.used = ++slot_clock;
-                        if (!sl.cached) kv_pool.release(*bslot_ss[0][(size_t) b]);
+                        if (!sl.cached) {
+                            if (!ver.wait_commit(err)) { std::printf("ERR %s\n", err.c_str()); return false; }
+                            kv_pool.release(*bslot_ss[0][(size_t) b]);
+                        }
                         break;
                     }
                     sl.x = y;
@@ -13728,6 +13764,19 @@ int main(int argc, char** argv) {
                             for (int i = 0; i < k_next; ++i) sl.draft[(size_t) i] = dd[i];
                             sl.n_drafts = k_next;
                             sl.draft_ready = true;
+                            strata::core::SessionState& sx = *bslot_ss[0][(size_t) b];
+                            if (sx.ple.ready() && sx.ple.table != nullptr) {
+                                int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
+                                auto pf = [&](int32_t tok) {
+                                    uint32_t rows16[strata::kernels::PLE_N_HEADS];
+                                    strata::kernels::ngram_rows(&tok, prev, 1, sx.ple.consts, rows16);
+                                    prev[0] = prev[1];
+                                    prev[1] = tok;
+                                    sx.ple.table->prefetch_rows(rows16);
+                                };
+                                pf(sl.x);
+                                for (int i = 0; i < k_next; ++i) pf(sl.draft[(size_t) i]);
+                            }
                         } else {
                             static int64_t df2_warn = 0;
                             if (++df2_warn <= 5)
@@ -13816,6 +13865,10 @@ int main(int argc, char** argv) {
                     for (int j = 0; j < nchk; ++j) bt_chk_bad += chk[j] != sd.draft[(size_t) j];
                     bt_chk_n += nchk;
                 }
+            }
+            if (!ver.wait_commit(err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return false;
             }
             pool_report();
             std::fflush(stdout);

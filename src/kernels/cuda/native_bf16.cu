@@ -236,7 +236,11 @@ void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64
                  cudaStream_t st, const uint16_t* w_aux = nullptr, float* y_aux = nullptr, int64_t ldy_aux = 0) {
     constexpr int RPB = 4;
     const unsigned nb = (unsigned) ((n_out + RPB - 1) / RPB);
+#if defined(__HIPCC__)
+    static const bool ts = [] { const char* v = std::getenv("STRATA_BF16_TSUM"); return v && v[0] == '1'; }();
+#else
     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+#endif
     if (w_aux != nullptr) {   // S26 STRATA_LFUSE: + one aux row block
 #define S26_AUX(TSV) \
         if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB, TSV, true><<<nb + 1, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); \

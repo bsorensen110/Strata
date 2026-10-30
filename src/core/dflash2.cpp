@@ -46,6 +46,8 @@ Dflash2Drafter::~Dflash2Drafter() {
     const OnDevice on_device(device_);
     if (cs_) cudaStreamSynchronize(cs_);
     for (auto& sl : slots_) free_slot(*sl);   // every conversation's graphs and rings, slot 0 first
+    if (dhead_ != nullptr && head_type_ == 14 && kernels::native_q6_k_packed_enabled())
+        kernels::native_q6_k_unpack(dhead_);
     auto fr = [](void* p) { if (p) cudaFree(p); };
     fr(blob_); fr(d_meta_); fr(xq_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rt_blk_);
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
@@ -253,7 +255,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
         return true;
     };
     const size_t B = kRows;
-    bool ok = dev(&d_meta_, 32) && dev(&xq_, kernels::native_q8_1_bytes(N_, kRows) + 4096) && dev(&xqp_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&xqc_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&rt_ctx_, B * 128) && dev(&rt_blk_, B * 128) &&
+    bool ok = dev(&d_meta_, 32) && dev(&xq_, kernels::native_q8_1_bytes(N_, kRows) + kernels::native_q8_1_il_bytes(N_, kRows) + 4096) && dev(&xqp_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&xqc_, (size_t) 5 * N_ * 8 + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * 8 + 64) && dev(&rt_ctx_, B * 128) && dev(&rt_blk_, B * 128) &&
               dev(&fcy_, B * N_) && dev(&hctx_, B * N_) && dev(&kc_, B * NKV_ * HD_) && dev(&vc_, B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
               dev(&xc_, B * N_) && dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
@@ -408,6 +410,19 @@ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, 
     return true;
 }
 
+uint64_t Dflash2Drafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file) const {
+    int64_t n_dv = 0;
+    if (!vocab_file.empty()) {
+        if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
+            std::fseek(vf, 0, SEEK_END);
+            const long size = std::ftell(vf);
+            std::fclose(vf);
+            if (size >= 4 && size % 4 == 0) n_dv = (int64_t) (size / 4);
+        }
+    }
+    return df2_bind_bytes(head_row_bytes, n_vocab, n_dv, kDrafts);
+}
+
 bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err) {
     const OnDevice on_device(device_);
     if (head == nullptr || !head->loaded()) { err = "dflash2: the drafter needs the native head (--native)"; return false; }
@@ -456,6 +471,8 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         head_rows = (int64_t) vocab.size();
     }
     if (!bind_raw(embed, hw, head->type(), head_rows, vocab, err)) return false;
+    if (dhead_ != nullptr && head_type_ == 14 && kernels::native_q6_k_packed_enabled())
+        kernels::native_q6_k_pack(dhead_, N_, (int) n_dvocab_, "DFlash2 draft head");
     std::fprintf(stderr, "strata dflash2: %lld-token draft head (%.1f MiB), drafter %.0f MiB of VRAM\n", (long long) n_dvocab_,
                  (double) (n_dvocab_ * row_bytes) / 1048576.0, (double) vram_ / 1048576.0);
     return true;
@@ -561,12 +578,30 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             stamp("df2_conv_rms_quant");
         }
         native_quantize_q8_1(fn_ + N_, xq_, N_, kDrafts, cs);   // rows 1..7, the head's format
-        df2_quant_rows(fn_ + N_, N_, kDrafts, xqp_, xdp_, cs);   // and the selector projection's
-        if (!skip_part("head")) native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, kDrafts, cs);
+        if (!skip_part("head")) {
+            static const int head_il = [] {
+                const char* e = std::getenv("STRATA_DFLASH_HEAD_IL");
+                return e && e[0] ? (e[0] != '0' ? 1 : 0) : -1;
+            }();
+            if (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, kDrafts, (int) n_dvocab_))) {
+                uint8_t* xil = xq_ + native_q8_1_bytes(N_, kRows);
+                native_q8_1_interleave(xq_, xil, N_, kDrafts, cs);
+                if (head_il == 1 && !native_mmvq_il_supported(head_type_, kDrafts, (int) n_dvocab_)) {
+                    native_mmvq_il_tune(4);
+                    native_mmvq_il(head_type_, head_w_, xq_, xil, logits_, N_, (int) n_dvocab_, kDrafts, cs);
+                    native_mmvq_il_tune(0);
+                } else {
+                    native_mmvq_il(head_type_, head_w_, xq_, xil, logits_, N_, (int) n_dvocab_, kDrafts, cs);
+                }
+            } else {
+                native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, kDrafts, cs);
+            }
+        }
         stamp("native_mmvq");
         df2_topk(logits_, (int) n_dvocab_, dvocab_, kDrafts, topscratch_, topval_, toptok_, cs);
         stamp("df2_topk");
-        gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, kDrafts, cs, xqp_, xdp_);
+        // df2_conv_rms_quant on the final layer has already quantized fn_ rows 1..7 into xqp_ + N_ and xdp_ + N_ / 32
+        gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, kDrafts, cs, xqp_ + N_, xdp_ + N_ / 32);
         stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, kDrafts, d_meta_ + 16, out_tok_,

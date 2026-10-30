@@ -3622,6 +3622,14 @@ GFX1103_SWITCHES = {
 # same greedy answers with all 17 on and with all 17 off, decode +2% and prompts +3-6%.  The engine's arch defaults are not used
 # for gfx1150 (src/core/arch_defaults_test.cpp asserts gfx1150 stays empty), so this keeps the default path byte-identical.
 GFX1150_SWITCHES = dict(GFX1103_SWITCHES)
+GFX12_SWITCHES = {
+    # prompt
+    "STRATA_GDN_HEAD": "1", "STRATA_GDN_PP": "2", "STRATA_GDN_CONVL2": "1", "STRATA_GDN_NOY": "1",
+    "STRATA_CVEC_FUSE": "1", "STRATA_PF_FUSED": "1", "STRATA_SELECT_WMMA": "1",
+    # decode
+    "STRATA_ATTN_LANECELL": "1", "STRATA_ATTN_MERGE_V2": "1", "STRATA_EXPDEC": "1",
+    "STRATA_GR_TSUM": "1", "STRATA_TSUM": "0",
+}
 AMD_NAMES = {"gfx1100": "AMD Radeon RX 7900 series (gfx1100)",   # when sysfs has no product name
              "gfx1101": "AMD Radeon RX 7800 XT / 7700 XT (gfx1101)",
              "gfx1102": "AMD Radeon RX 7600 / 7600 XT (gfx1102)",
@@ -6414,7 +6422,7 @@ def write_config(path: Path, cfg: dict):
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision", "args_written"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
-                       "STRATA_ROUTE_TAIL_SKIP"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
+                       "STRATA_ROUTE_TAIL_SKIP", "STRATA_HIP_WMMA"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES) | frozenset(GFX12_SWITCHES)   # the "env" entries setup writes (the gfx1103/gfx1150/gfx12 switches are setup's too: a re-run refreshes them, they do not linger)
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
 # user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
 # (0.1.44 dropped them with the rest of SETUP_ENV).
@@ -10072,9 +10080,13 @@ def main() -> int:
             cfg.setdefault("env", {}).update(GFX1103_SWITCHES)
         if GFX1150_OPT_IN and gfx_arch_is(gpu["arch"], "gfx1150"):
             # the exact gfx1151 speed switches measured on this chip (GFX1150_SWITCHES): the engine has no arch defaults
-            # for gfx1150, so setup writes them into the config.  They are setup's own (SETUP_ENV), so a re-run refreshes
+            # for gfx1150, so setup writes this set.  They are setup's own (SETUP_ENV), so a re-run refreshes
             # them and turning the opt-in off takes them out again.
             cfg.setdefault("env", {}).update(GFX1150_SWITCHES)
+        if gfx_arch_is(gpu["arch"], "gfx1200") or gfx_arch_is(gpu["arch"], "gfx1201"):
+            cfg.setdefault("env", {}).update(GFX12_SWITCHES)
+            if cfg.get("kv") != "k8v4":
+                cfg["env"]["STRATA_HIP_WMMA"] = "1"
         # RDNA2 (gfx103x): the prompt's FP16 GEMMs through rocBLAS's best kernel per shape (tools/hip/tune_rocblas;
         # the GDN input projection 6x faster below 1,152 tokens on a 6900 XT).  The ids are valid for one rocBLAS
         # build, which only the engine can read, so setup points it at the directory and the engine picks the file

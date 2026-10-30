@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <string>
 
+using strata::core::df2_bind_bytes;
 using strata::core::df2_graphs_valid_for;
 using strata::core::df2_ring_bytes;
 using strata::core::df2_ring_mirror_entries;
@@ -184,6 +185,14 @@ int main() {
     check(!df2_slot_ok(8, 8), "slot 8 is out of range for 8 slots");
     check(!df2_slot_ok(0, 0), "no slot is valid in 0 slots");
     check(!df2_slot_ok(-1, 0), "slot -1 in 0 slots is out of range");
+
+    // df2_bind_bytes: exact VRAM bind() allocates for the draft head subset, index map, and 7-row logits buffer
+    check_eq(df2_bind_bytes(2100, 248320, 106299, 7),
+             106299ull * 2100 + 106299ull * 4 + 7ull * 106299ull * 4,
+             "df2_bind_bytes with pruned draft_vocab.bin counts dhead + dvocab + 7*n_dvocab*4 logits");
+    check_eq(df2_bind_bytes(2100, 248320, 0, 7),
+             7ull * 248320ull * 4,
+             "df2_bind_bytes without draft_vocab.bin counts 7*n_vocab*4 logits (head stays in place)");
 
     std::printf("dflash2_slots_test: %ld checks, %s\n", g_checks, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

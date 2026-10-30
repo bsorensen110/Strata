@@ -5379,8 +5379,8 @@ namespace {
 // are fixed arrays of this many entries: a window's rows (up to kVerifyMaxT, the fork's DFlash2 batch ceiling included)
 // of the model's 10 routed experts must fit, and a larger k is refused at run time rather than written past them.
 // 128 for the 8-row window (as it was), 256 for 16.
-constexpr int64_t kMaxWindowEntries = strata::kernels::kVerifyMaxT <= 8 ? 128 : 256;
-static_assert(strata::kernels::kVerifyMaxT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+constexpr int64_t kMaxWindowEntries = strata::kernels::kWindowMaxT <= 8 ? 128 : 256;
+static_assert(strata::kernels::kWindowMaxT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 
 namespace {

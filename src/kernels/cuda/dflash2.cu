@@ -327,11 +327,11 @@ __global__ void attn_merge_kernel(const float* __restrict__ part, int n_chunks, 
 struct Df2Seg { const int8_t* q; const __half* d; float* y; int n_out; int row0; };
 struct Df2Segs { Df2Seg s[3]; int n; };
 
-template <int WARPS, bool COMPUTE, int UNR = 2>
+template <int WARPS, bool COMPUTE, int UNR = 2, int NCOLS = 8>
 __global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n_in, int ncols) {
     constexpr int R = 8;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row_g = (blockIdx.x * WARPS + warp) * R;   // first row of this warp's group, over all the launch's matrices
+    const int row_g = ((int) blockIdx.x * WARPS + warp) * R;
     int si = 0;
     while (si + 1 < segs.n && row_g >= segs.s[si + 1].row0) ++si;
     const Df2Seg sg = segs.s[si];
@@ -340,11 +340,11 @@ __global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const i
     const int4* wq = reinterpret_cast<const int4*>(sg.q + (size_t) row0 * n_in) + lane;
     const __half* wd = sg.d + (size_t) row0 * nb + (lane >> 1);
     const int4* xv = reinterpret_cast<const int4*>(xq) + lane;
-    float acc[R][8];
+    float acc[R][NCOLS];
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int c = 0; c < 8; ++c) acc[r][c] = 0.0f;
+        for (int c = 0; c < NCOLS; ++c) acc[r][c] = 0.0f;
 #pragma unroll UNR
     for (int st = 0; st < steps; ++st) {
         int4 w[R];
@@ -358,11 +358,11 @@ __global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const i
             for (int r = 0; r < R; ++r) acc[r][0] += (float) (w[r].x ^ w[r].y ^ w[r].z ^ w[r].w) * dw[r];
             continue;
         }
-        float xs[8];
+        float xs[NCOLS];
 #pragma unroll
-        for (int c = 0; c < 8; ++c) xs[c] = xd[(size_t) c * nb + st * 16 + (lane >> 1)];
+        for (int c = 0; c < NCOLS; ++c) xs[c] = xd[(size_t) c * nb + st * 16 + (lane >> 1)];
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < NCOLS; ++c) {
             const int4 x = xv[(size_t) c * (n_in / 16) + st * 32];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
@@ -377,7 +377,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const i
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < NCOLS; ++c) {
             float v = acc[r][c];
             v += __shfl_xor_sync(0xffffffffu, v, 16);
             v += __shfl_xor_sync(0xffffffffu, v, 8);
@@ -386,6 +386,21 @@ __global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const i
             v += __shfl_xor_sync(0xffffffffu, v, 1);
             if (lane == 0 && c < ncols) sg.y[(size_t) c * sg.n_out + row0 + r] = v;
         }
+}
+
+template <int WARPS>
+void launch_gemm8_ncols(int rows, cudaStream_t st, const Df2Segs& segs, const int8_t* xqp, const float* xd, int n_in, int ncols) {
+    const int grid = rows / (WARPS * 8), blk = WARPS * 32;
+    switch (ncols) {
+        case 1: gemm8_kernel<WARPS, true, 2, 1><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 1); break;
+        case 2: gemm8_kernel<WARPS, true, 2, 2><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 2); break;
+        case 3: gemm8_kernel<WARPS, true, 2, 3><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 3); break;
+        case 4: gemm8_kernel<WARPS, true, 2, 4><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 4); break;
+        case 5: gemm8_kernel<WARPS, true, 2, 5><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 5); break;
+        case 6: gemm8_kernel<WARPS, true, 2, 6><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 6); break;
+        case 7: gemm8_kernel<WARPS, true, 2, 7><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 7); break;
+        default: gemm8_kernel<WARPS, true, 2, 8><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
+    }
 }
 
 // quantize one 32-block of one row to the planar activation layout (a warp: lane = element)
@@ -564,23 +579,30 @@ __global__ void q8_tile_kernel(const uint8_t* __restrict__ blocks, int8_t* __res
 
 // ---- top-16
 constexpr int TK_CHUNK_MAX = 4096;
+constexpr int TK_PER_THR = TK_CHUNK_MAX / 256;
 __device__ __forceinline__ bool better(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
 
 __global__ void topk_part_kernel(const float* __restrict__ logits, int n, float* __restrict__ cval, int32_t* __restrict__ cidx) {
-    __shared__ float vals[TK_CHUNK_MAX];
     __shared__ float wv[8];
     __shared__ int wi[8];
     __shared__ int win;
     const int row = blockIdx.x, blk = blockIdx.y, tid = threadIdx.x;
     const int cs = (n + kDf2TopBlocks - 1) / kDf2TopBlocks;
     const int c0 = blk * cs, c1 = min(c0 + cs, n);
-    for (int i = tid; i < cs; i += 256) vals[i] = (c0 + i < c1) ? logits[(size_t) row * n + c0 + i] : -INFINITY;
-    __syncthreads();
+    float rv[TK_PER_THR];
+#pragma unroll
+    for (int u = 0; u < TK_PER_THR; ++u) {
+        const int i = u * 256 + tid;
+        rv[u] = (c0 + i < c1) ? logits[(size_t) row * n + c0 + i] : -INFINITY;
+    }
     for (int k = 0; k < kDf2TopK; ++k) {
         float bv = -INFINITY;
         int bi = 0x7fffffff;
-        for (int i = tid; i < cs; i += 256)
-            if (better(vals[i], i, bv, bi)) { bv = vals[i]; bi = i; }
+#pragma unroll
+        for (int u = 0; u < TK_PER_THR; ++u) {
+            const int i = u * 256 + tid;
+            if (i < cs && better(rv[u], i, bv, bi)) { bv = rv[u]; bi = i; }
+        }
         for (int o = 16; o > 0; o >>= 1) {
             const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
             const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
@@ -596,28 +618,43 @@ __global__ void topk_part_kernel(const float* __restrict__ logits, int n, float*
             const size_t o = ((size_t) row * kDf2TopBlocks + blk) * kDf2TopK + k;
             cval[o] = v;
             cidx[o] = v == -INFINITY ? -1 : c0 + ix;
-            win = ix;
-            if (v != -INFINITY) vals[ix] = -INFINITY;
+            win = v != -INFINITY ? ix : -1;
         }
         __syncthreads();
+        const int w_ix = win;
+        if (w_ix >= 0 && (w_ix & 255) == tid) {
+            const int u_win = w_ix >> 8;
+#pragma unroll
+            for (int u = 0; u < TK_PER_THR; ++u)
+                if (u == u_win) rv[u] = -INFINITY;
+        }
     }
 }
 
 __global__ void topk_merge_kernel(const float* __restrict__ cval, const int32_t* __restrict__ cidx, const int32_t* __restrict__ idx_map,
                                   float* __restrict__ val, int32_t* __restrict__ tok) {
     constexpr int NC = kDf2TopBlocks * kDf2TopK;
-    __shared__ float sv[NC];
-    __shared__ int si[NC];
+    constexpr int TM_PER_THR = NC / 256;
     __shared__ float wv[8];
     __shared__ int wi[8], wp[8];
+    __shared__ int win;
     const int row = blockIdx.x, tid = threadIdx.x;
-    for (int i = tid; i < NC; i += 256) { sv[i] = cval[(size_t) row * NC + i]; si[i] = cidx[(size_t) row * NC + i]; }
-    __syncthreads();
+    float rv[TM_PER_THR];
+    int ri[TM_PER_THR];
+#pragma unroll
+    for (int u = 0; u < TM_PER_THR; ++u) {
+        const int i = u * 256 + tid;
+        rv[u] = cval[(size_t) row * NC + i];
+        ri[u] = cidx[(size_t) row * NC + i];
+    }
     for (int k = 0; k < kDf2TopK; ++k) {
         float bv = -INFINITY;
         int bi = 0x7fffffff, bp = -1;
-        for (int i = tid; i < NC; i += 256)
-            if (si[i] >= 0 && better(sv[i], si[i], bv, bi)) { bv = sv[i]; bi = si[i]; bp = i; }
+#pragma unroll
+        for (int u = 0; u < TM_PER_THR; ++u) {
+            const int i = u * 256 + tid;
+            if (ri[u] >= 0 && better(rv[u], ri[u], bv, bi)) { bv = rv[u]; bi = ri[u]; bp = i; }
+        }
         for (int o = 16; o > 0; o >>= 1) {
             const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
             const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
@@ -631,11 +668,18 @@ __global__ void topk_merge_kernel(const float* __restrict__ cval, const int32_t*
             int ix = wi[0], p = wp[0];
             for (int w = 1; w < 8; ++w)
                 if (better(wv[w], wi[w], v, ix)) { v = wv[w]; ix = wi[w]; p = wp[w]; }
-            if (p >= 0) { si[p] = -1; }
+            win = p;
             val[row * kDf2TopK + k] = v;
             tok[row * kDf2TopK + k] = p >= 0 ? (idx_map ? idx_map[ix] : ix) : 0;
         }
         __syncthreads();
+        const int w_p = win;
+        if (w_p >= 0 && (w_p & 255) == tid) {
+            const int u_win = w_p >> 8;
+#pragma unroll
+            for (int u = 0; u < TM_PER_THR; ++u)
+                if (u == u_win) ri[u] = -1;
+        }
     }
 }
 
@@ -811,8 +855,8 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
         case 7: gemm8_kernel<4, true, 4><<<rows / 32, 128, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         case 8: gemm8_kernel<8, true, 2><<<rows / 64, 256, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         case 9: gemm8_kernel<4, false><<<rows / 32, 128, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
-        case 2: gemm8_kernel<2, true><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); break;   // 16 rows a block: every n_out is a multiple of 16
-        default: gemm8_kernel<4, true><<<rows / 32, 128, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
+        case 2: launch_gemm8_ncols<2>(rows, st, segs, xqp, xd, n_in, ncols); break;   // 16 rows a block: every n_out is a multiple of 16
+        default: launch_gemm8_ncols<4>(rows, st, segs, xqp, xd, n_in, ncols); break;
     }
     check("gemm8");
 }
