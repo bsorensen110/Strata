@@ -18,6 +18,8 @@
 
 namespace strata::kernels {
 
+inline constexpr int bf16_gemv_mmvf_kernel_max_rows = 8;
+
 /// `y[o] = sum_i f32(x[i]) * f32(w[o*n_in + i])`, with both sides bf16-valued so every product is exact in
 /// f32 and only the summation order differs.
 ///
@@ -64,8 +66,9 @@ void bf16_gemv_fp32_mmvf(const float* x, const uint16_t* w, float* y,
 /// `bf16_gemv_fp32_mmvf` call on it.
 void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64_t n_in, int64_t n_out, int ncols,
                               void* stream);
-/// bf16_gemv_fp32_mmvf for n_tok (1..8) activation rows x[t * ldx], outputs y[t * ldy + j]; one launch,
-/// the weight read once, every output bit-identical to its own single-row call.
+/// bf16_gemv_fp32_mmvf for up to 16 activation rows x[t * ldx], outputs y[t * ldy + j]. Rows are launched in
+/// tiles of at most bf16_gemv_mmvf_kernel_max_rows; wider windows reread weights per tile. Each output is bitwise
+/// identical to its own single-row call.
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream);
 /// S26 STRATA_LFUSE: bf16_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, n_tok) plus the 1-row

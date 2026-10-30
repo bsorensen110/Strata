@@ -388,6 +388,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(host_limits_test tests/platform/host_limits_test.cpp)
   target_include_directories(host_limits_test PRIVATE include)
   add_test(NAME host_limits_test COMMAND host_limits_test)
+
+  # the DFlash2 tap-capture rule of record_window (batch records capture too): header-only rule, no GPU
+  add_executable(dflash2_tap_test tests/core/dflash2_tap_test.cpp)
+  target_include_directories(dflash2_tap_test PRIVATE include)
+  add_test(NAME dflash2_tap_test COMMAND dflash2_tap_test)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------
@@ -1342,6 +1347,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     endif()
   endif()
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+    # Wide verifier windows tile the native Q8/MMVQ operations into the existing 8-column kernels; synthetic GPU parity.
+    add_executable(native_mmvq_wide_parity src/kernels/native_mmvq_wide_parity.cpp)
+    target_include_directories(native_mmvq_wide_parity PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(native_mmvq_wide_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME native_mmvq_wide_parity COMMAND native_mmvq_wide_parity)
+  endif()
+  if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # fork F4: the 2-4 column dense projections from the interleaved q8_1 copy, bitwise vs native_mmvq (GPU, synthetic).
     # Every backend that builds native_mmvq's interleaved kernels can measure its card with it (docs/MMVQ_IL_TABLE.md).
     add_executable(mmvq_il_parity src/kernels/mmvq_il_parity.cpp)
@@ -2035,6 +2047,18 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(batch_rows_test tests/core/batch_rows_test.cpp)
   target_include_directories(batch_rows_test PRIVATE include)
   add_test(NAME batch_rows_test COMMAND batch_rows_test)
+  # how a batch window shares its rows between the slots' drafts, and what a slot keeps from its group (header-only, CPU)
+  add_executable(batch_spec_test tests/core/batch_spec_test.cpp)
+  target_include_directories(batch_spec_test PRIVATE include)
+  add_test(NAME batch_spec_test COMMAND batch_spec_test)
+  # the per-slot split when only some slots have a draft ready, and the tap rows a committed prefix stages (header-only, CPU)
+  add_executable(batch_spec_slots_test tests/core/batch_spec_slots_test.cpp)
+  target_include_directories(batch_spec_slots_test PRIVATE include)
+  add_test(NAME batch_spec_slots_test COMMAND batch_spec_slots_test)
+  # the drafter's per-conversation slots: ring / state sizing and the VRAM fit (header-only, CPU)
+  add_executable(dflash2_slots_test tests/core/dflash2_slots_test.cpp)
+  target_include_directories(dflash2_slots_test PRIVATE include)
+  add_test(NAME dflash2_slots_test COMMAND dflash2_slots_test)
   # how many pipelined slot groups --batch runs with: the 0.1.41 default, and --batch-mtp keeping it serial (header-only, CPU)
   add_executable(batch_groups_test src/program/batch_groups_test.cpp)
   target_include_directories(batch_groups_test PRIVATE include)
@@ -2247,7 +2271,7 @@ if(STRATA_NATIVE_EXPERTS)
     add_test(NAME router_dot_parity COMMAND router_dot_parity)
     add_test(NAME router_dot_parity_avx COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_ISA=avx $<TARGET_FILE:router_dot_parity>)
   endif()
-  # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp) bit for bit against each other at 1..8 tokens and
+  # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp) bit for bit against each other at 1..16 tokens and
   # against ggml-cpu's dot, on random blocks; --bench: ms per expert on one thread, the weights streamed from DRAM
   add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
   target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)

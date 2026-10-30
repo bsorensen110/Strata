@@ -1,4 +1,5 @@
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "s26_tsum.cuh"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/pdl.hpp"
@@ -297,9 +298,18 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
-    if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
+    if (n_tok < 1 || n_tok > kVerifyMaxT || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
-        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: row count outside 1..kVerifyMaxT or invalid geometry/alignment");
+    if (n_tok > bf16_gemv_mmvf_kernel_max_rows) {
+        for (int offset = 0; offset < n_tok; offset += bf16_gemv_mmvf_kernel_max_rows) {
+            const int tile_t = n_tok - offset < bf16_gemv_mmvf_kernel_max_rows ? n_tok - offset
+                                                                                 : bf16_gemv_mmvf_kernel_max_rows;
+            bf16_gemv_fp32_mmvf_multi(x + (int64_t) offset * ldx, ldx, w, y + (int64_t) offset * ldy, ldy, n_in,
+                                      n_out, tile_t, stream);
+        }
+        return;
+    }
     const cudaStream_t st = (cudaStream_t) stream;
     static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
     if (rows && n_out >= 64) {

@@ -1160,10 +1160,10 @@ namespace {
 // arithmetic is `row_dot_s2_q8`'s, chunk by chunk in the same lane order, so every entry is bitwise the per-entry
 // hit kernel's.
 constexpr int GU_CHUNKS = (H / 32 + 31) / 32;   // 3: chunks of a gate/up row per lane (80 chunks / 32 lanes)
-constexpr int GMAX = 8;                          // entries per group (tokens routed to one expert in a window)
-// a group holds one entry per token of the window routed to its expert, and the kernels below keep at
-// most GMAX of them (`min(..., GMAX)`): a longer window would drop entries without a word.
-static_assert(GMAX >= kVerifyMaxT, "a verify window's group can exceed GMAX entries");
+constexpr int GMAX = kVerifyGroupRows;             // fixed tile; resident_plan chunks larger expert groups without dropping entries
+// Each grouped S2 tile sees at most GMAX routed entries. The resident-plan builder splits an expert's ordered entries
+// into contiguous chunks of at most GMAX before publishing the plan; the verifier's row count may be larger.
+static_assert(GMAX == 8, "resident_plan chunk size must match the S2 grouped tile");
 constexpr int GU_ROWS = 32;                      // gate/up rows per block: 4 per warp
 constexpr int D_ROWS = 64;                       // down rows per block: 8 per warp
 

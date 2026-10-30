@@ -278,7 +278,8 @@ int scalar_activation_contract() {
 int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const uint16_t* d_up,
                            const uint16_t* d_inject, float eps) {
     using namespace strata::kernels;
-    constexpr int N = 2560, HC = 4, LR = 320, D = N * HC, T = kFusedGrMaxT;
+    // The verify window stores 16 rows while the fused kernel's fixed LDS tile remains 8; the public path must tile.
+    constexpr int N = 2560, HC = 4, LR = 320, D = N * HC, T = 2 * kFusedGrMaxT;
     std::mt19937 rng(0x6f8a);
     std::normal_distribution<float> normal(0.0f, 0.3f);
     std::vector<float> r((size_t) T * D), bo((size_t) T * N), inj((size_t) T * HC);
@@ -364,7 +365,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "multi stream");
     // the uploads above (and the caller's weights) run on the legacy stream, which the non-blocking `stream` does not wait for
     check(cudaDeviceSynchronize(), "multi setup");
-    // Max T forces the HIP kernel's full dynamic-LDS request: 8 * 1280 * sizeof(float) = 40 KiB.
+    // The 16-row call tiles twice while each launch still forces the kernel's full dynamic-LDS request: 8 * 1280 * sizeof(float) = 40 KiB.
     fused_gr_read_multi(args.data(), T, d_xn, stream);
     check(cudaStreamSynchronize(stream), "multi max-T sync");
     const Snapshot multi = snapshot();
@@ -414,7 +415,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
 
 
     // S26 STRATA_QFUSE: the read's own q8_1 image of `mixed` must be the bytes native_quantize_q8_1 writes from it -
-    // for every T (1..8), directly and through a captured graph replayed twice (the group counters must reset)
+    // for every T (1..16), directly and through a captured graph replayed twice (the group counters must reset)
     {
         uint8_t *d_q = nullptr, *d_ref = nullptr;
         unsigned* d_cnt = nullptr;
@@ -456,7 +457,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                 }
             }
         }
-        std::printf("  fused GR read + q8_1 (STRATA_QFUSE), T 1..8, direct and graph replays: %s\n", qbad ? "FAIL" : "pass");
+        std::printf("  fused GR read + q8_1 (STRATA_QFUSE), T 1..16, direct and graph replays: %s\n", qbad ? "FAIL" : "pass");
         bad += qbad;
         cudaFree(d_q); cudaFree(d_ref); cudaFree(d_cnt);
     }
@@ -464,7 +465,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     // #3948: STRATA_QFUSE in a verify window of TWO GROUPS (verify.cpp gr_read_group with G = 2): the window's tokens are
     // read in two calls one after the other, the same group counters, each call with its own tokens' destinations - the
     // attention half's xq_ is indexed from the group's first token, the expert half's nat_xq_ by the window's token.
-    // Fresh random inputs every repetition, 200 repetitions for each T = 2..8 (a race that fires one launch in a hundred
+    // Fresh random inputs every repetition, 200 repetitions for each T = 2..16 (a race that fires one launch in a hundred
     // shows), direct and as a graph replay. After every repetition: both groups' q8_1 bytes equal what
     // native_quantize_q8_1 makes of `mixed`, nothing outside the written ranges changed, and the counters are back at zero.
     if (!v3) {
@@ -584,12 +585,12 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         }
         // the inputs the rest of the test (and its caller) expect again
         check(cudaDeviceSynchronize(), "qfuse2 done");
-        std::printf("  fused GR read + q8_1 (STRATA_QFUSE), a window of two groups, T 2..8, %ld runs (%d random inputs each T), "
+        std::printf("  fused GR read + q8_1 (STRATA_QFUSE), a window of two groups, T 2..16, %ld runs (%d random inputs each T), "
                     "group-relative and window-indexed, direct and graph: %s\n", runs, REPS, g2bad ? "FAIL" : "pass");
         bad += g2bad;
         cudaFree(d_qa); cudaFree(d_qb); cudaFree(d_qabs); cudaFree(d_ref2); cudaFree(d_cnt2);
     }
-    std::printf("  fused GR multi max-T=8 LDS launch and changing graph replay %s\n",
+    std::printf("  fused GR read window T=16 tiled at kernel max-T=8 and changing graph replay %s\n",
                 bad == 0 ? "pass" : "FAIL");
     check(cudaGraphExecDestroy(graph_exec), "multi graph exec destroy");
     check(cudaGraphDestroy(graph), "multi graph destroy");

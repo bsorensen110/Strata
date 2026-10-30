@@ -20,6 +20,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/shared_expert.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -405,13 +406,14 @@ int main(int argc, char** argv) {
             cudaStream_t nsw_stream = nullptr;
             check(cudaStreamCreateWithFlags(&nsw_stream, cudaStreamNonBlocking), "nsw stream");
             const size_t q81_bytes = (size_t) (std::max(n_embd, n_ff) / 32) * 36;
+            const size_t q81_multi_bytes = q81_bytes * (size_t) kVerifyMaxT;
             const size_t w_gate_bytes = native_mmvq_weight_bytes(8, (int) n_embd, (int) n_ff);
             const size_t w_down_bytes = native_mmvq_weight_bytes(8, (int) n_ff, (int) n_embd);
             uint8_t *d_wg = nullptr, *d_wu = nullptr, *d_wd = nullptr, *d_q81 = nullptr, *d_pre_q81 = nullptr;
             check(cudaMalloc(&d_wg, w_gate_bytes), "nsw wg");
             check(cudaMalloc(&d_wu, w_gate_bytes), "nsw wu");
             check(cudaMalloc(&d_wd, w_down_bytes), "nsw wd");
-            check(cudaMalloc(&d_q81, q81_bytes), "nsw q81");
+            check(cudaMalloc(&d_q81, q81_multi_bytes), "nsw q81");
             check(cudaMalloc(&d_pre_q81, q81_bytes), "nsw pre_q81");
             std::vector<uint8_t> hwg(w_gate_bytes, 3), hwu(w_gate_bytes, 5), hwd(w_down_bytes, 2);
             check(cudaMemcpy(d_wg, hwg.data(), w_gate_bytes, cudaMemcpyHostToDevice), "nsw cp wg");
@@ -436,6 +438,38 @@ int main(int argc, char** argv) {
             const bool xq_ok = std::memcmp(ref_nsw.data(), got_nsw.data(), ref_nsw.size() * sizeof(float)) == 0;
             std::printf("  native shared x_q8_1 reuse: %s\n", xq_ok ? "byte-identical" : "FAIL");
             if (!xq_ok) ++bad;
+            // The verifier's wide window is still a row-by-row parity contract: native weights and scratch hold 16 rows,
+            // while the projection kernels tile their work at eight.
+            nsw.x_q8_1 = nullptr;
+            constexpr int nt = kVerifyMaxT;
+            std::vector<float> multi_x((size_t) nt * n_embd);
+            std::vector<uint16_t> multi_xb((size_t) nt * n_embd);
+            for (int t = 0; t < nt; ++t) {
+                std::memcpy(multi_x.data() + (size_t) t * n_embd, witness.data(), (size_t) n_embd * sizeof(float));
+                std::memcpy(multi_xb.data() + (size_t) t * n_embd, hx_bf16.data(), (size_t) n_embd * sizeof(uint16_t));
+            }
+            float *d_mx = nullptr, *d_mgate = nullptr, *d_mup = nullptr, *d_mg = nullptr, *d_mout = nullptr;
+            uint16_t* d_mxb = nullptr;
+            check(cudaMalloc(&d_mx, multi_x.size() * sizeof(float)), "nsw multi x");
+            check(cudaMalloc(&d_mxb, multi_xb.size() * sizeof(uint16_t)), "nsw multi xb");
+            check(cudaMalloc(&d_mgate, (size_t) nt * n_ff * sizeof(float)), "nsw multi gate");
+            check(cudaMalloc(&d_mup, (size_t) nt * n_ff * sizeof(float)), "nsw multi up");
+            check(cudaMalloc(&d_mg, (size_t) nt * sizeof(float)), "nsw multi g");
+            check(cudaMalloc(&d_mout, (size_t) nt * n_embd * sizeof(float)), "nsw multi out");
+            check(cudaMemcpy(d_mx, multi_x.data(), multi_x.size() * sizeof(float), cudaMemcpyHostToDevice), "nsw multi upload x");
+            check(cudaMemcpy(d_mxb, multi_xb.data(), multi_xb.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "nsw multi upload xb");
+            shared_expert_multi(nt, d_mx, d_mxb, nsw, d_ginpb, d_mgate, d_mup, d_mg, d_mout, n_embd, n_ff, nsw_stream);
+            check(cudaStreamSynchronize(nsw_stream), "nsw multi sync");
+            std::vector<float> multi_out((size_t) nt * n_embd);
+            check(cudaMemcpy(multi_out.data(), d_mout, multi_out.size() * sizeof(float), cudaMemcpyDeviceToHost), "nsw multi read");
+            bool multi_same = true;
+            for (int t = 0; t < nt; ++t)
+                multi_same &= std::memcmp(multi_out.data() + (size_t) t * n_embd, ref_nsw.data(),
+                                          (size_t) n_embd * sizeof(float)) == 0;
+            std::printf("  native shared 16-row window: %s\n", multi_same ? "byte-identical" : "FAIL");
+            if (!multi_same) ++bad;
+            (void) cudaFree(d_mx); (void) cudaFree(d_mxb); (void) cudaFree(d_mgate); (void) cudaFree(d_mup);
+            (void) cudaFree(d_mg); (void) cudaFree(d_mout);
             (void) cudaStreamDestroy(nsw_stream);
             (void) cudaFree(d_wg); (void) cudaFree(d_wu); (void) cudaFree(d_wd); (void) cudaFree(d_q81); (void) cudaFree(d_pre_q81);
         }

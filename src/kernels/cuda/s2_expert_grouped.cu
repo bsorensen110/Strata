@@ -814,10 +814,10 @@ namespace {
 // arithmetic is `row_dot_s2_q8`'s, chunk by chunk in the same lane order, so every entry is bitwise the per-entry
 // hit kernel's.
 constexpr int GU_CHUNKS = (H / 32 + 31) / 32;   // 3: chunks of a gate/up row per lane (80 chunks / 32 lanes)
-constexpr int GMAX = 8;                          // entries per group (tokens routed to one expert in a window)
-// a group holds one entry per token of the window routed to its expert, and the kernels below keep at
-// most GMAX of them (`min(..., GMAX)`): a longer window would drop entries without a word.
-static_assert(GMAX >= kVerifyMaxT, "a verify window's group can exceed GMAX entries");
+constexpr int GMAX = kVerifyGroupRows;             // fixed tile; resident_plan chunks larger expert groups without dropping entries
+// Each grouped S2 tile sees at most GMAX routed entries. The resident-plan builder splits an expert's ordered entries
+// into contiguous chunks of at most GMAX before publishing the plan; the verifier's row count may be larger.
+static_assert(GMAX == 8, "resident_plan chunk size must match the S2 grouped tile");
 constexpr int GU_ROWS = 32;                      // gate/up rows per block: 4 per warp
 constexpr int D_ROWS = 64;                       // down rows per block: 8 per warp
 
@@ -1190,13 +1190,15 @@ __global__ void __launch_bounds__(256) down_grouped_t_kernel(const unsigned long
 }  // namespace
 
 namespace {
-// Plan v0.3 P6: groups built on the device when every expert is resident at `base + id * blob` (the MTP layer):
-// one block of 128 threads, groups in first-appearance order, entries of a group in routing order.
+// Plan v0.3 P6: groups built on the device when every expert is resident at `base + id * blob` (the MTP layer).
+// Expert entries remain in first-appearance/routing order and are chunked to the S2 tile's fixed group width.
+constexpr int kGroupResidentMax = kVerifyMaxT * 10;
 __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, int k_per_tok, const uint8_t* base,
                                       long long blob, unsigned long long* __restrict__ grp_ptr,
                                       int32_t* __restrict__ grp_start, int32_t* __restrict__ counts,
                                       int32_t* __restrict__ ent_dst, int32_t* __restrict__ ent_tok) {
-    __shared__ int e_s[128], first_s[128], size_s[128], gidx_s[128], gstart_s[129];
+    __shared__ int e_s[kGroupResidentMax], first_s[kGroupResidentMax], size_s[kGroupResidentMax],
+                   gidx_s[kGroupResidentMax], gstart_s[kGroupResidentMax + 1];
     const int i = threadIdx.x;
     const int e = i < n ? ids[i] : -1;
     e_s[i] = e;
@@ -1215,14 +1217,19 @@ __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, in
         int gi = 0, acc = 0;
         for (int j = 0; j < n; ++j)
             if (first_s[j] == j) {
+                const int n_groups = (size_s[j] + GMAX - 1) / GMAX;
                 gidx_s[j] = gi;
-                gstart_s[gi] = acc;
-                grp_ptr[gi] = (unsigned long long) (base + (size_t) e_s[j] * (size_t) blob);
-                grp_start[gi] = acc;
+                const unsigned long long p = (unsigned long long) (base + (size_t) e_s[j] * (size_t) blob);
+                for (int c = 0; c < n_groups; ++c) {
+                    gstart_s[gi + c] = acc + c * GMAX;
+                    grp_ptr[gi + c] = p;
+                    grp_start[gi + c] = acc + c * GMAX;
+                }
                 acc += size_s[j];
-                ++gi;
+                gi += n_groups;
             }
         grp_start[gi] = acc;
+        gstart_s[gi] = acc;
         counts[0] = gi;
         counts[1] = acc;
     }
@@ -1238,9 +1245,9 @@ __global__ void group_resident_kernel(const int32_t* __restrict__ ids, int n, in
 void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t* base, int64_t blob,
                         unsigned long long* grp_ptr, int32_t* grp_start, int32_t* counts, int32_t* ent_dst,
                         int32_t* ent_tok, void* stream) {
-    if (n < 1 || n > 128) { std::fprintf(stderr, "moe_group_resident: n must be 1..128\n"); std::exit(1); }
-    group_resident_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ids, n, k_per_tok, base, (long long) blob, grp_ptr,
-                                                               grp_start, counts, ent_dst, ent_tok);
+    if (n < 1 || n > kGroupResidentMax) { std::fprintf(stderr, "moe_group_resident: n must be 1..%d\n", kGroupResidentMax); std::exit(1); }
+    group_resident_kernel<<<1, kGroupResidentMax, 0, (cudaStream_t) stream>>>(ids, n, k_per_tok, base, (long long) blob, grp_ptr,
+                                                                             grp_start, counts, ent_dst, ent_tok);
     check("moe_group_resident", stream);
 }
 

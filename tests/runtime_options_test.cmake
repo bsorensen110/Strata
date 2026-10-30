@@ -42,4 +42,8 @@ expect_rejected_value("negative disk conversation-cache budget" "--conversation-
 expect_accepted("disk conversation-cache directory" --conversation-cache-dir /tmp/strata-cache-test)
 expect_accepted("disk conversation-cache retention" --conversation-cache-days 7)
 expect_rejected_value("negative disk conversation-cache retention" "--conversation-cache-days needs a nonnegative integer" --conversation-cache-days -1)
+expect_accepted("default DFlash batch draft window" --batch-draft-window 8)
+expect_accepted("opt-in 16-row DFlash batch draft window" --batch-draft-window 16)
+expect_rejected_value("unsupported DFlash batch draft window" "--batch-draft-window must be 8 or 16" --batch-draft-window 12)
+expect_rejected_value("non-DFlash --spec remains capped at 8" "--spec must be at most 8" --spec 16)
 message(STATUS "fork runtime option regression tests passed")

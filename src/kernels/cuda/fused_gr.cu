@@ -2381,8 +2381,8 @@ static bool gr_v3_default_on(int dev) {
 #endif
 }
 
-bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
-                         int stamp_i0) {
+static bool fused_gr_read_multi_tile(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
+                                     int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
@@ -2519,6 +2519,23 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     if (e != cudaSuccess) {
         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
         std::exit(1);
+    }
+    return q8;
+}
+
+bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
+                         unsigned long long* stamp_buf, int stamp_i0) {
+    if (a == nullptr || n_tok < 1 || n_tok > kFusedGrMaxWindowT || xn_scratch == nullptr) {
+        std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
+        std::exit(1);
+    }
+    const bool collect_stamps = n_tok <= kFusedGrMaxT;
+    bool q8 = true;
+    for (int offset = 0; offset < n_tok; offset += kFusedGrMaxT) {
+        const int tile_t = n_tok - offset < kFusedGrMaxT ? n_tok - offset : kFusedGrMaxT;
+        const bool tile_q8 = fused_gr_read_multi_tile(a + offset, tile_t, xn_scratch + (size_t) offset * D, stream,
+                                                       collect_stamps ? stamp_buf : nullptr, stamp_i0);
+        q8 = q8 && tile_q8;
     }
     return q8;
 }

@@ -14,8 +14,13 @@
 // The ring holds only COMMITTED rows (an accepted window row's taps arrive after the verify window), and the block's keys stay outside
 // it, so a rejected draft leaves nothing to roll back.  One CUDA graph per context-row count n = 1..8 holds the context update and the
 // block; the host stages the positions and the anchor and waits for the 7 drafts.
+//
+// The weights, head and block scratch belong to the card; the ring K/V and the captured round graphs belong to one conversation.  One
+// drafter can therefore hold the state of several conversations in slots (include/strata/core/dflash2_slots.hpp): it drafts the active
+// slot, and a batch loop switches slots between rounds.  One slot - the default - is exactly the drafter as it has always run.
 #pragma once
 
+#include "strata/core/dflash2_slots.hpp"
 #include "strata/core/session.hpp"
 
 #include <cuda_runtime.h>
@@ -24,6 +29,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -41,7 +47,7 @@ public:
     static constexpr int kRing = kDefaultWindow + kRingSlack;  ///< default pack ring size, kept for existing bench callers
     static constexpr int kMaxRing = kMaxWindow + kRingSlack;
 
-    Dflash2Drafter() = default;
+    Dflash2Drafter() { slots_.push_back(std::make_unique<Slot>()); }   // slot 0: the drafter as it runs today
     ~Dflash2Drafter();
     Dflash2Drafter(const Dflash2Drafter&) = delete;
     Dflash2Drafter& operator=(const Dflash2Drafter&) = delete;
@@ -62,7 +68,8 @@ public:
     bool context(const float* taps_dev, int64_t n, int64_t pos0, std::string& err);
     /// One round: the new context rows (n_new in 1..8: the committed window rows, taps device [n_new][5 * n_embd], positions pos0 ...),
     /// then the block for `anchor` (the last committed token, at pos0 + n_new).  `drafts` / `probs` get kDrafts entries (the
-    /// selector's pick and its probability).  The taps pointer must be the same device buffer on every call (graphs are captured on it).
+    /// selector's pick and its probability).  The taps pointer must be the device buffer this slot's graphs were captured on
+    /// (the guard is per slot: df2_graphs_valid_for against Slot::taps_); the engine keeps one shared staging buffer for all slots.
     bool draft(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err);
 
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
@@ -79,9 +86,8 @@ public:
     /// Host bytes one save_state() produces (header + slot table + L layers of planar K/V).
     size_t ring_elem_bytes() const { return fp16_ring_ ? 2 : 4; }
     void set_fp16_ring(bool on) { fp16_ring_ = on; }
-    size_t state_bytes() const {
-        return 128 + (size_t) ring_slots_ * 4 + (size_t) L_ * 2 * ((size_t) ring_slots_ * NKV_ * HD_ * ring_elem_bytes());
-    }
+    /// The header + slot table + rings arithmetic lives in dflash2_slots.hpp so the VRAM planner and the test read the same formula.
+    size_t state_bytes() const { return (size_t) df2_state_bytes(ring_slots_, L_, NKV_, HD_, (int) ring_elem_bytes()); }
     int attention_window() const { return window_; }
     int ring_slots() const { return ring_slots_; }
     /// Dumps the ring (device quiesced: draft() synchronized before returning) into `out`.
@@ -90,7 +96,26 @@ public:
     /// positions >= prefix_len (a branch this park took past the resumed checkpoint) are zeroed, every
     /// slot keeps the absolute position it was written at, `have_ctx_` becomes prefix_len.
     bool restore_state(const std::vector<uint8_t>& in, int64_t prefix_len, std::string& err);
-    int64_t have_ctx() const { return have_ctx_; }
+    int64_t have_ctx() const { return cur().have_ctx_; }
+
+    // ---- one drafter, several conversations (sizing and the cap in dflash2_slots.hpp) ------------------
+    // A round's captured graph bakes the ring pointers AND the taps staging pointer it was recorded against, so
+    // each slot owns its rings, its graph set, and the taps buffer those graphs read (Slot::taps_): launching
+    // another slot's graph would draft against the wrong ring, and launching a graph on a different taps buffer
+    // would read another buffer's rows.  By design all slots draft into ONE shared taps staging buffer (the
+    // batch loop stages each slot's committed rows into it before the round), so one buffer serves every slot
+    // and it stays valid for every slot's graphs until the engine rebuilds it - then each slot's own guard
+    // fails until that slot recaptures.  Everything above - context, draft, reset, rewind, save_state,
+    // restore_state, capture - acts on the active slot (slot() / set_slot); with the default single slot it is
+    // all exactly as before.  set_n_slots grows the drafter to serve more conversations on the same card: it
+    // allocates the extra slots' rings on the loaded device (or, before load, just records the count and lets
+    // alloc() give every slot its rings), never past kDf2MaxSlots, and refuses to drop a slot that has drafted -
+    // its ring holds a conversation.  A growth that runs out of VRAM partway is all-or-nothing: the pushed slots
+    // are freed and the drafter keeps the slot count it had before the call.
+    int n_slots() const { return (int) slots_.size(); }
+    bool set_n_slots(int n, std::string& err);
+    int slot() const { return cur_; }
+    bool set_slot(int i, std::string& err);
 
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
@@ -104,6 +129,31 @@ public:
     int64_t rounds = 0;
 
 private:
+    /// One conversation's drafter state.  The captured round graphs live here with the ring because the graphs bake
+    /// the ring pointers and the taps staging pointer they recorded: a ring needs its own graph set, and a batch
+    /// loop that switched rings (or the taps buffer) under a shared graph would draft against another
+    /// conversation's context.  All slots still share ONE taps staging buffer - the batch loop stages each slot's
+    /// rows into it - so the pointer only moves when the engine rebuilds that buffer; each slot's taps_ then
+    /// refuses rounds until that slot recaptures.
+    struct Slot {
+        float *kring_[8] = {}, *vring_[8] = {};   ///< ring K/V per layer (L <= 8), head-major [NKV][ring_slots][HD]
+        cudaGraphExec_t exec_[kRows + 1] = {};   ///< this slot's round graphs (n_new = 1..8), captured against its own rings
+        const float* taps_ = nullptr;            ///< the taps staging buffer this slot's exec_ graphs were captured on; draft() refuses another
+        size_t ring_plane_bytes_ = 0;            ///< bytes one ring plane (K or V, one layer) was cudaMalloc'd with; free_slot subtracts exactly these from vram_
+        int64_t have_ctx_ = 0;                   ///< last committed position (exclusive) for this conversation
+        /// The absolute position every ring slot was last written at (-1: never). Host-side mirror of the
+        /// device writes; maintained by context()/draft(), saved/restored with the ring (see save_state).
+        /// Sized from ring_slots_ wherever a slot comes to exist - load() sizes every slot, set_n_slots() sizes
+        /// each one it adds (df2_ring_mirror_entries) - and starts empty, so a slot whose sizing was missed
+        /// cannot hide behind a default that happens to fit (an 8k-window ring needs 8208, the default 2064 did not).
+        std::vector<int32_t> ring_pos_;
+    };
+    Slot& cur() { return *slots_[(size_t) cur_]; }
+    const Slot& cur() const { return *slots_[(size_t) cur_]; }
+    bool alloc_slot_rings(Slot& sl);   ///< cudaMalloc + zero this slot's rings on device_ (vram_ grows); unwinds itself on failure
+    void free_slot(Slot& sl);          ///< destroy this slot's graphs, free its rings (vram_ shrinks by the bytes recorded at allocation)
+    int32_t& mirror_cell(Slot& sl, int64_t pos);  ///< sl.ring_pos_[pos % ring_slots_] with the bounds asserted (df2_ring_mirror_index)
+
     struct Tensor { std::string name, dtype; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     const Tensor& find(const std::string& name) const;
     const void* q8(const std::string& name) const { return blob_ + find(name).off; }
@@ -146,7 +196,6 @@ private:
     int32_t* m_meta_ = nullptr;
     int32_t* h_out_ = nullptr;      ///< pinned: 7 draft tokens then 7 probabilities
     float* hp_out_ = nullptr;
-    float *kring_[8] = {}, *vring_[8] = {};
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;
     uint8_t* xq_ = nullptr;         ///< the head's q8_1 activations
     uint8_t* xqp_ = nullptr;        ///< planar activations of the drafter's own GEMMs (kernels/dflash2.hpp)
@@ -162,12 +211,8 @@ private:
     float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr;
     int32_t *toptok_ = nullptr, *out_tok_ = nullptr;
     uint32_t* topscratch_ = nullptr;
-    cudaGraphExec_t exec_[kRows + 1] = {};
-    const float* graph_taps_ = nullptr;
-    int64_t have_ctx_ = 0;
-    /// The absolute position every ring slot was last written at (-1: never). Host-side mirror of the
-    /// device writes; maintained by context()/draft(), saved/restored with the ring (see save_state).
-    std::vector<int32_t> ring_pos_ = std::vector<int32_t>(kRing, -1);
+    std::vector<std::unique_ptr<Slot>> slots_;   ///< one per conversation; the constructor makes slot 0
+    int cur_ = 0;                                ///< the active slot (set_slot); each slot keeps its own captured taps pointer (Slot::taps_)
     std::string pack_path_;          ///< the pack's path at load (restore refuses a moved pack)
     uint64_t pack_size_ = 0;         ///< the pack's size and mtime at load: a swapped pack is a foreign blob
     int64_t pack_mtime_ = 0;

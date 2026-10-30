@@ -25,6 +25,7 @@
 // kernels agreeing on garbage would otherwise pass.
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -265,10 +266,10 @@ void check_all() {
     const Fixture fx = make_blobs(12, rng);
     constexpr int K = 10;
 
-    // Activations for up to 8 tokens, device copies with and without the fp32 scales.
+    // Activations for up to kVerifyMaxT tokens, device copies with and without the fp32 scales.
     std::vector<uint8_t> x;
     std::vector<float> xs;
-    fill_x(x, xs, 8, rng);
+    fill_x(x, xs, k::kVerifyMaxT, rng);
     uint8_t* d_x = dalloc<uint8_t>(x.size());
     float* d_xs = dalloc<float>(xs.size());
     up(d_x, x);
@@ -424,8 +425,8 @@ void check_all() {
         ck(cudaFreeHost(h_host), "free host blob");
     }
 
-    // ---- 5. moe_group_resident + moe_grouped_s2: the MTP layer (experts resident at base + id * BLOB), T=1 and T=5
-    for (const int T : {1, 5}) {
+    // ---- 5. moe_group_resident + moe_grouped_s2: the MTP layer; T=16 forces each shared expert into two 8-entry tiles
+    for (const int T : {1, 5, k::kVerifyMaxT}) {
         const int n = T * K;
         std::vector<int32_t> ids(n);
         for (int t = 0; t < T; ++t) {   // distinct within a token, shared across tokens

@@ -70,10 +70,11 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
                    int64_t n_embd, int64_t n_ff, int tpr, void* stream, const float* x_f32 = nullptr,
                    const NativeSharedWeights* native = nullptr);
 
-/// Plan v0.3 P6: the shared expert for `n_tok` <= 8 tokens (a verify window) with all three projections native:
-/// multi-column MMVQ, so the weights are read once; every token is bitwise `shared_expert` on that token.
-/// `x` (n_tok, n_embd) f32, `x_bf16` the same rounded (only read when the native BF16 gate is off), `gate`/`up`
-/// (n_tok, n_ff) scratch, `g` n_tok floats, `out` (n_tok, n_embd).  `nw.q8_1` must hold n_tok columns of n_embd.
+/// Plan v0.3 P6: the shared expert for up to 16 tokens (a verify window) with all three projections native:
+/// The fixed-tile projection kernels process at most eight rows per launch; wider windows split into two row tiles.
+/// Each token's output is bitwise equal to `shared_expert` on that token. `x` (n_tok, n_embd) f32, `x_bf16` the same rounded (only read when the native BF16 gate
+/// is off), `gate`/`up` (n_tok, n_ff) scratch, `g` n_tok floats, `out` (n_tok, n_embd). `nw.q8_1` must hold n_tok columns
+/// of n_embd.
 /// x_q8_1_ready: the q8_1 image of x (n_tok rows), already quantized by the caller with the same quantizer (the
 /// same bytes native_quantize_q8_1 writes): its gate/up read it and x is not quantized again, and the SwiGLU and
 /// its q8_1 run as one launch (same values). Null: the separate launches.

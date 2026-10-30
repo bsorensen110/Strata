@@ -535,6 +535,7 @@ void dot_rows_wide_iq1m(const uint8_t* w, size_t row_bytes, int n, const void* c
 template <int TY, bool EX> STRATA_ROWS_FN
 void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                 float* const* ff, int r0, int r1) {
+    // The fixed template kernels stop at eight; tile a wider verify window without dropping its trailing rows.
     switch (nt) {
         case 1: gu_rows<TY, 1, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 2: gu_rows<TY, 2, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
@@ -543,7 +544,11 @@ void gu_rows_nt(int nt, const uint8_t* blob, size_t gu_row, size_t up_off, int n
         case 5: gu_rows<TY, 5, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 6: gu_rows<TY, 6, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 7: gu_rows<TY, 7, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
-        default: gu_rows<TY, 8, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 8: gu_rows<TY, 8, EX>(blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        default: for (int t0 = 0; t0 < nt; t0 += kIq256KernelMaxTokens) {
+            const int k = nt - t0 < kIq256KernelMaxTokens ? nt - t0 : kIq256KernelMaxTokens;
+            gu_rows_nt<TY, EX>(k, blob, gu_row, up_off, n, act + t0, ff + t0, r0, r1);
+        }
     }
 }
 

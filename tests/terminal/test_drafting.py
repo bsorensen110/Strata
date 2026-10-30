@@ -213,7 +213,7 @@ class WhatTheEngineSaid(unittest.TestCase):
         self.assertEqual(info, {"drafting": "mtp", "drafting_note": "Drafting: MTP (DFlash2 didn't fit)"})
 
     def test_a_mode_this_build_does_not_run(self):
-        log = "strata generate: --draft dflash2 is off: it is for one card and the CLI run (not --serve, --batch or a layer split) in this build; the MTP drafts instead\n"
+        log = "strata generate: --draft dflash2 is off: it needs --mtp (the fallback) and --spec 2 or more; the MTP drafts instead\n"
         self.assertEqual(drafting.engine_info(self.ARGS, log)["drafting_note"], "Drafting: MTP (DFlash2 isn't available in this mode)")
 
     def test_it_ran(self):
@@ -235,6 +235,34 @@ class WhatTheEngineSaid(unittest.TestCase):
                          "Drafting: MTP (the DFlash2 drafter isn't downloaded yet)")
 
 
+class TheEngineGate(unittest.TestCase):
+    """What the engine accepts `--draft dflash2` with (src/program/generate.cpp, its gate where the drafter loads):
+    single-card `--batch N` serves it - each active slot proposes into the shared window and the target verifies, so
+    the accepted tokens are the target's own picks. Refused stay: a layer split, a peer device, the remote expert
+    caches (the drafter is one card's) and `--batch-mtp` (it takes the slot's proposal row for its own drafter)."""
+
+    ARGS = ["--mtp", "/m", "--draft", "dflash2", "--draft-model", "/p"]
+    REFUSED = (
+        "strata generate: --draft dflash2 is off: it is for one card (not a layer split); the MTP drafts instead\n",
+        "strata generate: --draft dflash2 is off: it is for one card (not --peer-device); the MTP drafts instead\n",
+        "strata generate: --draft dflash2 is off: it is for one card (no remote expert caches); the MTP drafts instead\n",
+        "strata generate: --draft dflash2 is off: --batch-mtp takes the slot's second row for its own drafter "
+        "(use --batch without --batch-mtp); the MTP drafts instead\n",
+    )
+
+    def test_the_refused_combinations_run_the_mtp(self):
+        for log in self.REFUSED:
+            info = drafting.engine_info(self.ARGS, log)
+            self.assertEqual(info["drafting"], "mtp", log)
+            self.assertTrue(info["drafting_note"].startswith("Drafting: MTP ("), log)
+
+    def test_single_card_batch_serves_dflash2(self):
+        log = ("strata serve: --draft dflash2 with --batch 4: 4 drafter slots (40.3 MiB of K/V ring each), 8 window "
+               "rows: every active slot its anchor row, the rows left to the slots with a draft ready.\n"
+               "strata serve: DFlash2 drafter on (/p, graphs captured in 3 ms), the MTP stays as the fallback\n")
+        self.assertEqual(drafting.engine_info(self.ARGS, log), {"drafting": "dflash2", "drafting_note": ""})
+
+
 class WordsMatchTheApp(unittest.TestCase):
     def test_every_line_the_engine_start_can_say_is_in_the_apps_catalog_in_all_eight_languages(self):
         folder = ROOT / "apps" / "host" / "src" / "locales"
@@ -248,7 +276,11 @@ class WordsMatchTheApp(unittest.TestCase):
                 self.assertTrue(catalog[ids[line]].strip(), f"{line} in {lang}")
         # and what the engine's log makes of them
         self.assertEqual(drafting.fallback_note("--draft dflash2: out of memory"), drafting.mtp_line(drafting.DIDNT_FIT))
-        self.assertEqual(drafting.fallback_note("--draft dflash2 is off: it is for one card and the CLI run"), drafting.mtp_line(drafting.NOT_HERE))
+        # the mode refusals the engine can print today: --mtp / --spec and the native pack (the batch gate's own
+        # words are listed in TheEngineGate above, and need a phrase in drafting.fallback_note to be named)
+        self.assertEqual(drafting.fallback_note("--draft dflash2 is off: it needs --mtp (the fallback) and --spec 2 or more"),
+                         drafting.mtp_line(drafting.NOT_HERE))
+        self.assertEqual(drafting.fallback_note("--draft dflash2 is off: it needs a native pack"), drafting.mtp_line(drafting.NOT_HERE))
 
 
 class TerminalFlag(unittest.TestCase):

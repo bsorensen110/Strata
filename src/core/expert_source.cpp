@@ -5356,11 +5356,9 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 }
 
 namespace {
-// the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`)
-// are fixed arrays of this many entries: MAXT tokens of the model's 10 routed experts must fit, and a larger k is
-// refused at run time rather than written past them.
-constexpr int64_t kMaxWindowEntries = 128;
-static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+// The verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`) scale with the
+// CPU multi-token ceiling: MAXT tokens of the model's 10 routed experts must fit, and larger k is refused at runtime.
+constexpr int64_t kMaxWindowEntries = strata::kernels::cpu::MAXT * 10;
 }  // namespace
 
 namespace {

@@ -3,20 +3,22 @@
 // distinct experts in routing order, each with its entries ascending, `ptr[g]` = the expert's slot, counts / start /
 // dst / tok / start2 in the host pool's layout.
 //
-// n = 1..80 entries (a window of up to kVerifyMaxT tokens x 10 experts), ids drawn from pools of 3..512 experts so
-// duplicates run from "every entry the same expert" to "all distinct", with and without a slot table (`slot_off`).
-// Both modes are run: with a `skip` word (ring when the plan was built, 0 when an expert was not resident - and
-// then the plan is untouched) and without one (the all-resident graph: a non-resident expert gives an empty plan and
-// sets *plan_err).
+// n = 1..kVerifyMaxT tokens, each with 10 distinct top-k experts. Pools exercise duplicate experts across tokens,
+// including one expert routed by all 16 tokens. The planner chunks each expert's entries into groups of at most
+// kVerifyGroupRows so the S2 tile cannot truncate the tail. Both modes are run: with a `skip` word (ring when the
+// plan was built, 0 when an expert was not resident - and then the plan is untouched) and without one (the all-resident
+// graph: a non-resident expert gives an empty plan and sets *plan_err).
 // Every word of the plan the host pool would read is compared with memcmp. GPU, synthetic, no model.
 #include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <numeric>
 #include <random>
 #include <vector>
 
@@ -43,7 +45,7 @@ int main() {
     int32_t *d_ids, *d_res, *d_plan;
     unsigned long long* d_off;
     uint32_t* d_skip;
-    ck(cudaMalloc(&d_ids, 128 * 4), "ids");
+    ck(cudaMalloc(&d_ids, (size_t) capx * 4), "ids");
     ck(cudaMalloc(&d_res, NE * 4), "res");
     ck(cudaMalloc(&d_off, 1024 * 8), "off");
     ck(cudaMalloc(&d_plan, plan_words * 4), "plan");
@@ -59,36 +61,56 @@ int main() {
     ck(cudaMemcpy(d_off, off.data(), 1024 * 8, cudaMemcpyHostToDevice), "off");
 
     int cases = 0, bad = 0;
-    for (int n = 1; n <= 80; ++n) {
+    for (int n_tok = 1; n_tok <= k::kVerifyMaxT; ++n_tok) {
+        const int n = n_tok * K;
         for (int variant = 0; variant < 4; ++variant) {
-            const int pool = variant == 0 ? 3 : (variant == 1 ? 12 : (variant == 2 ? 40 : 512));
+            const int pool = variant == 0 ? 10 : (variant == 1 ? 12 : (variant == 2 ? 40 : 512));
             std::vector<int32_t> ids(n);
-            for (int i = 0; i < n; ++i) ids[i] = (int32_t) ((rng() % pool) * (512 / pool));
-            const bool use_off = (n + variant) % 2 == 1;
+            if (variant == 0) {
+                // Ten distinct routes per token; the first expert is shared by all tokens, forcing two 8-entry groups at T=16.
+                for (int t = 0; t < n_tok; ++t)
+                    for (int j = 0; j < K; ++j) ids[t * K + j] = j * (512 / pool);
+            } else {
+                std::vector<int> choices(pool);
+                std::iota(choices.begin(), choices.end(), 0);
+                for (int t = 0; t < n_tok; ++t) {
+                    std::shuffle(choices.begin(), choices.end(), rng);
+                    for (int j = 0; j < K; ++j) ids[t * K + j] = choices[j] * (512 / pool);
+                }
+            }
+            const bool use_off = (n_tok + variant) % 2 == 1;
             ck(cudaMemcpy(d_ids, ids.data(), n * 4, cudaMemcpyHostToDevice), "ids");
 
-            // host replay
+            // Host replay: first-seen expert order, then ascending entries split into groups of at most GMAX.
             std::vector<int32_t> counts = {0, n, 0}, start, dst(n), tok(n);
             std::vector<unsigned long long> ptr;
-            std::vector<int> first_seen;     // group -> expert
+            std::vector<int> first_seen;     // distinct experts in first-occurrence order
             for (int i = 0; i < n; ++i) {
-                int g = -1;
-                for (size_t q = 0; q < first_seen.size(); ++q)
-                    if (first_seen[q] == ids[i]) g = (int) q;
-                if (g < 0) { first_seen.push_back(ids[i]); g = (int) first_seen.size() - 1; }
+                if (std::find(first_seen.begin(), first_seen.end(), ids[i]) == first_seen.end())
+                    first_seen.push_back(ids[i]);
             }
-            const int groups = (int) first_seen.size();
-            counts[0] = groups;
-            start.assign(groups + 1, 0);
             int pos = 0;
-            for (int g = 0; g < groups; ++g) {
-                start[g] = pos;
-                ptr.push_back((unsigned long long) (uintptr_t) cache_base +
-                              (use_off ? off[res[first_seen[g]]] : (unsigned long long) res[first_seen[g]] * (unsigned long long) blob));
+            for (const int expert : first_seen) {
+                std::vector<int> entries;
                 for (int i = 0; i < n; ++i)
-                    if (ids[i] == first_seen[g]) { dst[pos] = i; tok[pos] = i / K; ++pos; }
+                    if (ids[i] == expert) entries.push_back(i);
+                for (int begin = 0; begin < (int) entries.size(); begin += k::kVerifyGroupRows) {
+                    start.push_back(pos);
+                    ptr.push_back((unsigned long long) (uintptr_t) cache_base +
+                                  (use_off ? off[res[expert]]
+                                           : (unsigned long long) res[expert] * (unsigned long long) blob));
+                    const int end = std::min((int) entries.size(), begin + k::kVerifyGroupRows);
+                    for (int q = begin; q < end; ++q) {
+                        const int i = entries[q];
+                        dst[pos] = i;
+                        tok[pos] = i / K;
+                        ++pos;
+                    }
+                }
             }
-            start[groups] = n;
+            const int groups = (int) ptr.size();
+            counts[0] = groups;
+            start.push_back(n);
 
             for (int mode = 0; mode < 2; ++mode) {   // 0: general kernel with a skip word, 1: all resident
                 ck(cudaMemset(d_plan, 0xAB, plan_words * 4), "fill");
@@ -111,8 +133,8 @@ int main() {
                 ok = ok && plan[(size_t) (ptr_off + 4 * capx)] == n;
                 ++cases;
                 if (!ok) {
-                    std::printf("    *** n=%d pool=%d %s %s: the plan differs from the host replay ***\n", n, pool,
-                                use_off ? "slot_off" : "blob", mode ? "all_resident" : "general");
+                    std::printf("    *** ntok=%d entries=%d pool=%d %s %s: the chunked plan differs from the host replay ***\n",
+                                n_tok, n, pool, use_off ? "slot_off" : "blob", mode ? "all_resident" : "general");
                     ++bad;
                 }
             }

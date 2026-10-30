@@ -3,6 +3,7 @@
 #endif
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
+#include "strata/core/dflash2_tap.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -1182,7 +1183,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
-        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, (int) T)));   // 147-verify: 5-8 columns too
+        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(
+            max_in, std::min(strata::kernels::native_mmvq_kernel_max_cols, std::max(4, (int) T))));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -1797,7 +1799,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             pending = false;
         }
         auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrMaxWindowT];
             for (int t = tb; t < te; ++t) {
                 FusedGrArgs& a = fa[t - tb];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = apply;
@@ -2694,7 +2696,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 24, grp);
         // STRATA_VERIFY_DEFER_CPU=check (late_add): this layer's own rows, here; =1 adds them in pre(l + 1)
         if (defer_check_ && deferred(l)) late_add(l, grp);
-        if (tap_on_ && !batch_rec_ && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
+        if (dflash2_tap_capture(tap_on_, batch_rec_, l, tap_slot_)) {   // batch rows too: the tap_dev_ rows are row-major (include/strata/core/dflash2_tap.hpp)
             // the layer's completed output: R with this FFN half's write applied (the next layer's read would fold it), the mean of
             // the hc streams, all rows of the group in one launch
             const int64_t nt = (int64_t) tap_layers_.size();
@@ -2752,7 +2754,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr && head_ != nullptr && head_->loaded();
         bool q8_head = false;
         if (mix_q8) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrMaxWindowT];
             for (int t = 0; t < T; ++t) {
                 FusedGrArgs& a = fa[t];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
@@ -2766,7 +2768,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             q8_head = fused_gr_read_multi(fa, T, xn_, cs);
         }
         else if (fuse_head_gr) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrMaxWindowT];
             for (int t = 0; t < T; ++t) {
                 FusedGrArgs& a = fa[t];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = true;
@@ -2793,7 +2795,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 err = "verify: the output_hc_* weights have the wrong engine forms";
                 return false;
             }
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrMaxWindowT];
             for (int t = 0; t < T; ++t) {
                 fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
@@ -4888,8 +4890,8 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
 
 bool Verifier::run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                          std::string& err) {
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = t;
+    int rows[strata::kernels::kVerifyMaxT] = {};
+    for (int t = 0; t < S && t < strata::kernels::kVerifyMaxT; ++t) rows[t] = t;
     return run_slot_rows(rows, S, tokens, pos, pool, user, out, err);
 }
 
@@ -5067,8 +5069,8 @@ bool Verifier::sample_rows(int S, std::string& err) {
 }
 
 bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err) {
-    int rows[8] = {};
-    for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
+    int rows[strata::kernels::kVerifyMaxT] = {};
+    for (int t = 0; t < S && t < strata::kernels::kVerifyMaxT; ++t) rows[t] = base + t;
     return batch_launch_rows(base, S, rows, tokens, pos, err);
 }
 

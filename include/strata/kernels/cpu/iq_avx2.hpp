@@ -10,12 +10,16 @@
 
 namespace strata::kernels::cpu {
 
+/// The IQ2/IQ3 multi-row microkernels' tile width; public row dispatch accepts MAXT (16) and splits wider batches here.
+inline constexpr int kIq256KernelMaxTokens = 8;
+
 bool iq256_supported(int ggml_type) noexcept;
 /// Bit-identical to ggml's singleton gate/up for IQ2_XXS, IQ2_XS, IQ3_XXS and IQ3_S.
 /// The caller checks AVX2 support and passes one Q8_K activation.
 void iq256_gu_rows_exact_one(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
                              const void* act, float* ff, int r0, int r1);
 
+/// The row entry points accept the CPU expert window width (MAXT=16); their fixed-width microkernels tile at eight rows.
 /// ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t]), rows [r0, r1); gate rows at blob, up rows at blob + up_off.
 void iq256_gu_rows(int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act,
                    int nt, float* const* ff, int r0, int r1);

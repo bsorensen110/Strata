@@ -63,12 +63,14 @@ void fused_gr_dequant_q8_0_pair(const uint8_t* q8_0, uint16_t* bf16_0, const uin
                                 int64_t n_blocks, void* stream);
 void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks, void* stream);
 
-/// Plan v0.3 P6: the same read for up to 8 tokens that share the weights (a verify window): the weights are read
-/// once for all of them.  `a[t]` is token t's arguments (its own R, pending write, lo, rs, inject, mixed; the four
-/// weight pointers and eps must be the same for every t); `xn_scratch` is n_tok * hc * n_embd floats.  Every
-/// token's outputs are bitwise `fused_gr_read(a[t])`.
+/// The fused GR kernel tile is limited to eight tokens by its LDS/shared-memory footprint.
 constexpr int kFusedGrMaxT = 8;
-/// Returns true when it also wrote the q8_1 images (every token's q8_mixed set and this read supports it).
+/// The verifier may present a 16-row window; fused_gr_read_multi tiles it into kFusedGrMaxT-sized launches.
+constexpr int kFusedGrMaxWindowT = 16;
+/// The same read for up to kFusedGrMaxWindowT tokens that share weights. `a[t]` is token t's arguments (its own R,
+/// pending write, lo, rs, inject, mixed; the four weight pointers and eps must be the same for every t);
+/// `xn_scratch` is n_tok * hc * n_embd floats. Every token's outputs are bitwise `fused_gr_read(a[t])`.
+/// When stamp_buf is provided, stamps are emitted only for a single kernel tile (n_tok <= kFusedGrMaxT).
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
 

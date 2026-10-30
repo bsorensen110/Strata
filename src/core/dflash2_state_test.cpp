@@ -106,7 +106,96 @@ int main(int argc, char** argv) {
         cudaFree(taps);
         return 1;
     }
+
+    // The batch drafter grows after load(), and a grown slot owns a distinct K/V ring plus its own host position
+    // mirror. On an 8k-window pack this covers the 8208-entry mirror (the former 2064-entry default overflowed it).
+    if (!df.set_n_slots(2, err)) {
+        std::fprintf(stderr, "grow to two drafter slots: %s\n", err.c_str());
+        cudaFree(taps);
+        return 1;
+    }
+    if (!df.set_slot(0, err) || !df.restore_state(state, 2, err)) {
+        std::fprintf(stderr, "restore slot 0 before interleave: %s\n", err.c_str());
+        cudaFree(taps);
+        return 1;
+    }
+    std::vector<uint8_t> slot0_before;
+    if (!df.save_state(slot0_before, err, 2)) {
+        std::fprintf(stderr, "save slot 0 before interleave: %s\n", err.c_str());
+        cudaFree(taps);
+        return 1;
+    }
+    std::vector<float> host_alt(n);
+    for (size_t i = 0; i < n; ++i) host_alt[i] = (float)((int)(i % 29) - 14) * 0.037f;
+    float* taps_alt = nullptr;
+    if (cudaMalloc((void**)&taps_alt, n * sizeof(float)) != cudaSuccess ||
+        cudaMemcpy(taps_alt, host_alt.data(), n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+        std::fprintf(stderr, "allocate/copy slot 1 taps failed\n");
+        if (taps_alt) cudaFree(taps_alt);
+        cudaFree(taps);
+        return 1;
+    }
+    if (!df.set_slot(1, err) || !df.context(taps_alt, 2, 0, err)) {
+        std::fprintf(stderr, "slot 1 context: %s\n", err.c_str());
+        cudaFree(taps_alt);
+        cudaFree(taps);
+        return 1;
+    }
+    std::vector<uint8_t> slot1_state;
+    if (!df.save_state(slot1_state, err, 2) || slot1_state.size() != df.state_bytes()) {
+        std::fprintf(stderr, "save slot 1: %s (bytes=%zu expected=%zu)\n", err.c_str(), slot1_state.size(), df.state_bytes());
+        cudaFree(taps_alt);
+        cudaFree(taps);
+        return 1;
+    }
+    if (!df.set_slot(0, err)) {
+        std::fprintf(stderr, "switch back to slot 0: %s\n", err.c_str());
+        cudaFree(taps_alt);
+        cudaFree(taps);
+        return 1;
+    }
+    std::vector<uint8_t> slot0_after;
+    if (!df.save_state(slot0_after, err, 2) || slot0_after != slot0_before) {
+        std::fprintf(stderr, "slot 1 context changed slot 0's ring: %s\n", err.c_str());
+        cudaFree(taps_alt);
+        cudaFree(taps);
+        return 1;
+    }
+    if (!df.set_slot(1, err)) {
+        std::fprintf(stderr, "switch to slot 1: %s\n", err.c_str());
+        cudaFree(taps_alt);
+        cudaFree(taps);
+        return 1;
+    }
+    df.reset();
+    if (!df.restore_state(slot1_state, 2, err)) {
+        std::fprintf(stderr, "restore slot 1 after reset: %s\n", err.c_str());
+        cudaFree(taps_alt);
+        cudaFree(taps);
+        return 1;
+    }
+    std::vector<uint8_t> slot1_roundtrip;
+    if (!df.save_state(slot1_roundtrip, err, 2) || slot1_roundtrip != slot1_state) {
+        std::fprintf(stderr, "slot 1 save/restore did not preserve its ring: %s\n", err.c_str());
+        cudaFree(taps_alt);
+        cudaFree(taps);
+        return 1;
+    }
+    if (!df.set_slot(0, err)) {
+        std::fprintf(stderr, "switch to slot 0 after slot 1 restore: %s\n", err.c_str());
+        cudaFree(taps_alt);
+        cudaFree(taps);
+        return 1;
+    }
+    std::vector<uint8_t> slot0_final;
+    if (!df.save_state(slot0_final, err, 2) || slot0_final != slot0_before) {
+        std::fprintf(stderr, "slot 1 restore changed slot 0's ring: %s\n", err.c_str());
+        cudaFree(taps_alt);
+        cudaFree(taps);
+        return 1;
+    }
+    cudaFree(taps_alt);
     cudaFree(taps);
-    std::printf("dflash2_state_test: save/restore/rewind passed (%zu bytes)\n", state.size());
+    std::printf("dflash2_state_test: save/restore/rewind and two-slot isolation passed (%zu bytes per slot)\n", state.size());
     return 0;
 }

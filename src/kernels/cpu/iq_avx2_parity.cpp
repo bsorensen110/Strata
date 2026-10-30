@@ -4,7 +4,7 @@
 //
 //     iq_avx2_parity [--cpu N]
 //         IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS gate/up rows, IQ4_NL and Q2_0 down rows: every variant
-//         this CPU runs, 1..8 tokens, each token's rows bit for bit the scalar variant's rows for that token alone (so
+//         this CPU runs, 1..16 tokens, each token's rows bit for bit the scalar variant's rows for that token alone (so
 //         also the same at every width, #152); the scalar rows against ggml-cpu's vec_dot (Q2_0: a double
 //         reference), rel <= 1e-5; and where the engine's dispatch (native_gu_rows) takes the multi-token kernel from
 //         one token on (native_gu_mt_min), each token's rows the same alone and in a group.
@@ -58,7 +58,7 @@ using Clock = std::chrono::steady_clock;
 namespace {
 
 constexpr int64_t kH = 2560, kFF = 640;   // the experts' geometry: n_embd, expert width
-constexpr int kMaxT = 8;
+constexpr int kMaxT = cpu::MAXT;
 
 // ---- the variants: the public dispatch only in a DISPATCH_ONLY build
 #if defined(STRATA_IQ_PARITY_DISPATCH_ONLY)
@@ -279,7 +279,7 @@ int check_gate_up(int type) {
             for (int t = 0; t < nt; ++t)
                 differ += rows_differ(gp[t], &one_g[t * R], R) + rows_differ(fp[t], &one_ff[t * R], R);
         }
-        std::printf("  %-8s %-12s 1..8 tokens: %zu gate / gate+up rows differ from the %s one-token rows\n",
+        std::printf("  %-8s %-12s 1..16 tokens: %zu gate / gate+up rows differ from the %s one-token rows\n",
                     type_name(type), variant_name(v).c_str(), differ, variant_name(0).c_str());
         if (differ) ++failures;
     }
@@ -344,7 +344,7 @@ int check_down(int d_type) {
             run(v, nt, op);
             for (int t = 0; t < nt; ++t) differ += rows_differ(op[t], &one[t * R], R);
         }
-        std::printf("  %-8s %-12s 1..8 tokens: %zu down rows differ from the %s one-token rows\n", type_name(d_type),
+        std::printf("  %-8s %-12s 1..16 tokens: %zu down rows differ from the %s one-token rows\n", type_name(d_type),
                     variant_name(v).c_str(), differ, variant_name(0).c_str());
         if (differ) ++failures;
     }

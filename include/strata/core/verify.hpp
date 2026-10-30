@@ -27,6 +27,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -480,13 +481,13 @@ private:
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
-    int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
+    int brow_[strata::kernels::kVerifyMaxT] = {};  ///< row t is slot brow_[t]; one slot may own several draft rows
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
-    int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    int last_rows_[strata::kernels::kVerifyMaxT] = {};  ///< slot ID for each row of the last batch window
     std::vector<int> bkey(const int* rows, int S, int hbase) const {   // #871: the doorbell variant has its own graphs
         std::vector<int> k = batch_key(rows, S, hbase);
         k.push_back(ar_off_ ? 1 : 0);
@@ -515,7 +516,7 @@ private:
             std::chrono::steady_clock::duration(b_last_.load(std::memory_order_acquire)));
     }
     std::chrono::steady_clock::time_point ext_checked_{};   ///< batch_poll's last check with external serving
-    int32_t b_out_[8] = {};
+    int32_t b_out_[strata::kernels::kVerifyMaxT] = {};
     std::vector<strata::kernels::SamplerParams> slot_sp_;
     std::vector<std::vector<float>> slot_bias_host_;   ///< per slot (final stage only): the bias table it was last given
     std::vector<float*> slot_bias_dev_;                ///< per slot (final stage only): that table on the device
@@ -524,7 +525,7 @@ private:
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
-    int64_t last_pos_b_[8] = {};
+    int64_t last_pos_b_[strata::kernels::kVerifyMaxT] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     // STRATA_PIPED_MTP (init_deferred_commit): the saved rows, laid out as the window scratch (global layer index) with
     // dc_rows_ rows per layer instead of max_t_; the slots' accepted prefixes (mapped and device, 2 + max_t_ per slot)
@@ -680,7 +681,7 @@ private:
     float* ple_val_ = nullptr;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    int32_t last_tokens_[strata::kernels::kVerifyMaxT] = {};
     int64_t n_vocab_ = 0;
     cudaStream_t cs_ = nullptr;
     cudaStream_t sh_cs_ = nullptr;
