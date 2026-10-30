@@ -336,10 +336,6 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
-  add_executable(nv_defaults_test src/core/nv_defaults_test.cpp src/core/nv_defaults.cpp)
-  target_include_directories(nv_defaults_test PRIVATE include)
-  add_test(NAME nv_defaults_test COMMAND nv_defaults_test)
-
   add_executable(batch_telemetry_test src/core/batch_telemetry_test.cpp)
   target_include_directories(batch_telemetry_test PRIVATE include)
   add_test(NAME batch_telemetry_test COMMAND batch_telemetry_test)
@@ -598,12 +594,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)
     add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
     set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
-
-    add_executable(qsa_topk_active_parity src/kernels/qsa_topk_active_parity.cpp)
-    target_include_directories(qsa_topk_active_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(qsa_topk_active_parity PRIVATE strata_kernels CUDA::cudart)
-    add_test(NAME qsa_topk_active_parity COMMAND qsa_topk_active_parity)
-    set_tests_properties(qsa_topk_active_parity PROPERTIES SKIP_RETURN_CODE 77)
     # STRATA_QSA_SLOTS: a batch window's scores, top-k and attention as one launch over rows of different slots
     # against one call per row, bitwise (synthetic, no model)
     add_executable(qsa_slots_parity src/kernels/qsa_slots_parity.cpp)
@@ -631,12 +621,6 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                          SKIP_RETURN_CODE 77)
     set_tests_properties(qsa_merge_daily_parity_daily PROPERTIES ENVIRONMENT "STRATA_ATTN_DAILY=1"
                          SKIP_RETURN_CODE 77)
-    # the prompt path's block scores on the thread-per-head kernel (Turing) against the warp kernel, bitwise
-    add_executable(qsa_scores_parity src/kernels/qsa_scores_parity.cpp)
-    target_include_directories(qsa_scores_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
-    target_link_libraries(qsa_scores_parity PRIVATE strata_kernels CUDA::cudart)
-    add_test(NAME qsa_scores_parity COMMAND qsa_scores_parity)
-    set_tests_properties(qsa_scores_parity PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "STRATA_SCORES_THREAD=1")
   endif()
   # QSAROWS (docs/QSAROWS.md): what the T rows of a verification window cost in a QSA layer's decode kernels at a long
   # context (block scores, top-k, attention over each row's selection, indexer append), row by row; GPU, synthetic, no

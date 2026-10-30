@@ -568,7 +568,7 @@ int main() {
         fs::create_directories(rt);
         spit(rt / "draft_vocab.bin", std::vector<char>(64, 'v'));
         spit(mtp / "mtp-q2_0.gguf", std::vector<char>(4096, 'm'));
-        unsetenv("STRATA_METAL_MTP_GGUF");
+        set_env("STRATA_METAL_MTP_GGUF", nullptr);
         check(metal_mtp_gguf_path(rt.string() + "/") == (mtp / "mtp-q2_0.gguf").string(), "metal mtp: <rt>/../mtp-q2_0.gguf");
         uint64_t a = 0, b = 0, c = 0;
         check(session_model_fingerprint(session_mtp_inputs(rt.string(), true), a, error),
@@ -578,9 +578,9 @@ int main() {
               "metal mtp: the GGUF enters the fingerprint");
         check(!session_model_fingerprint(session_mtp_inputs(rt.string(), false), c, error),
               "cuda mtp: <rt>/dense.bin is still required");
-        setenv("STRATA_METAL_MTP_GGUF", (dir / "other.gguf").string().c_str(), 1);
+        set_env("STRATA_METAL_MTP_GGUF", (dir / "other.gguf").string().c_str());
         check(metal_mtp_gguf_path(rt.string()) == (dir / "other.gguf").string(), "metal mtp: the environment names the GGUF");
-        unsetenv("STRATA_METAL_MTP_GGUF");
+        set_env("STRATA_METAL_MTP_GGUF", nullptr);
     }
     // R2: runtime limits bound every array before it is allocated, and the file size follows from them
     {
