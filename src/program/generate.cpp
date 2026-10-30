@@ -781,6 +781,7 @@ struct Options {
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
+    bool dflash_no_mtp = false;   ///< --dflash-no-mtp (opt-in, needs --draft dflash2): DFlash2 drafts alone; the MTP layer is never loaded, its VRAM goes to the expert cache
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
@@ -1078,6 +1079,7 @@ void usage() {
                  "                       and keeps the MTP layer loaded as the fallback (opt-in, Flash-Next, CUDA / HIP)\n"
                  "  --draft-conf P       with --draft dflash2: end the window where the product of the selector's probabilities falls below P (default 0 = --spec-min-p)\n"
                  "  --draft-cap N        the widest verify window with --draft dflash2 (default by card: 5 on Strix Halo / iGPU, --spec as given elsewhere)\n"
+                 "  --dflash-no-mtp      with --draft dflash2: DFlash2 drafts alone, the MTP layer is never loaded (no fallback; its VRAM goes to the expert cache)\n"
                  "  --control-vector-scaled FILE:SCALE[,...]  a control vector GGUF on the residual stream (llama.cpp's\n"
                  "                       format; --control-vector FILE = scale 1).  --serve: requests switch it (cvec=0|1)\n"
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
@@ -3253,6 +3255,7 @@ int main(int argc, char** argv) {
         else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
+        else if (a == "--dflash-no-mtp") o.dflash_no_mtp = true;
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
         else if (a == "--adapt-decay") o.adapt_decay = strata::program::adapt_decay_checked(std::atof(next("--adapt-decay")));   // #1284: outside 0..1 -> 0.7, said
@@ -3429,6 +3432,10 @@ int main(int argc, char** argv) {
             return 2;
         }
         }
+    }
+    if (o.dflash_no_mtp) {
+        if (o.draft != "dflash2") { std::fprintf(stderr, "strata generate: --dflash-no-mtp needs --draft dflash2\n"); return 2; }
+        o.mtp.clear();   // DFlash2 drafts alone: the MTP layer is never loaded (use_mtp is false everywhere)
     }
     if (o.batch_draft_window != strata::kernels::kVerifyDefaultMaxT &&
         o.batch_draft_window != strata::kernels::kVerifyMaxT) {
@@ -6346,7 +6353,8 @@ int main(int argc, char** argv) {
             mtp.enable_cell_floor(kc.wants_cell_floor(ke, !o.mtp.empty() && o.spec >= 2));
         }
     }
-    if (!o.mtp.empty()) {
+    // --dflash-no-mtp: the block still runs (the DFlash2 gate lives in it); every mtp.load / batch-MTP use inside is guarded by o.mtp
+    if (!o.mtp.empty() || o.dflash_no_mtp) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
             o.mtp.clear();
@@ -6369,7 +6377,7 @@ int main(int argc, char** argv) {
         if (o.draft == "dflash2") {
             // Single-card --batch N is served (the batch windows give each slot its own proposals, the target verifies
             // them): only the modes with another proposal machinery, or with the drafter on another card, are refused.
-            const char* why = o.mtp.empty() ? "it needs --mtp (the fallback) and --spec 2 or more"
+            const char* why = (o.mtp.empty() && !o.dflash_no_mtp) ? "it needs --mtp (the fallback) and --spec 2 or more"
                               : !native_pack ? "it needs a native pack"
                               : multi_gpu && o.batch > 0 && o.batch_groups > 1
                                   ? "DFlash2 tap rows are not handed across --batch-groups (pipelined layer-split groups) yet"
