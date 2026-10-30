@@ -763,6 +763,13 @@ struct Options {
     /// simply never emitted - only how many rows the drafter's chains get.
     int batch_draft_depth = 0;
     int batch_draft_window = strata::kernels::kVerifyDefaultMaxT;  ///< --batch-draft-window: 8 (default) or opt-in 16 row cap, DFlash2 batch only
+    /// --batch-suffix-draft N: with `--draft dflash2` in a --batch window, the minimum n-gram match (in tokens) the
+    /// per-slot suffix co-drafter extends on.  0 (the default) turns the co-draft off; N >= 3 lets a slot whose
+    /// last N+ tokens already occurred earlier in its own conversation (prompt + committed output) propose the
+    /// tokens that followed the longest earlier occurrence, before the DFlash2 drafter runs.  The proposals are
+    /// verified by the target, so a match the target did not pick is never emitted - the co-draft can only raise
+    /// the acceptance on copy-heavy workloads (edits, refactors, repeated code), where the continuation is exact.
+    int batch_suffix_draft = 0;
     std::string spec_oracle;
     int spec_corrupt = 0;
     /// Benchmarks and A/B checks (eddoursul's fork, F19): the run emits this continuation (token ids) instead of
@@ -1030,6 +1037,10 @@ void usage() {
                  "                       keeps N proposals per selected slot and rotates the other slots through later windows\n"
                  "                       (breadth/depth trade-off; it never changes which tokens the target emits)\n"
                  "  --batch-draft-window 8|16 --serve --batch --draft dflash2: max verifier rows for that path (default 8); 16 lets four slots hold three proposals each\n"
+                 "  --batch-suffix-draft N --serve --batch --draft dflash2: per-slot n-gram co-draft (opt-in, 0 = off): a slot whose\n"
+                 "                       last N+ tokens already occurred earlier in its own conversation proposes the tokens that\n"
+                 "                       followed the longest earlier occurrence, before the DFlash2 drafter runs (no weights, no\n"
+                 "                       GPU; a match the target did not pick is never emitted - it only helps copy-heavy workloads)\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
                  "  --pipeline-windows N --serve with a layer split on two GPUs (on by default for 2+ stages on AMD gfx12;\n"
                  "                       STRATA_PIPELINE_AUTO=0 or N=0 turns it off): one conversation's verify windows\n"
@@ -3235,6 +3246,7 @@ int main(int argc, char** argv) {
         else if (a == "--batch-mtp") o.batch_mtp = true;
         else if (a == "--batch-draft-depth") o.batch_draft_depth = std::atoi(next("--batch-draft-depth"));
         else if (a == "--batch-draft-window") o.batch_draft_window = std::atoi(next("--batch-draft-window"));
+        else if (a == "--batch-suffix-draft") o.batch_suffix_draft = std::max(0, std::atoi(next("--batch-suffix-draft")));
         else if (a == "--spec-oracle") o.spec_oracle = next("--spec-oracle");
         else if (a == "--spec-corrupt") o.spec_corrupt = std::atoi(next("--spec-corrupt"));
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
@@ -12881,6 +12893,12 @@ int main(int argc, char** argv) {
             bool tainted = false;
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
             int64_t used = 0;              ///< when it last ended a request (--kv-pool-tokens gives way oldest first)
+            // C1: the slot's n-gram co-drafter (the suffix lookup, no weights, no GPU).  It proposes the tokens
+            // that followed the longest earlier occurrence of the slot's current suffix, so on copy-heavy workloads
+            // (edits, refactors, repeated code) the continuation is usually exact and a verify pass accepts many
+            // tokens at once.  It is primed at admission with the slot's prompt tokens and appended with every
+            // committed token; the batch loop checks it before falling back to the DFlash2 draft.
+            strata::spec::SuffixDrafter sfx;
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
         // timing of the batch windows since the slots were last all idle (one stderr line then)
@@ -13139,6 +13157,15 @@ int main(int argc, char** argv) {
                 (void) df2.set_slot(0, se);
                 bs[(size_t) b].draft_ready = false;   // its first round drafts from its own committed rows
                 bs[(size_t) b].n_drafts = 0;
+                if (o.batch_suffix_draft > 0) {
+                    // C1: prime the slot's n-gram co-drafter with its own conversation (the prompt, then every
+                    // committed token as the windows feed).  It proposes the tokens that followed the longest
+                    // earlier occurrence of the slot's current suffix, so on copy-heavy workloads the continuation
+                    // is usually exact and a verify pass accepts many tokens at once.  No weights, no GPU.
+                    bs[(size_t) b].sfx.reset();
+                    bs[(size_t) b].sfx.configure(o.batch_suffix_draft, 64);
+                    for (int32_t t : bs[(size_t) b].ids) bs[(size_t) b].sfx.append(t);
+                }
                 if (!primed)
                     std::fprintf(stderr, "strata serve: batch admission: DFlash2 slot %d starts cold (%s)\n", b,
                                  de.c_str());
@@ -13536,6 +13563,7 @@ int main(int argc, char** argv) {
                     }
                     sl.x = y;
                     sl.p += 1;
+                    if (o.batch_suffix_draft > 0) sl.sfx.append(y);   // C1: the co-drafter sees every committed token
                 }
                 if (batch_mtp && sl.active) {
                     // The slot's two residual rows (the final residuals of the last stage: ver.final_R_all() follows the
@@ -13566,7 +13594,21 @@ int main(int argc, char** argv) {
                     const int k_next = strata::core::batch_spec_draft_store_cap(dflash_k);
                     sl.draft_ready = false;
                     sl.n_drafts = 0;
-                    if (geo && hi > lo && k_next > 0) {
+                    // C1: the per-slot n-gram co-drafter.  If the slot's current suffix already occurred earlier
+                    // in its own conversation (prompt + committed output), the tokens that followed the longest
+                    // earlier occurrence are the most likely continuation - a verify pass accepts them at once.
+                    // No weights, no GPU.  A match the target did not pick is never emitted (the verifier
+                    // confirms every row), so this can only raise the acceptance on copy-heavy workloads.
+                    if (o.batch_suffix_draft > 0 && k_next > 0) {
+                        int32_t sfx_draft[strata::kernels::kVerifyMaxT];
+                        const int k_sfx = sl.sfx.propose(k_next, sfx_draft);
+                        if (k_sfx > 0) {
+                            for (int i = 0; i < k_sfx; ++i) sl.draft[(size_t) i] = sfx_draft[i];
+                            sl.n_drafts = k_sfx;
+                            sl.draft_ready = true;
+                        }
+                    }
+                    if (!sl.draft_ready && geo && hi > lo && k_next > 0) {
                         std::string de;
                         const strata::core::OnDevice on_df2(0);   // --batch with DFlash2 is refused on more than one card
                         bool ok = cudaMemcpyAsync(df2_stage.get(), ver.tap_dev() + (size_t) lo * df2_stage_stride,

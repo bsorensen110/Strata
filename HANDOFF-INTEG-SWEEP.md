@@ -540,3 +540,98 @@ This is the latest task state; preceding production and integration entries abov
 ### Production state / next action
 - `strata.service` remains **inactive**; no candidate scope owns `/dev/kfd`. No production binary/config was replaced and no candidate was promoted. Direct systemd state still says `UnitFileState=enabled`, `FragmentPath=/home/soren/.config/systemd/user/strata.service`; the `/run/user/1000/systemd/user/strata.service -> /dev/null` link is not an effective mask. It may autostart on a future user-manager start. Persistent disablement or overwriting the unit needs Brooks' direction; do not start production as part of this branch push.
 - Best next acceptance experiments: one-variable `--spec-min-p` and `STRATA_DFLASH_DEPTH_SLOPE` sweeps; for quality rather than fewer proposals, evaluate a DFlash2 pack calibrated against the exact target weights/quantization/workload. The active tree has no beam-search CLI option. Review the untested `STRATA_DFLASH_CONF_ADAPT` policy before relying on it; current policy construction sets `max_k=1`.
+
+## C1 n-gram co-draft + C2 batch-penalty diagnosis (2026-10-29)
+
+Work done in the **`/home/soren/Strata-integ`** worktree (branch `integ/community-2026-10`),
+fast-forwarded from `de45cafd` to `62fc2924` (the `feat/dflash2-batch-parallel` commit) so the
+batch DFlash2 code is present. **Nothing pushed yet** (worktree is ahead of `fork/integ/community-2026-10`
+by the fast-forward + the C1 commit). Production remains inactive; the GPU is occupied by the
+paiton vLLM service (port 18982), so only compile-only and CPU tests were run.
+
+### C1 — `--batch-suffix-draft N`: per-slot n-gram co-draft for DFlash2 batch windows (IMPLEMENTED)
+
+Ports the paiton n-gram co-draft idea (`PAITON_NGRAM_CODRAFT`, `REFERENCE.md:947-996`, +26-29%
+decode on copy-heavy workloads) into Strata's batch DFlash2 path. The existing `SuffixDrafter`
+(`include/strata/spec/suffix_drafter.hpp`, CPU-only, no weights) was already wired for the solo
+MTP path (`--suffix-draft`) but not for batch. Changes:
+
+- `BSlot` gains a `strata::spec::SuffixDrafter sfx;` member (per-slot co-drafter).
+- New option `--batch-suffix-draft N` (`o.batch_suffix_draft`, default 0 = off; help text added).
+- At batch admission (`generate.cpp` ~13160): the slot's `sfx` is reset, configured from
+  `o.batch_suffix_draft` (min match) with `max_match=64`, and primed with the slot's prompt tokens
+  (`bs[b].ids`).
+- After each batch window commits rows (`generate.cpp` ~13566): every committed token is appended
+  to the slot's `sfx` (`sl.sfx.append(y)`).
+- In the per-slot next-draft block (`generate.cpp` ~13600, the `df2_win` branch): before the
+  DFlash2 drafter runs, the slot's `sfx.propose(k_next, ...)` is checked. If it proposes a
+  continuation (the tokens that followed the longest earlier occurrence of the slot's current
+  suffix), those tokens are stored in `sl.draft` and the DFlash2 drafter round is **skipped**
+  (no GPU draft round, no `set_slot`/staging copy). Otherwise the DFlash2 drafter runs as before.
+  The proposals are verified by the target as usual, so a match the target did not pick is never
+  emitted — the co-draft can only raise acceptance on copy-heavy workloads.
+- `SuffixDrafter` gains a `configure(int min_match, int max_match)` method (the per-slot drafter is
+  default-constructed in `BSlot` and then configured from the flag).
+- Test: `src/spec/suffix_drafter_test.cpp` gains a C1 block pinning `configure()`'s threshold
+  changes (min_match=4 ignores a 3-token match; min_match=5 ignores a 4-token match; reconfiguring
+  back to 3 restores the match). **`suffix_drafter_test` passes.**
+
+Verification (this session, no GPU):
+- `generate.cpp` compiles clean (`-fsyntax-only`, 0 errors) with the production-matched HIP flags.
+- CPU CTest subset: `batch_spec_test`, `batch_spec_slots_test`, `dflash2_slots_test`, `dflash2_tap_test`,
+  `suffix_drafter_test` — **5/5 passed** (no regressions).
+
+Not done (needs a GPU window): a live A/B of `--batch-suffix-draft 3` on vs off against the
+copy-heavy/agentic workload, to measure the acceptance lift. The co-draft is opt-in (default off)
+and changes nothing about which tokens the target emits.
+
+### C2 — batch DFlash2 acceptance penalty: code-level diagnosis (DIAGNOSED, not GPU-confirmed)
+
+Symptom (from `docs/DFLASH2_BATCH_TUNING_2026-10-29.md`): at equal proposal depth, batch accepts
+far less than true-solo — e.g. depth-2: solo cap-3 **75.40%** vs batch **53.46%** (a 22-point
+gap); depth-3: solo cap-5 **61.90%** vs batch **42.01%**. Same drafter, same pack, so it is a
+batch-specific penalty, not a drafter-quality issue.
+
+The two draft paths (verified against source):
+- **True-solo** (`generate.cpp:19402`, `draft_next`): `df2.draft(ver.tap_dev(), a_ + 1, p, ...)` —
+  `n_new = a_+1` rows read directly from the verifier's live tap buffer; the drafter is slot 0,
+  the single conversation's ring, accumulated continuously from prefill.
+- **Batch** (`generate.cpp:13558-13593`): `df2.draft(df2_stage.get(), hi - lo, pos[first[t]], ...)` —
+  `n_new = keep[b]` rows read from a **shared staging buffer** `df2_stage` (the captured graphs
+  bake that one pointer, so every slot drafts into the same rows, each against its own ring via
+  `set_slot(b)`); the slot's ring was **primed at admission** from the main session's (slot 0's)
+  ring via `save_state`/`restore_state` (a host round-trip of the whole ring).
+
+Root-cause candidates (ranked):
+- **H3 (strongest, code-level):** the slot's ring is primed at admission from the main session's
+  ring by a **host round-trip** (`save_state` device-to-host, `restore_state` host-to-device) of
+  the entire ring (L * 2 * ring_slots * NKV * HD * elem_bytes bytes). If that round-trip is not
+  perfectly faithful (an fp16/fp32 precision loss, or a position-table mismatch in
+  `ring_pos_`/`restore_state`'s zeroing of cells at positions >= `prefix_len`), the slot's ring
+  could be subtly different from the solo ring, lowering the drafter's per-depth confidence.
+  **Not confirmable without a GPU A/B test** comparing the slot's ring (after priming) to the
+  solo ring (at the same conversation point) and the drafter's output on both.
+- **H1 (multi-turn risk):** the priming is a one-time copy at admission; in serve mode the main
+  session's ring has only seen the prompt (and the previous turn's tail for multi-turn), so a
+  multi-turn slot's ring could miss the previous turn's committed rows. Correct for single-turn
+  (the tuning's case), a real risk for multi-turn serving.
+- **H2 (ring-wrap collision):** the slot's ring accumulates its committed rows at `pos %
+  ring_slots`; if a committed position wraps the ring and collides with a prompt position still
+  in the window, the ring cell is overwritten. Bounded by the ring size (2064) and the window;
+  not expected in the tuning's short runs.
+- **H4 (ruled out):** the batch anchor `sl.x` is set from the target's pick (`outb[first[t]+j]`),
+  the same as solo's `outv[a_]` — not a cause.
+
+Next steps (require a GPU window):
+1. Dump the slot's ring (after priming) and the solo ring (at the same conversation point);
+   compare the position table and K/V values. If they differ, the priming round-trip is the cause.
+2. If the rings match, compare the drafter's output (draft tokens + probabilities) on both rings.
+   If the outputs differ, the drafter is seeing a different context (H2); if they match, the
+   penalty is from the verification (a target-model issue, not a drafter issue).
+
+Full write-up: `docs/C2-BATCH-PENALTY-DIAGNOSIS.md`.
+
+### Still owed (needs a GPU window; do not start the paiton service or any live Strata service)
+- C1 A/B: `--batch-suffix-draft 3` on vs off on a copy-heavy workload (measure acceptance lift).
+- C2 GPU A/B: the ring-comparison dump above (confirm or refute H3).
+- A2 sweeps: one-variable `--spec-min-p` and `STRATA_DFLASH_DEPTH_SLOPE` (short, isolated).
