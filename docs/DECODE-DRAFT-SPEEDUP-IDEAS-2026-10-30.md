@@ -26,7 +26,7 @@ between a VRAM cache and a host RAM arena. Sources: [DFLASH2_BATCH_TUNING_2026-1
 Already tried, do not repeat without a new reason:
 
 - Two-phase MTP co-draft (`STRATA_BATCH_DRAFT_TWOPHASE=1`): no gain (2.05–2.53 ms against 2.2 ms).
-- Grouped MTP co-draft (`STRATA_BATCH_DRAFT_GROUP=1`): saves about 0.8 ms per window, drafts differ in bits; opt-in only.
+- Grouped MTP co-draft (`STRATA_BATCH_DRAFT_GROUP=1`): saves about 0.8 ms per window, drafts differ in bits; opt-in only. Window 3 (batch 4, parity mode, MTP depth 1, two launches): draft time 5.8 → 3.0 ms per window with 7.7 co-draft calls per window (`docs/BATCH-MTP-TEST-RESULTS.md`).
 - Async batch commit (`STRATA_BATCH_COMMIT_ASYNC`): the wait moved into emit; reverted.
 - PCIe-wait fold (`STRATA_FUSE_PCIE_WAIT=1`): −4% at 4 concurrent; default off.
 - Fused decode (`STRATA_FUSE_DECODE=1`): its kernels do not run on the native pack.
@@ -142,7 +142,7 @@ today at two rows). The two-phase co-draft (`STRATA_BATCH_DRAFT_TWOPHASE`) is no
 proposals per slot-window.
 
 Where it should help: windows with spare rows. With 4 busy slots in an 8-row window there are none, so it needs
-`--batch-draft-window 16` (one GPU) or fewer busy slots. That is the case to measure first.
+`--batch-draft-window 16` (one GPU) or fewer busy slots. Measured in window 2 (non-parity, one launch each): depth 3 with the default 8-row window ran at 114.2 concurrent aggregate tok/s against 126.6 for the base (−9.8%); with the 16-row window, 118.2 (−6.6%). No gain at batch 4 on this box.
 
 Code: `include/strata/core/batch_mtp_depth.hpp` (the rules, CPU-only), `tests/core/batch_mtp_depth_test.cpp`, and the
 batch loop in `src/program/generate.cpp` (row build, accept, draft, admission).
@@ -175,9 +175,9 @@ alone, because the draft probabilities arrive after the rows are fixed.
 
 ### Not done yet
 
-- No GPU build or run. The `.cpp` files pass a host syntax check (`g++ -fsyntax-only` against the CUDA headers); the
-  HIP build has not been run. The depth rules have a CPU unit test, which passes.
-- No speed numbers. Whether either switch is faster is unknown until the A/B below is run.
+- The `.cpp` files passed a host syntax check (`g++ -fsyntax-only` against the CUDA headers); the
+  HIP build has been run and used for the A/B windows (`docs/BATCH-MTP-TEST-RESULTS.md`). The depth rules have a CPU unit test, which passes.
+- Speed numbers: `docs/BATCH-MTP-TEST-RESULTS.md` (window 2 for the depth and group arms, window 3 for the combined treatment).
 - The solo MTP path (the `mtp_select` to `copy_i32_from_mapped` gap in DECODE-TRACE-2026-10-30) still goes through
   the host.
 - DFlash2 batch depth (idea 2 for DFlash2) is not started.
@@ -195,9 +195,9 @@ batch loop runs the same code as before.
 | Switch | Report item | What it does |
 |---|---|---|
 | `STRATA_BATCH_DRAFT_GROUP=1` with `STRATA_BATCH_MTP_DEPTH=N` | 2: grouped multi-token drafting | Each slot's first draft comes from the one group pass, as before. A slot that may draft more runs its later steps on its own stream right after it. The host waits once for all of them. |
-| `STRATA_BATCH_MTP_EARLYCOPY=1` | 3: early residual copies | Each slot's residual rows are queued for its drafter when the window is queued, not after the host has accepted and committed. The copy still waits for the window on the GPU. |
-| `STRATA_BATCH_MTP_SELECT=1` or `=N` | 5: slot choice by acceptance | When a window cannot carry every live slot, it takes those whose proposals are taken most often. No slot waits more than N windows (2 by default). |
-| `STRATA_BATCH_MTP_SELECT_OVERLAP=W` | 7: expert-overlap grouping | With `SELECT`: also prefer slots whose last rows used the same CPU-served experts as the slots already chosen (weight W, 0 to 8). |
+| `STRATA_BATCH_MTP_EARLYCOPY=1` | 3: early residual copies | Each slot's residual rows are queued for its drafter when the window is queued, not after the host has accepted and committed. The copy still waits for the window on the GPU. Window 2 (one launch): 92.2 tok/s concurrent against 126.6 for the base (−27%). |
+| `STRATA_BATCH_MTP_SELECT=1` or `=N` | 5: slot choice by acceptance | When a window cannot carry every live slot, it takes those whose proposals are taken most often. No slot waits more than N windows (2 by default). Batch 4 with the 8-row window carries every slot, so it does not act there (window 3). |
+| `STRATA_BATCH_MTP_SELECT_OVERLAP=W` | 7: expert-overlap grouping | With `SELECT`: also prefer slots whose last rows used the same CPU-served experts as the slots already chosen (weight W, 0 to 8). Window 2 (batch 6, one launch against J0): −1.8% concurrent. |
 | `STRATA_BATCH_MTP_DEVACCEPT=1` | 6: accept on the device | Needs `STRATA_BATCH_MTP_DEVTOK=1`. A greedy slot's next draft round is set up and started by the GPU right after its window, before the host has read the window. |
 | `STRATA_BATCH_EXPERT_AHEAD=N` | 8: earlier CPU expert loads | While the host waits for layer l, it asks the expert source to start reading layer l+N's experts (N is 1 to 4). It asks for the experts the last window sent to the CPU. |
 
