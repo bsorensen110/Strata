@@ -13002,9 +13002,10 @@ int main(int argc, char** argv) {
             // source the --batch-mtp path uses, and is stored here (separate from the DFlash2 `draft[]`).
             int32_t mtp_draft = 0;
             bool mtp_draft_ready = false;
-            // STRATA_BATCH_MTP_DEPTH: how often the target picked this request's first proposal (an EMA), and the
-            // draft layer's probability for each stored proposal
+            // STRATA_BATCH_MTP_DEPTH / STRATA_BATCH_DF2_DEPTH: how often the target picked this request's first
+            // proposal (an EMA), and the draft layer's probability for each stored proposal
             float mtp_ema = 0.5f;
+            float df2_ema = 0.5f;
             std::array<float, strata::kernels::kVerifyNarrowT> dprob{};
             // STRATA_BATCH_MTP_SELECT: windows since the slot was last carried, and the CPU-served experts its rows
             // were last routed to (STRATA_BATCH_MTP_SELECT_OVERLAP)
@@ -13295,6 +13296,12 @@ int main(int argc, char** argv) {
         int df2_want_depth = o.batch_draft_depth;
         if (const char* e = std::getenv("STRATA_BATCH_DRAFT_DEPTH")) df2_want_depth = std::atoi(e);
         if (df2_want_depth < 0) df2_want_depth = 0;
+        const strata::core::MtpDepthConfig df2_depth = df2_batch
+            ? strata::core::mtp_depth_config(std::getenv("STRATA_BATCH_DF2_DEPTH"),
+                                             std::getenv("STRATA_BATCH_DF2_DEPTH_FLOOR"),
+                                             std::max(1, dflash_k))
+            : strata::core::MtpDepthConfig{};
+        const bool df2_depth_on = df2_depth.on() && df2_batch;
         strata::core::Df2WindowPlan df2_plan{};
         strata::core::Df2DraftStats df2_stats{};
         if (df2_batch) {
@@ -13308,6 +13315,10 @@ int main(int argc, char** argv) {
                          o.batch_draft_window, df2_want_depth,
                          df2_want_depth == 0 ? "every slot in the window, the rows left split between them"
                                              : "each slot keeps this depth, the slots that do not fit take their turn");
+            if (df2_depth_on)
+                std::fprintf(stderr, "strata batch: DFlash2 adaptive depth on: up to %d proposals per slot, "
+                                     "floor %.2f (STRATA_BATCH_DF2_DEPTH)\n",
+                             df2_depth.max_depth, (double) df2_depth.floor);
         }
 #endif
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
@@ -13749,15 +13760,25 @@ int main(int argc, char** argv) {
                 df2_plan = strata::core::df2_window_plan(cap, n_active, dflash_k, df2_want_depth);
                 const int run = df2_plan.n_sel < 1 ? 1 : df2_plan.n_sel;
                 bool ready[strata::kernels::kVerifyMaxT] = {};
+                int max_d[strata::kernels::kVerifyMaxT] = {};
+                float ema_sel[strata::kernels::kVerifyMaxT] = {};
                 for (size_t offset = 0; offset < bs.size() && A < run; ++offset) {
                     const int b = (int) ((next_slot + offset) % bs.size());
                     if (!bs[(size_t) b].active) continue;
-                    ready[A] = bs[(size_t) b].draft_ready && bs[(size_t) b].n_drafts > 0;
+                    const BSlot& sl = bs[(size_t) b];
+                    ready[A] = sl.draft_ready && sl.n_drafts > 0;
+                    if (df2_depth_on && ready[A]) {
+                        const int d_b = strata::core::mtp_depth_for(sl.df2_ema, df2_depth);
+                        max_d[A] = std::min({d_b, sl.n_drafts, dflash_k});
+                    }
+                    ema_sel[A] = sl.df2_ema;
                     active[A++] = b;
                 }
                 if (A > 0) next_slot = ((size_t) active[(size_t) A - 1] + 1) % bs.size();
                 int rows_sel[strata::kernels::kVerifyMaxT] = {}, ntok_sel[strata::kernels::kVerifyMaxT] = {};
-                const int S_all = strata::core::batch_spec_slot_rows(cap, A, ready, df2_plan.depth, rows_sel, ntok_sel);
+                const int S_all = df2_depth_on
+                    ? strata::core::batch_spec_slot_rows(cap, A, max_d, rows_sel, ntok_sel, ema_sel)
+                    : strata::core::batch_spec_slot_rows(cap, A, ready, df2_plan.depth, rows_sel, ntok_sel);
                 df2_stats.note_plan(A, df2_plan.depth);
                 // a slot stores the drafts its last round gave it: take no more proposal rows than it has
                 int t = 0;
@@ -14023,6 +14044,9 @@ int main(int argc, char** argv) {
                         outb + i, sl.draft_ready && sl.n_drafts > 0 ? sl.draft.data() : nullptr, ntok[a], sl.x, sl.p,
                         o.max_context, sl.produced, sl.max_new, eos32.data(), (int) eos32.size(), sl.stop);
                     keep[b] = acc.keep;
+                    if (df2_depth_on && ntok[a] >= 2 && !sl.stop)
+                        bs[(size_t) b].df2_ema = strata::core::mtp_depth_ema(sl.df2_ema, acc.keep >= 2,
+                                                                             df2_depth.alpha);
                     // what this round did, for the run's line: what the slot held, how many of those proposals the
                     // window gave a row to, and how many of those the target confirmed
                     df2_stats.note_round(sl.draft_ready && sl.n_drafts > 0 ? sl.n_drafts : 0, ntok[a] - 1, acc.keep - 1);
@@ -14251,6 +14275,7 @@ int main(int argc, char** argv) {
                         }
                     }
                     if (!sl.draft_ready && geo && hi > lo && k_next > 0) {
+                        const Clock::time_point td0 = Clock::now();
                         std::string de;
                         const strata::core::OnDevice on_df2(0);   // --batch with DFlash2 is refused on more than one card
                         bool ok = cudaMemcpyAsync(df2_stage.get(), ver.tap_dev() + (size_t) lo * df2_stage_stride,
@@ -14263,10 +14288,19 @@ int main(int argc, char** argv) {
                         if (ok && !df2.draft(df2_stage.get(), hi - lo, pos[first[t]], sl.x, dd, pp, de)) ok = false;
                         std::string se;
                         (void) df2.set_slot(0, se);   // back to slot 0: the prompt taps between the windows feed it
+                        bt_draft += msd(td0, Clock::now());
+                        ++bt_draft_n;
                         if (ok) {
-                            for (int i = 0; i < k_next; ++i) sl.draft[(size_t) i] = dd[i];
-                            sl.n_drafts = k_next;
-                            sl.draft_ready = true;
+                            const int k_keep = df2_depth_on
+                                ? std::min({k_next, df2_depth.max_depth,
+                                            strata::core::mtp_depth_trim(pp, k_next, df2_depth.floor)})
+                                : k_next;
+                            for (int i = 0; i < k_keep; ++i) {
+                                sl.draft[(size_t) i] = dd[i];
+                                sl.dprob[(size_t) i] = pp[i];
+                            }
+                            sl.n_drafts = k_keep;
+                            sl.draft_ready = k_keep > 0;
                             strata::core::SessionState& sx = *bslot_ss[0][(size_t) b];
                             if (sx.ple.ready() && sx.ple.table != nullptr) {
                                 int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
@@ -14278,7 +14312,7 @@ int main(int argc, char** argv) {
                                     sx.ple.table->prefetch_rows(rows16);
                                 };
                                 pf(sl.x);
-                                for (int i = 0; i < k_next; ++i) pf(sl.draft[(size_t) i]);
+                                for (int i = 0; i < sl.n_drafts; ++i) pf(sl.draft[(size_t) i]);
                             }
                         } else {
                             static int64_t df2_warn = 0;
@@ -14471,6 +14505,15 @@ int main(int argc, char** argv) {
                                  df2_stats.tokens_per_round(), (long long) df2_stats.rounds, df2_stats.avg_slots(),
                                  df2_stats.avg_depth(), df2_want_depth, (long long) df2_stats.stored,
                                  (long long) df2_stats.unverified(), df2_stats.deepest_accepted(), depth_hist);
+                    if (df2_depth_on && df2_stats.rounds > 0)
+                        std::fprintf(stderr, "strata batch: DFlash2 depth: accepted %lld of %lld offered proposal rows (%.1f%%), "
+                                             "%.2f proposals per slot-window, %.2f verified rows/window "
+                                             "(STRATA_BATCH_DF2_DEPTH=%d, floor=%.2f)\n",
+                                     (long long) df2_stats.accepted, (long long) df2_stats.offered,
+                                     100.0 * (double) df2_stats.accepted / (double) std::max<int64_t>(df2_stats.offered, 1),
+                                     (double) df2_stats.offered / (double) df2_stats.rounds,
+                                     (double) (df2_stats.rounds + df2_stats.offered) / w,
+                                     df2_depth.max_depth, (double) df2_depth.floor);
                     df2_stats = strata::core::Df2DraftStats{};
                 } else
 #endif
@@ -14497,10 +14540,13 @@ int main(int argc, char** argv) {
                                  (long long) ahead_ctx.asked, expert_ahead);
                     ahead_ctx.asked = 0;
                 }
-                if (batch_mtp && std::getenv("STRATA_BATCH_DRAFT_TIMING") != nullptr)
+                if ((batch_mtp || df2_win) && std::getenv("STRATA_BATCH_DRAFT_TIMING") != nullptr)
                     std::fprintf(stderr, "strata batch draft: %.2f ms/window in %.2f co-draft calls/window (%s)\n",
                                  bt_draft / w, (double) bt_draft_n / w,
-                                 draft_group_on ? "one group round per window" : draft_two_phase ? "two-phase: begin + end" : "serial, each syncs");
+                                 df2_win ? "DFlash2 serial, each syncs"
+                                         : draft_group_on ? "one group round per window"
+                                         : draft_two_phase ? "two-phase: begin + end"
+                                         : "serial, each syncs");
                 if (batch_mtp && draft_check)
                     std::fprintf(stderr, "strata batch draft check: %lld of %lld drafted tokens differ from a serial draft\n",
                                  (long long) bt_chk_bad, (long long) bt_chk_n);

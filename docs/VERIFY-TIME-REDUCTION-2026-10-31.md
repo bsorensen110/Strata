@@ -115,3 +115,40 @@ BATCH-WINDOW-SYNC tried `STRATA_BATCH_COMMIT_ASYNC`: commit host time 2.2→0.02
 # P6 ring shrink
 # env: STRATA_DF2_RING_SLOTS=1024  (default 2064)
 ```
+
+## 7. Measured P1 + P2 results on `gfx1201` (2026-10-31, build `69a14d5e`)
+
+Implemented `STRATA_BATCH_DF2_DEPTH=N` + `STRATA_BATCH_DF2_DEPTH_FLOOR=F` (`include/strata/core/batch_spec_slots.hpp`, `src/program/generate.cpp`, unit tests in `tests/core/batch_spec_slots_test.cpp` and `tests/core/batch_mtp_depth_test.cpp`) and extended `STRATA_BATCH_DRAFT_TIMING=1` to DFlash2 batch co-drafting.
+
+4×256 concurrent greedy coding requests (`parallel: 4`, `swift-1.5-iq3_s`):
+
+| Metric | Baseline (`W=16, depth=3`, fixed) | Arm 1 (`W=16, depth=3, DF2_DEPTH=3`) | Arm 2 (`W=8, depth=1, DF2_DEPTH=3`) |
+|---|---|---|---|
+| Windows | 85 | 96 | **138** |
+| Verified rows / window | ~14.2 | 12.42 | **7.89** |
+| Committed tokens / window (`bt_rows`) | 12.13 | 10.61 | **7.38** |
+| Offered proposals / slot-window | 3.00 | 2.36 (257 trimmed) | **1.01** (1166 trimmed) |
+| Proposal acceptance | 707/960 (73.6%) | 664/837 (**79.3%**) | 478/548 (**87.2%**) |
+| Accepted-depth histogram | — | `0:52, 1:91, 2:63, 3:149` | `0:72, 1:464, 2:1, 3:4` |
+| **Total window ms** | **90.84 ms** | **82.14 ms** (−9.6%) | **53.49 ms** (**−41.1%**) |
+| **`run` (verify pass)** | **79.78 ms** | **72.09 ms** (−9.6%) | **43.61 ms** (**−45.3%**) |
+| — `CUDA0 GPU-reach wait` | 44.61 ms | 37.69 ms (−15.5%) | **26.39 ms** (**−40.8%**) |
+| — `CPU experts` | 28.11 ms | 23.96 ms (−14.8%) | **14.31 ms** (**−49.1%**) |
+| `commit` | 0.02 ms | 0.02 ms | 0.02 ms |
+| `emit` (incl. co-draft) | 10.74 ms | 9.55 ms | 9.54 ms |
+| — `strata batch draft` (`STRATA_BATCH_DRAFT_TIMING=1`) | — | **9.51 ms** (3.07 calls/win, 3.10 ms/call) | **9.49 ms** (3.19 calls/win, 2.97 ms/call) |
+| Routed entries / window | 7268.6 | 5960.0 (−18.0%) | **3787.8** (**−47.9%**) |
+| — VRAM hit % | 83.2% | 83.6% | **86.2%** |
+| — CPU expert entries / window | 1100.2 (15.1%) | 882.8 (14.8%) | **479.4 (12.7%)** |
+| — CPU experts / layer-window | 15.85 | 13.60 | **8.21** |
+| **Engine batch decode (`rows/s`)** | ~123 rows/s | **129.2 rows/s** (+5.0%) | **138.0 rows/s** (**+12.2%**) |
+| **HTTP aggregate `tok/s`** | 113.4 tok/s | 110.2 tok/s | **114.7 tok/s** (28.7–29.8/slot) |
+
+### Key takeaways from the measurement
+
+1. **`STRATA_BATCH_DF2_DEPTH=3` works as designed on both 16-row and 8-row windows**:
+   - On `W=16, depth=3`, it trims 257 low-confidence / post-rejection proposals (`3.00 → 2.36` proposals/slot-window), raising acceptance from **73.6% → 79.3%**, cutting verify `run` time from **79.78 → 72.09 ms** (−7.7 ms) and window time from **90.84 → 82.14 ms**, and lifting engine batch decode speed to **129.2 rows/s**.
+   - On `W=8, depth=1` (8-row batched DFlash2 with `STRATA_BATCH_DF2_DEPTH=3`), verified rows average **7.89 rows/window**, acceptance jumps to **87.2%** (`7.38` committed tokens per `7.89` verified rows = **93.5% row efficiency**), routed CPU expert misses drop by **56%** (`1100.2 → 479.4`), verify `run` time drops from **79.78 → 43.61 ms (−45.3%)**, total window drops from **90.84 → 53.49 ms (−41.1%)**, and engine batch decode reaches **138.0 rows/s** (**114.7 tok/s** HTTP wall).
+2. **`STRATA_BATCH_DRAFT_TIMING=1` isolates DFlash2 co-draft inside `emit`**:
+   - Of the `9.54 ms` `emit` bucket, **`9.49 ms` (99.5%) is serialized DFlash2 co-drafting** (`3.19` calls/window × `2.97 ms/call`).
+   - Now that `W=8` brings verify `run` down to `43.61 ms`, serialized DFlash2 co-draft (`9.49 ms`) is **17.7% of the entire 53.49 ms window** — making Phase 1 (`BATCHHEAD`: batched head across slots + event overlap, saving ~6–7 ms/window) an immediate ~12% total-window win on top of `W=8`.

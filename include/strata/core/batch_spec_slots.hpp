@@ -14,6 +14,7 @@
 // target rejected is never staged (the ring only ever sees committed rows, include/strata/core/dflash2.hpp).
 #pragma once
 
+#include "strata/core/batch_mtp_depth.hpp"
 #include "strata/core/batch_spec.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -57,6 +58,57 @@ inline int batch_spec_slot_rows(int cap, int n_sel, const bool* ready, int max_d
             if (k[a] >= md) continue;
             ++k[a];
             ++given;
+        }
+    }
+    int t = 0;
+    for (int a = 0; a < n_sel; ++a) {
+        ntok_out[a] = 1 + k[a];
+        for (int j = 0; j <= k[a]; ++j) rows_out[t++] = a;
+    }
+    return t;
+}
+
+/// Per-slot proposal caps `max_drafts[0..n_sel)` (STRATA_BATCH_DF2_DEPTH): 0 keeps a slot's anchor row alone, >0 asks
+/// for up to that many proposals.  When `ema` is provided and the requested proposals exceed `cap` while at least one
+/// proposal per ready slot fits, `mtp_depth_fit` drops from the slot with the lowest `ema[a]^k[a]` first and never
+/// drops a ready slot's first proposal; when `ema` is nullptr (or not even one proposal per ready slot fits), spare
+/// rows are dealt round-robin from the left.
+inline int batch_spec_slot_rows(int cap, int n_sel, const int* max_drafts, int* rows_out, int* ntok_out,
+                                const float* ema = nullptr) {
+    if (cap <= 0 || n_sel <= 0 || rows_out == nullptr || ntok_out == nullptr) return 0;
+    if (cap > strata::kernels::kVerifyMaxT) cap = strata::kernels::kVerifyMaxT;
+    if (cap < n_sel || n_sel > strata::kernels::kVerifyMaxT) return 0;
+    const int max_extra = cap - n_sel;
+    int k[strata::kernels::kVerifyMaxT] = {};
+    int cap_k[strata::kernels::kVerifyMaxT] = {};
+    int n_ready = 0;
+    int total_want = n_sel;
+    for (int a = 0; a < n_sel; ++a) {
+        const int md = (max_drafts != nullptr && max_drafts[a] > 0)
+                           ? (max_drafts[a] < max_extra ? max_drafts[a] : max_extra)
+                           : 0;
+        cap_k[a] = md;
+        if (md > 0) ++n_ready;
+        total_want += md;
+    }
+    if (n_ready > 0) {
+        if (total_want <= cap) {
+            for (int a = 0; a < n_sel; ++a) k[a] = cap_k[a];
+        } else if (ema != nullptr && n_sel + n_ready <= cap) {
+            for (int a = 0; a < n_sel; ++a) k[a] = cap_k[a];
+            (void) mtp_depth_fit(k, ema, n_sel, cap);
+        } else {
+            int given = 0;
+            while (n_sel + given < cap) {
+                bool grew = false;
+                for (int a = 0; a < n_sel && n_sel + given < cap; ++a) {
+                    if (k[a] >= cap_k[a]) continue;
+                    ++k[a];
+                    ++given;
+                    grew = true;
+                }
+                if (!grew) break;
+            }
         }
     }
     int t = 0;

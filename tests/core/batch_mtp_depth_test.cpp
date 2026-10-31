@@ -82,6 +82,24 @@ int main() {
         const float ema[2] = {0.9f, 0.9f};
         check(mtp_depth_fit(k, ema, 2, 3) == 3 && k[0] == 0 && k[1] == 1, "slot without draft stays at 0");
     }
+    // DFlash2 adaptive depth workflow: mtp_depth_for + mtp_depth_trim
+    {
+        const MtpDepthConfig df2_cfg = mtp_depth_config("3", "0.5", 6);
+        check(df2_cfg.on() && df2_cfg.max_depth == 3 && df2_cfg.floor == 0.5f, "df2 depth config 3");
+        float ema = 0.5f;
+        check(mtp_depth_for(ema, df2_cfg) == 1, "df2 initial ema 0.5 -> depth 1");
+        ema = mtp_depth_ema(ema, true, df2_cfg.alpha);   // 0.625
+        ema = mtp_depth_ema(ema, true, df2_cfg.alpha);   // 0.71875 (0.71875^2 = 0.5166 >= 0.5)
+        check(mtp_depth_for(ema, df2_cfg) == 2, "df2 after 2 acceptances -> depth 2");
+        ema = mtp_depth_ema(ema, true, df2_cfg.alpha);   // 0.78906
+        ema = mtp_depth_ema(ema, true, df2_cfg.alpha);   // 0.84180 (0.8418^3 = 0.5965 >= 0.5)
+        check(mtp_depth_for(ema, df2_cfg) == 3, "df2 after 4 acceptances -> depth 3");
+        ema = mtp_depth_ema(ema, false, df2_cfg.alpha);  // 0.63135 (0.63135^2 = 0.3986 < 0.5)
+        check(mtp_depth_for(ema, df2_cfg) == 1, "df2 rejection immediately drops depth back to 1");
+        const float pp[6] = {0.9f, 0.8f, 0.6f, 0.9f, 0.9f, 0.9f};
+        // 0.9 * 0.8 = 0.72 >= 0.5 (keep 2), * 0.6 = 0.432 < 0.5 (stop at 2)
+        check(mtp_depth_trim(pp, 6, df2_cfg.floor) == 2, "df2 selector prob trim stops at 2");
+    }
 
     if (g_fail != 0) {
         std::fprintf(stderr, "batch_mtp_depth_test: %d failure(s)\n", g_fail);

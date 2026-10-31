@@ -547,6 +547,37 @@ int main() {
               "the planned shape averages the windows, and a negative one counts as nothing");
     }
 
+    // ---- per-slot max_drafts (STRATA_BATCH_DF2_DEPTH) ----
+    {
+        // Under cap in a 16-row window: each slot gets its own adaptive depth (e.g. 1, 3, 0, 2 -> 4 + 6 = 10 rows).
+        int rows[kStorageCap] = {}, ntok[kStorageCap] = {};
+        const int max_d[4] = {1, 3, 0, 2};
+        const float ema[4] = {0.5f, 0.85f, 0.5f, 0.75f};
+        const int S = strata::core::batch_spec_slot_rows(kStorageCap, 4, max_d, rows, ntok, ema);
+        check(S == 10 && ntok[0] == 2 && ntok[1] == 4 && ntok[2] == 1 && ntok[3] == 3,
+              "per-slot max_drafts under cap: each slot keeps its exact requested depth (10 rows in a 16-row window)");
+        int64_t pos[kStorageCap];
+        positions(rows, S, pos);
+        check(strata::core::batch_rows_error(rows, S, pos, 4, kStorageCap, 0, false, kStorageCap) == nullptr,
+              "per-slot max_drafts under cap: passes the layout law");
+
+        // Over cap with EMA: 4 slots requesting {3, 3, 3, 3} in a 12-row window -> lowest ema^k dropped first.
+        const int max_d12[4] = {3, 3, 3, 3};
+        const float ema12[4] = {0.9f, 0.6f, 0.8f, 0.7f};
+        const int S12 = strata::core::batch_spec_slot_rows(12, 4, max_d12, rows, ntok, ema12);
+        check(S12 == 12 && ntok[0] == 4 && ntok[1] == 2 && ntok[2] == 4 && ntok[3] == 2,
+              "per-slot max_drafts over cap with EMA: best slots keep depth 3, lower EMA slots trim to 1");
+        positions(rows, S12, pos);
+        check(strata::core::batch_rows_error(rows, S12, pos, 4, kStorageCap, 0, false, 12) == nullptr,
+              "per-slot max_drafts over cap with EMA: passes the layout law");
+
+        // Over cap without EMA: round-robin from the left up to each slot's cap.
+        const int max_d_rr[3] = {1, 4, 4};
+        const int Srr = strata::core::batch_spec_slot_rows(kCap, 3, max_d_rr, rows, ntok, nullptr);
+        check(Srr == 8 && ntok[0] == 2 && ntok[1] == 3 && ntok[2] == 3,
+              "per-slot max_drafts without EMA: slot 0 stops at its cap 1, slots 1 and 2 share the remaining rows");
+    }
+
     if (g_fail != 0) {
         std::fprintf(stderr, "batch_spec_slots_test: %d of %ld checks FAILED\n", g_fail, g_checks);
         return EXIT_FAILURE;
