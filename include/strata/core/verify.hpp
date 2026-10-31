@@ -452,6 +452,21 @@ public:
     /// STRATA_ADAPT_FETCH's admissions).
     /// It gets this verifier's stream; false (with the message in `err`) fails the launch.
     void set_pre_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { pre_launch_ = std::move(f); }
+    /// STRATA_BATCH_MTP_DEVTOK (opt-in): the next run_slot_rows takes the tokens of rows [first, first + n) from the
+    /// device instead of `tokens`: another stream writes them into `tok_rows_dev() + first` and records `ev`, and the
+    /// window's launch waits for `ev` (no host wait between that stream's work and the launch).  One-shot: cleared by the
+    /// next run_slot_rows.  Not with PLE (its rows are gathered from the host tokens) nor a layer split (one verifier).
+    /// After the window, `patch_last_token` gives the host's record of a device row its real token.  n == 0: the launch
+    /// only waits for `ev` (work on another stream that still reads this verifier's rows, e.g. final_R_all()).
+    bool add_device_rows(int first, int n, cudaEvent_t ev) {
+        if (n < 0 || first < 0 || first + n > strata::kernels::kVerifyMaxT || dev_n_ev_ >= strata::kernels::kVerifyMaxT)
+            return false;
+        for (int t = first; t < first + n; ++t) dev_rows_[t] = true;
+        if (ev != nullptr) dev_ev_[dev_n_ev_++] = ev;
+        return true;
+    }
+    int32_t* tok_rows_dev() const { return m_tok_; }
+    void patch_last_token(int t, int32_t tok) { if (t >= 0 && t < strata::kernels::kVerifyMaxT) last_tokens_[t] = tok; }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     /// The PCIe count of each layer from measured costs (PcieModel) instead of a fixed share: the spin kernels stamp
@@ -771,6 +786,13 @@ private:
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
+    bool dev_rows_[strata::kernels::kVerifyMaxT] = {};             // add_device_rows: rows the host does not stage
+    cudaEvent_t dev_ev_[strata::kernels::kVerifyMaxT] = {};        // ... and the events the launch waits for
+    int dev_n_ev_ = 0;
+    void clear_device_rows() {
+        for (bool& r : dev_rows_) r = false;
+        dev_n_ev_ = 0;
+    }
     int groups_[strata::kernels::kWindowMaxT + 1] = {};
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
     // STRATA_VERIFY_DEFER_CPU=1 (opt-in, changes the output): a decode window's layer l adds the CPU's expert rows to the

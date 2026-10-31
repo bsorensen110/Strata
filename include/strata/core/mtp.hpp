@@ -147,6 +147,12 @@ public:
     bool fast_draft_ok() const { return !chain_rule_; }
     bool draft_begin(int T, const int32_t* tokens, int64_t p, int a, std::string& err);
     bool draft_end(int32_t* drafts, std::string& err);
+    /// STRATA_BATCH_MTP_DEVTOK: a draft_begin is in flight, how many drafts it makes, and the device address of the
+    /// mapped outputs its graphs write them to (`out_dev()[j]`, j < pending_steps(); valid once the stream reaches
+    /// the round's end, so read them only from work queued on `stream()`).
+    bool pending() const { return pend_; }
+    int pending_steps() const { return pend_ ? pend_max_steps_ : 0; }
+    const int32_t* out_dev() const { return m_out_; }
 
     /// The batch co-draft for several slots in one round (STRATA_BATCH_DRAFT_GROUP).  Each item is one slot's
     /// draft(2, tokens, p, a) with a single step (max_drafts 1).  This drafter (the owner) stages item i's two rows at
