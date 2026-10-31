@@ -182,25 +182,9 @@ alone, because the draft probabilities arrive after the rows are fixed.
   the host.
 - DFlash2 batch depth (idea 2 for DFlash2) is not started.
 
-### How to measure (R9700, `strata-speed-ab-testing` method)
+### How to measure
 
-Same engine binary, same config, one variable per arm. Stop `strata.service` and use a scratch server, or edit the
-service's environment between arms. Report cold trial 1 and warm trials apart, and the engine's `generated in` lines.
-
-| Arm | Environment / flags |
-|---|---|
-| A (control) | `--batch 4 --batch-mtp`, no new variables |
-| B (handoff) | A + `STRATA_BATCH_MTP_DEVTOK=1` |
-| C (depth, 8 rows) | A + `STRATA_BATCH_MTP_DEPTH=3` |
-| D (depth, 16 rows) | A + `STRATA_BATCH_MTP_DEPTH=3 --batch-draft-window 16` |
-| E (both) | D + `STRATA_BATCH_MTP_DEVTOK=1` |
-
-For each arm, run the skill's 4 x 256 concurrent test 3 times, and the solo greedy test once (one busy slot shows
-depth best). Keep `STRATA_BATCH_DRAFT_TIMING=1` in every arm for the per-window draft time. Check:
-
-- Output: at `temperature=0`, arms B to E must give the same text as A for the same prompt. A difference is a bug.
-- Speed: aggregate tok/s, window ms, and the "MTP proposals accepted" and "MTP depth" stderr lines.
-- B should cut the draft time per window (about 0.75 ms per slot today), not the acceptance.
+The test runs are in [BATCH-MTP-TEST-RUNS.md](BATCH-MTP-TEST-RUNS.md).
 
 ## Six more MTP draft switches
 
@@ -278,15 +262,4 @@ number of experts asked for ahead (`EXPERT_AHEAD`).
 
 ### How to measure
 
-Use the same method as above, with one variable per arm on top of control A (`--batch 4 --batch-mtp`):
-
-| Arm | Adds |
-|---|---|
-| F | `STRATA_BATCH_MTP_EARLYCOPY=1` |
-| G | `STRATA_BATCH_MTP_DEVTOK=1 STRATA_BATCH_MTP_DEVACCEPT=1` (compare with B) |
-| H | `STRATA_BATCH_MTP_DEPTH=3 STRATA_BATCH_DRAFT_GROUP=1` (compare with C) |
-| I | `STRATA_BATCH_EXPERT_AHEAD=1`, then `=2` |
-| J | `--batch 6` with `STRATA_BATCH_MTP_SELECT=1`, then with `STRATA_BATCH_MTP_SELECT_OVERLAP=2` (compare with `--batch 6` alone) |
-
-At `temperature=0` every arm must give the same text as A. `STRATA_BATCH_DRAFT_TIMING=1` shows the draft time per
-window. For G, a high "redrafted by the host" count means the round is thrown away too often to pay.
+The test runs are in [BATCH-MTP-TEST-RUNS.md](BATCH-MTP-TEST-RUNS.md).
