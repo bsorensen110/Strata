@@ -153,9 +153,30 @@ public:
     bool pending() const { return pend_; }
     int pending_steps() const { return pend_ ? pend_max_steps_ : 0; }
     const int32_t* out_dev() const { return m_out_; }
+    /// STRATA_BATCH_MTP_DEVACCEPT (opt-in): draft_begin for a window whose accepted count only the device knows yet.
+    /// After `after` (an event on the verifier's stream, recorded once the window's graph is launched) this drafter's
+    /// stream compares the slot's rows [first, first + n) of the window (`ver_out`: the target's picks, `ver_tok`: the
+    /// rows' tokens) and stages the round itself: its tokens are the picks, row a is the first draft the target did not
+    /// pick, the draft cells follow it.  All n rows are caught up (as STRATA_MTP_CATCHUP_ALL).  Then the round and its
+    /// steps run with no host wait; draft_end collects them.  The host must later find the same a (`a == keep - 1`) or
+    /// throw the round away.  `dev_round_fits` first: the steps must fit whatever a turns out to be.
+    int dev_round_steps() const { return std::min(max_t_ - 1, max_drafts_); }
+    bool dev_round_fits(int n, int64_t p) const {
+        return !chain_rule_ && !coupled_active_ && n >= 1 && n <= max_t_ && dev_round_steps() >= 1 &&
+               p + n - 1 + dev_round_steps() <= st_.max_cells;
+    }
+    /// `staged` (optional) is recorded once the window's rows have been read (the round no longer needs them).
+    /// Captures the round for n rows and every step graph draft_begin_dev may launch.  Call it before the window
+    /// whose hook calls draft_begin_dev: a capture synchronises this drafter's stream, which there already waits for
+    /// that window (and the window waits for the host's doorbells).  Cheap once captured.
+    bool prepare_dev_round(int n, std::string& err);
+    bool draft_begin_dev(int n, int64_t p, cudaEvent_t after, const int32_t* ver_out, const int32_t* ver_tok, int first,
+                         cudaEvent_t staged, std::string& err);
 
     /// The batch co-draft for several slots in one round (STRATA_BATCH_DRAFT_GROUP).  Each item is one slot's
-    /// draft(2, tokens, p, a) with a single step (max_drafts 1).  This drafter (the owner) stages item i's two rows at
+    /// draft(2, tokens, p, a), one step by default (max_drafts 1).  An item whose drafter allows more steps
+    /// (STRATA_BATCH_MTP_DEPTH sets max_drafts per slot) takes its first draft from the group's head pass and its
+    /// later ones from its own step graphs on its own stream, all queued before the one wait.  This drafter (the owner) stages item i's two rows at
     /// rows 2i, 2i+1 of its own buffers; the front appends each item's K/V into that item's own state; the rest attends
     /// each row over its own item's cells; one head pass gives every item's draft (its row a).  `key` (one bit per slot)
     /// names the item set: one captured graph per key.  `group_applies` checks everything without side effects.
@@ -167,6 +188,8 @@ public:
         int64_t p = 0;                     ///< the first cell of its window
         int a = 0;                         ///< its accepted row (0 or 1)
         int32_t* drafts = nullptr;         ///< receives its draft (one token, then zeros as draft() writes)
+        float* probs = nullptr;            ///< optional: each draft's probability under the draft layer
+        int* n_drafts = nullptr;           ///< optional: how many drafts it got
     };
     bool group_applies(const GroupItem* it, int S) const;
     bool draft_group(const GroupItem* it, int S, int key, std::string& err);
@@ -326,7 +349,9 @@ private:
     int rest_T_ = 1;                   ///< the rest's rows: 1 for the round, 2 per item for a group
     std::vector<cudaGraphExec_t> group_exec_;   ///< by item-set key
     int32_t* grp_out_h_ = nullptr;     ///< pinned: the group's draft ids
+    float* grp_prob_h_ = nullptr;      ///< pinned: ... and their probabilities
     cudaEvent_t grp_ev_ = nullptr;
+    cudaEvent_t grp_sel_ev_ = nullptr; ///< a multi-step item: its first draft taken from the owner's rows
     bool capture_group(int key, GroupSeg* segs, int S, std::string& err);
     bool pend_ = false;                 // a draft_begin awaits its draft_end
     int pend_max_steps_ = 0;

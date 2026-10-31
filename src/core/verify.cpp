@@ -4938,7 +4938,31 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     clear_device_rows();
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    // set_post_launch: work on other streams that waits for this window on the device.  A failure is reported after
+    // the window has been served and has finished (its graph waits for this host's doorbells).
+    std::string post_err;
+    const bool post_ok = !post_launch_ || le_ < g.n_layers || post_launch_(cs_, post_err);
     (void) cudaStreamQuery(cs_);
+    auto post_check = [&]() -> bool {
+        if (post_ok) return true;
+        err = post_err.empty() ? std::string("verify: the post-launch work failed") : post_err;
+        return false;
+    };
+    // set_route_record: this window's ids per layer, kept for the caller (route_at_ names the window)
+    if (route_rec_) {
+        const size_t nl = (size_t) std::max<int64_t>(0, le_ - lb_);
+        route_k_ = ss_->k;
+        route_stride_ = (size_t) strata::kernels::kVerifyMaxT * (size_t) route_k_;
+        if (route_ids_.size() != nl * route_stride_) {
+            route_ids_.assign(nl * route_stride_, -1);
+            route_at_.assign(nl, 0);
+            route_n_.assign(nl, 0);
+        }
+        if (++route_seq_ == 0) {   // (the counter wrapped: forget every record rather than mistake an old one)
+            std::fill(route_at_.begin(), route_at_.end(), 0u);
+            route_seq_ = 1;
+        }
+    }
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int64_t steps = le_ - lb_;
@@ -4959,6 +4983,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
         cudaStreamSynchronize(copy_);
+        if (!post_check()) return false;
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -4976,8 +5001,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         auto last_flush = a;
         uint32_t spins = 0;
         progress_at("verify batch: waiting for the GPU to reach layer", l);
+        bool ahead = ahead_ != nullptr;   // set_layer_ahead: its work for layer l, a little between the doorbell checks
         while (*seq < want) {
-            strata_cpu_pause();
+            if (ahead) ahead = ahead_(ahead_user_, l);
+            else strata_cpu_pause();
             if ((++spins & 1023u) != 0) continue;
             const auto now = Clock::now();
             if (now - last_flush > std::chrono::microseconds(2000)) {
@@ -5006,6 +5033,13 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         sink_.partial = nullptr;
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
         if (remote_opt_) remote_opt_->end();
+        if (route_rec_ && !route_ids_.empty() && S <= strata::kernels::kVerifyMaxT) {
+            const size_t i = (size_t) k;
+            std::memcpy(route_ids_.data() + i * route_stride_, (const int32_t*) h_ids_,
+                        (size_t) S * (size_t) route_k_ * sizeof(int32_t));
+            route_at_[i] = route_seq_;
+            route_n_[i] = S;
+        }
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         strata_store_fence();
@@ -5026,6 +5060,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
     cudaStreamSynchronize(copy_);
+    if (!post_check()) return false;
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);

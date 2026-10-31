@@ -188,6 +188,12 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs = nullptr,
                 float* out_p = nullptr);
+/// STRATA_BATCH_MTP_DEVACCEPT: a slot's next draft round staged from its window on the device.  a = how many of the
+/// rows [first, first + n) the target confirmed (ver_out[first + j] == ver_tok[first + j + 1], j < n - 1, from the
+/// start); tok[t] = ver_out[first + t] (t < n); row = {a, 0}; the cells of step row 2 * max_t - 1 (p + a) and of step
+/// rows max_t + j - 1 (p + a + j, 1 <= j < steps) as MtpDrafter stages them on the host.
+void mtp_dev_accept(const int32_t* ver_out, const int32_t* ver_tok, int first, int n, int32_t* tok, int32_t* row,
+                    int32_t* step, int32_t* pos, int64_t n_head, int max_t, int64_t p, int steps, void* stream);
 /// --pipeline-windows, the drafter's chain teacher forced: `*tok = force[j]` when force[j] >= 0 (`force` is mapped
 /// host memory, read when the kernel runs), else `*tok` is left as it is.
 void force_token(int32_t* tok, const int32_t* force, int j, void* stream);

@@ -851,6 +851,42 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
     check("mtp_select");
 }
 
+__global__ void mtp_dev_accept_kernel(const int32_t* ver_out, const int32_t* ver_tok, int first, int n, int32_t* tok,
+                                      int32_t* row, int32_t* step, int32_t* pos, int64_t n_head, int max_t, int64_t p,
+                                      int steps) {
+    __shared__ int s_a;
+    if (threadIdx.x == 0) {
+        int a = 0;
+        while (a + 1 < n && ver_out[first + a] == ver_tok[first + a + 1]) ++a;
+        s_a = a;
+        row[0] = a;
+        row[1] = 0;
+    }
+    __syncthreads();
+    const int a = s_a;
+    for (int t = threadIdx.x; t < n; t += blockDim.x) tok[t] = ver_out[first + t];
+    // step row 2*max_t-1 (the round's rest, cell p+a) and rows max_t+j-1 (the steps, cell p+a+j)
+    for (int j = 0; j < steps; ++j) {
+        const int r = j == 0 ? 2 * max_t - 1 : max_t + j - 1;
+        const int64_t cell = p + a + j;
+        if (threadIdx.x == 0) {
+            step[r * 4 + 0] = (int32_t) cell;
+            step[r * 4 + 1] = (int32_t) (cell + 1);
+            step[r * 4 + 2] = (int32_t) ((cell + 1) / 4);
+            step[r * 4 + 3] = (int32_t) (cell + 1);
+        }
+        for (int64_t h = threadIdx.x; h < n_head; h += blockDim.x) pos[(int64_t) r * n_head + h] = (int32_t) cell;
+    }
+    __threadfence_system();
+}
+
+void mtp_dev_accept(const int32_t* ver_out, const int32_t* ver_tok, int first, int n, int32_t* tok, int32_t* row,
+                    int32_t* step, int32_t* pos, int64_t n_head, int max_t, int64_t p, int steps, void* stream) {
+    mtp_dev_accept_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ver_out, ver_tok, first, n, tok, row, step, pos, n_head,
+                                                                max_t, p, steps);
+    check("mtp_dev_accept");
+}
+
 void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {
     force_token_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(tok, force, j);
     check("force_token");
