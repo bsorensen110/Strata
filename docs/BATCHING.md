@@ -41,6 +41,12 @@ by default, and the pipelined path does not run the slots' MTP drafts, so with `
 engine (0.1.43.1) pipelines and leaves `--batch-mtp` off, and says so (0.1.42/0.1.43 ran one serial group with it: 4 streams on 2x A4000 aggregated 63.9 tok/s against 91.8 pipelined, 85.8 pipelined without `--batch-mtp`; #2038). `--batch-groups 1` or `STRATA_BATCH_MTP_SERIAL=1` keeps `--batch-mtp` with serial windows, which is the better choice for about two streams as measured below; `--batch-groups G` (G above 1) or `--batch-groups auto` given on the command line
 keeps the pipeline and turns `--batch-mtp` off. Only a layer split of two stages on two GPUs has been run.
 
+Two opt-in switches for the serial `--batch-mtp` windows are in testing; neither has been measured yet
+([DECODE-DRAFT-SPEEDUP-IDEAS-2026-10-30.md](DECODE-DRAFT-SPEEDUP-IDEAS-2026-10-30.md#adaptive-depth-and-on-device-draft-handoff)).
+`STRATA_BATCH_MTP_DEPTH=N` lets a slot whose proposals keep being accepted check up to N proposals per window (more
+with `--batch-draft-window 16` on one GPU). `STRATA_BATCH_MTP_DEVTOK=1` keeps the draft tokens on the GPU so the host
+does not wait for each slot's draft (one GPU, no PLE). Unset, the windows run as before.
+
 Measured on a layer split of 2x RTX 3080 20 GB (220 W cap) with a Xeon E5-2696 v4, UD-Q4_K_XL, `"layer_split": "23"`,
 `"parallel": 2`, `--spec 4`: two concurrent greedy decodes of 300 tokens, the two streams' tok/s added, median of
 the measurements (10 rounds of two streams after each restart of the engine, 20 measurements per restart). The

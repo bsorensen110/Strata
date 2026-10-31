@@ -4859,8 +4859,15 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         return false;
     const Clock::time_point t0 = Clock::now();
     const QsaShapes s = shapes_of(g);
+    bool any_dev = false;
+    for (int t = 0; t < S; ++t) any_dev = any_dev || dev_rows_[t];
+    if (any_dev && ((ss_->ple.ready() && ple_stage()) || next_ != nullptr || lb_ > 0)) {
+        clear_device_rows();
+        err = "verify: device-fed token rows need one verifier without PLE (STRATA_BATCH_MTP_DEVTOK)";
+        return false;
+    }
     for (int t = 0; t < S; ++t) {
-        h_tok_[t] = tokens[t];
+        if (!dev_rows_[t]) h_tok_[t] = tokens[t];   // (add_device_rows: another stream writes this row's token)
         qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
         for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
         int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
@@ -4919,8 +4926,16 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     using namespace strata::kernels;
     const OnDevice on_device(device_);
     const ModelGeometry& g = *g_;
-    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
-    if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    if (pre_launch_ && !pre_launch_(cs_, err)) { clear_device_rows(); return false; }
+    if (!stage_batch(rows, S, 0, tokens, pos, err)) { clear_device_rows(); return false; }
+    // add_device_rows: the rows another stream fills are written once its event fires; the launch waits on the device
+    for (int i = 0; i < dev_n_ev_; ++i)
+        if (cudaStreamWaitEvent(cs_, dev_ev_[i], 0) != cudaSuccess) {
+            clear_device_rows();
+            err = "verify: waiting for the device-fed token rows failed";
+            return false;
+        }
+    clear_device_rows();
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
