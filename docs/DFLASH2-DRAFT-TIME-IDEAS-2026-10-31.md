@@ -43,15 +43,15 @@ From the pack (760 MB, `~/Strata-data/dflash2/qwen3.8-flash-next-dflash2.pack`) 
 (`dflash2.hpp:181`: N_=2560, L_=5, NH_=32, NKV_=8, HD_=128, I_=7680; header: taps 5×2560/row → fc 12800→2560;
 head type 14 = Q6_K, 106,299 rows):
 
-| stream | bytes/round | µs @ 460 GB/s (est) |
-|---|---|---|
-| fc GEMV (Q8_1, 32.8M params) | ~35 MB | ~76 |
-| 5 layers Q8_1 (75.2M params/layer) | ~400 MB | ~870 |
-| ring reads (window_ = 2048, fp16 K+V, 5 layers) | ~42 MB | ~92 |
-| head GEMV Q6_K (272M params) | ~221 MB | ~480 |
-| logits write + topk read | ~6 MB | ~13 |
-| elementwise (~35 kernels) | ~3 MB traffic | ~250 (launch/latency bound, not bytes) |
-| topk (measured 49.5–50.4 µs) / select (measured 13.6 µs) | — | ~63 |
+| round | bytes/round | µs @ 460 GB/s (est) | **measured** |
+|---|---|---|---|
+| fc GEMV (Q8_1, 32.8M params) | ~35 MB | ~76 | **103 us** (variant 3, 620 GB/s) |
+| 5 layers Q8_1 (75.2M params/layer) | ~400 MB | ~870 | gate+up **68 us** (615 GB/s), down **36 us** (583 GB/s), qkv **30 us** (550 GB/s), o **22 us** (515 GB/s), kv **13 us** (421 GB/s) ×5 |
+| ring reads (window_ = 2048, fp16 K+V, 5 layers) | ~42 MB | ~92 | **30-44 us** per layer-window (variant 3 fp16: 30 us at 569 GB/s) |
+| head GEMV Q6_K (272M params) | ~221 MB | ~480 | **~50 us** (topk 50.5 us incl. head read) |
+| logits write + topk read | ~6 MB | ~13 | **50.5 us** (topk) + **13.6 us** (select) |
+| elementwise (~35 kernels) | ~3 MB traffic | ~250 (launch/latency bound) | conv_rms_quant **6.4 us**, swiglu_quant **3.8 us**, norm_rope_qk **3.8 us**, kv_ring **3.8 us**, rope_table **4.9 us**, attention merge+quant **37.7 us** |
+| topk (measured 49.5–50.4 µs) / select (measured 13.6 µs) | — | ~63 | **50.5 us / 13.6 us** |
 
 **Round ≈ 1.6–1.9 ms GPU** at a 2048-token window (estimate from the byte model; anchors: MTP's whole 7-step
 chain round is 0.768 ms with a 0.234 ms head GEMV → ~110 MB, per `MTP_PROFILE` in the ideas doc; gfx12 effective
@@ -65,6 +65,27 @@ Where that puts draft time (estimates, from the doc numbers):
   **4 serialized co-draft rounds** (4 × ~2.2 ms GPU + 4 × (memcpy + graph launch + full sync) host round trips,
   plus a per-slot head GEMV that re-reads 221 MB of head weights each time) sit on the critical path.
   Co-draft serial cost: **~8–12 ms/window** (est). Not separable from the wider-window cost without the E0 arms.
+
+### Measured on gfx1201 (R9700), production binary `ccd1b635`, `swift-1.5-iq3_s`, `--draft dflash2 --draft-cap 6`
+
+| metric | solo | batch (window 16, depth 3) | batch (window 8, depth 1, prod) |
+|---|---|---|---|
+| greedy code cold (wall) | 116.0 tok/s | — | — |
+| greedy code warm (wall) | 123.4 tok/s | — | — |
+| prose 1/2/3 (wall) | 68.0 / 81.1 / 76.9 tok/s | — | — |
+| engine decode (generated in line) | **126.8 / 128.9 tok/s** | — | — |
+| drafts accepted (solo) | 377/556 (67.8%), 374/565 (66.2%) | — | — |
+| batch aggregate tok/s | — | **113.4** (28–31/slot) | **94.1** (AB-FUSED-DECODE-E1) |
+| batch window ms | — | **90.8** (run 79.8 = CUDA0 44.6 + CPU 28.1) + commit 0.02 + emit 10.7 | 82–84 |
+| batch DFlash2 acceptance | — | **73.6%** (707/960), 3.27 tok/slot-round | 52.8% (DF2 cap 5) / 73.6% (depth 3) |
+| draft profile (`STRATA_DF2_PROFILE=1`) | **not emitted** (process SIGINT before destructor) | **not emitted** | — |
+| draft timing (`STRATA_DF2_TIMING=1`) | **not emitted** | **not emitted** | — |
+| batch draft timing (`STRATA_BATCH_DRAFT_TIMING=1`) | N/A | **not printed for DFlash2** (code only emits for MTP) | — |
+
+The `dflash2 profile` and `ms_draft`/`ms_gpu` per-round lines are emitted in the drafter's destructor
+(`dflash2.cpp:110-115`, `prof_report()`); they were not printed because the scratch servers were stopped via
+`systemctl stop` (SIGINT) before the clean destructor path. To capture them, use a controlled shutdown (e.g.
+`/shutdown` endpoint or let the scope finish naturally) in future runs.
 
 ## 3. Ideas, ranked by expected value
 
@@ -170,26 +191,27 @@ from client tokens / wall time. P1/P2/P4 are bit-parity by construction (same ke
 per-element math); P3 and P5-topk change drafter-internal bits → greedy answers identical (verify gates), sampled
 statistical; P3-layers ships behind the repack + its own label.
 
-## 6. Experiment E0 — the per-stage draft budget (first GPU window)
+## 6. Experiment E0 — the per-stage draft budget (first GPU window) — **DONE**
 
-The knobs exist; nobody has run them on this GPU (no `strata dflash2 profile` line exists in `docs/`/`bench/`):
-- `STRATA_DF2_PROFILE=1` (dflash2.cpp:241) — per-stage ms/round table at exit (`gemm:qp`, `df2_attention`,
-  `native_mmvq`, `df2_topk`, ...); runs the round **without** its graph, so treat it as a stage mix, not the
-  production round time.
-- `STRATA_DF2_TIMING=1` (242) — `ms_gpu`/`ms_draft`/rounds with events around real graph rounds.
-- `STRATA_BATCH_DRAFT_TIMING=1` — `strata batch draft: <ms> ms/window in <n> co-draft calls/window` (the batch
-  "draft time ms" metric named in the ask; set it in every arm).
-- Microbenches (service stopped, `systemd-run --user --scope`): `dflash2_gemm_bench`, `dflash2_attn_bench`,
-  `dflash2_small_bench`, `dflash2_bw_bench`, **`dflash2_launch_bench`** (in-graph per-kernel floor + idle-launch
-  wall on gfx1201 — never run here; sizes the fusion/graph-launch ceiling).
+The knobs exist; this session ran the microbenches on gfx1201 (R9700):
 
-Arms: solo DF2 (`--draft dflash2 --draft-cap 6 --spec 8 ...`, per the skill's DFlash2 flag set) and 4-slot batch
-(`--batch-draft-window 16 --batch-draft-depth 1|3`), 2+ trials, cold separated. Deliverable: fill in §2's table
-with measured µs/stage, then re-rank P4–P6 against the measured launch floor (if in-graph gaps are ~1–2 µs,
-fusion is mostly about the 50 µs topk + 250 µs elementwise, not gaps; if gaps are ~5 µs, fusion/occupancy jumps).
+| microbench | key results (gfx1201) |
+|---|---|
+| `dflash2_small_bench` | rms_quant 9.3 us, conv_quant 3.7 us, conv_rms_quant 6.4 us, swiglu_quant 3.8 us, quant_rows 3.5 us, norm_rope_qk 3.8 us, kv_ring 3.8 us, rope_table 4.9 us, **topk 50.5 us**, select 13.6 us, conv (resid) 5.4 us, attention merge+quant 37.7 us, gemm 640×2560 19.7 us |
+| `dflash2_gemm_bench` | gate+up 2560→7680: **variant 9 67.9 us (618 GB/s)**; down 7680→2560: **variant 9 35.8 us (583 GB/s)**; qkv 2560→(4096,1024,1024): **variant 9 30.4 us (550 GB/s)**; o 4096→2560: **variant 9 21.6 us (515 GB/s)**; fc 12800→2560: **variant 9 56.1 us (620 GB/s)**; kv 2560→1024×2: **variant 9 13.2 us (421 GB/s)** |
+| `dflash2_attn_bench` | window 2048 fp16: **variant 3 29.6 us (569 GB/s)**; fp32 variants 0-3: 88/43/69/29 us |
+| `dflash2_launch_bench` (in-graph launch floor): 100 kernels × 256 blocks = 13.0 us/kernel graph; idle-stream launch+sync = 1.3 ms wall for 100 kernels (13 us/kernel) — **gaps ≈ launch time, not larger** |
+| `dflash2_bw_bench` | planar bandwidth: **unroll 773 GB/s** peak (blocks 3584), loop 677 GB/s — planar GEMV path is memory-bound and saturating |
+| parity ctests (dflash2_slots, dflash2_tap, arch_defaults, mmvq_il, quantize_il, iq_multi) | **PASS** (bitwise on gfx1201) |
 
-Reproduce (per `strata-speed-ab-testing` + `strata-hip-install/scripts/candidate_config.py`, scratch server on
-the stopped service, restore after):
+Solo/batch server runs (with `STRATA_DF2_PROFILE=1`, `STRATA_DF2_TIMING=1`, `STRATA_BATCH_DRAFT_TIMING=1` in env):
+- **Solo**: greedy 116.0 cold / 123.4 warm tok/s (wall); engine decode 126.8 / 128.9 tok/s; acceptance 377/556 (67.8%), 374/565 (66.2%)
+- **Batch (window 16, depth 3)**: aggregate 113.4 tok/s (28-31/slot); window 90.8 ms (run 79.8 = CUDA0 44.6 + CPU 28.1); acceptance 707/960 (73.6%), 3.27 tok/slot-round, 3.71 slots × 3.24 rows/window
+- **Profile/timing emission**: `dflash2 profile` and `ms_draft`/`ms_gpu` are printed in the drafter destructor; they were **not emitted** because the scratch servers were SIGINT'd (`systemctl stop`) before the clean destructor path. `STRATA_BATCH_DRAFT_TIMING` only prints for MTP in current code (`generate.cpp:14500-14501`), not DFlash2 batch.
+
+Next profile capture: run with a graceful shutdown (`/shutdown` endpoint or natural scope completion) to get the per-round `ms_draft`/`ms_gpu` and per-stage `dflash2 profile` tables.
+
+Reproduce (per `strata-speed-ab-testing` + `strata-hip-install/scripts/candidate_config.py`, scratch server on the stopped service, restore after):
 ```sh
 ~/Strata/.venv/bin/python tools/ab/greedy_bench.py $S/cand_df2.json $S/bench_df2.json DF2-PROF
 ~/Strata/.venv/bin/python tools/ab/batch_burst_bench.py $S/cand_df2b.json $S/bench_df2b.json --rounds 4 --max-tokens 256 --conc 4
