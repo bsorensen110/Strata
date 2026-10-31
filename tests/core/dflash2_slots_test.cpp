@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <string>
 
+using strata::core::df2_batch_slot_max_k;
 using strata::core::df2_bind_bytes;
 using strata::core::df2_graphs_valid_for;
 using strata::core::df2_ring_bytes;
@@ -51,6 +52,9 @@ static_assert(df2_slots_after_failed_grow(1, 3) == 1, "failed growth: back to th
 // drafter-wide one that another slot's prepare() could move.
 constexpr const float t1 = 0, t2 = 0;
 static_assert(df2_graphs_valid_for(&t1, &t1) && !df2_graphs_valid_for(&t1, &t2), "the taps guard reads the slot's own captured pointer");
+static_assert(df2_batch_slot_max_k(8, 4, 4, 6) == 1, "8-row window with 4 selected+ready slots fits at most 1 proposal per slot");
+static_assert(df2_batch_slot_max_k(8, 3, 3, 6) == 3, "8-row window with 3 selected+ready slots fits up to 3 proposals on one slot");
+static_assert(df2_batch_slot_max_k(16, 4, 4, 3) == 3, "16-row window with 4 slots capped at depth 3 allows all 3 proposals");
 }  // namespace ct
 
 namespace {
@@ -193,6 +197,15 @@ int main() {
     check_eq(df2_bind_bytes(2100, 248320, 0, 7),
              7ull * 248320ull * 4,
              "df2_bind_bytes without draft_vocab.bin counts 7*n_vocab*4 logits (head stays in place)");
+
+    // df2_batch_slot_max_k: exact upper bound on proposal rows a slot can be offered in the next window
+    check_eq((uint64_t) df2_batch_slot_max_k(8, 4, 4, 6), 1, "W=8, 4 selected, 4 ready -> at most 1 proposal/slot (4 total head rows)");
+    check_eq((uint64_t) df2_batch_slot_max_k(8, 3, 3, 6), 3, "W=8, 3 selected, 3 ready -> up to 3 proposals on a slot");
+    check_eq((uint64_t) df2_batch_slot_max_k(8, 2, 2, 3), 3, "W=8, 2 selected, 2 ready, k_cap=3 -> all 3 proposals fit");
+    check_eq((uint64_t) df2_batch_slot_max_k(16, 4, 4, 3), 3, "W=16, 4 selected, 4 ready, k_cap=3 -> all 3 proposals fit");
+    check_eq((uint64_t) df2_batch_slot_max_k(16, 4, 4, 6), 6, "W=16, 4 selected, 4 ready, k_cap=6 -> up to 6 proposals fit");
+    check_eq((uint64_t) df2_batch_slot_max_k(8, 8, 8, 6), 1, "tight window never drops below 1 proposal when k_cap >= 1");
+    check_eq((uint64_t) df2_batch_slot_max_k(8, 4, 4, 0), 0, "k_cap 0 -> 0 proposals");
 
     std::printf("dflash2_slots_test: %ld checks, %s\n", g_checks, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

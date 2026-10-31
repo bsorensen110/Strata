@@ -51,7 +51,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     auto fr = [](void* p) { if (p) cudaFree(p); };
     fr(blob_); fr(d_meta_); fr(xq_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rt_blk_);
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
-    fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
+    fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(fn_batch_); fr(hsel_batch_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
     fr(dvocab_); fr(dhead_);
     if (h_meta_) cudaFreeHost(h_meta_);
     if (h_out_) cudaFreeHost(h_out_);
@@ -259,20 +259,22 @@ bool Dflash2Drafter::alloc(std::string& err) {
               dev(&fcy_, B * N_) && dev(&hctx_, B * N_) && dev(&kc_, B * NKV_ * HD_) && dev(&vc_, B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
               dev(&xc_, B * N_) && dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
-              dev(&part_, (size_t) kernels::df2_attention_chunks(window_) * 8 * 32 * 130) && dev(&fn_, B * N_) && dev(&topval_, kDrafts * 16) && dev(&toptok_, kDrafts * 16) &&
+              dev(&part_, (size_t) kernels::df2_attention_chunks(window_) * 8 * 32 * 130) && dev(&fn_, B * N_) &&
+              dev(&fn_batch_, (size_t) kBatchMaxRows * N_) && dev(&hsel_batch_, (size_t) kBatchMaxRows * rank_) &&
+              dev(&topval_, (size_t) kBatchMaxRows * 16) && dev(&toptok_, (size_t) kBatchMaxRows * 16) &&
               dev(&hsel_, kDrafts * rank_) && dev(&topscratch_, (size_t) kDrafts * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
     for (auto& sl : slots_)
         if (ok && !alloc_slot_rings(*sl)) ok = false;   // every slot the drafter was grown to before load()
     if (!ok) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
     void* hd = nullptr;
     void* dd = nullptr;
-    if (!mapped(32 * 4, (void**) &hd, &dd)) { err = "dflash2: mapped staging"; return false; }
+    if (!mapped((kDf2MaxSlots * 32 + kDf2MaxSlots * 4) * 4, (void**) &hd, &dd)) { err = "dflash2: mapped staging"; return false; }
     h_meta_ = (int32_t*) hd;
     m_meta_ = (int32_t*) dd;
-    if (!mapped(64 * 4, &hd, &dd)) { err = "dflash2: mapped output"; return false; }
+    if (!mapped(128 * 4, &hd, &dd)) { err = "dflash2: mapped output"; return false; }
     h_out_ = (int32_t*) hd;
-    out_tok_ = (int32_t*) dd;            // the select kernel writes the 7 picks here (host-visible) ...
-    out_prob_ = (float*) dd + 16;        // ... and their probabilities at +16 ints
+    out_tok_ = (int32_t*) dd;            // the select kernel writes the picks here (8 ints per slot, up to 8 slots) ...
+    out_prob_ = (float*) dd + 64;        // ... and their probabilities at +64 ints
     cudaMemset(rt_ctx_, 0, B * 128 * 4);
     cudaMemset(xqp_, 0, (size_t) 5 * N_ * 8 + 4096);
     cudaMemset(xdp_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
@@ -302,6 +304,8 @@ bool Dflash2Drafter::alloc_slot_rings(Slot& sl) {
 
 void Dflash2Drafter::free_slot(Slot& sl) {
     for (cudaGraphExec_t& e : sl.exec_)
+        if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    for (cudaGraphExec_t& e : sl.body_exec_)
         if (e) { cudaGraphExecDestroy(e); e = nullptr; }
     // the bytes this slot's planes were cudaMalloc'd with, not a recompute from the current geometry.
     // up to 8, not L_: a half-loaded drafter can hold rings for layers it never validated
@@ -524,7 +528,7 @@ bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, s
     return true;
 }
 
-bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
+bool Dflash2Drafter::record_block_body(cudaStream_t cs, std::string& err) {
     using namespace kernels;
     Slot& sl = cur();   // the block attends over the active conversation's ring
     try {
@@ -577,6 +581,19 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_, group_, eps_, xqp_, xdp_, cs);
             stamp("df2_conv_rms_quant");
         }
+        // df2_conv_rms_quant on the final layer has already quantized fn_ rows 1..7 into xqp_ + N_ and xdp_ + N_ / 32
+        gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, kDrafts, cs, xqp_ + N_, xdp_ + N_ / 32);
+        stamp("gemm:candidate_selector.hidden_projection");
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    return true;
+}
+
+bool Dflash2Drafter::record_block_head(cudaStream_t cs, std::string& err) {
+    using namespace kernels;
+    try {
         native_quantize_q8_1(fn_ + N_, xq_, N_, kDrafts, cs);   // rows 1..7, the head's format
         if (!skip_part("head")) {
             static const int head_il = [] {
@@ -600,9 +617,6 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
         stamp("native_mmvq");
         df2_topk(logits_, (int) n_dvocab_, dvocab_, kDrafts, topscratch_, topval_, toptok_, cs);
         stamp("df2_topk");
-        // df2_conv_rms_quant on the final layer has already quantized fn_ rows 1..7 into xqp_ + N_ and xdp_ + N_ / 32
-        gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, kDrafts, cs, xqp_ + N_, xdp_ + N_ / 32);
-        stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, kDrafts, d_meta_ + 16, out_tok_,
                    out_prob_, cs);
@@ -611,6 +625,10 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
         return false;
     }
     return true;
+}
+
+bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
+    return record_block_body(cs, err) && record_block_head(cs, err);
 }
 
 // Captures against the active slot: the graph bakes this slot's ring pointers and the taps staging pointer,
@@ -623,7 +641,7 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     if (sl.exec_[n]) return true;
     if (!df2_graphs_valid_for(sl.taps_, taps)) { err = "dflash2: capture: this slot's graphs are captured on another taps buffer"; return false; }
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin capture"; return false; }
-    kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
+    kernels::copy_i32_from_mapped(d_meta_, m_meta_ + (size_t) cur_ * 32, 32, cs_);
     // the context update (fc, the keys and values) and the block's front run side by side: they meet before each layer's attention
     // measured: -0.3 ms a round on an RTX 3060, +0.0..0.7 on a Strix Halo (gfx1151), so the HIP builds keep one stream (STRATA_DF2_FORK=1 / 0 overrides)
 #if defined(STRATA_USE_HIP)
@@ -657,14 +675,63 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     return true;
 }
 
+bool Dflash2Drafter::capture_body(int n, const float* taps, std::string& err) {
+    Slot& sl = cur();
+    if (sl.body_exec_[n]) return true;
+    if (!df2_graphs_valid_for(sl.taps_, taps)) { err = "dflash2: capture_body: this slot's graphs are captured on another taps buffer"; return false; }
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin capture"; return false; }
+    kernels::copy_i32_from_mapped(d_meta_, m_meta_ + (size_t) cur_ * 32, 32, cs_);
+#if defined(STRATA_USE_HIP)
+    static const bool fork_default = false;
+#else
+    static const bool fork_default = true;
+#endif
+    const bool fork_on = [] { const char* e = std::getenv("STRATA_DF2_FORK"); return e && e[0] ? e[0] == '1' : fork_default; }();
+    fork_ = fork_on && prof_ == nullptr && cs2_ != nullptr;
+    if (fork_) {
+        cudaEventRecord(ev_fork_, cs_);
+        cudaStreamWaitEvent(cs2_, ev_fork_, 0);
+    }
+    bool ok = record_context(taps, n, fork_ ? cs2_ : cs_, err);
+    if (fork_) cudaEventRecord(ev_join_, cs2_);
+    if (ok) ok = record_block_body(cs_, err);
+    if (fork_) cudaStreamWaitEvent(cs_, ev_join_, 0);
+    fork_ = false;
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
+    if (ce != cudaSuccess || cudaGraphInstantiate(&sl.body_exec_[n], graph, 0) != cudaSuccess) {
+        if (graph) cudaGraphDestroy(graph);
+        err = std::string("dflash2: capture_body: ") + cudaGetErrorString(ce);
+        return false;
+    }
+    cudaGraphDestroy(graph);
+    cudaGraphUpload(sl.body_exec_[n], cs_);
+    cudaStreamSynchronize(cs_);
+    sl.taps_ = taps;
+    return true;
+}
+
 bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     if (!bound_) { err = "dflash2: not bound"; return false; }
     if (prof_ != nullptr) return true;   // the profile runs without graphs
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
-    for (int i = 0; i < 8; ++i) h_meta_[i] = i;
-    for (int n = 1; n <= kRows; ++n)
-        if (!capture(n, taps, err)) return false;
+    const int saved_cur = cur_;
+    if (slots_.size() > 1 && cur_ == 0) {
+        for (int s = 0; s < (int) slots_.size(); ++s) {
+            if (!df2_graphs_valid_for(slots_[(size_t) s]->taps_, taps)) continue;
+            cur_ = s;
+            for (int i = 0; i < 8; ++i) h_meta_[(size_t) s * 32 + i] = i;
+            for (int n = 1; n <= kRows; ++n)
+                if (!capture_body(n, taps, err)) { cur_ = saved_cur; return false; }
+        }
+        cur_ = saved_cur;
+    } else {
+        for (int i = 0; i < 8; ++i) h_meta_[(size_t) cur_ * 32 + i] = i;
+        for (int n = 1; n <= kRows; ++n)
+            if (!capture(n, taps, err)) return false;
+    }
     ms_capture = ms_since(t0);
     return true;
 }
@@ -673,12 +740,13 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
     const OnDevice on_device(device_);
     Slot& sl = cur();
     const int tap_n = (int) taps_.size() * N_;
+    int32_t* hm = h_meta_ + (size_t) cur_ * 32;
     for (int64_t r0 = 0; r0 < n; r0 += kRows) {
         const int m = (int) std::min<int64_t>(kRows, n - r0);
-        for (int i = 0; i < m; ++i) h_meta_[i] = (int32_t) (pos0 + r0 + i);
+        for (int i = 0; i < m; ++i) hm[i] = (int32_t) (pos0 + r0 + i);
         for (int i = 0; i < m; ++i) mirror_cell(sl, pos0 + r0 + i) = (int32_t) (pos0 + r0 + i);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
+        kernels::copy_i32_from_mapped(d_meta_, m_meta_ + (size_t) cur_ * 32, 32, cs_);
         if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, cs_, err)) return false;
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     }
@@ -695,19 +763,20 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     // the guard is this slot's: its graphs read the buffer this slot captured on (Slot::taps_), so a
     // prepare() on another slot cannot move it out from under them (df2_graphs_valid_for)
     if (!df2_graphs_valid_for(sl.taps_, taps)) { err = "dflash2: the taps buffer moved after capture"; return false; }
+    int32_t* hm = h_meta_ + (size_t) cur_ * 32;
     if (!prof_ && !sl.exec_[n_new]) {
         // the staging must hold valid positions while the capture runs the (empty) kernels' parameter checks;
         // an extra slot reaches here on its first draft() and captures its graphs against its own rings
-        for (int i = 0; i < 8; ++i) h_meta_[i] = (int32_t) (pos0 + i);
+        for (int i = 0; i < 8; ++i) hm[i] = (int32_t) (pos0 + i);
         if (!capture(n_new, taps, err)) return false;   // capture() records this slot's taps_ on success
     }
     const int64_t s = pos0 + n_new;
-    for (int i = 0; i < 8; ++i) { h_meta_[i] = (int32_t) (pos0 + std::min(i, n_new - 1)); h_meta_[8 + i] = (int32_t) (s + i); }
+    for (int i = 0; i < 8; ++i) { hm[i] = (int32_t) (pos0 + std::min(i, n_new - 1)); hm[8 + i] = (int32_t) (s + i); }
     for (int i = 0; i < n_new; ++i) mirror_cell(sl, pos0 + i) = (int32_t) (pos0 + i);
-    h_meta_[16] = anchor;
-    h_meta_[17] = (int32_t) s;
-    h_meta_[24] = anchor;
-    for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
+    hm[16] = anchor;
+    hm[17] = (int32_t) s;
+    hm[24] = anchor;
+    for (int i = 1; i < 8; ++i) hm[24 + i] = mask_token_;
     for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (timing_) cudaEventRecord(ev_a_, cs_);
@@ -716,7 +785,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
         for (cudaEvent_t e : prof_->ev) cudaEventDestroy(e);   // the stamps of context() calls are not a round
         prof_->ev.clear();
         prof_->name.clear();
-        kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
+        kernels::copy_i32_from_mapped(d_meta_, m_meta_ + (size_t) cur_ * 32, 32, cs_);
         stamp("start");
         if (!record_context(taps, n_new, cs_, err) || !record_block(cs_, err)) return false;
         prof_collect();
@@ -727,7 +796,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     for (int i = 0; i < kDrafts; ++i) {
         drafts[i] = ((volatile int32_t*) h_out_)[i];
-        if (probs) probs[i] = ((volatile float*) h_out_)[16 + i];
+        if (probs) probs[i] = ((volatile float*) h_out_)[64 + i];
     }
     if (timing_) {
         float ms = 0;
@@ -736,6 +805,155 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     sl.have_ctx_ = std::max<int64_t>(sl.have_ctx_, s);
     ms_draft += ms_since(t0);
     ++rounds;
+    return true;
+}
+
+bool Dflash2Drafter::draft_batch(const BatchItem* items, int n_items, float* stage_taps, size_t stage_stride, std::string& err) {
+    if (!bound_) { err = "dflash2: not bound"; return false; }
+    if (n_items == 0) return true;
+    if (items == nullptr || n_items < 0 || n_items > kDf2MaxSlots) { err = "dflash2: invalid batch items"; return false; }
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    const int saved_cur = cur_;
+
+    int total_rows = 0;
+    for (int idx = 0; idx < n_items; ++idx) {
+        const BatchItem& it = items[idx];
+        if (!df2_slot_ok(it.slot, (int) slots_.size())) { err = "dflash2: batch slot out of range"; return false; }
+        if (it.n_new < 1 || it.n_new > kRows) { err = "dflash2: batch draft rows out of range"; return false; }
+        if (it.k_want < 1 || it.k_want > kDrafts) { err = "dflash2: batch k_want out of range"; return false; }
+        const float* cap_taps = stage_taps != nullptr ? stage_taps : it.taps;
+        Slot& sl = *slots_[(size_t) it.slot];
+        if (!df2_graphs_valid_for(sl.taps_, cap_taps)) { err = "dflash2: the taps buffer moved after capture"; return false; }
+        if (!prof_ && !sl.body_exec_[it.n_new]) {
+            cur_ = it.slot;
+            int32_t* hm = h_meta_ + (size_t) it.slot * 32;
+            for (int i = 0; i < 8; ++i) hm[i] = (int32_t) (it.pos0 + i);
+            if (!capture_body(it.n_new, cap_taps, err)) { cur_ = saved_cur; return false; }
+        }
+        total_rows += it.k_want;
+    }
+
+    int row_off = 0;
+    int32_t* bmeta = h_meta_ + (size_t) kDf2MaxSlots * 32;
+    for (int idx = 0; idx < n_items; ++idx) {
+        const BatchItem& it = items[idx];
+        Slot& sl = *slots_[(size_t) it.slot];
+        int32_t* hm = h_meta_ + (size_t) it.slot * 32;
+        const int64_t s = it.pos0 + it.n_new;
+        for (int i = 0; i < 8; ++i) {
+            hm[i] = (int32_t) (it.pos0 + std::min(i, it.n_new - 1));
+            hm[8 + i] = (int32_t) (s + i);
+        }
+        for (int i = 0; i < it.n_new; ++i) mirror_cell(sl, it.pos0 + i) = (int32_t) (it.pos0 + i);
+        hm[16] = it.anchor;
+        hm[17] = (int32_t) s;
+        hm[24] = it.anchor;
+        for (int i = 1; i < 8; ++i) hm[24 + i] = mask_token_;
+        bmeta[idx * 4 + 0] = row_off;
+        bmeta[idx * 4 + 1] = it.k_want;
+        bmeta[idx * 4 + 2] = it.anchor;
+        bmeta[idx * 4 + 3] = 0;
+        for (int i = 0; i < it.k_want; ++i) ((volatile int32_t*) h_out_)[idx * 8 + i] = -1;
+        row_off += it.k_want;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+
+    if (timing_) cudaEventRecord(ev_a_, cs_);
+    row_off = 0;
+    for (int idx = 0; idx < n_items; ++idx) {
+        const BatchItem& it = items[idx];
+        Slot& sl = *slots_[(size_t) it.slot];
+        const float* cap_taps = stage_taps != nullptr ? stage_taps : it.taps;
+        if (stage_taps != nullptr && it.taps != stage_taps) {
+            if (cudaMemcpyAsync(stage_taps, it.taps, (size_t) it.n_new * stage_stride * sizeof(float),
+                                cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+                cur_ = saved_cur;
+                err = "dflash2 draft_batch: stage copy failed";
+                return false;
+            }
+        }
+        cur_ = it.slot;
+        if (prof_) {
+            kernels::copy_i32_from_mapped(d_meta_, m_meta_ + (size_t) it.slot * 32, 32, cs_);
+            if (!record_context(cap_taps, it.n_new, cs_, err) || !record_block_body(cs_, err)) {
+                cur_ = saved_cur;
+                return false;
+            }
+        } else if (cudaGraphLaunch(sl.body_exec_[it.n_new], cs_) != cudaSuccess) {
+            cur_ = saved_cur;
+            err = std::string("dflash2 draft_batch: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        try {
+            kernels::df2_pack_head_rows(fn_ + N_, hsel_, fn_batch_ + (size_t) row_off * N_,
+                                        hsel_batch_ + (size_t) row_off * rank_, it.k_want, N_, rank_, cs_);
+        } catch (const std::exception& e) {
+            cur_ = saved_cur;
+            err = e.what();
+            return false;
+        }
+        row_off += it.k_want;
+    }
+    cur_ = saved_cur;
+
+    try {
+        using namespace kernels;
+        static const int head_il = [] {
+            const char* e = std::getenv("STRATA_DFLASH_HEAD_IL");
+            return e && e[0] ? (e[0] != '0' ? 1 : 0) : -1;
+        }();
+        for (int c0 = 0; c0 < total_rows; c0 += kDrafts) {
+            const int nc = std::min((int) kDrafts, total_rows - c0);
+            native_quantize_q8_1(fn_batch_ + (size_t) c0 * N_, xq_, N_, nc, cs_);
+            if (!skip_part("head")) {
+                if (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_))) {
+                    uint8_t* xil = xq_ + native_q8_1_bytes(N_, kRows);
+                    if (nc >= 2) native_q8_1_interleave(xq_, xil, N_, nc, cs_);
+                    if (head_il == 1 && !native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)) {
+                        native_mmvq_il_tune(4);
+                        native_mmvq_il(head_type_, head_w_, xq_, xil, logits_, N_, (int) n_dvocab_, nc, cs_);
+                        native_mmvq_il_tune(0);
+                    } else {
+                        native_mmvq_il(head_type_, head_w_, xq_, xil, logits_, N_, (int) n_dvocab_, nc, cs_);
+                    }
+                } else {
+                    native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, nc, cs_);
+                }
+            }
+            df2_topk(logits_, (int) n_dvocab_, dvocab_, nc, topscratch_,
+                     topval_ + (size_t) c0 * 16, toptok_ + (size_t) c0 * 16, cs_);
+        }
+        df2_select_multi(hsel_batch_, topval_, toptok_,
+                         reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
+                         reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off),
+                         rank_, m_meta_ + (size_t) kDf2MaxSlots * 32, n_items, out_tok_, out_prob_, cs_);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+
+    if (timing_) cudaEventRecord(ev_b_, cs_);
+    (void) cudaStreamQuery(cs_);
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("dflash2 draft_batch: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    for (int idx = 0; idx < n_items; ++idx) {
+        const BatchItem& it = items[idx];
+        for (int i = 0; i < it.k_want; ++i) {
+            it.drafts[i] = ((volatile int32_t*) h_out_)[idx * 8 + i];
+            if (it.probs) it.probs[i] = ((volatile float*) h_out_)[64 + idx * 8 + i];
+        }
+        Slot& sl = *slots_[(size_t) it.slot];
+        sl.have_ctx_ = std::max<int64_t>(sl.have_ctx_, it.pos0 + it.n_new);
+    }
+    if (timing_) {
+        float ms = 0;
+        if (cudaEventElapsedTime(&ms, ev_a_, ev_b_) == cudaSuccess) ms_gpu += ms;
+    }
+    ms_draft += ms_since(t0);
+    rounds += n_items;
     return true;
 }
 

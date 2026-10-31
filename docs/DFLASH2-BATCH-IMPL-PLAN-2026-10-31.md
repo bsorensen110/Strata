@@ -205,3 +205,33 @@ Order of cheapness:
 
 Phases 1+2 are independent of each other and of GPU access for coding; ship each behind its own gate, measure
 interleaved, and only fold defaults into the DFlash2 batch launch line once a window shows the gain.
+
+## Measured Phase 1 (`STRATA_DF2_BATCHHEAD`) + Phase 2 (`STRATA_BATCH_DF2_DEPTH`) Results on `gfx1201` (2026-10-31, build `a83e4a16`)
+
+### Implementation summary
+- **Kernels (`include/strata/kernels/dflash2.hpp`, `src/kernels/cuda/dflash2.cu`)**:
+  - Factored device helper `select_slot_walk` out of `select_kernel` and added `select_multi_kernel` / `df2_select_multi` (1 block of 256 threads per slot reading `batch_meta[idx*4 + 0..2] = {row_off, rows, prev0}` and writing `out_tok[idx*8 + i]`, `out_prob[idx*8 + i]`).
+  - Added `pack_head_rows_kernel` / `df2_pack_head_rows` (fusing `fn` `[rows, N]` and `hsel` `[rows, rank]` packing into `fn_batch_` and `hsel_batch_` in a single launch).
+  - Verified bitwise parity and microbench latency in `dflash2_small_bench`: `select_multi (4 x 3 rows)` = **7.73 µs** (vs `4 × 13.34 = 53.36 µs` for 4 solo launches), `pack_head_rows (3 rows)` = **3.11 µs**, `select_multi + pack_head_rows parity (4 slots, k={7,3,1,5}): PASS`.
+- **Drafter (`include/strata/core/dflash2.hpp`, `src/core/dflash2.cpp`)**:
+  - Split `record_block` into `record_block_body` (block embed + 5 layers + final norm + `candidate_selector.hidden_projection`) and `record_block_head` (draft head GEMM + `df2_topk` + `df2_select`).
+  - Added `Slot::body_exec_[kRows + 1]` and `capture_body(int n, const float* taps, std::string& err)`; `prepare()` captures `body_exec_[1..8]` for all `n_slots()` up front so decode windows never stall on lazy graph capture (`graphs captured in 31–39 ms` for 4 slots).
+  - Implemented `Dflash2Drafter::draft_batch(items, n_items, stage_taps, stage_stride, err)`: queues all slots' `body_exec_[n_new]` + `df2_pack_head_rows` back-to-back on `cs_` with no host sync between slots, runs the `212.9 MiB` `Q6_K` draft head (`native_mmvq_il` / `native_mmvq`) and `df2_topk` across `total_rows = sum(k_want)` in chunks of up to `kDrafts = 7` columns, runs `df2_select_multi` in 1 launch, and calls `cudaStreamSynchronize(cs_)` **once** per window.
+  - Added `df2_batch_slot_max_k(window_cap, n_sel, n_ready, k_cap)` in `include/strata/core/dflash2_slots.hpp` (tested in `tests/core/dflash2_slots_test.cpp`) so each slot only projects `k_want <= max_window_k` head rows that can actually fit in the next verify window (e.g. `1` row/slot = `4` total head rows when 4 slots are active and ready in an 8-row window).
+
+### 4×256 Concurrent Greedy Benchmark (`parallel: 4`, `swift-1.5-iq3_s`, `gfx1201`)
+
+| Metric | Baseline (`W=16, d=3` fixed, serial) | `W=16, d=3` (`DF2_DEPTH=3`, serial) | `W=16, d=3` (`DF2_DEPTH=3, BATCHHEAD=1`) | `W=8, d=1` (`DF2_DEPTH=3`, serial) | `W=8, d=1` (`DF2_DEPTH=3, BATCHHEAD=1`) |
+|---|---|---|---|---|---|
+| Windows | 85 | 96 | 94 | 138 | **139** |
+| Verified rows / window | ~14.2 | 12.42 | 12.63 | 7.89 | **7.91** |
+| Committed tokens / window (`bt_rows`) | 12.13 | 10.61 | 10.84 | 7.38 | **7.33** |
+| Proposal acceptance | 707/960 (73.6%) | 664/837 (79.3%) | 671/839 (80.0%) | 478/548 (87.2%) | 475/555 (**85.6%**) |
+| Stored proposals (`not offered`) | — | 1094 (257) | **969 (130)** | 1714 (1166) | **967 (412)** |
+| **Co-draft `ms/window` (`bt_draft`)** | — | 9.51 ms (3.10 ms/call) | **8.35 ms** (**−12.2%**, 2.73 ms/call) | 9.49 ms (2.97 ms/call) | **7.63 ms** (**−19.6%**, 2.41 ms/call) |
+| **`emit` phase `ms/window`** | 10.74 ms | 9.55 ms | **8.44 ms** | 9.54 ms | **7.66 ms** |
+| **`run` (verify pass) `ms/window`** | 79.78 ms | 72.09 ms | 73.25 ms | 43.61 ms | **42.46 ms** |
+| **Total window `ms/window`** | 90.84 ms | 82.14 ms | 82.25 ms | 53.49 ms | **50.41 ms** (**−44.5% vs base**) |
+| **Engine batch decode (`rows/s`)** | ~123 rows/s | 129.2 rows/s | **131.8 rows/s** (+7.2%) | 138.0 rows/s | **145.4 rows/s** (**+18.2% vs base**) |
+| **HTTP 4×256 wall (`tok/s`)** | 113.4 tok/s | 110.2 tok/s | 111.4 tok/s | 114.7 tok/s | **120.1 tok/s** (**30.0–31.4/slot**) |
+

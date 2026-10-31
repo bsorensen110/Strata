@@ -106,4 +106,18 @@ inline constexpr uint64_t df2_bind_bytes(uint64_t head_row_bytes, int64_t n_voca
     return n_vocab > 0 ? (uint64_t) k_drafts * (uint64_t) n_vocab * 4ull : 0ull;
 }
 
+/// Upper bound on how many proposal rows a single slot can be offered in the next verify window of `window_cap` rows
+/// when `n_sel` slots are selected (`df2_window_plan().n_sel`), `n_ready` slots are co-drafting for that window, and
+/// each slot is capped at `k_cap` proposals.  Every selected slot takes 1 anchor row (`n_sel` rows), and the other
+/// `min(n_ready, n_sel) - 1` ready slots each take at least 1 proposal row, leaving at most
+/// `window_cap - n_sel - (min(n_ready, n_sel) - 1)` proposal rows for any one slot (clamped to `[1, k_cap]`).
+inline constexpr int df2_batch_slot_max_k(int window_cap, int n_sel, int n_ready, int k_cap) {
+    if (k_cap < 1) return 0;
+    const int a = n_sel < 1 ? 1 : n_sel;
+    const int r = n_ready < a ? (n_ready < 1 ? 1 : n_ready) : a;
+    const int fit = window_cap - a - (r - 1);
+    const int hi = fit < 1 ? 1 : fit;
+    return hi < k_cap ? hi : k_cap;
+}
+
 }  // namespace strata::core

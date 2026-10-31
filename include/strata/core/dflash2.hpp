@@ -41,11 +41,23 @@ class Dflash2Drafter {
 public:
     static constexpr int kRows = 8;           ///< block rows: the anchor + 7 masks
     static constexpr int kDrafts = kRows - 1;
+    static constexpr int kBatchMaxRows = kDf2MaxSlots * kDrafts;
     static constexpr int kDefaultWindow = 2048;
     static constexpr int kMaxWindow = 8192;   ///< opt-in pack metadata limit; longer windows need larger ring/kernel buffers
     static constexpr int kRingSlack = 16;     ///< rows written ahead of a rejection
     static constexpr int kRing = kDefaultWindow + kRingSlack;  ///< default pack ring size, kept for existing bench callers
     static constexpr int kMaxRing = kMaxWindow + kRingSlack;
+
+    struct BatchItem {
+        int slot = 0;                ///< conversation slot index (0 .. n_slots() - 1)
+        const float* taps = nullptr; ///< device pointer to this slot's committed tap rows [n_new][n_taps * N]
+        int n_new = 0;               ///< committed tap rows (1 .. kRows)
+        int64_t pos0 = 0;            ///< position of the first committed row
+        int32_t anchor = 0;          ///< last committed token (the block's row 0 token)
+        int k_want = kDrafts;        ///< proposals to produce for this slot (1 .. kDrafts)
+        int32_t* drafts = nullptr;   ///< host output [k_want]
+        float* probs = nullptr;      ///< optional host output [k_want]
+    };
 
     Dflash2Drafter() { slots_.push_back(std::make_unique<Slot>()); }   // slot 0: the drafter as it runs today
     ~Dflash2Drafter();
@@ -73,6 +85,12 @@ public:
     /// selector's pick and its probability).  The taps pointer must be the device buffer this slot's graphs were captured on
     /// (the guard is per slot: df2_graphs_valid_for against Slot::taps_); the engine keeps one shared staging buffer for all slots.
     bool draft(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err);
+
+    /// Co-drafts `n_items` active slots (1 .. kDf2MaxSlots) in one batch: each slot's context update and 5-layer
+    /// transformer body run on its own captured body graph (`Slot::body_exec_[n_new]`) into a packed batch buffer,
+    /// then the draft head GEMM, top-16 reduction, and candidate selector run together across all slots with a
+    /// single stream synchronization at the end.  Bitwise equal to calling draft() on each slot for `k_want` rows.
+    bool draft_batch(const BatchItem* items, int n_items, float* stage_taps, size_t stage_stride, std::string& err);
 
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
@@ -140,6 +158,7 @@ private:
     struct Slot {
         float *kring_[8] = {}, *vring_[8] = {};   ///< ring K/V per layer (L <= 8), head-major [NKV][ring_slots][HD]
         cudaGraphExec_t exec_[kRows + 1] = {};   ///< this slot's round graphs (n_new = 1..8), captured against its own rings
+        cudaGraphExec_t body_exec_[kRows + 1] = {}; ///< this slot's body-only graphs (context + 5 layers + hsel) for draft_batch
         const float* taps_ = nullptr;            ///< the taps staging buffer this slot's exec_ graphs were captured on; draft() refuses another
         size_t ring_plane_bytes_ = 0;            ///< bytes one ring plane (K or V, one layer) was cudaMalloc'd with; free_slot subtracts exactly these from vram_
         int64_t have_ctx_ = 0;                   ///< last committed position (exclusive) for this conversation
@@ -163,8 +182,11 @@ private:
     /// planar Q8 matrices (1..3 of them, same input width) times the planar activations in xqp_ / xdp_ (ncols columns)
     void gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd);
     bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err);
+    bool record_block_body(cudaStream_t cs, std::string& err);
+    bool record_block_head(cudaStream_t cs, std::string& err);
     bool record_block(cudaStream_t cs, std::string& err);
     bool capture(int n, const float* taps, std::string& err);
+    bool capture_body(int n, const float* taps, std::string& err);
     bool alloc(std::string& err);
     struct Prof;
     Prof* prof_ = nullptr;
@@ -210,6 +232,7 @@ private:
     float *fcy_ = nullptr, *hctx_ = nullptr, *kc_ = nullptr, *vc_ = nullptr;
     float *h_ = nullptr, *xn_ = nullptr, *xc_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *qn_ = nullptr, *k_ = nullptr, *v_ = nullptr, *kblk_ = nullptr;
     float *ao_ = nullptr, *o_ = nullptr, *gate_ = nullptr, *up_ = nullptr, *mlp_ = nullptr, *part_ = nullptr, *fn_ = nullptr;
+    float *fn_batch_ = nullptr, *hsel_batch_ = nullptr;
     float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr;
     int32_t *toptok_ = nullptr, *out_tok_ = nullptr;
     uint32_t* topscratch_ = nullptr;

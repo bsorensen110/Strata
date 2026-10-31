@@ -13302,6 +13302,10 @@ int main(int argc, char** argv) {
                                              std::max(1, dflash_k))
             : strata::core::MtpDepthConfig{};
         const bool df2_depth_on = df2_depth.on() && df2_batch;
+        const bool df2_batch_head = df2_batch && [] {
+            const char* e = std::getenv("STRATA_DF2_BATCHHEAD");
+            return !(e && e[0] == '0');
+        }();
         strata::core::Df2WindowPlan df2_plan{};
         strata::core::Df2DraftStats df2_stats{};
         if (df2_batch) {
@@ -13319,6 +13323,8 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata batch: DFlash2 adaptive depth on: up to %d proposals per slot, "
                                      "floor %.2f (STRATA_BATCH_DF2_DEPTH)\n",
                              df2_depth.max_depth, (double) df2_depth.floor);
+            if (df2_batch_head)
+                std::fprintf(stderr, "strata batch: DFlash2 batched co-draft head on (STRATA_DF2_BATCHHEAD=0 for serial)\n");
         }
 #endif
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
@@ -14089,6 +14095,20 @@ int main(int argc, char** argv) {
             std::vector<DraftWait> draft_wait;   // the two-phase co-drafts in flight in this window
             std::vector<strata::core::MtpDrafter::GroupItem> group_items;   // STRATA_BATCH_DRAFT_GROUP: this window's rounds
             std::vector<int> group_slots;
+#if defined(STRATA_HAVE_DFLASH2)
+            struct Df2Pend {
+                int b = 0;
+                int t = 0;
+                int lo = 0;
+                int hi = 0;
+                int64_t p0 = 0;
+                int k_next = 0;
+                int k_want = 0;
+                int32_t dd[strata::core::Dflash2Drafter::kDrafts] = {};
+                float pp[strata::core::Dflash2Drafter::kDrafts] = {};
+            };
+            std::vector<Df2Pend> df2_pend;
+#endif
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
@@ -14274,6 +14294,20 @@ int main(int argc, char** argv) {
                             sl.draft_ready = true;
                         }
                     }
+                    if (!sl.draft_ready && geo && hi > lo && k_next > 0 && df2_batch_head) {
+                        Df2Pend dp;
+                        dp.b = b;
+                        dp.t = t;
+                        dp.lo = lo;
+                        dp.hi = hi;
+                        dp.p0 = pos[first[t]];
+                        dp.k_next = k_next;
+                        dp.k_want = df2_depth_on
+                            ? std::min({k_next, df2_depth.max_depth, strata::core::mtp_depth_for(sl.df2_ema, df2_depth)})
+                            : k_next;
+                        df2_pend.push_back(dp);
+                        continue;
+                    }
                     if (!sl.draft_ready && geo && hi > lo && k_next > 0) {
                         const Clock::time_point td0 = Clock::now();
                         std::string de;
@@ -14346,6 +14380,87 @@ int main(int argc, char** argv) {
                 }
 #endif
             }
+#if defined(STRATA_HAVE_DFLASH2)
+            if (!df2_pend.empty()) {
+                const Clock::time_point td0 = Clock::now();
+                const strata::core::OnDevice on_df2(0);
+                int n_live = 0, n_ready_already = 0;
+                for (const BSlot& s_live : bs) {
+                    if (s_live.active) {
+                        ++n_live;
+                        if (s_live.draft_ready && s_live.n_drafts > 0) ++n_ready_already;
+                    }
+                }
+                const int A_next = std::max(1, strata::core::df2_window_plan(cap, std::max(1, n_live), dflash_k, df2_want_depth).n_sel);
+                const int max_window_k = strata::core::df2_batch_slot_max_k(
+                    cap, A_next, n_ready_already + (int) df2_pend.size(), (int) strata::core::Dflash2Drafter::kDrafts);
+                std::vector<strata::core::Dflash2Drafter::BatchItem> bitems(df2_pend.size());
+                for (size_t i = 0; i < df2_pend.size(); ++i) {
+                    Df2Pend& dp = df2_pend[i];
+                    dp.k_want = std::clamp(std::min(dp.k_want, max_window_k), 1, (int) strata::core::Dflash2Drafter::kDrafts);
+                    bitems[i].slot = dp.b;
+                    bitems[i].taps = ver.tap_dev() + (size_t) dp.lo * df2_stage_stride;
+                    bitems[i].n_new = dp.hi - dp.lo;
+                    bitems[i].pos0 = dp.p0;
+                    bitems[i].anchor = bs[(size_t) dp.b].x;
+                    bitems[i].k_want = dp.k_want;
+                    bitems[i].drafts = dp.dd;
+                    bitems[i].probs = dp.pp;
+                }
+                std::string de;
+                const bool ok = df2.draft_batch(bitems.data(), (int) bitems.size(), df2_stage.get(), df2_stage_stride, de);
+                bt_draft += msd(td0, Clock::now());
+                bt_draft_n += (int64_t) bitems.size();
+                for (size_t i = 0; i < df2_pend.size(); ++i) {
+                    Df2Pend& dp = df2_pend[i];
+                    const int b = dp.b;
+                    const int t = dp.t;
+                    BSlot& sl = bs[(size_t) b];
+                    if (ok) {
+                        const int k_keep = df2_depth_on
+                            ? std::min({dp.k_want, df2_depth.max_depth,
+                                        strata::core::mtp_depth_trim(dp.pp, dp.k_want, df2_depth.floor)})
+                            : dp.k_want;
+                        for (int j = 0; j < k_keep; ++j) {
+                            sl.draft[(size_t) j] = dp.dd[j];
+                            sl.dprob[(size_t) j] = dp.pp[j];
+                        }
+                        sl.n_drafts = k_keep;
+                        sl.draft_ready = k_keep > 0;
+                        strata::core::SessionState& sx = *bslot_ss[0][(size_t) b];
+                        if (sx.ple.ready() && sx.ple.table != nullptr) {
+                            int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
+                            auto pf = [&](int32_t tok) {
+                                uint32_t rows16[strata::kernels::PLE_N_HEADS];
+                                strata::kernels::ngram_rows(&tok, prev, 1, sx.ple.consts, rows16);
+                                prev[0] = prev[1];
+                                prev[1] = tok;
+                                sx.ple.table->prefetch_rows(rows16);
+                            };
+                            pf(sl.x);
+                            for (int j = 0; j < sl.n_drafts; ++j) pf(sl.draft[(size_t) j]);
+                        }
+                    } else {
+                        static int64_t df2_warn = 0;
+                        if (++df2_warn <= 5)
+                            std::fprintf(stderr, "strata batch: DFlash2 slot %d proposes nothing next window (%s)\n",
+                                         b, de.c_str());
+                    }
+                    if (batch_mtp && sl.active && slot_mtp[(size_t) b] && sl.n_drafts < strata::core::Dflash2Drafter::kDrafts) {
+                        const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
+                        const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
+                        if (cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(),
+                                            ver.final_R_all() + (size_t) first[t] * stride,
+                                            2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                            slot_mtp[(size_t) b]->stream()) == cudaSuccess &&
+                            slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
+                                                       &sl.draft[(size_t) sl.n_drafts], err)) {
+                            ++sl.n_drafts;
+                        }
+                    }
+                }
+            }
+#endif
             if (!group_items.empty()) {   // STRATA_BATCH_DRAFT_GROUP: the co-drafts of every active slot in one round
                 const Clock::time_point wg = Clock::now();
                 const int S = (int) group_items.size();
@@ -14543,7 +14658,8 @@ int main(int argc, char** argv) {
                 if ((batch_mtp || df2_win) && std::getenv("STRATA_BATCH_DRAFT_TIMING") != nullptr)
                     std::fprintf(stderr, "strata batch draft: %.2f ms/window in %.2f co-draft calls/window (%s)\n",
                                  bt_draft / w, (double) bt_draft_n / w,
-                                 df2_win ? "DFlash2 serial, each syncs"
+                                 df2_win ? (df2_batch_head ? "DFlash2 batched head, one sync per window"
+                                                           : "DFlash2 serial, each syncs")
                                          : draft_group_on ? "one group round per window"
                                          : draft_two_phase ? "two-phase: begin + end"
                                          : "serial, each syncs");

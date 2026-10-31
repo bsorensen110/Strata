@@ -93,6 +93,15 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
                 const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream);
 
+/// Multi-slot candidate selector walk: one threadblock per item (`0 <= s < n_items`).  Item `s` reads
+/// `row_off = batch_meta[s * 4 + 0]`, `rows = batch_meta[s * 4 + 1]`, and `prev0 = batch_meta[s * 4 + 2]`, walks
+/// `rows` rows starting at `row_off` of `hp` / `unary` / `tok`, and writes `out_tok[s * 8 + i]` and `out_prob[s * 8 + i]`.
+void df2_select_multi(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank,
+                      const int32_t* batch_meta, int n_items, int32_t* out_tok, float* out_prob, void* stream);
+
+/// Packs `rows` rows of `fn_in` ([rows][N]) and `hsel_in` ([rows][rank]) into `fn_out` and `hsel_out` in one launch.
+void df2_pack_head_rows(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out, int rows, int N, int rank, void* stream);
+
 /// The verify window's tap: out[r][d] = mean over the hc streams c of (R[r][c][d] + bo[r][d] * 2 * sigmoid(inject[r][c] / hc)) - the layer output with
 /// its pending FFN write (gr_write) applied, averaged over the streams.  R rows are `R_stride` floats apart, bo rows `bo_stride`, inject rows
 /// `inj_stride`, out rows `out_stride`.
