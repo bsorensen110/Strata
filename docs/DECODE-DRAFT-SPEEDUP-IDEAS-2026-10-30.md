@@ -108,9 +108,9 @@ Further ideas from the code reading, lower priority:
 
 ## Implementation status (this branch)
 
-Ideas 2 and 3 are coded for batch MTP (`--batch-mtp`, serial windows). Both are off unless their environment
-variable is set. See "Adaptive depth and on-device draft handoff" below. Nothing here has been built for a GPU or
-measured yet. The other ideas are still open.
+Ideas 2 and 3 are coded for batch MTP (`--batch-mtp`, serial windows). Six more MTP ideas from the MTP report
+followed. Every one is off unless its environment variable is set. See "Adaptive depth and on-device draft handoff"
+and "Six more MTP draft switches" below. Nothing here has been built for a GPU or measured yet.
 
 ## Adaptive depth and on-device draft handoff
 
@@ -137,8 +137,8 @@ Each slot keeps a running average (EMA, weight 0.25, start 0.5) of "the target p
    deeper proposals do not fit, the ones with the lowest expected value (`average^k`) are dropped first.
 
 Answers do not change. A proposal the target did not pick is never emitted (`batch_spec_accept`, the same rule as
-today at two rows). The group and two-phase co-drafts (`STRATA_BATCH_DRAFT_GROUP` / `TWOPHASE`) are not used with
-it. The engine prints one more stderr line when the slots go idle: offered proposal rows, accepted rows, and
+today at two rows). The two-phase co-draft (`STRATA_BATCH_DRAFT_TWOPHASE`) is not used with it. The group co-draft
+(`STRATA_BATCH_DRAFT_GROUP`) now joins it; see "Six more MTP draft switches" below. The engine prints one more stderr line when the slots go idle: offered proposal rows, accepted rows, and
 proposals per slot-window.
 
 Where it should help: windows with spare rows. With 4 busy slots in an 8-row window there are none, so it needs
@@ -201,3 +201,92 @@ depth best). Keep `STRATA_BATCH_DRAFT_TIMING=1` in every arm for the per-window 
 - Output: at `temperature=0`, arms B to E must give the same text as A for the same prompt. A difference is a bug.
 - Speed: aggregate tok/s, window ms, and the "MTP proposals accepted" and "MTP depth" stderr lines.
 - B should cut the draft time per window (about 0.75 ms per slot today), not the acceptance.
+
+## Six more MTP draft switches
+
+These come from the MTP report's list (its items 2, 3, 5, 6, 7 and 8). Its item 1 (two-phase drafting by default) was
+measured before with no gain, and item 4 is the adaptive depth above. All six are off by default. With none set, the
+batch loop runs the same code as before.
+
+| Switch | Report item | What it does |
+|---|---|---|
+| `STRATA_BATCH_DRAFT_GROUP=1` with `STRATA_BATCH_MTP_DEPTH=N` | 2: grouped multi-token drafting | Each slot's first draft comes from the one group pass, as before. A slot that may draft more runs its later steps on its own stream right after it. The host waits once for all of them. |
+| `STRATA_BATCH_MTP_EARLYCOPY=1` | 3: early residual copies | Each slot's residual rows are queued for its drafter when the window is queued, not after the host has accepted and committed. The copy still waits for the window on the GPU. |
+| `STRATA_BATCH_MTP_SELECT=1` or `=N` | 5: slot choice by acceptance | When a window cannot carry every live slot, it takes those whose proposals are taken most often. No slot waits more than N windows (2 by default). |
+| `STRATA_BATCH_MTP_SELECT_OVERLAP=W` | 7: expert-overlap grouping | With `SELECT`: also prefer slots whose last rows used the same CPU-served experts as the slots already chosen (weight W, 0 to 8). |
+| `STRATA_BATCH_MTP_DEVACCEPT=1` | 6: accept on the device | Needs `STRATA_BATCH_MTP_DEVTOK=1`. A greedy slot's next draft round is set up and started by the GPU right after its window, before the host has read the window. |
+| `STRATA_BATCH_EXPERT_AHEAD=N` | 8: earlier CPU expert loads | While the host waits for layer l, it asks the expert source to start reading layer l+N's experts (N is 1 to 4). It asks for the experts the last window sent to the CPU. |
+
+### How each one works
+
+**Group with depth.** Before, `draft_group` only ran when every slot drafted one token. Now a slot whose drafter
+allows more steps also joins. The group pass fills its first draft. Its own `mtp_select` then takes its row of the
+group's output, and its step graphs run on its own stream. The group's ids and probabilities are copied out before
+any step runs, because the owner's steps reuse those buffers. The owner's own slot goes last, after the other slots
+have read its rows. A slot that accepted more than one proposal (a > 1) does not fit the group's two rows a slot, so
+it drafts on its own, as with depth alone. Drafts are then cut by probability, as with depth alone.
+
+**Early copy.** A new hook, `Verifier::set_post_launch`, runs right after a window's graph is queued. It records an
+event on the verifier's stream. Each carried slot's drafter stream waits for that event and copies the slot's rows.
+The copy after the commit is then skipped. A slot that ended in that window drafts nothing, so the host waits for its
+copy before the next window.
+
+**Slot choice.** Only matters when there are more live slots than the window holds (two rows a slot). With 4 slots and
+8 rows it never acts. It acts with more slots, or with deep slots on a 16-row window. Each slot counts the windows it
+waited. A window first takes the longest-waiting slots it must take so that no slot waits more than N windows. If the
+window is too small for N, the bound is the smallest one it can keep. The rest are ranked by their acceptance average,
+plus the overlap bonus. The rules are in `include/strata/core/batch_mtp_select.hpp` with a CPU test.
+
+**Expert overlap.** With `SELECT_OVERLAP`, the verifier keeps the routed expert ids of each row and layer it serves
+from the host (`Verifier::set_route_record`). Each slot keeps a 1024-bit sketch of the experts its rows sent to the
+CPU (experts already on the GPU are skipped). Slots that share CPU experts make the CPU's work per window smaller. When
+every expert is on the GPU there are no records, and the choice uses acceptance alone.
+
+**Device accept.** In the post-launch hook, the rounds the window waited for are collected first (they are already
+done on the GPU). Then, for each greedy slot, a small new kernel (`mtp_dev_accept`) runs on the drafter's stream after
+the window. It counts the proposals the target picked, writes the round's tokens, row and cells, and the round and its
+steps follow (`MtpDrafter::draft_begin_dev`). Their graphs are captured in the hook before the drafter's stream
+waits for the window (`prepare_dev_round`), because a capture waits for that stream. Every row of the slot is caught up, as with `STRATA_MTP_CATCHUP_ALL`.
+After the window the host runs its own accept rule. If it keeps the same count, the round stands. If it stops sooner
+(an end-of-stream token, a length bound, a cancel), the round is thrown away and the slot drafts as with DEVTOK alone.
+A slot with sampling or a bias table is not staged, because its row is drawn again after the graph. The draft tokens
+may differ in their last float bits from the host path, because all rows are caught up. The target still checks every
+proposal, so the output does not change.
+
+**Experts ahead.** A new hook, `Verifier::set_layer_ahead`, runs once per layer while the host waits for the GPU. It
+takes the last window's routes for layer l+N, drops experts already on the GPU, and calls the source's `warm` (if
+it reads ahead) or `prefetch` (for each expert). A source held in RAM does nothing with it.
+
+### When they turn off
+
+`EARLYCOPY`, `DEVACCEPT` and `SELECT_OVERLAP` turn off, with a stderr line, without `--batch-mtp`, with the pipelined
+MTP windows, with a layer split, or on Metal. `DEVACCEPT` also needs `DEVTOK`, so it is off with PLE and with a chain
+rule too. `EXPERT_AHEAD` is off with a layer split. The hooks only act in the serial batch windows
+(`run_slot_rows`), not in DFlash2 windows.
+
+New stderr lines when the slots go idle: device-staged rounds kept, redrafted and not staged (`DEVACCEPT`), and the
+number of experts asked for ahead (`EXPERT_AHEAD`).
+
+### Not tested
+
+- No GPU build. The `.cpp` files pass a host syntax check. The new kernel's logic passes a host mock. The slot choice
+  rules pass a CPU unit test (`tests/core/batch_mtp_select_test.cpp`).
+- No speed numbers and no output check on a GPU.
+- The early copy can run while the commit runs. The copy today already does that (the commit may be asynchronous,
+  `commit_slot_prefixes`), so the switch adds no new overlap. Both rely on the commit graph not writing the residual
+  rows, which was read from the code, not tested.
+
+### How to measure
+
+Use the same method as above, with one variable per arm on top of control A (`--batch 4 --batch-mtp`):
+
+| Arm | Adds |
+|---|---|
+| F | `STRATA_BATCH_MTP_EARLYCOPY=1` |
+| G | `STRATA_BATCH_MTP_DEVTOK=1 STRATA_BATCH_MTP_DEVACCEPT=1` (compare with B) |
+| H | `STRATA_BATCH_MTP_DEPTH=3 STRATA_BATCH_DRAFT_GROUP=1` (compare with C) |
+| I | `STRATA_BATCH_EXPERT_AHEAD=1`, then `=2` |
+| J | `--batch 6` with `STRATA_BATCH_MTP_SELECT=1`, then with `STRATA_BATCH_MTP_SELECT_OVERLAP=2` (compare with `--batch 6` alone) |
+
+At `temperature=0` every arm must give the same text as A. `STRATA_BATCH_DRAFT_TIMING=1` shows the draft time per
+window. For G, a high "redrafted by the host" count means the round is thrown away too often to pay.

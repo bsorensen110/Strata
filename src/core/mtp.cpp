@@ -155,6 +155,8 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : group_exec_) if (e) cudaGraphExecDestroy(e);
     if (grp_out_h_) cudaFreeHost(grp_out_h_);
     if (grp_ev_) cudaEventDestroy(grp_ev_);
+    if (grp_prob_h_) cudaFreeHost(grp_prob_h_);
+    if (grp_sel_ev_) cudaEventDestroy(grp_sel_ev_);
     if (pf_dev_) cudaFree(pf_dev_);
     if (dense4_) cudaFree(dense4_);
     for (auto& e : round_exec_) if (e) cudaGraphExecDestroy(e);
@@ -2116,7 +2118,7 @@ bool MtpDrafter::group_applies(const GroupItem* it, int S) const {
         const MtpDrafter& d = *it[i].d;
         if (d.pend_ || d.coupled_active_ || d.chain_rule_ || d.chain_live_) return false;
         const int64_t ms = std::min<int64_t>(std::min<int64_t>(d.max_t_ - 1, d.max_drafts_), d.st_.max_cells - (it[i].p + it[i].a));
-        if (ms != 1) return false;   // a single step: the round only
+        if (ms < 1) return false;   // one step: the round only; more: the item's own step graphs after it
         if (it[i].a < 0 || it[i].a > 1 || it[i].p < 0 || it[i].p + 2 > d.st_.max_cells) return false;
         if (it[i].R == nullptr || it[i].tokens == nullptr || it[i].drafts == nullptr) return false;
     }
@@ -2156,20 +2158,48 @@ bool MtpDrafter::draft_group(const GroupItem* it, int S, int key, std::string& e
     if (grp_out_h_ == nullptr && cudaMallocHost((void**) &grp_out_h_, (size_t) (max_t_ + 8) * sizeof(int32_t)) != cudaSuccess) {
         err = "mtp group: pinned ids"; return false;
     }
+    if (grp_prob_h_ == nullptr && cudaMallocHost((void**) &grp_prob_h_, (size_t) (max_t_ + 8) * sizeof(float)) != cudaSuccess) {
+        err = "mtp group: pinned probabilities"; return false;
+    }
     const int64_t HCN = g_->hc * g_->n_embd, NH = g_->n_head;
     const int R2 = 2 * S;
-    auto put = [&](int row, int64_t cell) {
-        h_step_[row * 4 + 0] = (int32_t) cell;
-        h_step_[row * 4 + 1] = (int32_t) (cell + 1);
-        h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
-        h_step_[row * 4 + 3] = (int32_t) (cell + 1);
-        for (int64_t h = 0; h < NH; ++h) h_pos_[row * NH + h] = (int32_t) cell;
+    auto put_in = [NH](MtpDrafter& d, int row, int64_t cell) {
+        d.h_step_[row * 4 + 0] = (int32_t) cell;
+        d.h_step_[row * 4 + 1] = (int32_t) (cell + 1);
+        d.h_step_[row * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        d.h_step_[row * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) d.h_pos_[row * NH + h] = (int32_t) cell;
+    };
+    auto put = [&](int row, int64_t cell) { put_in(*this, row, cell); };
+    // an item's steps: as many as its drafter allows (1: the group's head pass only)
+    auto steps_of = [](const GroupItem& x) {
+        const MtpDrafter& d = *x.d;
+        return (int) std::min<int64_t>(std::min<int64_t>(d.max_t_ - 1, d.max_drafts_), d.st_.max_cells - (x.p + x.a));
     };
     for (int i = 0; i < S; ++i)
         for (int t = 0; t < 2; ++t) {
             h_tok_[2 * i + t] = it[i].tokens[t];
             put(2 * i + t, it[i].p + t);
         }
+    // the multi-step items: their step graphs (captured before anything is queued), cells and selection rows
+    bool multi = false;
+    for (int i = 0; i < S; ++i) {
+        const int ms = steps_of(it[i]);
+        if (ms <= 1) continue;
+        MtpDrafter& d = *it[i].d;
+        if (d.grp_sel_ev_ == nullptr && cudaEventCreateWithFlags(&d.grp_sel_ev_, cudaEventDisableTiming) != cudaSuccess) {
+            err = "mtp group: event create"; return false;
+        }
+        for (int j = 1; j < ms; ++j)
+            if (!d.capture_step(j, false, err)) return false;
+        if (&d != this)   // (the owner's own rows are staged above; its step rows are past them)
+            for (int j = 1; j < ms; ++j) put_in(d, d.max_t_ + j - 1, coupled_draft_cell(it[i].p, it[i].a, j));
+        else
+            for (int j = 1; j < ms; ++j) put(max_t_ + j - 1, coupled_draft_cell(it[i].p, it[i].a, j));
+        for (int j = 0; j < ms; ++j) ((volatile int32_t*) d.h_out_)[j] = -1;
+        if (d.h_force_ != nullptr) for (int j = 0; j < 16; ++j) d.h_force_[j] = -1;
+        multi = true;
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     // each item's two residual rows: after the stream that wrote them
     for (int i = 0; i < S; ++i) {
@@ -2189,17 +2219,130 @@ bool MtpDrafter::draft_group(const GroupItem* it, int S, int key, std::string& e
         err = std::string("mtp group: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
+    // the head pass's ids and probabilities leave before any item's steps (the owner's steps overwrite them)
     if (cudaMemcpyAsync(grp_out_h_, out_ids_, (size_t) R2 * sizeof(int32_t), cudaMemcpyDeviceToHost, cs_) != cudaSuccess ||
-        cudaStreamSynchronize(cs_) != cudaSuccess) {
+        cudaMemcpyAsync(grp_prob_h_, probs_, (size_t) R2 * sizeof(float), cudaMemcpyDeviceToHost, cs_) != cudaSuccess) {
+        err = std::string("mtp group: ids: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    if (multi) {
+        // Each multi-step item: its row (2i + a) of the owner's rest output becomes its chain's input (as its own round's
+        // mtp_select would), then its step graphs.  The other drafters first, on their streams after the group; the
+        // owner's own item last, after those selections read its rows.
+        if (cudaEventRecord(grp_ev_, cs_) != cudaSuccess) { err = "mtp group: event record"; return false; }
+        for (int pass = 0; pass < 2; ++pass)
+            for (int i = 0; i < S; ++i) {
+                const int ms = steps_of(it[i]);
+                if (ms <= 1) continue;
+                MtpDrafter& d = *it[i].d;
+                if ((&d == this) != (pass == 1)) continue;
+                d.h_row_[0] = 2 * i + it[i].a;
+                d.h_row_[1] = 0;   // (the steps' selection: their single row)
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                if ((&d != this && cudaStreamWaitEvent(d.cs_, grp_ev_, 0) != cudaSuccess) ||
+                    cudaMemcpyAsync(d.row_, d.m_row_, 2 * sizeof(int32_t), cudaMemcpyDefault, d.cs_) != cudaSuccess) {
+                    err = "mtp group: staging an item's chain failed";
+                    return false;
+                }
+                strata::kernels::mtp_select(R_, HCN, out_ids_, d.row_, d.Rin_, d.tok_, d.m_out_, 0, d.cs_, probs_, d.m_prob_);
+                if (&d != this) {
+                    if (cudaEventRecord(d.grp_sel_ev_, d.cs_) != cudaSuccess || cudaStreamWaitEvent(cs_, d.grp_sel_ev_, 0) != cudaSuccess) {
+                        err = "mtp group: event record"; return false;
+                    }
+                }
+                for (int j = 1; j < ms; ++j)
+                    if (cudaGraphLaunch(d.step_exec_[j], d.cs_) != cudaSuccess) {
+                        err = std::string("mtp group step: ") + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+            }
+    }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = std::string("mtp group: ids: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
     for (int i = 0; i < S; ++i) {
-        it[i].drafts[0] = grp_out_h_[2 * i + it[i].a];
-        for (int j = 1; j < max_t_ - 1; ++j) it[i].drafts[j] = 0;
-        ++it[i].d->rounds;
+        const int ms = steps_of(it[i]);
+        MtpDrafter& d = *it[i].d;
+        int n = 1;
+        if (ms > 1) {
+            if (&d != this && cudaStreamSynchronize(d.cs_) != cudaSuccess) {
+                err = std::string("mtp group step: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            for (int j = 0; j < ms; ++j) {
+                it[i].drafts[j] = ((volatile int32_t*) d.h_out_)[j];
+                if (it[i].probs != nullptr) it[i].probs[j] = ((volatile float*) d.h_prob_)[j];
+            }
+            n = ms;
+        } else {
+            it[i].drafts[0] = grp_out_h_[2 * i + it[i].a];
+            if (it[i].probs != nullptr) it[i].probs[0] = grp_prob_h_[2 * i + it[i].a];
+        }
+        for (int j = n; j < max_t_ - 1; ++j) it[i].drafts[j] = 0;
+        if (it[i].n_drafts != nullptr) *it[i].n_drafts = n;
+        ++d.rounds;
     }
     ++rounds;
+    return true;
+}
+
+bool MtpDrafter::prepare_dev_round(int n, std::string& err) {
+    if (n < 1 || n > max_t_) { err = "mtp: device round rows out of range"; return false; }
+    if (round_exec_[n] != nullptr && (max_t_ < 3 || step_exec_[max_t_ - 2] != nullptr)) return true;
+    const OnDevice on_device(device_);
+    if (!capture_round(n, false, err)) return false;
+    for (int j = 1; j <= max_t_ - 2; ++j)
+        if (!capture_step(j, false, err)) return false;
+    return true;
+}
+
+bool MtpDrafter::draft_begin_dev(int n, int64_t p, cudaEvent_t after, const int32_t* ver_out, const int32_t* ver_tok,
+                                 int first, cudaEvent_t staged, std::string& err) {
+    if (pend_) { err = "mtp: a draft_begin is already pending"; return false; }
+    if (!dev_round_fits(n, p)) { err = "mtp: the device round does not fit"; return false; }
+    if (!decode_ready(err)) return false;
+    if (chain_live_) { err = "mtp: a pipelined chain is still in flight"; return false; }
+    const OnDevice on_device(device_);
+    const int ms = dev_round_steps();
+    // never a capture here (prepare_dev_round): its synchronisation could wait for the window that waits for the host
+    bool ready = round_exec_[n] != nullptr;
+    for (int j = 1; j < ms; ++j) ready = ready && step_exec_[j] != nullptr;
+    if (!ready) { err = "mtp: draft_begin_dev before prepare_dev_round"; return false; }
+    const int64_t NH = g_->n_head;
+    for (int t = 0; t < n; ++t) {   // the rows' cells do not depend on a; the draft cells are staged on the device
+        const int64_t cell = p + t;
+        h_step_[t * 4 + 0] = (int32_t) cell;
+        h_step_[t * 4 + 1] = (int32_t) (cell + 1);
+        h_step_[t * 4 + 2] = (int32_t) ((cell + 1) / 4);
+        h_step_[t * 4 + 3] = (int32_t) (cell + 1);
+        for (int64_t h = 0; h < NH; ++h) h_pos_[t * NH + h] = (int32_t) cell;
+    }
+    for (int j = 0; j < ms; ++j) ((volatile int32_t*) h_out_)[j] = -1;
+    if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (after != nullptr && cudaStreamWaitEvent(cs_, after, 0) != cudaSuccess) {
+        err = "mtp: waiting for the window failed";
+        return false;
+    }
+    strata::kernels::mtp_dev_accept(ver_out, ver_tok, first, n, m_tok_, m_row_, m_step_, m_pos_, NH, max_t_, p, ms, cs_);
+    if (!stage_source_R(n, err)) return false;
+    if (staged != nullptr && cudaEventRecord(staged, cs_) != cudaSuccess) { err = "mtp: event record failed"; return false; }
+    pend_max_steps_ = ms;
+    pend_ = true;
+    pend_do_ple_ = false;
+    if (cudaGraphLaunch(round_exec_[n], cs_) != cudaSuccess) {
+        pend_ = false;
+        err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    for (int j = 1; j < ms; ++j)
+        if (cudaGraphLaunch(step_exec_[j], cs_) != cudaSuccess) {
+            pend_ = false;
+            err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+    (void) cudaStreamQuery(cs_);
     return true;
 }
 

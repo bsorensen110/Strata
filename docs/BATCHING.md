@@ -45,7 +45,10 @@ Two opt-in switches for the serial `--batch-mtp` windows are in testing; neither
 ([DECODE-DRAFT-SPEEDUP-IDEAS-2026-10-30.md](DECODE-DRAFT-SPEEDUP-IDEAS-2026-10-30.md#adaptive-depth-and-on-device-draft-handoff)).
 `STRATA_BATCH_MTP_DEPTH=N` lets a slot whose proposals keep being accepted check up to N proposals per window (more
 with `--batch-draft-window 16` on one GPU). `STRATA_BATCH_MTP_DEVTOK=1` keeps the draft tokens on the GPU so the host
-does not wait for each slot's draft (one GPU, no PLE). Unset, the windows run as before.
+does not wait for each slot's draft (one GPU, no PLE). Six more opt-in switches (`STRATA_BATCH_MTP_EARLYCOPY`,
+`STRATA_BATCH_MTP_DEVACCEPT`, `STRATA_BATCH_MTP_SELECT`, `STRATA_BATCH_MTP_SELECT_OVERLAP`, `STRATA_BATCH_EXPERT_AHEAD`,
+and `STRATA_BATCH_DRAFT_GROUP` together with depth) are described in the same file, also not measured. Unset, the
+windows run as before.
 
 Measured on a layer split of 2x RTX 3080 20 GB (220 W cap) with a Xeon E5-2696 v4, UD-Q4_K_XL, `"layer_split": "23"`,
 `"parallel": 2`, `--spec 4`: two concurrent greedy decodes of 300 tokens, the two streams' tok/s added, median of

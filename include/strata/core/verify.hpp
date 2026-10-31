@@ -467,6 +467,39 @@ public:
     }
     int32_t* tok_rows_dev() const { return m_tok_; }
     void patch_last_token(int t, int32_t tok) { if (t >= 0 && t < strata::kernels::kVerifyMaxT) last_tokens_[t] = tok; }
+    /// STRATA_BATCH_MTP_EARLYCOPY / DEVACCEPT (opt-in): called by run_slot_rows on the last stage right after the
+    /// window's graph is launched, before the host serves the window's layers and waits for it.  It gets this
+    /// verifier's stream, so it can record an event there and queue work on other streams that waits for the window
+    /// on the device (the drafters' residual copies, the next draft rounds).  False (with `err`) fails the window.
+    void set_post_launch(std::function<bool(cudaStream_t cs, std::string& err)> f) { post_launch_ = std::move(f); }
+    /// The device address of the window's picks (row t's argmax, mapped; written by the window's graph).  A slot with
+    /// sampling or a bias table has its row drawn again after the graph (`slot_greedy` is false for it).
+    const int32_t* out_rows_dev() const { return next_ ? next_->out_rows_dev() : m_out_; }
+    bool slot_greedy(int slot) const {
+        if (next_) return next_->slot_greedy(slot);
+        if (slot < 0 || slot >= (int) slot_sp_.size()) return false;
+        const strata::kernels::SamplerParams& sp = slot_sp_[(size_t) slot];
+        return (sp.greedy || sp.temperature <= 0.0f) && sp.logit_bias == nullptr;
+    }
+    /// STRATA_BATCH_MTP_SELECT_OVERLAP / STRATA_BATCH_EXPERT_AHEAD (opt-in; one stage): run_slot_rows keeps the routed
+    /// experts of every row and layer its host serves (the ids its pool gets).  `last_route(l)` is layer l's S x k ids
+    /// of the last window (S = last_route_rows(), k = last_route_k()), or null when that layer rang no doorbell.
+    /// `fresh`: only ids the last window itself recorded (its rows are that window's rows); else the latest any window
+    /// recorded for that layer (`*rows` gets how many rows they cover).
+    void set_route_record(bool on) { route_rec_ = on; }
+    const int32_t* last_route(int64_t layer, bool fresh, int* rows) const {
+        if (!route_rec_ || layer < lb_ || layer >= le_ || route_ids_.empty()) return nullptr;
+        const size_t i = (size_t) (layer - lb_);
+        if (route_at_[i] == 0 || (fresh && route_at_[i] != route_seq_)) return nullptr;
+        if (rows != nullptr) *rows = route_n_[i];
+        return route_ids_.data() + i * route_stride_;
+    }
+    int64_t last_route_k() const { return route_k_; }
+    /// STRATA_BATCH_EXPERT_AHEAD (opt-in): while run_slot_rows waits for layer l's doorbell, it calls `f(user, l)`
+    /// between spins until it returns false (no more work for that layer); a call should do a few microseconds of
+    /// work, so the doorbell is answered on time.  Null: off.
+    using LayerAheadFn = bool (*)(void* user, int64_t layer);
+    void set_layer_ahead(LayerAheadFn f, void* user) { ahead_ = f; ahead_user_ = user; }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
 
     /// The PCIe count of each layer from measured costs (PcieModel) instead of a fixed share: the spin kernels stamp
@@ -786,6 +819,16 @@ private:
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     std::function<bool(cudaStream_t, std::string&)> pre_launch_;   // set_pre_launch
+    std::function<bool(cudaStream_t, std::string&)> post_launch_;  // set_post_launch
+    bool route_rec_ = false;                                       // set_route_record
+    std::vector<int32_t> route_ids_;                               // per layer of this stage: kVerifyMaxT x k ids
+    std::vector<uint32_t> route_at_;                               // ... the window that wrote them (0: none)
+    std::vector<int> route_n_;                                     // ... and its rows
+    size_t route_stride_ = 0;
+    uint32_t route_seq_ = 0;
+    int64_t route_k_ = 0;
+    LayerAheadFn ahead_ = nullptr;                                 // set_layer_ahead
+    void* ahead_user_ = nullptr;
     bool dev_rows_[strata::kernels::kVerifyMaxT] = {};             // add_device_rows: rows the host does not stage
     cudaEvent_t dev_ev_[strata::kernels::kVerifyMaxT] = {};        // ... and the events the launch waits for
     int dev_n_ev_ = 0;
