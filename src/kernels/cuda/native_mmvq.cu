@@ -1380,12 +1380,12 @@ bool q8_0_rows1(int n_in, int n_out) {
     }
 }
 
-// ---- B6 STRATA_B6_MMVQ_ROWS (lab, opt-in): the exact multi-column layout with each column's activation fragment
-// loaded ONCE per weight block and reused across ROWS rows of the block (the default kernel reloads it for every row
-// it applies it to, and the K-quant scales once per column).  A thread keeps the same blocks (kbx = tid / T, stride
-// BPI with WARPS warps), each (row, column) sum adds the same per-block values in the same order, and the cross-warp
-// and warp reductions are the default kernel's: every output is bitwise the default exact layout's, so bitwise a
-// single-column call.  Only the formats with a B6X below; the others keep the default kernel.
+// ---- B6 STRATA_B6_MMVQ_ROWS (lab, opt-in) & ROWS > 1 register activation caching: the exact multi-column layout with
+// each column's activation fragment loaded ONCE per weight block and reused across ROWS rows of the block (the uncached
+// loop reloads it for every row it applies it to, and the K-quant scales once per column). A thread keeps the same blocks
+// (kbx = tid / T, stride BPI with WARPS warps), each (row, column) sum adds the same per-block values in the same order,
+// and the cross-warp and warp reductions are the default kernel's: every output is bitwise the default exact layout's, so
+// bitwise a single-column call. Only the formats with a B6X below; the others keep the default loop.
 template<typename F> struct B6X { static constexpr bool ok = false; };
 template<> struct B6X<Q6KTraits> {
     static constexpr bool ok = true;
@@ -1476,6 +1476,168 @@ template<> struct B6X<IQ4XSTraits> {
         return d * sumi;
     }
 };
+
+// S26 STRATA_LFUSE (PAIR): blocks n_out.. compute the same rows of w2 into y2 (two matrices of one shape on one
+// input in one launch; each output's code is the single matrix's)
+// INDEXED (fork): row_ids[] maps the block's ROWS output rows onto arbitrary weight rows, so a caller can
+// multiply a gathered subset of experts without copying weights first. INDEXED=false folds the row index
+// back to the dense `row0 + i` exactly, so every existing instantiation compiles to the same code.
+template<typename F, int NCOLS, int NW, int ROWS, bool TS = false, bool PAIR = false, bool INDEXED = false>
+__launch_bounds__(NW * WARP, (ROWS <= 2 ? 4 : 1))
+__global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w, const Q81Block* x_, float* y_,
+                                         int n_in, int n_out,
+                                         const typename F::Block* __restrict__ w2 = nullptr, float* __restrict__ y2 = nullptr,
+                                         const int32_t* __restrict__ row_ids = nullptr) {
+    const Q81Block* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
+    float* STRATA_PDL_RESTRICT y = y_;
+    constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    int bxi = int(blockIdx.x);
+    if constexpr (PAIR) {
+        if (bxi >= n_out / ROWS) { bxi -= n_out / ROWS; w = w2; y = y2; }
+    }
+    const int row0 = ROWS * bxi;
+    const int blocks_per_row = n_in / F::DIV;
+    const int x_stride = n_in / Q8K;                   // Q8_1 blocks per activation column
+    float tmp[NCOLS][ROWS] = {};
+    int kbx = tid / F::T;
+    if constexpr (kPdlPrefetch) {
+        // PDL (pdl.hpp): the first block's weights are loaded before waiting for the activations, then that block
+        // is applied exactly as the loop below would apply it (the same rows, columns and order)
+        typename F::W w0[ROWS];
+        const int kqs = F::kqs(tid);
+        if (kbx < blocks_per_row) {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i)
+                if (row0 + i < n_out) w0[i] = F::load(w + std::size_t(INDEXED ? row_ids[row0 + i] : row0 + i) * blocks_per_row + kbx, kqs);
+        }
+        pdl_trigger();
+        pdl_wait();
+        if (kbx < blocks_per_row) {
+            const int kby = kbx * F::KBY;
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j)
+                        tmp[j][i] += F::apply(w0[i], x + std::size_t(j) * x_stride + kby, kqs);
+                }
+            }
+        }
+        kbx += BPI;
+    }
+    for (; kbx < blocks_per_row; kbx += BPI) {
+        const int kby = kbx * F::KBY;
+        const int kqs = F::kqs(tid);
+        if constexpr (ROWS > 1 && B6X<F>::ok) {
+            using XB = B6X<F>;
+            typename XB::X xv[NCOLS];
+#pragma unroll
+            for (int j = 0; j < NCOLS; ++j) xv[j] = XB::xload(x + std::size_t(j) * x_stride + kby, kqs);
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+                    const std::size_t block = std::size_t(INDEXED ? row_ids[row0 + i] : row0 + i) * blocks_per_row + kbx;
+                    const typename XB::W wv = XB::wload(w + block, kqs);
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j) tmp[j][i] += XB::dot(wv, xv[j]);
+                }
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+                    const std::size_t block = std::size_t(INDEXED ? row_ids[row0 + i] : row0 + i) * blocks_per_row + kbx;
+                    const typename F::W wv = F::load(w + block, kqs);      // once per (row, block)
+#pragma unroll
+                    for (int j = 0; j < NCOLS; ++j)                         // then per column
+                        tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+                }
+            }
+        }
+    }
+    __shared__ float partial[NW - 1 > 0 ? NW - 1 : 1][NCOLS][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][j][i][threadIdx.x] = tmp[j][i];
+    }
+    mmvq_sync_lds();
+    if (threadIdx.y > 0) return;
+    if constexpr (TS) {
+        constexpr int V = NCOLS * ROWS, P = s26ts::pow2_ceil(V);
+        float v[P];
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+                for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+                v[j * ROWS + i] = tmp[j][i];
+            }
+#pragma unroll
+        for (int k = V; k < P; ++k) v[k] = 0.0f;
+        const float sum = s26ts::tsum<P>(v, int(threadIdx.x));
+        const int k = s26ts::tsum_token<P>(int(threadIdx.x));
+        const int j = k / ROWS, i = k % ROWS;
+        if (int(threadIdx.x) == s26ts::tsum_lane<P>(k) && k < V && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = sum;
+        return;
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+            for (int l = 0; l < NW - 1; ++l) tmp[j][i] += partial[l][j][i][threadIdx.x];
+            tmp[j][i] = warp_sum(tmp[j][i]);
+            if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = tmp[j][i];
+        }
+    }
+}
+
+// MODEL-UPDATE: the dense Q8_0 projections of Unsloth's files (all of attention, SSM and the shared expert are Q8_0
+// there) take one row per block where that was measured faster - the same per-row sums and reduction as two rows per
+// block (each row its own partials), so every output is the same bits.  q8_gemv_bench, 2-4 columns:
+//   gfx1201 (R9700): n_in <= 4096 with n_out >= 4096 (qkv 2560->10240 73-79% -> 76-78%, gate 2560->6144
+//     51-68% -> 76-78%, q 2560->12288 74-80% -> 85-86%); 6144->2560 is slower there (79% -> 55-59%) and keeps two rows.
+//   sm_86 (RTX A4000): every n_out >= 2048 (+1-4% at 2-4 columns, 6144->2560 at 6 columns 70% -> 76%).
+// Other cards keep two rows until measured (STRATA_NO_MMVQ_ROWS2=1 forces one row everywhere; =0 keeps two everywhere).
+int dev_class() {   // 1 = gfx12, 2 = sm_86, 0 = the rest; per device
+    static int cls[16];   // 0 unknown, else class + 1
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return 0;
+    if (cls[dev] == 0) {
+        int c = 0;
+#if defined(__HIPCC__)
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName)) c = 1;
+#else
+        int major = 0, minor = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) == cudaSuccess &&
+            cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) == cudaSuccess && major == 8 && minor == 6)
+            c = 2;
+#endif
+        (void) cudaGetLastError();
+        cls[dev] = c + 1;
+    }
+    return cls[dev] - 1;
+}
+template<typename F>
+bool q8_0_rows1(int n_in, int n_out) {
+    if constexpr (!std::is_same_v<F, SmallTraits<Q80Block, 8>>) {
+        (void) n_in; (void) n_out;
+        return false;
+    } else {
+        static const int env = [] {
+            const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+            return v == nullptr || v[0] == '\0' ? -1 : v[0] != '0';
+        }();
+        if (env == 0) return false;
+        const int c = dev_class();
+        return (c == 1 && n_in <= 4096 && n_out >= 4096) || (c == 2 && n_out >= 2048);
+    }
+}
 
 template<typename F, int NCOLS, int ROWS>
 __launch_bounds__(WARPS * WARP, 1)
