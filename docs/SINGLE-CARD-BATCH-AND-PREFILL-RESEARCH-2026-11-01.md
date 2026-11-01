@@ -168,56 +168,51 @@ All 4 Wave 3 items were implemented as separate small atomic commits (`b0be13a4.
 
 ---
 
-## Part 6: Wave 4 Proposals for Concurrent Requests & Project-Wide Speedups
+## Part 6: Wave 4 Implementation & Measured Results (`9f72ce1a`, Promoted 2026-11-01)
 
-While implementing and profiling Wave 3 on `gfx1201`, we identified **6 high-leverage Wave 4 proposals** spanning concurrent request orchestration, MoE kernel grid compaction, GPU-resident router planning, and fused shared-expert / dense MMVQ paths:
+All 6 Wave 4 optimizations were implemented as separate small atomic commits (`2d826840..2ec832a9` on `Strata-integ` / `080a91be..d9c8ddac` on PR #4937 `pr/dflash2-batch-optimizations`), verified with `157/157` `serve.test_parallel` & `serve.test_parallel_yield` unit tests + `16/16` CTest parity suites + 4-slot `dflash2_small_bench` bitwise parity, and promoted to `strata.service` (`9f72ce1a82ee11eb15a454952cec76f3`, 8/8 5K needle gate):
 
-### Proposal 1 (Concurrent Burst Admission — Saves `~43 ms` per burst from idle): Direct `BYIELD <slot>` In-Engine Transition (`serve/server.py` & `src/program/generate.cpp`)
-- **Observed Bottleneck in Wave 3 Telemetry:**
-  - When 2–4 HTTP requests arrive simultaneously at an idle server, the 1st request acquires the dispatcher lock when `active_slots == 0` and starts as a solo `GEN` command (`prompt 45 tokens = 0 reused + 45 read in 248 ms, 1 generated in 18 ms`).
-  - Less than `1 ms` later, the 2nd request arrives and `serve/server.py` sends `BYIELD 0`, which halts the 1st request after 1 token (`moved in 23.5 ms`), returns to Python, and immediately re-submits the 1st request via `BGEN 0` (`prompt 46 tokens = 45 reused + 1 read, 1 generated in 19 ms`) — running a **redundant second admission window (`~43 ms`)** for the 1st request!
-- **Proposed Fix:**
-  - Either (a) when `parallel > 1`, always admit requests directly into a batch slot via `BGEN <slot>` (or coalesce concurrent arrivals over a `1–2 ms` micro-window in `serve/server.py` when `active_slots == 0`), OR (b) when `BYIELD <slot>` interrupts an active `GEN` command after its first token (`produced_n == 1`), keep the slot active in `bs[<slot>]` with its already-sampled token and initial DFlash2 draft ready instead of requiring a second `BGEN <slot>` round-trip.
+1. **Wave 4 Commit 1 (`2d826840` / `080a91be`): Skip Solo `GEN` -> `STOP` -> `BGEN` on Concurrent Bursts & Move Turn Checkpoint on Solo Promotion (`serve/server.py`, `serve/test_parallel.py`, `src/program/generate.cpp`):**
+   - Added `_others_admitted()` on `ParallelEngine` (`serve/server.py`), wired to `Service.admission_reserved`, so when another HTTP request has already passed `reserve_inference()` (e.g., tokenizing concurrently in a `c >= 2` burst), the first request to reach `generate_batched` skips solo `GEN` and enters a batch slot directly (`BGEN 0`).
+   - In `src/program/generate.cpp`, skipped launching `mtp.draft` / `dflash2.propose` when `give_way()` (`admit_slot < 0 && stop_req.load()`) becomes true during a solo `ver.run()`, and recovered `prompt_turn_at` from `o.turn_token` in `BGEN` when `turn_at < 0 && from_live && req_ckpt` so `move_best` moves the solo turn checkpoint instead of copying it.
+   - **Measured Result:** Completely eliminated `BYIELD` / `SOLO_AGAIN` churn on concurrent bursts (`0` `BYIELD` events on `c=2` and `c=4`), saving `~43 ms` of redundant solo-to-slot re-admission on every burst from idle.
+2. **Wave 4 Commit 2 (`941ad664` / `5fbb340d`): Run 16-Row `read_windows` on One-Card DFlash2 While Keeping 8-Row Decode Windows (`src/program/generate.cpp`):**
+   - Updated `batch_max_t()` so one-card (`stages.empty()`) DFlash2 batch mode initializes `Verifier` with `kVerifyMaxT` (`16` rows) while keeping DFlash2 batch decode windows capped at `o.batch_draft_window` (`8` rows) via `df2_cap = std::min(cap, o.batch_draft_window)` and `win_cap = (use_df2 && !stages.empty()) ? std::min(S, o.batch_draft_window) : S`.
+   - **Measured Result:** Short-prompt `read_windows` speed on `BGEN` slot admission rose by **+35%** (`160 tok/s -> 208–227 tok/s`, cutting 50-token admission `read_windows` from `312 ms` to `211–240 ms`) while keeping 8-row decode verify windows unchanged.
+3. **Wave 4 Commit 3 (`db82a2e0` / `11661eed`): Split `>4`-Entry Resident MoE Groups into Parallel `blockIdx.y` Chunks & Skip First Pre-Stage Barrier (`src/core/expert_source.cpp`, `src/kernels/cuda/iq_kernels.cu`):**
+   - In `emit_vram_group` (`src/core/expert_source.cpp`), split resident MoE expert groups with `M_e > 4` into multiple `<= 4`-entry (`ED_NC = 4`) groups in `P.ptr` / `P.start` (guarded by `groups + 1 < kMaxWindowEntries`) so `expdec_gu_kernel` and `expdec_down_kernel` (`gridDim.y = min(max_groups, 16)`) execute all `<= 4`-entry chunks in parallel across `blockIdx.y` instead of looping serially (`for (int e = e0; e < e1; e += ED_NC)`).
+   - In `expdec_gu_kernel` and `expdec_down_kernel` (`src/kernels/cuda/iq_kernels.cu`), skipped the redundant initial `iq_sync_lds()` / `__syncthreads()` barrier when `g == blockIdx.y && e == e0`.
+4. **Wave 4 Commit 4 (`39815802` / `274424c8`): Zero-CPU-Miss Fast Path in `expert_pool_dispatch_multi` and `copy_rows_from_mapped_kernel` (`src/core/expert_source.cpp`, `src/kernels/cuda/elementwise.cu`):**
+   - Added an early return in `expert_pool_dispatch_multi` when `gpu_zeroes_hits && planned_vram_entries >= 0 && planned_gpu_entries == n && d.peer == nullptr && d.remote_count == 0`, skipping the per-entry `any_cpu` scan, `d.job_of` zeroing, and CPU pool wakeup whenever all `n` routed entries for the layer are handled on GPU (VRAM + PCIe).
+   - Added a `c >= (int) gridDim.x` fast check in `copy_rows_from_mapped_kernel` (`src/kernels/cuda/elementwise.cu`) so all-GPU-hit layers set `hit = 1` in `O(1)` without scanning `hit_rows[0..c)`.
+5. **Wave 4 Commit 5 (`292639b0` / `4a7488e1`): Fuse Shared-Expert `gate+up` MMVQ Pair (`ROWS=2`) & Router Aux Scalar Gate Across All Verify Layers (`src/core/verify.cpp`, `src/kernels/cuda/shared_expert.cu`, `src/kernels/cuda/native_mmvq.cu`):**
+   - Updated `q8_0_pair_launch` in `src/kernels/cuda/native_mmvq.cu` to dispatch `native_mmvq_multi_kernel<F, NCOLS, WARPS, 2, ..., true>` (`ROWS = 2`, `n_out = 640` blocks in one launch, filling 100% of all 64 WGPs in Wave 1 instead of two separate 320-block `0.625`-wave launches) when `!rows1 && !q8_0_rows1<F>(n_in, n_out) && (n_out & 1) == 0`, and enabled `pair` by default in `shared_expert_multi` (`STRATA_LFUSE_PAIR` != `0`).
+   - Enabled `bf16_gemv_fp32_mmvf_multi_aux` in `src/core/verify.cpp` on all `n = 2..8` verify layers (independent of `lfuse_on(n)` / `ar_on()`) and passed `lfuse |= 4` (`gate_precomputed`) to `shared_expert_multi` so `sh_g_` is computed as block `512` of the router GEMV launch and the separate 1-block `bf16_gemv_fp32_mmvf_multi` launch in `shared_expert_multi` is eliminated (`96` kernel launches saved per 48-layer verify window, 100% bitwise identical).
+6. **Wave 4 Commit 6 (`2ec832a9` / `d9c8ddac`): Cache Per-Column `Q8_1` Activation Fragments in Registers Across `ROWS > 1` in `native_mmvq_multi_kernel` (`src/kernels/cuda/native_mmvq.cu`):**
+   - Hoisted `B6X<F>` above `native_mmvq_multi_kernel` and added `if constexpr (ROWS > 1 && B6X<F>::ok)` inside `native_mmvq_multi_kernel` so each thread loads `xv[0 .. NCOLS - 1]` once per `kbx` iteration and reuses it across all `ROWS` output rows (`ROWS = 2` on `ssm_out` `6144->2560`, `attn_output` `6144->2560`, `attn_k`, `attn_v`, and `shared_expert` `gate+up` / `down`), cutting `Q8_1` activation loads by 50% across 144+ `Q8_0` launches per verify window with 100% bitwise parity.
 
-### Proposal 2 (Batch Admission Coalescing — Est. `-500 to -700 ms` on 4-request bursts): Multi-Slot Batched `read_windows` Admission
-- **Where:** `src/program/generate.cpp` (`in_lines` queue draining before `batch_step()`)
-- **Bottleneck:**
-  - In a `c=4` burst of 45-token prompts, slots 1, 2, and 3 each run `read_windows` serially (`3 × ~215 ms = ~645 ms`), where each 8-token window executes on 1 session while the other 3 batch slots wait.
-- **Proposed Fix:**
-  - When multiple `BGEN <slot>` commands are queued in `in_lines` (or when 1–2 `BGEN` requests arrive while 1–2 slots are already decoding), pack 2–4 tokens per admitting slot into `ver.run_slot_rows` (`8` rows total across slots) so up to 4 short prompts prefill their uncached tails **in parallel in a single verify graph pass**, cutting 4-slot admission wall time by `~3x`.
-
-### Proposal 3 (Verify Window GPU Time — Est. `-2.5 to -4.0 ms/window`): 2D-Grid Compacted to Active `(expert, m_idx)` Pairs in `expdec_gu` & `expdec_down`
-- **Where:** `src/kernels/cuda/iq_kernels.cu` (`expdec_gu`, lines `1958–1986`, and `expdec_down`, lines `2209–2236`)
-- **Bottleneck:**
-  - Both `expdec_gu` and `expdec_down` launch a 3D grid `dim3(blocks_y, max_m, count)` where `count = n_active_experts <= 80` and `max_m = min(B, 4)` (`4` when `B = 8`).
-  - Even though `plan->order` only contains active experts (`count ≈ 55–68` per layer in an 8-row window), `80–85%` of those active experts have multiplicity `M_e == 1`, meaning **`75%` of all launched workgroups (`m_idx = 1, 2, 3`) immediately exit at `if (m_idx >= M) return;`** (`~180` dummy workgroups per layer × `96` launches = `~17,280` wasted workgroups per verify window)!
-- **Proposed Fix:**
-  - Since total routed pairs `(expert, m_idx)` across `B = 8, K = 10` is at most `B * K = 80`, store a compact flat pair table `pair_entry[p] = (order_idx << 8) | m_idx` (`p = 0 .. total_resident_pairs - 1`, `<= 80`) in `ExpDecPlan` (`d_plan`), and launch a 2D grid `dim3(blocks_y, total_resident_pairs)` (`<= 80` y-slices instead of `count * 4 ≈ 260` y-slices) where **100% of launched workgroups are active**!
-
-### Proposal 4 (All-Resident / High-Hit Verify Windows — Est. `-1.5 to -2.5 ms/window`): GPU-Side Resident Plan Compaction & Speculative Zero-Doorbell Fast Path
-- **Where:** `src/core/verify.cpp` (`record_moe_ffn`) and `src/kernels/cuda/moe.cu`
-- **Bottleneck:**
-  - At warm steady state (`94%+` VRAM hit rate, `CPU experts = 4.05` out of `80` routed entries/layer), ~15–20 of the 48 layers in a window have **0 CPU expert misses** (`100%` VRAM hit for that layer), yet the GPU still writes `topk_ids` to host-mapped memory, fires `record_doorbell`, waits for the CPU thread to scan all 80 entries, and copies `ExpDecPlan` back to the GPU (`96` H2D/D2H doorbell handshakes per window).
-- **Proposed Fix:**
-  - Extend `moe_router_topk` (when `res_table` is on device) to atomically count `n_misses` and populate `d_plan` (`order`, `tok_idx`, `tok_w`) directly on the GPU in the same kernel! If `n_misses == 0` for layer `l`, the host thread sees a single `n_misses == 0` word in mapped memory and skips `expert_pool_dispatch_multi` + `cudaMemcpyAsync(d_plan)` completely.
-
-### Proposal 5 (Project-Wide Decode & Prefill Speedup — Est. `-1.2 to -1.8 ms/window`): Fused Shared-Expert `gate+up + SwiGLU + Q8_1` (`shared_expert_multi`)
-- **Where:** `src/kernels/cuda/shared_expert.cu` (`shared_expert_multi`) and `src/core/verify.cpp:3140–3180`
-- **Bottleneck:**
-  - Across all 48 layers, when `T > 1` (`T = 8`), `shared_expert_multi` currently runs 3 separate kernels per layer (`144` launches/window): (1) `native_mmvq_pair` (`gate` + `up` -> FP32 `d_sh_inter_`), (2) `swiglu` (`d_sh_inter_` -> `d_sh_inter_`), and (3) `native_quantize_q8_1` (`d_sh_inter_` -> `nat_sh_q_`), before launching `sh_down`.
-- **Proposed Fix:**
-  - Fuse `SwiGLU + Q8_1 quantization` directly into the epilogue of `native_mmvq_pair` (since `gate[row, col]` and `up[row, col]` are already computed in the same wave/CTA for each output column `col`!), writing quantized `block_q8_1` directly to `nat_sh_q_` and eliminating **96 kernel launches/window** (`swiglu` + `native_quantize_q8_1` across 48 layers) plus the global memory round-trip through `d_sh_inter_`.
-
-### Proposal 6 (Project-Wide Solo & Batch Decode — Est. `-1.0 to -1.5 ms/window`): Dedicated `M = 8` Register-Tiled `IQ3_S` / `IQ4_XS` MMVQ Kernel for Dense QSA/GDN Projections
-- **Where:** `src/kernels/cuda/native_mmvq.cu`
-- **Bottleneck:**
-  - Every verify window (`T = 8`) runs dense `Q/K/V/O` (QSA, 12 layers) and `in_proj / out_proj` (GDN, 36 layers) through `native_mmvq` (`ncols = 8`). On `gfx1201`, `native_mmvq` loops over `col = 0..7` in registers while reloading or broadcasting `q8_1` activations per column.
-- **Proposed Fix:**
-  - Add a specialized `ncols == 8` (and `ncols == 4`) template instantiation in `native_mmvq.cu` (mirroring `df2_gemm`'s 8-row LDS activation staging + 2×4 register accumulator tile), loading each weight super-block once into registers and multiplying against all 8 activation rows in LDS.
+### Wave 4 Measured End-to-End Summary (`gfx1201`, `9f72ce1a82ee11eb15a454952cec76f3`)
+- **`c=2` (`2 × 256` greedy code):**
+  - Cold R1: **`127.75 tok/s`** (**`63.88 tok/s/slot`**, `4.01 s`, up from `126.13 tok/s` in Wave 3 and `105.4 tok/s` pre-Wave 1 — **`+21.2%` vs baseline**).
+  - Warm R2 (AVL/Tarjan): **`130.38 tok/s`** (Slot 1 **`68.80 tok/s`**, Slot 2 **`65.20 tok/s`**), window time **`38.79 ms/window`** (`run 34.76 ms [CUDA0 22.88 + CPU 9.25 ms] + emit 3.56 ms`, down from `39.79 ms/window` in Wave 3 — **`-1.00 ms/window`**).
+  - Warm (Dijkstra/LRU canonical pair): **`137.93 tok/s`** (**`68.96 tok/s/slot`**, Slot 1 **`69.77 tok/s`**, Slot 2 **`68.99 tok/s`**, `512` tokens in **`3.71 s`**, `162.0 rows/s`, up from `132.45 tok/s` / `3.87 s` in Wave 3 — **`+5.48 tok/s` / `+4.1%` over Wave 3** and **`+18.0%` over pre-Wave 1**).
+- **`c=4` (`4 × 256` greedy code):**
+  - R1: **`145.19 tok/s`** (**`36.30 tok/s/slot`**, individual slots up to **`39.23 tok/s`**, `1,024` tokens in **`7.05 s`**, `42.48 ms/window = run 35.92 + emit 6.02 ms`, `165.6 rows/s`, up from `140.00–143.76 tok/s` in Wave 3 and `113.4 tok/s` pre-Wave 1 — **`+28.0%` vs baseline**).
 
 ---
 
-## Part 7: Exact Reproduction Commands
+## Part 7: Wave 5 Proposals for Further Concurrent/Batched Speedups
+
+1. **Multi-Slot Batched `read_windows` Admission (`src/program/generate.cpp`):**
+   - When multiple `BGEN <slot>` commands arrive in a `c=4` burst (or while 1–2 slots are already decoding), pack 4–8 prompt tokens per admitting slot into `ver.run_slot_rows` (`16` rows total across slots) so up to 4 short prompts prefill their uncached tails in parallel in a single verify graph pass instead of running `read_windows` serially (`3 × ~215 ms = ~645 ms`).
+2. **Fused `native_mmvq_pair` Epilogue with `SwiGLU + Q8_1` Quantization (`src/kernels/cuda/native_mmvq.cu`, `src/kernels/cuda/shared_expert.cu`):**
+   - Have each block `bxi < n_out / ROWS` compute both `gate` and `up` rows for the same `row0 + i`, apply `SwiGLU(gate, up)` in registers, and write quantized `Q8_1` blocks directly to `nw.q8_1`, eliminating `native_swiglu_quantize_q8_1` (`48` launches/window) and the FP32 global memory round-trip through `sh_gate_` / `sh_up_`.
+3. **Device-Side Router Resident Plan Construction (`src/kernels/cuda/moe.cu`, `src/core/verify.cpp`):**
+   - Build `ExpDecPlan` (`P.ptr`, `P.start`, `P.tok`, `P.dst`) directly on the GPU inside `native_router_top10_multi` when `planned_gpu_entries == n` (`0` CPU misses), eliminating the host doorbell wait and `cudaMemcpyAsync(d_plan)` on all-GPU-hit layers.
+
+---
+
+## Part 8: Exact Reproduction Commands
 
 ```bash
 # 1. Build strata + unit & parity tests in Strata-integ
