@@ -82,9 +82,11 @@ Implemented, unit-tested, A/B benchmarked on `gfx1201` (AMD Radeon AI PRO R9700,
 
 ---
 
-## 3. Wave 2 Follow-Up (`75cd16bd` — Batched DFlash2 Body, Layer-36 Overlap, `BGEN` & Rank-Major `lend()` Fixes)
+## 3. Wave 2 & Wave 3 Follow-Ups (`75cd16bd` -> `d4f36a10`)
 
-See [`docs/SINGLE-CARD-BATCH-AND-PREFILL-RESEARCH-2026-11-01.md`](SINGLE-CARD-BATCH-AND-PREFILL-RESEARCH-2026-11-01.md) for the Wave 2 root-cause analysis, 6 atomic commits (`996650ea..2170b617` on `Strata-integ` / `a6a4d7c4..42864fcc` on PR #4937), promoted production binary `75cd16bde97ddff79db9934db9cbc1c8` measurements (`c=2` warm **`132.96 tok/s` / `66.48 tok/s/slot`** at `39.77 ms/win`, `emit 3.88 ms`; `c=4` **`140.00 / 143.76 tok/s` / `35.00–35.94 tok/s/slot`** at `42.46 ms/win`, `emit 5.46 ms`, `167.8 rows/s`; `c=2 + 3,200`-token concurrent prefill **`70.39 tok/s` decode (`35.20 tok/s/slot`) alongside `1,532 tok/s` prefill**), and Wave 3 recommendations.
+See [`docs/SINGLE-CARD-BATCH-AND-PREFILL-RESEARCH-2026-11-01.md`](SINGLE-CARD-BATCH-AND-PREFILL-RESEARCH-2026-11-01.md) for:
+- **Wave 2 (`75cd16bde97ddff79db9934db9cbc1c8`, commits `996650ea..2170b617` / PR #4937 `a6a4d7c4..42864fcc`):** Batched DFlash2 body (`STRATA_DF2_BATCHBODY`), Layer-36 context projection overlap, `Dflash2Drafter::copy_slot`, `BGEN` `n-1` tap/draft/suffix fixes, rank-major `--expert-cache-per-layer` slot lending, and `STRATA_BATCH_PREFILL_CHUNK=2048`.
+- **Wave 3 (`d4f36a107ba0e9fb8aa09071bc86faf3`, commits `b0be13a4..df0775e8` / PR #4937 `5f49f24f..42fa8284`):** Multi-slot `df2_kv_ring_batch[_f16]`, `df2_attention_batch[_f16]`, and `df2_pack_head_rows_batch` + `batch_body_exec_[n_items]` CUDA Graph capture (`emit` down to **`3.54–3.68 ms/win` at `c=2`** and **`5.30 ms/win` at `c=4`**), `M_e`-bucketed resident MoE plan ordering (`STRATA_MOE_BUCKET_PLAN`) + shared-expert `q8_ffn` reuse, mid-chunk layer-boundary prefill yielding (`STRATA_BATCH_PREFILL_LAYER_YIELD=16`, 9 yield parts across a `5,762`-token prefill sustaining **`66.45 tok/s` decode / `33.23 tok/s/slot`**), and fast `BGEN` admission (`6.7–7.0 ms` slot moves, `-41%`), plus **Wave 4 Concurrent-Request & Project-Wide Speedup Proposals**.
 
 ---
 
