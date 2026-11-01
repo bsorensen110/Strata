@@ -13605,7 +13605,7 @@ int main(int argc, char** argv) {
                 // is usually exact and a verify pass accepts many tokens at once.  No weights, no GPU.
                 bs[(size_t) b].sfx.reset();
                 bs[(size_t) b].sfx.configure(o.batch_suffix_draft, 64);
-                for (int32_t t : bs[(size_t) b].ids) bs[(size_t) b].sfx.append(t);
+                if (!ids.empty()) bs[(size_t) b].sfx.append(ids.data(), ids.size());
             }
 #if defined(STRATA_HAVE_DFLASH2)
             if (df2_batch && has_dflash) {
@@ -14370,10 +14370,23 @@ int main(int argc, char** argv) {
                             if (geo && hi > lo) {
                                 const strata::core::OnDevice on_df2(df2.device());
                                 std::string de, se;
-                                (void) (df2.set_slot(b, de) &&
-                                        df2.context(ver.final_tap_dev() + (size_t) lo * df2_stage_stride,
-                                                    hi - lo, pos[first[t]], de));
-                                (void) df2.set_slot(0, se);
+                                const float* ctx_taps = ver.final_tap_dev() + (size_t) lo * df2_stage_stride;
+                                bool stage_ok = true;
+                                if (df2_stage) {
+                                    try {
+                                        strata::kernels::copy_from_mapped(
+                                            df2_stage.get(), ctx_taps,
+                                            (int64_t) ((size_t) (hi - lo) * df2_stage_stride), df2.stream());
+                                        ctx_taps = df2_stage.get();
+                                    } catch (const std::exception&) {
+                                        stage_ok = false;
+                                    }
+                                }
+                                if (stage_ok) {
+                                    (void) (df2.set_slot(b, de) &&
+                                            df2.context(ctx_taps, hi - lo, pos[first[t]], de));
+                                    (void) df2.set_slot(0, se);
+                                }
                             }
                         }
                     }
@@ -18995,8 +19008,14 @@ int main(int argc, char** argv) {
                     df_pending_k = std::min(room_k, df_conf_adapt ? df_conf_policy.choose() : df_auto ? df_policy.choose() : req_dflash_k);
                     // Finish near the context limit with target-only windows rather than
                     // proposing a block which the next verification window cannot fit.
+                    // On a BGEN batch admission pass, max_new is rewritten to 1 while admit_max_new holds the request's
+                    // true target length: still run the DFlash2 round on the admission window so the final prompt
+                    // token's tap (position n - 1) enters slot 0's KV ring before copy_to_slot copies it to the batch
+                    // slot, and so the admitted slot starts its first batch window with an initial draft proposal.
+                    const int64_t df2_eff_max_new =
+                        (admit_slot >= 0 && df2_batch && admit_max_new > max_new) ? admit_max_new : max_new;
                     dflash_ready = false;
-                    if (!eos && produced_n < max_new) {   // the next block, from the committed rows' taps
+                    if (!eos && produced_n < df2_eff_max_new) {   // the next block, from the committed rows' taps
                         int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                         float pp[strata::core::Dflash2Drafter::kDrafts];
                         // `p` has not been incremented yet (`p += a + 1` is at the end of the loop, as in CLI):
@@ -19420,6 +19439,56 @@ int main(int argc, char** argv) {
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
+                    if (o.batch_suffix_draft > 0) {
+                        // Re-prime after `sl = BSlot{}` reset the slot: include all prompt tokens (`live`) plus the
+                        // first generated token `x` (which `sl.x` holds entering the first batch window).
+                        sl.sfx.reset();
+                        sl.sfx.configure(o.batch_suffix_draft, 64);
+                        if (!live.empty()) sl.sfx.append(live.data(), live.size());
+                        sl.sfx.append(x);
+                    }
+#if defined(STRATA_HAVE_DFLASH2)
+                    if (df2_batch && has_dflash) {
+                        const int k_next = strata::core::batch_spec_draft_store_cap(dflash_k);
+                        int k_sfx = 0;
+                        int32_t sfx_draft[strata::kernels::kVerifyMaxT] = {};
+                        if (o.batch_suffix_draft > 0 && k_next > 0)
+                            k_sfx = sl.sfx.propose(k_next, sfx_draft);
+                        if (k_sfx > 0) {
+                            for (int i = 0; i < k_sfx; ++i) {
+                                sl.draft[(size_t) i] = sfx_draft[i];
+                                sl.dprob[(size_t) i] = 1.0f;
+                            }
+                            sl.n_drafts = k_sfx;
+                            sl.draft_ready = true;
+                        } else if (dflash_ready && df_pending_k > 0 && k_next > 0) {
+                            const int k_cap = std::min<int>({df_pending_k, k_next, (int) sl.draft.size()});
+                            const int k_keep = df2_depth_on
+                                ? std::min({k_cap, df2_depth.max_depth,
+                                            strata::core::mtp_depth_trim(dprob.data(), k_cap, df2_depth.floor)})
+                                : k_cap;
+                            for (int i = 0; i < k_keep; ++i) {
+                                sl.draft[(size_t) i] = drafts[(size_t) i];
+                                sl.dprob[(size_t) i] = dprob[(size_t) i];
+                            }
+                            sl.n_drafts = k_keep;
+                            sl.draft_ready = k_keep > 0;
+                        }
+                        strata::core::SessionState& sx = *bslot_ss[0][(size_t) admit_slot];
+                        if (sl.draft_ready && sx.ple.ready() && sx.ple.table != nullptr) {
+                            int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
+                            auto pf = [&](int32_t tok) {
+                                uint32_t rows16[strata::kernels::PLE_N_HEADS];
+                                strata::kernels::ngram_rows(&tok, prev, 1, sx.ple.consts, rows16);
+                                prev[0] = prev[1];
+                                prev[1] = tok;
+                                sx.ple.table->prefetch_rows(rows16);
+                            };
+                            pf(sl.x);
+                            for (int i = 0; i < sl.n_drafts; ++i) pf(sl.draft[(size_t) i]);
+                        }
+                    }
+#endif
                     if (batch_mtp) {
                         int nd = 1;   // (STRATA_PIPED_MTP: up to its proposals per window, as --spec-min-p allows)
                         const bool depth_gate = mtp_depth.on() && !piped_mtp;   // STRATA_BATCH_MTP_DEPTH: a new request's depth
