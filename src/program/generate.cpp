@@ -13471,12 +13471,13 @@ int main(int argc, char** argv) {
         // the main sessions and the slot sessions of a stage live on the same device and are carved alike, so
         // a slot copy can go device to device (the same bytes into the same places as the checkpoint/K-V image
         // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); each device is
-        // synchronized once before and once after.  Opt-in: STRATA_SLOT_COPY_DIRECT=1 (default: the host path).
+        // synchronized once before and once after.  Default ON (`STRATA_SLOT_COPY_DIRECT=0` forces the host path).
         static const bool slot_copy_direct = [] {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
+            return v == nullptr || v[0] == '\0' || v[0] != '0';
         }();
-        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
+        auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, bool skip_pooled_kv,
+                                    std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
             auto sync_all = [&]() {
                 bool ok = true;
@@ -13499,10 +13500,12 @@ int main(int argc, char** argv) {
                 strata::core::SessionState& to = into_slot ? slot_ss : main_ss;
                 const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                 if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, e, queued)) return failed();
-                for (int64_t j = 0; j < from.qsa_alloc; ++j)
+                for (int64_t j = 0; j < from.qsa_alloc; ++j) {
+                    if (skip_pooled_kv && from.qsa_states[from.qsa_ord0 + j].kv_mode == 1) continue;
                     if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
                                                             to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
                         return failed();
+                }
             }
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
@@ -13560,8 +13563,8 @@ int main(int argc, char** argv) {
                 if (!pool_reserve(*bslot_ss[0][(size_t) b], upto + 8, b)) { e = "the KV pool is full"; return false; }
                 kv_pool.shrink(*bslot_ss[0][(size_t) b], upto + 8);
             }
-            if (slot_copy_direct && !moved) {   // with a pool the streamed K/V moves by chunks (pool_move), not by a copy
-                if (!direct_slot_copy(true, b, ids, e)) return false;
+            if (slot_copy_direct) {   // with a pool the streamed K/V moves by chunks (pool_move); GDN + non-pooled QSA copy D2D
+                if (!direct_slot_copy(true, b, ids, moved, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
@@ -13613,12 +13616,8 @@ int main(int argc, char** argv) {
                 // (the main session reads the prompts), so the slot's first window drafts against this
                 // conversation's context - never a cold ring, and never another conversation's.  A copy that fails
                 // leaves the slot cold: it proposes nothing until its own committed rows prime it.
-                const strata::core::OnDevice on_df2(df2.device());
                 std::string de;
-                std::vector<uint8_t> blob;
-                (void) cudaDeviceSynchronize();
-                const bool primed = df2.set_slot(0, de) && df2.save_state(blob, de, upto) &&
-                                    df2.set_slot(b, de) && df2.restore_state(blob, upto, de);
+                const bool primed = df2.copy_slot(0, b, upto, de);
                 std::string se;
                 (void) df2.set_slot(0, se);
                 bs[(size_t) b].draft_ready = false;   // its first round drafts from its own committed rows
@@ -13642,8 +13641,8 @@ int main(int argc, char** argv) {
             if (at != nullptr && at->stage_parts.size() != stages.size()) { e = "a checkpoint without its stage parts"; return false; }
             const bool moved = kv_pool.active();
             if (moved && !pool_move(b, -1, upto, e)) return false;
-            if (slot_copy_direct && at == nullptr && !moved) {   // with a pool the streamed K/V moves by chunks, not by a copy
-                if (!direct_slot_copy(false, b, bs[(size_t) b].ids, e)) return false;
+            if (slot_copy_direct && at == nullptr) {   // with a pool the streamed K/V moves by chunks; GDN + non-pooled QSA copy D2D
+                if (!direct_slot_copy(false, b, bs[(size_t) b].ids, moved, e)) return false;
             } else
             for (size_t k = 0; k < bslot_ss.size(); ++k) {
                 strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
@@ -13688,12 +13687,10 @@ int main(int argc, char** argv) {
                 // the drafter's ring follows the conversation back: slot b's ring becomes slot 0's, so the solo
                 // request that reads on from here drafts against its own context.  Without the copy the drafter
                 // would draft against whatever ring slot 0 held last - another conversation's.
-                const strata::core::OnDevice on_df2(df2.device());
                 std::string de;
-                std::vector<uint8_t> blob;
-                (void) cudaDeviceSynchronize();
-                const bool carried = df2.set_slot(b, de) && df2.save_state(blob, de, upto) &&
-                                     df2.set_slot(0, de) && df2.restore_state(blob, upto, de);
+                const bool carried = df2.copy_slot(b, 0, upto, de);
+                std::string se;
+                (void) df2.set_slot(0, se);
                 if (!carried) {
                     df2.reset();   // slot 0 cold: no conversation's ring is shown to this one
                     std::fprintf(stderr, "strata serve: batch slot restore: DFlash2 context NOT carried over (%s); "
