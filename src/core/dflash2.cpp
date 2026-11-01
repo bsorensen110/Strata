@@ -600,16 +600,19 @@ bool Dflash2Drafter::record_block_head(cudaStream_t cs, std::string& err) {
                 const char* e = std::getenv("STRATA_DFLASH_HEAD_IL");
                 return e && e[0] ? (e[0] != '0' ? 1 : 0) : -1;
             }();
-            if (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, kDrafts, (int) n_dvocab_))) {
+            bool use_il = (head_il != 0) && native_mmvq_il_supported(head_type_, kDrafts, (int) n_dvocab_);
+            bool tuned_il = false;
+            if (!use_il && head_il == 1) {
+                native_mmvq_il_tune(4);
+                use_il = native_mmvq_il_supported(head_type_, kDrafts, (int) n_dvocab_);
+                tuned_il = use_il;
+                if (!use_il) native_mmvq_il_tune(0);
+            }
+            if (use_il) {
                 uint8_t* xil = xq_ + native_q8_1_bytes(N_, kRows);
                 native_q8_1_interleave(xq_, xil, N_, kDrafts, cs);
-                if (head_il == 1 && !native_mmvq_il_supported(head_type_, kDrafts, (int) n_dvocab_)) {
-                    native_mmvq_il_tune(4);
-                    native_mmvq_il(head_type_, head_w_, xq_, xil, logits_, N_, (int) n_dvocab_, kDrafts, cs);
-                    native_mmvq_il_tune(0);
-                } else {
-                    native_mmvq_il(head_type_, head_w_, xq_, xil, logits_, N_, (int) n_dvocab_, kDrafts, cs);
-                }
+                native_mmvq_il(head_type_, head_w_, xq_, xil, logits_, N_, (int) n_dvocab_, kDrafts, cs);
+                if (tuned_il) native_mmvq_il_tune(0);
             } else {
                 native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, kDrafts, cs);
             }
@@ -866,10 +869,11 @@ bool Dflash2Drafter::draft_batch(const BatchItem* items, int n_items, float* sta
         Slot& sl = *slots_[(size_t) it.slot];
         const float* cap_taps = stage_taps != nullptr ? stage_taps : it.taps;
         if (stage_taps != nullptr && it.taps != stage_taps) {
-            if (cudaMemcpyAsync(stage_taps, it.taps, (size_t) it.n_new * stage_stride * sizeof(float),
-                                cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+            try {
+                kernels::copy_from_mapped(stage_taps, it.taps, (int64_t) ((size_t) it.n_new * stage_stride), cs_);
+            } catch (const std::exception& e) {
                 cur_ = saved_cur;
-                err = "dflash2 draft_batch: stage copy failed";
+                err = e.what();
                 return false;
             }
         }
@@ -907,16 +911,19 @@ bool Dflash2Drafter::draft_batch(const BatchItem* items, int n_items, float* sta
             const int nc = std::min((int) kDrafts, total_rows - c0);
             native_quantize_q8_1(fn_batch_ + (size_t) c0 * N_, xq_, N_, nc, cs_);
             if (!skip_part("head")) {
-                if (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_))) {
+                bool use_il = (head_il != 0) && native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_);
+                bool tuned_il = false;
+                if (!use_il && head_il == 1) {
+                    native_mmvq_il_tune(4);
+                    use_il = native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_);
+                    tuned_il = use_il;
+                    if (!use_il) native_mmvq_il_tune(0);
+                }
+                if (use_il) {
                     uint8_t* xil = xq_ + native_q8_1_bytes(N_, kRows);
                     if (nc >= 2) native_q8_1_interleave(xq_, xil, N_, nc, cs_);
-                    if (head_il == 1 && !native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)) {
-                        native_mmvq_il_tune(4);
-                        native_mmvq_il(head_type_, head_w_, xq_, xil, logits_, N_, (int) n_dvocab_, nc, cs_);
-                        native_mmvq_il_tune(0);
-                    } else {
-                        native_mmvq_il(head_type_, head_w_, xq_, xil, logits_, N_, (int) n_dvocab_, nc, cs_);
-                    }
+                    native_mmvq_il(head_type_, head_w_, xq_, xil, logits_, N_, (int) n_dvocab_, nc, cs_);
+                    if (tuned_il) native_mmvq_il_tune(0);
                 } else {
                     native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, nc, cs_);
                 }

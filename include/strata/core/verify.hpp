@@ -430,11 +430,13 @@ public:
     const float* final_R(int t) const;
     const float* final_R_all() const { return next_ ? next_->final_R_all() : R_; }
     /// DFlash2 (before init): keep the completed outputs of these layers (zero-based; the mean of the hc streams) for every row of
-    /// each window in a device buffer, tap_dev() = [max_t][n_taps][n_embd] floats, valid until the next window.  Single-stage
-    /// verifiers only; STRATA_TAP_FILE (research dump) turns the same buffer on without this call.
-    void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
+    /// each window in a device buffer, tap_dev() = [max_t][n_taps][n_embd] floats, valid until the next window.
+    /// On a layer split, `shared_tap_dev` is this stage's device alias of a shared portable mapped buffer (`[max_t][n_taps][n_embd]`),
+    /// so each stage writes the tap slots of its own `[lb_, le_)` layers and `final_tap_dev()` returns the last stage's alias.
+    void set_taps(const std::vector<int>& layers, float* shared_tap_dev = nullptr) { tap_req_ = layers; tap_shared_ = shared_tap_dev; }
     const float* tap_dev() const { return tap_dev_; }
-    bool tapping() const { return tap_on_; }
+    const float* final_tap_dev() const { return next_ ? next_->final_tap_dev() : tap_dev_; }
+    bool tapping() const { return tap_on_ && (next_ == nullptr || next_->tapping()); }
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
@@ -774,6 +776,7 @@ private:
     std::vector<int> tap_layers_;                 ///< the tapped layer ids (zero-based, completed outputs)
     std::vector<int> tap_slot_;                   ///< layer -> slot in tap_layers_, or -1
     float* tap_dev_ = nullptr;                    ///< [max_t][n_taps][n_embd]
+    float* tap_shared_ = nullptr;                 ///< non-null on a layer split: external mapped alias (not cudaFree'd here)
     float* tap_scratch_ = nullptr;                ///< one row's streams, [hc][n_embd]
     float* h_tap_ = nullptr;     float* m_tap_ = nullptr;       ///< the mapped copy of tap_dev_
     std::FILE* tap_file_ = nullptr;

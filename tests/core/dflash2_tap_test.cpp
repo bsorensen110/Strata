@@ -10,6 +10,7 @@
 #include <vector>
 
 using strata::core::dflash2_tap_capture;
+using strata::core::dflash2_stage_taps_active;
 using strata::core::dflash2_kernels_in_build;
 
 namespace {
@@ -58,6 +59,17 @@ int main() {
     check(dflash2_tap_capture(true, true, 15, tap_slot) == dflash2_kernels_in_build,
           "the default follows the build: a batch window captures exactly when the build has the DFlash2 tap kernels");
     check(dflash2_tap_capture(true, false, 15, tap_slot), "the default follows the build: a single window is not affected");
+
+    // layer-split stage tap activation (Verifier::init):
+    check(!dflash2_stage_taps_active(false, false, 0, 48, 48, false, true), "no tap_req and no tap_file: inactive");
+    check(dflash2_stage_taps_active(true, false, 0, 48, 48, false, true), "single-stage [0, n_layers): active without shared buffer");
+    check(dflash2_stage_taps_active(false, true, 0, 48, 48, false, false), "single-stage tap_file: active even without kernels");
+    check(!dflash2_stage_taps_active(true, false, 0, 24, 48, false, true), "partial stage [0, 24) without shared buffer: inactive");
+    check(!dflash2_stage_taps_active(true, false, 24, 48, 48, false, true), "partial stage [24, 48) without shared buffer: inactive");
+    check(dflash2_stage_taps_active(true, false, 0, 24, 48, true, true), "partial stage [0, 24) with shared buffer and kernels: active");
+    check(dflash2_stage_taps_active(true, false, 24, 48, 48, true, true), "partial stage [24, 48) with shared buffer and kernels: active");
+    check(!dflash2_stage_taps_active(true, false, 0, 24, 48, true, false), "partial stage with shared buffer but no kernels: inactive");
+    check(!dflash2_stage_taps_active(false, true, 0, 24, 48, true, true), "partial stage with tap_file only (no tap_req): inactive");
 
     std::printf("dflash2_tap_test: %ld checks, %s\n", g_checks, g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;

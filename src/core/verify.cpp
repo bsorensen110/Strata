@@ -832,7 +832,7 @@ Verifier::~Verifier() {
     if (qcnt_) cudaFree(qcnt_);
     if (d_spec_) cudaFree(d_spec_);
     if (tap_file_) std::fclose(tap_file_);
-    if (tap_dev_) cudaFree(tap_dev_);
+    if (tap_dev_ && tap_shared_ == nullptr) cudaFree(tap_dev_);
     if (tap_scratch_) cudaFree(tap_scratch_);
     if (h_tap_) cudaFreeHost(h_tap_);
     if (logit_bias_device_) cudaFree(logit_bias_device_);
@@ -1104,9 +1104,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // DFlash2 taps: set_taps (the drafter) or STRATA_TAP_FILE (the research dump); off, and nothing is allocated or captured, otherwise
     const char* tap_path = std::getenv("STRATA_TAP_FILE");
     if (tap_path != nullptr && tap_path[0] == '\0') tap_path = nullptr;
-    if ((tap_path != nullptr || !tap_req_.empty()) && lb_ == 0 && le_ == g.n_layers) {
+    if (dflash2_stage_taps_active(!tap_req_.empty(), tap_path != nullptr, lb_, le_, g.n_layers, tap_shared_ != nullptr)) {
         tap_layers_.clear();
-        if (tap_path == nullptr) {
+        if (tap_path == nullptr || tap_shared_ != nullptr) {
             for (int l : tap_req_) if (l >= 0 && l < g.n_layers - 1) tap_layers_.push_back(l);
         } else {
             const char* tl = std::getenv("STRATA_TAP_LAYERS");
@@ -1122,9 +1122,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         tap_slot_.assign((size_t) g.n_layers, -1);
         for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot_[(size_t) tap_layers_[i]] = (int) i;
         const size_t nt = tap_layers_.size();
-        if (nt == 0 || cudaMalloc((void**) &tap_dev_, (size_t) T * nt * N * 4) != cudaSuccess ||
-            (tap_path != nullptr && (cudaMalloc((void**) &tap_scratch_, (size_t) HC * N * 4) != cudaSuccess ||
-                                     !mapped((size_t) T * nt * N * 4, (void**) &h_tap_, (void**) &m_tap_)))) {
+        if (tap_shared_ != nullptr) {
+            if (nt == 0) {
+                err = "verify: the DFlash2 tap buffers could not be allocated";
+                return false;
+            }
+            tap_dev_ = tap_shared_;
+        } else if (nt == 0 || cudaMalloc((void**) &tap_dev_, (size_t) T * nt * N * 4) != cudaSuccess ||
+                   (tap_path != nullptr && (cudaMalloc((void**) &tap_scratch_, (size_t) HC * N * 4) != cudaSuccess ||
+                                            !mapped((size_t) T * nt * N * 4, (void**) &h_tap_, (void**) &m_tap_)))) {
             err = "verify: the DFlash2 tap buffers could not be allocated";
             return false;
         }

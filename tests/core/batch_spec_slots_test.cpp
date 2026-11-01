@@ -33,6 +33,9 @@ void check(bool ok, const char* what) {
 
 constexpr int kCap = strata::kernels::kVerifyDefaultMaxT;  // the preserved runtime window default
 constexpr int kStorageCap = strata::kernels::kVerifyMaxT;  // all host arrays cover the 16-row hard ceiling
+// The 16-row window only exists in a wide build (-DSTRATA_WINDOW_MAX_T=16; the HIP engine builds it by default).
+// A narrow build has 8-row storage, so the 16-row plans below clamp to 8 and their checks are skipped, not passed.
+constexpr bool kWideWindow = strata::kernels::kVerifyMaxT >= 16;
 
 // The positions a window gives the rows: each slot's group at consecutive positions of its own, every slot starting
 // somewhere different so a mix-up of the slots shows up (as in tests/core/batch_spec_test.cpp).
@@ -400,7 +403,7 @@ int main() {
     }
 
     // ---- the opt-in 16-row DFlash window (RED until the verifier capacity is raised) ----
-    {
+    if (kWideWindow) {
         using strata::core::df2_window_plan;
         constexpr int wide_cap = 16;
         int rows[wide_cap] = {}, ntok[wide_cap] = {};
@@ -414,6 +417,7 @@ int main() {
         for (int i = 0; i < 4; ++i) full = full && ntok[i] == 4;
         check(full, "the opt-in 16-row window stores four rows per selected slot");
     }
+    else { std::fputs("skip: the opt-in 16-row DFlash window plan needs a wide build (kVerifyMaxT == 16)\n", stderr); }
 
     // ---- default DFlash windows remain 8 rows after the verifier storage ceiling grows to 16 ----
     {
@@ -433,16 +437,20 @@ int main() {
         bool ready[6] = {true, true, true, true, true, true};
         int selected[16] = {}, rows[16] = {}, ntok[16] = {};
         auto p = df2_piped_group_rows(16, 6, active, ready, 7, 3, 4, selected, rows, ntok);
-        check(p.n_sel == 4 && p.depth == 3 && p.rows == 16 && p.next == 2,
-              "piped row planner fits four 3-proposal groups and advances the rotation");
-        const int want_sel[4] = {4, 5, 0, 1};
-        bool shape_ok = true;
-        for (int i = 0; i < 4; ++i) shape_ok = shape_ok && selected[i] == want_sel[i] && ntok[i] == 4;
-        for (int r = 0; r < 16; ++r) shape_ok = shape_ok && rows[r] == want_sel[r / 4];
-        check(shape_ok, "piped rows stay contiguous and map back to the rotating group-local slots");
-        p = df2_piped_group_rows(16, 6, active, ready, 7, 3, p.next, selected, rows, ntok);
-        check(p.n_sel == 4 && selected[0] == 2 && selected[1] == 3 && selected[2] == 4 && selected[3] == 5,
-              "piped row rotation gives waiting slots their turn");
+        if (kWideWindow) {
+            check(p.n_sel == 4 && p.depth == 3 && p.rows == 16 && p.next == 2,
+                  "piped row planner fits four 3-proposal groups and advances the rotation");
+            const int want_sel[4] = {4, 5, 0, 1};
+            bool shape_ok = true;
+            for (int i = 0; i < 4; ++i) shape_ok = shape_ok && selected[i] == want_sel[i] && ntok[i] == 4;
+            for (int r = 0; r < 16; ++r) shape_ok = shape_ok && rows[r] == want_sel[r / 4];
+            check(shape_ok, "piped rows stay contiguous and map back to the rotating group-local slots");
+            p = df2_piped_group_rows(16, 6, active, ready, 7, 3, p.next, selected, rows, ntok);
+            check(p.n_sel == 4 && selected[0] == 2 && selected[1] == 3 && selected[2] == 4 && selected[3] == 5,
+                  "piped row rotation gives waiting slots their turn");
+        } else {
+            std::fputs("skip: the 16-row pipelined DFlash2 group contract needs a wide build (kVerifyMaxT == 16)\n", stderr);
+        }
 
         bool cold[4] = {true, true, true, true};
         bool has_draft[4] = {true, false, true, false};
@@ -549,27 +557,41 @@ int main() {
 
     // ---- per-slot max_drafts (STRATA_BATCH_DF2_DEPTH) ----
     {
-        // Under cap in a 16-row window: each slot gets its own adaptive depth (e.g. 1, 3, 0, 2 -> 4 + 6 = 10 rows).
         int rows[kStorageCap] = {}, ntok[kStorageCap] = {};
-        const int max_d[4] = {1, 3, 0, 2};
-        const float ema[4] = {0.5f, 0.85f, 0.5f, 0.75f};
-        const int S = strata::core::batch_spec_slot_rows(kStorageCap, 4, max_d, rows, ntok, ema);
-        check(S == 10 && ntok[0] == 2 && ntok[1] == 4 && ntok[2] == 1 && ntok[3] == 3,
-              "per-slot max_drafts under cap: each slot keeps its exact requested depth (10 rows in a 16-row window)");
         int64_t pos[kStorageCap];
-        positions(rows, S, pos);
-        check(strata::core::batch_rows_error(rows, S, pos, 4, kStorageCap, 0, false, kStorageCap) == nullptr,
-              "per-slot max_drafts under cap: passes the layout law");
+        if (kWideWindow) {
+            // Under cap in a 16-row window: each slot gets its own adaptive depth (e.g. 1, 3, 0, 2 -> 4 + 6 = 10 rows).
+            const int max_d[4] = {1, 3, 0, 2};
+            const float ema[4] = {0.5f, 0.85f, 0.5f, 0.75f};
+            const int S = strata::core::batch_spec_slot_rows(kStorageCap, 4, max_d, rows, ntok, ema);
+            check(S == 10 && ntok[0] == 2 && ntok[1] == 4 && ntok[2] == 1 && ntok[3] == 3,
+                  "per-slot max_drafts under cap: each slot keeps its exact requested depth (10 rows in a 16-row window)");
+            positions(rows, S, pos);
+            check(strata::core::batch_rows_error(rows, S, pos, 4, kStorageCap, 0, false, kStorageCap) == nullptr,
+                  "per-slot max_drafts under cap: passes the layout law");
 
-        // Over cap with EMA: 4 slots requesting {3, 3, 3, 3} in a 12-row window -> lowest ema^k dropped first.
-        const int max_d12[4] = {3, 3, 3, 3};
-        const float ema12[4] = {0.9f, 0.6f, 0.8f, 0.7f};
-        const int S12 = strata::core::batch_spec_slot_rows(12, 4, max_d12, rows, ntok, ema12);
-        check(S12 == 12 && ntok[0] == 4 && ntok[1] == 2 && ntok[2] == 4 && ntok[3] == 2,
-              "per-slot max_drafts over cap with EMA: best slots keep depth 3, lower EMA slots trim to 1");
-        positions(rows, S12, pos);
-        check(strata::core::batch_rows_error(rows, S12, pos, 4, kStorageCap, 0, false, 12) == nullptr,
-              "per-slot max_drafts over cap with EMA: passes the layout law");
+            // Over cap with EMA: 4 slots requesting {3, 3, 3, 3} in a 12-row window -> lowest ema^k dropped first.
+            const int max_d12[4] = {3, 3, 3, 3};
+            const float ema12[4] = {0.9f, 0.6f, 0.8f, 0.7f};
+            const int S12 = strata::core::batch_spec_slot_rows(12, 4, max_d12, rows, ntok, ema12);
+            check(S12 == 12 && ntok[0] == 4 && ntok[1] == 2 && ntok[2] == 4 && ntok[3] == 2,
+                  "per-slot max_drafts over cap with EMA: best slots keep depth 3, lower EMA slots trim to 1");
+            positions(rows, S12, pos);
+            check(strata::core::batch_rows_error(rows, S12, pos, 4, kStorageCap, 0, false, 12) == nullptr,
+                  "per-slot max_drafts over cap with EMA: passes the layout law");
+        } else {
+            std::fputs("skip: the 10-row and 12-row per-slot max_drafts checks need a wide build (kVerifyMaxT == 16)\n", stderr);
+        }
+
+        // Under/over cap in an 8-row window (runs in both narrow and wide builds).
+        const int max_d8[4] = {1, 2, 0, 2};
+        const float ema8[4] = {0.6f, 0.9f, 0.5f, 0.7f};
+        const int S8 = strata::core::batch_spec_slot_rows(kCap, 4, max_d8, rows, ntok, ema8);
+        check(S8 == 8 && ntok[0] == 2 && ntok[1] == 3 && ntok[2] == 1 && ntok[3] == 2,
+              "per-slot max_drafts in 8-row window with EMA: highest-EMA slot keeps depth 2, slot 2 stays anchor-only");
+        positions(rows, S8, pos);
+        check(strata::core::batch_rows_error(rows, S8, pos, 4, kCap, 0, false, kCap) == nullptr,
+              "per-slot max_drafts in 8-row window with EMA: passes the layout law");
 
         // Over cap without EMA: round-robin from the left up to each slot's cap.
         const int max_d_rr[3] = {1, 4, 4};
