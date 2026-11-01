@@ -48,3 +48,17 @@ CUDA build green (fresh configure in the worktree — caches from other dirs are
 ## Ship
 
 Rebased branch stays on the fork; the fork-unique waves are PR candidates for upstream (Niko1221) once green — upstream is actively developing this exact area, so contribution beats long-lived divergence.
+
+## Execution results (2026-11-03)
+
+**Ported and gated: wave 1 only.** FP16 context K/V ring + uint2 register prefetch (`cf70f46ac`) merged by hand into main's rewritten kernels (`70f43138d`): fork's `RegTraits<RingT>` templating and all-ring fast path fused with main's `tag`/`epoch` ring-log params; `df2_attention_f16`/`df2_kv_ring_f16` entry points; `STRATA_DF2_FP16_RING=0` off-switch; `copy_state_from` refuses mixed-dtype state; bench parity gate ported. Gates on RTX 5080: `dflash2_parity` rc 0, `dflash2_q4_parity` rc 0, `dflash2_ring_test` rc 0, `dflash2_attn_bench` bitwise-equal fp32 reference + timing line.
+
+**Wave 2 (BATCHBODY `2999c0b18` + `copy_slot` `5928dc613` + graph `b0be13a49`): NOT applicable as a port — replacement.** `5928dc613` is GDN/kv_pool serve-batch plumbing (main covers drafter D2D copies with `copy_state_from`); BATCHBODY is a kernel-level batched body across fork `BatchItem` slots, while main's `29d55bd71` runs per-slot CUDA graphs launched-then-finished together. Merging them is a design change to upstream's batch scheduler, not an optimization of it → RFC for upstream, not this branch.
+
+**Wave 3 (verify overlap `19e213789`): NOT applicable — consumes wave 2.** `precompute_batch_context` feeds the precomputed projections only into `draft_batch_begin`'s batch body; without wave 2 the optimization has no consumer. The `set_taps_ready` hook grafts onto fork's verify tap layout (conflicts in verify.hpp/generate.cpp). Ships with the wave-2 RFC.
+
+**Wave 4 (window merges `941ad664f`, `922620781`): NOT applicable — generate.cpp call-site commits.** Each touches only `src/program/generate.cpp` (16+/11− and 24+/10−): they widen the fork's serve window calls. Main's `read_windows` (generate.cpp:16221) is main's own structure; the perf must be re-implemented against main's admission/window code if wanted → RFC.
+
+**Wave 5 (head micro-perf `3f647f45b`): NOT applicable — HIP-only.** Head IL + Q6 pack + register top-k are the gfx12/HIP head layout; main's CUDA side already ships its own native-head Q4_0 codebook path (8ec2c8a91, b353ce7d4). No CUDA-side delta to A/B.
+
+**Net:** the fork's CUDA-relevant dflash2 perf that is *applicable to upstream's implementation* is the FP16 ring; the batch-body family is a parallel architecture, best carried to upstream as an RFC with the fork's measurement data (concurrent-serve +24–41%).
