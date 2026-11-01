@@ -17877,11 +17877,11 @@ int main(int argc, char** argv) {
             // and the serial loop with nothing else reading its windows
             int64_t merge_at = -1;
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
-                if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
+                if (!admit_merge_first_env() || (admit_slot < 0 && !has_dflash) || max_new < 1 || batch_mtp || pipe) return -1;
                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
-                int mt = strata::kernels::kVerifyDefaultMaxT;
+                int mt = (!use_mtp && !pipe) ? ver.max_t() : strata::kernels::kVerifyDefaultMaxT;
                 bool all_ar = !host_res.empty() && pending.empty() &&
                               std::none_of(host_res.begin(), host_res.end(), [](int32_t r) { return r < 0; });
                 for (int k = 0; k < n_pipe; ++k) {
@@ -17891,10 +17891,10 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 if (all_ar) return std::max(a0, n - mt);
                 if (n_pipe == 1 && o.pcie_frac <= 0.0f) {
-                    const int64_t win_w = std::min<int64_t>(S, mt);
+                    const int64_t win_w = (!use_mtp && !pipe) ? std::max(S, ver.max_t()) : std::min<int64_t>(S, mt);
                     if (win_w >= 2) {
                         const int64_t rem = (to - a0) % win_w;
-                        if (rem > 0 && rem < win_w) return to - rem;
+                        if (rem > 0 && rem + 1 <= mt) return to - rem;
                     }
                 }
                 return -1;
@@ -19138,7 +19138,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(ctx_done - tw0).count();
                         df_policy.observe(df_proposed_k, a + 1, ms + df_pending_ms);
                     }
-                    ++df_windows[T - 1];
+                    if (!merged && T >= 1 && T <= 8) ++df_windows[T - 1];
                     const int room_k = (int) std::max<int64_t>(0, std::min<int64_t>(max_fit_k, o.max_context - (p + a + 2)));
                     df_pending_k = std::min(room_k, df_conf_adapt ? df_conf_policy.choose() : df_auto ? df_policy.choose() : req_dflash_k);
                     // Finish near the context limit with target-only windows rather than
@@ -19155,15 +19155,29 @@ int main(int argc, char** argv) {
                         float pp[strata::core::Dflash2Drafter::kDrafts];
                         // `p` has not been incremented yet (`p += a + 1` is at the end of the loop, as in CLI):
                         // the `a + 1` committed rows are at positions p .. p + a, and draft() sets the anchor at p + a + 1.
+                        const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) df2.n_embd();
                         const float* df2_taps = ver.final_tap_dev();
+                        int df2_n = a + 1;
+                        int64_t df2_p = p;
+                        if (merged && a > 0) {
+                            const int64_t df_lo = std::max<int64_t>(0, (n - 1) - (df2.attention_window() - 1));
+                            const int64_t t0 = std::min<int64_t>(a, std::max<int64_t>(0, df_lo - p));
+                            if (a - t0 > 0 && !df2.context(ver.final_tap_dev() + (size_t) t0 * tap_stride, a - t0, p + t0, err)) {
+                                std::printf("ERR %s\n", err.c_str());
+                                return 1;
+                            }
+                            df2_taps = ver.final_tap_dev() + (size_t) a * tap_stride;
+                            df2_n = 1;
+                            df2_p = p + a;
+                        }
                         if (df2_stage) {
                             // --batch or layer split: the round graphs were captured on the shared draft row buffer in
                             // VRAM on the drafter's device, so this window's committed rows are staged there first
                             const strata::core::OnDevice on_df2(df2.device());
                             try {
                                 strata::kernels::copy_from_mapped(
-                                    df2_stage.get(), ver.final_tap_dev(),
-                                    (int64_t) ((size_t) (a + 1) * df2_stage_stride), df2.stream());
+                                    df2_stage.get(), df2_taps,
+                                    (int64_t) ((size_t) df2_n * df2_stage_stride), df2.stream());
                             } catch (const std::exception& ex) {
                                 std::printf("ERR %s\n", ex.what());
                                 return 1;
@@ -19180,12 +19194,12 @@ int main(int argc, char** argv) {
                             if (ks > 0 && sfx.last_match() >= o.suffix_draft) k_sfx_solo = ks;
                         }
                         if (solo_stopping) {
-                            if (!df2.context(df2_taps, a + 1, p, err)) {
+                            if (!df2.context(df2_taps, df2_n, df2_p, err)) {
                                 std::printf("ERR %s\n", err.c_str());
                                 return 1;
                             }
                         } else if (k_sfx_solo > 0) {
-                            if (!df2.context(df2_taps, a + 1, p, err)) {
+                            if (!df2.context(df2_taps, df2_n, df2_p, err)) {
                                 std::printf("ERR %s\n", err.c_str());
                                 return 1;
                             }
@@ -19194,7 +19208,7 @@ int main(int argc, char** argv) {
                             df_proposed_k = k_sfx_solo;
                             df_pending_k = k_sfx_solo;
                         } else {
-                            if (!df2.draft(df2_taps, a + 1, p, outv[(size_t) a], dd, pp, err)) {
+                            if (!df2.draft(df2_taps, df2_n, df2_p, outv[(size_t) a], dd, pp, err)) {
                                 std::printf("ERR %s\n", err.c_str());
                                 return 1;
                             }
