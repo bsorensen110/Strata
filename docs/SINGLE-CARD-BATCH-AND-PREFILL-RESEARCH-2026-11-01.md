@@ -201,18 +201,51 @@ All 6 Wave 4 optimizations were implemented as separate small atomic commits (`2
 
 ---
 
-## Part 7: Wave 5 Proposals for Further Concurrent/Batched Speedups
+## Part 7: Wave 5 Implementation & Measured Results (`a106bc92`, Promoted 2026-11-01)
 
-1. **Multi-Slot Batched `read_windows` Admission (`src/program/generate.cpp`):**
-   - When multiple `BGEN <slot>` commands arrive in a `c=4` burst (or while 1–2 slots are already decoding), pack 4–8 prompt tokens per admitting slot into `ver.run_slot_rows` (`16` rows total across slots) so up to 4 short prompts prefill their uncached tails in parallel in a single verify graph pass instead of running `read_windows` serially (`3 × ~215 ms = ~645 ms`).
-2. **Fused `native_mmvq_pair` Epilogue with `SwiGLU + Q8_1` Quantization (`src/kernels/cuda/native_mmvq.cu`, `src/kernels/cuda/shared_expert.cu`):**
-   - Have each block `bxi < n_out / ROWS` compute both `gate` and `up` rows for the same `row0 + i`, apply `SwiGLU(gate, up)` in registers, and write quantized `Q8_1` blocks directly to `nw.q8_1`, eliminating `native_swiglu_quantize_q8_1` (`48` launches/window) and the FP32 global memory round-trip through `sh_gate_` / `sh_up_`.
-3. **Device-Side Router Resident Plan Construction (`src/kernels/cuda/moe.cu`, `src/core/verify.cpp`):**
-   - Build `ExpDecPlan` (`P.ptr`, `P.start`, `P.tok`, `P.dst`) directly on the GPU inside `native_router_top10_multi` when `planned_gpu_entries == n` (`0` CPU misses), eliminating the host doorbell wait and `cudaMemcpyAsync(d_plan)` on all-GPU-hit layers.
+All 4 Wave 5 optimizations were implemented as separate small atomic commits (`2ede778f..eb850cba` on `Strata-integ`), verified with `24/24` GPU CTest parity suites (`shared_expert_parity`, `spec_verify_parity`, `verify_batch_parity`, `mmvf_rows_parity`, `gr_parity`, `s2_expert_grouped_parity`, `resident_plan_parity`, `native_multi_parity`, plus the `16/16` DFlash2/MMVQ/IQ suite) + 4-slot `dflash2_small_bench` bitwise parity + `49/49` `serve.test_parallel` & `serve.test_web_element_ids`, and promoted to `strata.service` (`a106bc923fc97bf4ba02ca6efbe07656`, 8/8 5K needle gate):
+
+1. **Wave 5 Commit 1 (`2ede778f`): Fuse `SwiGLU` into `native_mmvq_pair_swiglu` & Defer Shared Gate into `combine_k10_vec4_hits` (`include/strata/kernels/native_mmvq.hpp`, `src/kernels/cuda/native_mmvq.cu`, `src/kernels/cuda/shared_expert.cu`, `include/strata/kernels/native_moe.hpp`, `src/kernels/cuda/native_moe.cu`, `src/core/verify.cpp`):**
+   - Added `SWIGLU_PAIR` template mode to `native_mmvq_multi_kernel<F, NCOLS, NW, 2, false, true, false, true>` and `native_mmvq_pair_swiglu(...)` (`STRATA_MMVQ_PAIR_SWIGLU`, default on): each CTA `bxi` (`0 .. n_out - 1`) computes row `bxi` of `w_gate` (`i = 0`) and row `bxi` of `w_up` (`i = 1`) in the same CTA, loading the `Q8_1` input activation fragments `xv[0..NCOLS-1]` once for both `gate` and `up`, reducing `g` and `u` across warps in shared memory in the exact same order as `native_mmvq_pair`, and writing `(g / (1.0f + expf(-g))) * u` directly to `y_swiglu` before calling `native_quantize_q8_1`, eliminating the `up[n_tok, n_ff]` global memory write+read (`100%` bitwise identical, verified in `shared_expert_parity`).
+   - Templated `combine_k10_vec4_hits<bool GATED_SH>` and enabled `sg_ready = sg_aux && (lfuse_on(n) || (g_lfuse() && can_hits_in_combine))` in `src/core/verify.cpp`, passing `sg_gated_[grp] ? (sh_g_ + tb) : nullptr` to `native_moe_combine_multi_hits_added` so `shared_expert_multi` skips `sigmoid_mul_rows_2d` across all 48 verify layers (**`48` kernel launches saved per verify window**) and applies `1.0f / (1.0f + expf(-shared_gate[tk]))` directly inside `combine_k10_vec4_hits<true>`.
+2. **Wave 5 Commit 2 (`92262078`): Merge up to 16 Trailing Prompt Tokens into the First Verify Window on DFlash2 Admission (`src/program/generate.cpp`):**
+   - Updated `merge_from(a0, to)` in `src/program/generate.cpp` so that on `BGEN` slot admission (`admit_slot >= 0 && max_new == 1 && admit_max_new > 1`) on a single-stage pipeline (`n_pipe == 1 && o.pcie_frac <= 0.0f`), up to `std::min(mt, 16)` trailing prompt tokens are merged into the final admission verify window (`std::max(a0, n - std::min(mt, 16))`) even when `req_dflash_k > 0 || df2_active`.
+   - Enabled the DFlash2 initial draft step on that merged admission window (`a + 1 < max_new || (merged && admit_slot >= 0 && max_new == 1 && admit_max_new > 1)`), recording the final prompt token's tap (`n - 1`) into slot 0's KV ring and staging `df2_stage[admit_slot]` immediately on admission.
+   - **Measured Result:** Per-slot `BGEN` admission verify + initial DFlash2 draft (`1 generated in ... ms`) dropped by **-55%** from `~40–43 ms` in Wave 4 down to **`18–19 ms` (`53–55.5 tok/s`)** across every `c=2` and `c=4` slot admission.
+3. **Wave 5 Commit 3 (`740c325e`): Skip Zero-Filling Hit Rows in `copy_rows_from_mapped` and Select `hits4` Directly in `combine_k10_vec4_hits` (`include/strata/kernels/elementwise.hpp`, `src/kernels/cuda/elementwise.cu`, `src/kernels/cuda/native_moe.cu`, `src/core/verify.cpp`):**
+   - Updated `combine_k10_vec4_hits` (`src/kernels/cuda/native_moe.cu`) to select `((mask >> expert) & 1) ? hits4[...] : parts4[...]` directly instead of reading `parts4` (`0.0f`) and adding `hits4` on GPU-hit rows.
+   - Templated `copy_rows_from_mapped_kernel<bool SKIP_HIT_ZERO>` (`src/kernels/cuda/elementwise.cu`) and passed `skip_hit_zero = hits_in_combine` from `src/core/verify.cpp`, so GPU-hit rows (`86%–100%` of the 80 rows per layer) return immediately without writing `2,048` zeros (`8 KB`) to `parts_out` — eliminating **`~53–61 MB` of global memory writes and reads per 48-layer verify window** (`100%` bitwise identical).
+4. **Wave 5 Commit 4 (`a1c7c002`) & Commit 5 (`eb850cba`): Per-Token `float4` Doorbell Activation Publish, Single-Pass Host Distinct Plan, and `int4` Plan Copy Trim (`src/kernels/cuda/elementwise.cu`, `src/core/expert_source.cpp`, `src/program/generate.cpp`, `src/kernels/cuda/verify_kernels.cu`, `src/core/verify.cpp`):**
+   - Replaced the whole-window `any_miss` boolean in `doorbell_publish_res_kernel` (`src/kernels/cuda/elementwise.cu`) with a per-token miss bitmask `tok_miss` (`1u << (threadIdx.x / 10)`) and vectorized `float4` PCIe stores, copying `x + t * N -> x_out + t * N` over PCIe only for tokens `t` that actually have at least one missed expert instead of copying all 8 tokens (`64 KB`) whenever any single token misses VRAM (while keeping `set_always_publish(true)` when `drive.d.lookahead != nullptr`).
+   - Cached `ids[0..n-1]` from mapped memory `h_ids_` into a stack array `lid[kMaxWindowEntries]` in `expert_pool_dispatch_multi` (`src/core/expert_source.cpp`) and tracked `minr_i0` on the fly during the initial distinct-expert pass, eliminating the second $O(n \cdot nd)$ search loop in `STRATA_ROUTE_TAIL_SKIP` before `P.publish(P.ctx)` raises `h_flagA_`.
+   - Vectorized `wait_copy_i32_kernel` (`src/kernels/cuda/verify_kernels.cu`) with 128-bit `int4` loads/stores and trimmed the unused PCIe plan tail (`ptr2`, `start2`, `dst2`) when `sink_.pcie_mode < 0`, cutting per-layer plan copy size on an 8-row window by **51%** (`1,322 -> 646` int32s).
+
+### Wave 5 Measured End-to-End Summary (`gfx1201`, `a106bc923fc97bf4ba02ca6efbe07656`)
+- **`c=2` (`2 × 256` greedy code):**
+  - Cold R1: **`128.40 tok/s`** (**`64.20 tok/s/slot`**, `3.99 s`, up from `127.75 tok/s` in Wave 4 and `105.4 tok/s` pre-Wave 1).
+  - Warm R2: **`137.88 tok/s`** (**`68.94 tok/s/slot`**, `512` tokens in **`3.71 s`**, **`38.89 ms/window`** with **`run = 34.44 ms` [CUDA0 `23.76 ms` + CPU `8.61 ms`]**, down from `run = 34.76–34.81 ms` in Wave 4; **`163.9 rows/s`**; per-slot admission verify dropped to **`18–19 ms`**).
+- **`c=4` (`4 × 256` mixed prompts — code + history + math + systems):**
+  - Cold R1: **`111.63 tok/s`** (**`27.91 tok/s/slot`**, `CUDA0 wait = 20.01 ms`).
+  - Warm R2: **`124.25 tok/s`** (**`31.06 tok/s/slot`**, `1,024` tokens in **`8.24 s`**, **`47.56 ms/window = run 40.26 ms` [CUDA0 `22.28 ms` + CPU `14.71 ms`]**, `141.1 rows/s`, up **`+13.2%`** from `109.76 tok/s` in Wave 4).
+- **`c=4` (`4 × 256` greedy code):**
+  - **`140.02–141.79 tok/s`** (**`35.00–35.45 tok/s/slot`**, `42.62 ms/window = run 35.78 ms [CUDA0 25.95 + CPU 7.70 ms] + emit 6.21 ms`, `163.9 rows/s`, per-slot admission verify **`18–19 ms`**).
+- **`c=2` (`2 × 256` greedy code) + concurrent `4,364`-token long prefill (`STRATA_BATCH_PREFILL_LAYER_YIELD=16`):**
+  - Prompt read in **7 parts** with slots decoding **`1,793 ms`** between parts; active decode slots sustained **`61.64 tok/s`** combined (**`30.82` and `32.16 tok/s/slot`**) while the `4,364`-token prompt prefilled at **`932.1 tok/s`** and admitted its final 16 merged tokens in **`20 ms`**.
 
 ---
 
-## Part 8: Exact Reproduction Commands
+## Part 8: Wave 6 Proposals for Further Concurrent/Batched Speedups
+
+1. **Multi-Slot Batched `read_windows` Admission (`src/program/generate.cpp`):**
+   - When multiple `BGEN <slot>` commands arrive in a `c=4` burst (or while 1–2 slots are already decoding), pack 4–8 prompt tokens per admitting slot into `ver.run_slot_rows` (`16` rows total across slots) so up to 4 short prompts prefill their uncached tails in parallel in a single verify graph pass instead of running `read_windows` serially (`4 × ~215 ms = ~860 ms`).
+2. **Direct `Q8_1` Output in `native_mmvq_pair_swiglu` (`src/kernels/cuda/native_mmvq.cu`, `src/kernels/cuda/shared_expert.cu`):**
+   - Fold the `32`-element `Q8_1` block max-abs + scale reduction directly into warp 0 of `native_mmvq_multi_kernel<..., SWIGLU_PAIR=true>` (grouping 32 output rows per CTA or writing via a warp shuffle across 32 adjacent `bxi` rows) to eliminate the separate `native_quantize_q8_1(gate, nw.q8_1, ...)` launch (`48` kernel launches/window).
+3. **Host-Thread Pre-Quantization Overlap (`src/core/expert_source.cpp`):**
+   - On layers with `nmiss >= 2` CPU expert jobs, let worker threads quantize their own required token rows `x_q8[t]` on demand (via a per-token atomic state `0=unquantized, 1=in-progress, 2=ready`) instead of serializing all `x_q8` quantizations on the main host thread before `pool->dispatch`.
+
+---
+
+## Part 9: Exact Reproduction Commands
 
 ```bash
 # 1. Build strata + unit & parity tests in Strata-integ
