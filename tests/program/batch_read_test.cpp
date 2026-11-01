@@ -11,9 +11,12 @@
 using strata::prefill::kPictureRunBytes;
 using strata::prefill::picture_run_rows;
 using strata::prefill::prompt_upload_bytes;
+using strata::program::batch_decode_share;
+using strata::program::batch_prefill_chunk;
 using strata::program::batch_read_piece;
 using strata::program::concurrent_read_off;
 using strata::program::ConcurrentReadSetup;
+using strata::program::kDefaultBatchPrefillChunk;
 using strata::program::piped_decode_budget_ms;
 using strata::program::piped_read_lead_in;
 using strata::program::piped_read_piece;
@@ -86,6 +89,20 @@ int main() {
     CHECK(!piped_read_lead_in(true, true, -1.0, 400.0));
     CHECK(!piped_read_lead_in(false, true, 0.0, 400.0));
     CHECK(!piped_read_lead_in(true, false, 0.0, 400.0));
+    // batch_prefill_chunk: caps single-GPU chunk to STRATA_BATCH_PREFILL_CHUNK when slots are decoding, leaves solo intact
+    CHECK(batch_prefill_chunk(true, false, false, 8192, kDefaultBatchPrefillChunk) == 2048);
+    CHECK(batch_prefill_chunk(true, false, false, 16384, kDefaultBatchPrefillChunk) == 2048);
+    CHECK(batch_prefill_chunk(false, false, false, 8192, kDefaultBatchPrefillChunk) == 8192);
+    CHECK(batch_prefill_chunk(true, true, false, 8192, kDefaultBatchPrefillChunk) == 8192);
+    CHECK(batch_prefill_chunk(true, false, true, 8192, kDefaultBatchPrefillChunk) == 8192);
+    CHECK(batch_prefill_chunk(true, false, false, 8192, 0) == 8192);
+    CHECK(batch_prefill_chunk(true, false, false, 1024, kDefaultBatchPrefillChunk) == 1024);
+    // batch_decode_share: scales 0.5 -> 0.75 -> 1.0 with active slots unless explicitly configured
+    CHECK(batch_decode_share(0.5, false, 1) == 0.5);
+    CHECK(batch_decode_share(0.5, false, 2) == 0.75);
+    CHECK(batch_decode_share(0.5, false, 3) == 1.0);
+    CHECK(batch_decode_share(0.5, false, 4) == 1.0);
+    CHECK(batch_decode_share(0.3, true, 3) == 0.3);
     // prompt_upload_bytes: what the concurrent read grows the prompt path's pinned slots to before a read
     // (the model's K = 10 routed ids a token, rows of N = 2560 floats)
     const int64_t K = 10, N = 2560, row = N * 4;
