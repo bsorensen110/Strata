@@ -19119,7 +19119,8 @@ int main(int argc, char** argv) {
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
                 const GatedDraftLimit draft_limit(mtp, gated_proposal && !req_dflash, S_mtp, p + a + 1, o.max_context);
-                bool drafted = req_dflash || !use_mtp || eos || produced_n >= max_new ||
+                const bool solo_stopping = admit_slot < 0 && stop_req.load();
+                bool drafted = req_dflash || !use_mtp || eos || solo_stopping || produced_n >= max_new ||
                                mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
                                          nullptr, gated_proposal ? &generation : nullptr);
                 if (has_dflash) {
@@ -19169,11 +19170,16 @@ int main(int argc, char** argv) {
                             return e != nullptr && e[0] != '\0' && std::strcmp(e, "0") != 0;
                         }();
                         int k_sfx_solo = 0;
-                        if (df2_ngram_solo && o.suffix_draft > 0 && req_dflash && df_pending_k > 0) {
+                        if (!solo_stopping && df2_ngram_solo && o.suffix_draft > 0 && req_dflash && df_pending_k > 0) {
                             const int ks = sfx.propose(std::min<int>(df_pending_k, strata::core::Dflash2Drafter::kDrafts), dd);
                             if (ks > 0 && sfx.last_match() >= o.suffix_draft) k_sfx_solo = ks;
                         }
-                        if (k_sfx_solo > 0) {
+                        if (solo_stopping) {
+                            if (!df2.context(df2_taps, a + 1, p, err)) {
+                                std::printf("ERR %s\n", err.c_str());
+                                return 1;
+                            }
+                        } else if (k_sfx_solo > 0) {
                             if (!df2.context(df2_taps, a + 1, p, err)) {
                                 std::printf("ERR %s\n", err.c_str());
                                 return 1;
@@ -19661,8 +19667,26 @@ int main(int argc, char** argv) {
                             }
                     // STRATA_SLOT_CKPT_MOVE: this request's own turn checkpoint (or the one it moved out of this slot)
                     // moves into the slot; a pinned prefix, a root and any other the chain shares are copied as before
+                    int64_t prompt_turn_at = turn_at;
+                    if (prompt_turn_at < 0 && from_live && req_ckpt && o.prompt_cache > 0 && o.turn_token >= 0) {
+                        for (int64_t i = n - 1; i > 0; --i)
+                            if (ids[(size_t) i] == o.turn_token) { prompt_turn_at = i; break; }
+                        if (prompt_turn_at > 0 && o.tail_role_token >= 0)
+                            for (int64_t i = prompt_turn_at - 1; i > 0; --i)
+                                if (ids[(size_t) i] == o.turn_token) {
+                                    if (ids[(size_t) i + 1] == o.tail_role_token) prompt_turn_at = i;
+                                    break;
+                                }
+                        if (o.prompt_cache_root > 0) {
+                            for (int64_t i = 1; i < n; ++i)
+                                if (ids[(size_t) i] == o.turn_token) {
+                                    if (i >= o.prompt_cache_root && prompt_turn_at == i) prompt_turn_at = -1;
+                                    break;
+                                }
+                        }
+                    }
                     const bool move_best = slot_ckpt_move_env() && best != nullptr && !best_lent && !sl.img &&
-                                           !best->pinned && ((turn_at > 0 && (int64_t) best->ids.size() == turn_at) ||
+                                           !best->pinned && ((prompt_turn_at > 0 && (int64_t) best->ids.size() == prompt_turn_at) ||
                                             (int64_t) best->ids.size() == moved_in);
                     const auto tc3 = Clock::now();
                     if (move_best) {

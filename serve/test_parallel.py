@@ -1283,6 +1283,21 @@ class ParallelService(FakeEngineCase):
         self.assertEqual(res["r"]["choices"][0]["message"]["content"], "ok, done.")
         self.assertEqual(self.get("/metrics")["live"]["queued"], 0)
 
+    def test_concurrent_admission_skips_solo_gen_promotion(self):
+        """When another HTTP inference call is already admitted (e.g. tokenizing in a concurrent burst), the first
+        request to reach generate_batched enters a batch slot directly (BGEN) rather than starting solo (GEN) only to
+        be immediately STOPped and re-admitted."""
+        self.start(2)
+        self.assertTrue(self.svc.reserve_inference())
+        try:
+            r = self.chat("burst peer", max_tokens=16)
+            self.assertEqual(r["choices"][0]["message"]["content"], "ok, done.")
+        finally:
+            self.svc.release_inference()
+        lines = self.log.read_text().splitlines()
+        self.assertTrue(any(x.startswith("BGEN ") for x in lines), lines)
+        self.assertFalse(any(x.startswith("GEN ") for x in lines), lines)
+
 
 if __name__ == "__main__":
     unittest.main()
