@@ -82,9 +82,15 @@ int main() {
         const float ema[2] = {0.9f, 0.9f};
         check(mtp_depth_fit(k, ema, 2, 3) == 3 && k[0] == 0 && k[1] == 1, "slot without draft stays at 0");
     }
-    // DFlash2 adaptive depth workflow: mtp_depth_for + mtp_depth_trim
+    // DFlash2 adaptive depth workflow: df2_depth_config + mtp_depth_for + mtp_depth_trim
     {
-        const MtpDepthConfig df2_cfg = mtp_depth_config("3", "0.5", 6);
+        check(!df2_depth_config(nullptr, nullptr, 6, false).on(), "df2 unset multi-stage is off");
+        const MtpDepthConfig df2_auto = df2_depth_config(nullptr, nullptr, 6, true);
+        check(df2_auto.on() && df2_auto.max_depth == 3, "df2 unset single-card defaults to auto (3)");
+        check(!df2_depth_config("0", nullptr, 6, true).on(), "df2 0 turns off even on single card");
+        const MtpDepthConfig df2_one = df2_depth_config("1", nullptr, 6, true);
+        check(df2_one.on() && df2_one.max_depth == 1, "df2 1 explicitly caps at 1 proposal");
+        const MtpDepthConfig df2_cfg = df2_depth_config("3", "0.5", 6, false);
         check(df2_cfg.on() && df2_cfg.max_depth == 3 && df2_cfg.floor == 0.5f, "df2 depth config 3");
         float ema = 0.5f;
         check(mtp_depth_for(ema, df2_cfg) == 1, "df2 initial ema 0.5 -> depth 1");

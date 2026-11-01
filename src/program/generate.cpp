@@ -10552,11 +10552,17 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        bool any_pcie_layer = false;
+        if ((drive.d.pcie_num > 0 || drive.d.pcie_model.on) && drive.d.src != nullptr) {
+            for (int64_t l = 0; l < g.n_layers && !any_pcie_layer; ++l)
+                any_pcie_layer = drive.d.src->pcie_layer(l);
+        }
+        const int eff_pcie_mode = !any_pcie_layer ? -1 : (o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
         for (int st = 0; st < n_stages && n_stages > 1; ++st) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
             if (st > 0) {
                 stage_ver(st).set_split(o.spec_split);
-                stage_ver(st).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                stage_ver(st).set_pcie_mode(eff_pcie_mode);
             }
         }
         if (pipe) {   // the odd windows' pool routing: the same as the even ones', with their plans
@@ -10564,7 +10570,7 @@ int main(int argc, char** argv) {
             for (int st = 0; st < n_stages; ++st) {
                 split_drive_b.plan[st] = stage_ver_p(st, 1).plan_sink();
                 stage_ver_p(st, 1).set_split(o.spec_split);
-                stage_ver_p(st, 1).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                stage_ver_p(st, 1).set_pcie_mode(eff_pcie_mode);
             }
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
@@ -10572,12 +10578,13 @@ int main(int argc, char** argv) {
         const strata::core::PoolMultiFn invariant_win_pool_fn = n_stages > 1 ? &drive_pool_split_invariant : &drive_pool_multi_invariant;
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
+        strata::core::Verifier::set_commit_async(stages.empty());
         ver.set_split(o.spec_split);
         // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
         // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
         // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
         // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
-        ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+        ver.set_pcie_mode(eff_pcie_mode);
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it
@@ -13347,9 +13354,10 @@ int main(int argc, char** argv) {
         if (const char* e = std::getenv("STRATA_BATCH_DRAFT_DEPTH")) df2_want_depth = std::atoi(e);
         if (df2_want_depth < 0) df2_want_depth = 0;
         const strata::core::MtpDepthConfig df2_depth = df2_batch
-            ? strata::core::mtp_depth_config(std::getenv("STRATA_BATCH_DF2_DEPTH"),
+            ? strata::core::df2_depth_config(std::getenv("STRATA_BATCH_DF2_DEPTH"),
                                              std::getenv("STRATA_BATCH_DF2_DEPTH_FLOOR"),
-                                             std::max(1, dflash_k))
+                                             std::max(1, dflash_k),
+                                             false)
             : strata::core::MtpDepthConfig{};
         const bool df2_depth_on = df2_depth.on() && df2_batch;
         const bool df2_batch_head = df2_batch && [] {
@@ -14460,6 +14468,7 @@ int main(int argc, char** argv) {
                 }
 #endif
             }
+            std::fflush(stdout);
 #if defined(STRATA_HAVE_DFLASH2)
             if (!df2_pend.empty()) {
                 const Clock::time_point td0 = Clock::now();
@@ -14488,7 +14497,26 @@ int main(int argc, char** argv) {
                     bitems[i].probs = dp.pp;
                 }
                 std::string de;
-                const bool ok = df2.draft_batch(bitems.data(), (int) bitems.size(), df2_stage.get(), df2_stage_stride, de);
+                bool ok = df2.draft_batch_begin(bitems.data(), (int) bitems.size(), df2_stage.get(), df2_stage_stride, de);
+                // Overlap host PLE anchor prefetch and async commit wait with the GPU DFlash2 co-draft stream.
+                if (ok) {
+                    for (size_t i = 0; i < df2_pend.size(); ++i) {
+                        const int b = df2_pend[i].b;
+                        BSlot& sl = bs[(size_t) b];
+                        strata::core::SessionState& sx = *bslot_ss[0][(size_t) b];
+                        if (sx.ple.ready() && sx.ple.table != nullptr) {
+                            int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
+                            uint32_t rows16[strata::kernels::PLE_N_HEADS];
+                            strata::kernels::ngram_rows(&sl.x, prev, 1, sx.ple.consts, rows16);
+                            sx.ple.table->prefetch_rows(rows16);
+                        }
+                    }
+                }
+                if (!ver.wait_commit(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return false;
+                }
+                if (ok) ok = df2.draft_batch_end(bitems.data(), (int) bitems.size(), de);
                 bt_draft += msd(td0, Clock::now());
                 bt_draft_n += (int64_t) bitems.size();
                 for (size_t i = 0; i < df2_pend.size(); ++i) {
@@ -14509,7 +14537,7 @@ int main(int argc, char** argv) {
                         sl.draft_ready = k_keep > 0;
                         strata::core::SessionState& sx = *bslot_ss[0][(size_t) b];
                         if (sx.ple.ready() && sx.ple.table != nullptr) {
-                            int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
+                            int32_t prev[2] = {sx.ple_prev[1], sl.x};
                             auto pf = [&](int32_t tok) {
                                 uint32_t rows16[strata::kernels::PLE_N_HEADS];
                                 strata::kernels::ngram_rows(&tok, prev, 1, sx.ple.consts, rows16);
@@ -14517,7 +14545,6 @@ int main(int argc, char** argv) {
                                 prev[1] = tok;
                                 sx.ple.table->prefetch_rows(rows16);
                             };
-                            pf(sl.x);
                             for (int j = 0; j < sl.n_drafts; ++j) pf(sl.draft[(size_t) j]);
                         }
                     } else {

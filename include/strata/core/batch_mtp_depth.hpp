@@ -23,11 +23,12 @@
 namespace strata::core {
 
 struct MtpDepthConfig {
-    int max_depth = 1;        ///< proposals per slot at most; 1 = off (one proposal, today's windows)
+    int max_depth = 1;        ///< proposals per slot at most; 1 = off for MTP (one proposal, today's windows)
     float floor = 0.5f;       ///< the expected acceptance the deepest proposal row must still reach
     float alpha = 0.25f;      ///< EMA weight of the newest window
     float ema_init = 0.5f;    ///< a new request's acceptance estimate (below the gate for depth 2 at floor 0.5)
-    bool on() const { return max_depth > 1; }
+    bool explicit_on = false; ///< true when explicitly enabled (including max_depth == 1 for DFlash2)
+    bool on() const { return explicit_on || max_depth > 1; }
 };
 
 /// STRATA_BATCH_MTP_DEPTH (N, clamped to [1, max_cap]) and STRATA_BATCH_MTP_DEPTH_FLOOR (a probability in (0, 1]).
@@ -37,6 +38,35 @@ inline MtpDepthConfig mtp_depth_config(const char* depth_env, const char* floor_
     if (depth_env != nullptr && depth_env[0] != '\0') {
         const int n = std::atoi(depth_env);
         c.max_depth = n < 1 ? 1 : (n > max_cap ? (max_cap < 1 ? 1 : max_cap) : n);
+    }
+    if (floor_env != nullptr && floor_env[0] != '\0') {
+        const float f = (float) std::atof(floor_env);
+        if (f > 0.0f && f <= 1.0f) c.floor = f;
+    }
+    return c;
+}
+
+/// STRATA_BATCH_DF2_DEPTH (0/off = disabled; auto = adaptive up to min(3, max_cap); N = 1..max_cap) and
+/// STRATA_BATCH_DF2_DEPTH_FLOOR.  When `default_auto` is true (single-card DFlash2 batch), unset defaults to `auto`
+/// so 2-slot windows do not unconditionally stuff 3 low-acceptance proposals per slot into an 8-row window.
+inline MtpDepthConfig df2_depth_config(const char* depth_env, const char* floor_env, int max_cap,
+                                       bool default_auto = false) {
+    MtpDepthConfig c;
+    const int cap = max_cap < 1 ? 1 : max_cap;
+    if (depth_env == nullptr || depth_env[0] == '\0') {
+        if (default_auto) {
+            c.max_depth = cap < 3 ? cap : 3;
+            c.explicit_on = true;
+        }
+    } else if ((depth_env[0] == 'a' || depth_env[0] == 'A')) {
+        c.max_depth = cap < 3 ? cap : 3;
+        c.explicit_on = true;
+    } else {
+        const int n = std::atoi(depth_env);
+        if (n >= 1) {
+            c.max_depth = n > cap ? cap : n;
+            c.explicit_on = true;
+        }
     }
     if (floor_env != nullptr && floor_env[0] != '\0') {
         const float f = (float) std::atof(floor_env);
