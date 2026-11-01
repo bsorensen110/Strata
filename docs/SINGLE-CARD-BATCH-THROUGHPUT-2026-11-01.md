@@ -82,7 +82,13 @@ Implemented, unit-tested, A/B benchmarked on `gfx1201` (AMD Radeon AI PRO R9700,
 
 ---
 
-## 3. Reproduction
+## 3. Wave 2 Follow-Up (`75cd16bd` — Batched DFlash2 Body, Layer-36 Overlap, `BGEN` & Rank-Major `lend()` Fixes)
+
+See [`docs/SINGLE-CARD-BATCH-AND-PREFILL-RESEARCH-2026-11-01.md`](SINGLE-CARD-BATCH-AND-PREFILL-RESEARCH-2026-11-01.md) for the Wave 2 root-cause analysis, 6 atomic commits (`996650ea..2170b617` on `Strata-integ` / `a6a4d7c4..42864fcc` on PR #4937), promoted production binary `75cd16bde97ddff79db9934db9cbc1c8` measurements (`c=2` warm **`132.96 tok/s` / `66.48 tok/s/slot`** at `39.77 ms/win`, `emit 3.88 ms`; `c=4` **`140.00 / 143.76 tok/s` / `35.00–35.94 tok/s/slot`** at `42.46 ms/win`, `emit 5.46 ms`, `167.8 rows/s`; `c=2 + 3,200`-token concurrent prefill **`70.39 tok/s` decode (`35.20 tok/s/slot`) alongside `1,532 tok/s` prefill**), and Wave 3 recommendations.
+
+---
+
+## 4. Reproduction
 
 ```bash
 # 1. Build strata + unit tests
