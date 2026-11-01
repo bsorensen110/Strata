@@ -327,18 +327,20 @@ __global__ void attn_merge_kernel(const float* __restrict__ part, int n_chunks, 
 struct Df2Seg { const int8_t* q; const __half* d; float* y; int n_out; int row0; };
 struct Df2Segs { Df2Seg s[3]; int n; };
 
-template <int WARPS, bool COMPUTE, int UNR = 2, int NCOLS = 8>
+template <int WARPS, bool COMPUTE, int UNR = 2, int NCOLS = 8, int R = 8>
 __global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n_in, int ncols) {
-    constexpr int R = 8;
+    static_assert(R == 8 || R == 4 || R == 2, "R must divide the 8-row Q8_0 tile");
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int row_g = ((int) blockIdx.x * WARPS + warp) * R;
     int si = 0;
     while (si + 1 < segs.n && row_g >= segs.s[si + 1].row0) ++si;
     const Df2Seg sg = segs.s[si];
     const int row0 = row_g - sg.row0;
+    const int row_base = row0 & ~7;
+    const int r0 = row0 & 7;
     const int nb = n_in / 32, steps = nb / 16;
-    const int4* wq = reinterpret_cast<const int4*>(sg.q + (size_t) row0 * n_in) + lane;
-    const __half* wd = sg.d + (size_t) row0 * nb + (lane >> 1);
+    const int4* wq = reinterpret_cast<const int4*>(sg.q + (size_t) row_base * n_in) + (size_t) r0 * 32 + lane;
+    const __half* wd = sg.d + (size_t) row_base * nb + (size_t) r0 * 16 + (lane >> 1);
     const int4* xv = reinterpret_cast<const int4*>(xq) + lane;
     float acc[R][NCOLS];
 #pragma unroll
@@ -399,7 +401,16 @@ void launch_gemm8_ncols(int rows, cudaStream_t st, const Df2Segs& segs, const in
         case 5: gemm8_kernel<WARPS, true, 2, 5><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 5); break;
         case 6: gemm8_kernel<WARPS, true, 2, 6><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 6); break;
         case 7: gemm8_kernel<WARPS, true, 2, 7><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 7); break;
-        default: gemm8_kernel<WARPS, true, 2, 8><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
+        case 8: gemm8_kernel<WARPS, true, 2, 8><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 8); break;
+        default:
+            if (ncols <= 16) {
+                gemm8_kernel<4, true, 2, 16, 4><<<rows / 16, 128, 0, st>>>(segs, xqp, xd, n_in, ncols);
+            } else if (ncols <= 24) {
+                gemm8_kernel<4, true, 2, 24, 2><<<rows / 8, 128, 0, st>>>(segs, xqp, xd, n_in, ncols);
+            } else {
+                gemm8_kernel<4, true, 2, 32, 2><<<rows / 8, 128, 0, st>>>(segs, xqp, xd, n_in, ncols);
+            }
+            break;
     }
 }
 
@@ -443,7 +454,9 @@ __global__ void rms_quant_kernel(const float* __restrict__ h, const float* __res
     }
 }
 
-// conv (as conv_kernel, no residual) then the planar quantization: grid (ceil(H / 32 / 8), rows), 256 threads
+// conv (as conv_kernel, no residual) then the planar quantization: grid (ceil(H / 32 / 8), rows), 256 threads.
+// When `rows` is a multiple of kDf2Rows (8) across multiple batched slots, each 8-row slot block starts a fresh
+// causal 2-tap convolution (`(b & 7) - o < 0`).
 __global__ void conv_quant_kernel(const float* __restrict__ x, const float* __restrict__ dyn, int dyn_stride, const float* __restrict__ base, int H, int group,
                                   int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int blk = blockIdx.x * 8 + (threadIdx.x >> 5), b = blockIdx.y, lane = threadIdx.x & 31;
@@ -452,7 +465,7 @@ __global__ void conv_quant_kernel(const float* __restrict__ x, const float* __re
     float acc = 0.0f;
 #pragma unroll
     for (int o = 0; o < 2; ++o) {
-        if (b - o < 0) continue;
+        if ((b & 7) - o < 0) continue;
         const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + o * groups + c / group];
         acc = fmaf(k, x[(size_t) (b - o) * H + c], acc);
     }
@@ -478,7 +491,7 @@ __global__ void __launch_bounds__(1024) conv_rms_quant_kernel(const float* __res
             float acc = 0.0f;
 #pragma unroll
             for (int o = 0; o < 2; ++o) {
-                if (b - o < 0) continue;
+                if ((b & 7) - o < 0) continue;
                 const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + o * groups + c / group];
                 acc = fmaf(k, x[(size_t) (b - o) * H + c], acc);
             }
@@ -861,7 +874,7 @@ void df2_gemm_variant(int v) { g_gemm_variant = v; }
 void df2_attention_variant(int v) { g_attn_variant = v; }
 
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream) {
-    if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1 || ncols > 8) throw std::invalid_argument("df2_gemm: unsupported shape");
+    if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1 || ncols > 32) throw std::invalid_argument("df2_gemm: unsupported shape");
     Df2Segs segs;
     int rows = 0;
     for (int i = 0; i < n; ++i) {
