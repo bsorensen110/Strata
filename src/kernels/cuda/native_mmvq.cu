@@ -3464,10 +3464,21 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
                       cudaStream_t s) {
     using F = SmallTraits<Q80Block, 8>;
     const dim3 threads(WARP, WARPS);
+    static const bool rows1 = [] {
+        const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    if (rows1 || q8_0_rows1<F>(n_in, n_out) || (n_out & 1) != 0) {
+        if (s26_tsum_on())
+            native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
+        else
+            native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
+        return;
+    }
     if (s26_tsum_on())
-        native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
+        native_mmvq_multi_kernel<F, NCOLS, WARPS, 2, true, true><<<unsigned(n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
     else
-        native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
+        native_mmvq_multi_kernel<F, NCOLS, WARPS, 2, false, true><<<unsigned(n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
 }
 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
