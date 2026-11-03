@@ -2573,7 +2573,7 @@ __device__ __forceinline__ um_b16 um_frag(const uint16_t* p, int hi) {   // 16 B
     const uint32_t w[4] = {a.x, a.y, a.z, a.w};
     return __builtin_bit_cast(um_b16, w);
 #else
-    (void) hi;>>>>>>> bf1ff2e4e (perf(rdna4): port gr_upmix to gfx12 and fuse Q8_0 w_up dequantization (P1b))
+    (void) hi;
     const uint4 a = *reinterpret_cast<const uint4*>(p), b = *reinterpret_cast<const uint4*>(p + 8);
     const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
     return __builtin_bit_cast(um_b16, w);
@@ -2589,7 +2589,7 @@ __device__ __forceinline__ uint32_t um_bf16x2_finite(float f0, float f1) {
 // The block's w_up rows (16 columns x 4 streams x all 320 k) are staged in LDS once; each wave streams its own 16
 // tokens' lo16 rows from global memory (every A fragment feeds the 4 streams' WMMAs) - one barrier per block.
 __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restrict__ lo16, const uint16_t* __restrict__ wu,
-                                                       const uint8_t* __restrict__ wu_q8,>>>>>>> bf1ff2e4e (perf(rdna4): port gr_upmix to gfx12 and fuse Q8_0 w_up dequantization (P1b))
+                                                       const uint8_t* __restrict__ wu_q8,
                                                        const float* __restrict__ R, const float* __restrict__ rs,
                                                        const float* __restrict__ w, float* __restrict__ mixed,
                                                        uint16_t* __restrict__ mixed16, uint16_t* __restrict__ mixed_h,
@@ -2641,7 +2641,7 @@ __global__ void __launch_bounds__(256) gr_upmix_kernel(const uint16_t* __restric
             const int rr = i / (LR / 8), q = i % (LR / 8);
             const int c = rr / UM_D, dd = rr % UM_D;
             *reinterpret_cast<uint4*>(&sB[rr][8 * q]) = *reinterpret_cast<const uint4*>(wu + (size_t) (c * N + d0 + dd) * LR + 8 * q);
-        }>>>>>>> bf1ff2e4e (perf(rdna4): port gr_upmix to gfx12 and fuse Q8_0 w_up dequantization (P1b))
+        }
     }
 #if defined(__gfx1200__) || defined(__gfx1201__)
     asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
@@ -2910,7 +2910,7 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
     }();
     if (!wmma_ok || T <= 0 || (w_up == nullptr && w_up_q8 == nullptr)) return false;
     gr_upmix_kernel<<<dim3(N / UM_D, (unsigned) ((T + UM_T - 1) / UM_T)), 256, 0, (cudaStream_t) stream>>>(
-        lo16, w_up, w_up_q8, R, rs, w_norm, mixed, mixed16, mixed_h, T);>>>>>>> bf1ff2e4e (perf(rdna4): port gr_upmix to gfx12 and fuse Q8_0 w_up dequantization (P1b))
+        lo16, w_up, w_up_q8, R, rs, w_norm, mixed, mixed16, mixed_h, T);
     check("gr_upmix");
     return true;
 #else

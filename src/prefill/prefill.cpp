@@ -4031,7 +4031,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     wd = &wd_q8;
                 }
-                pt.mark(kPfHcDown, cs);   // STRATA_PREFILL_TIMING: the hyper-connection read's parts on their own lines (norm stays on "hc read")>>>>>>> bf1ff2e4e (perf(rdna4): port gr_upmix to gfx12 and fuse Q8_0 w_up dequantization (P1b))
+                pt.mark(kPfHcDown, cs);   // STRATA_PREFILL_TIMING: the hyper-connection read's parts on their own lines (norm stays on "hc read")
                 bool hcd = false;
                 bool hdown = false;
                 if (wd->q8_scale == nullptr && ldx != D && !pf_hcdown()) {   // not with STRATA_HC_REQ8's int8 rows   // STRATA_HCD_EXACT: the exact-order down kernel when hipBLASLt would take 1176 / 1177
@@ -4097,7 +4097,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
                 }
                 if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
-                pt.mark(kPfHcInj, cs);>>>>>>> bf1ff2e4e (perf(rdna4): port gr_upmix to gfx12 and fuse Q8_0 w_up dequantization (P1b))
+                pt.mark(kPfHcInj, cs);
                 if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 pt.mark(kPfHcMix, cs);
                 if (upmixed) {
@@ -4441,7 +4441,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                (uint64_t) m.attn_batch *
                                                                    strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s),
                                                                m.attn, T, m.cs)))
-#endif>>>>>>> 99f255ac4 (qsa: STRATA_PROMPT_ATTN_RDNA2=1 (opt-in, HIP gfx103x, INT8 K/V) reads a prompt's attention one block per (query, KV head))
+#endif
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
                             strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,

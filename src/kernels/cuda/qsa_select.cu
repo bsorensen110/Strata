@@ -442,7 +442,6 @@ __device__ __forceinline__ uint32_t pack_bf16x2(uint32_t a, uint32_t b) {   // l
 // L2-marginal and the swap is slower, so STRATA_SELECT_GRID=2 swaps only launches deeper than
 // STRATA_SELECT_GRID_MIN blocks (default 8192 = a 32K context); =1 forces the swap at any size.
 template <bool S2, bool XQ = false>
->>>>>>> 939d56e1c (hip: STRATA_SELECT_GRID=2 - the selection scorer's CTA order swaps for L2 (bitwise identical))
 __global__ void __launch_bounds__(128) block_scores_wmma_kernel(const float* __restrict__ pooled,
                                                                 const float* __restrict__ q_idx,
                                                                 const int32_t* __restrict__ steps, int64_t nq,
@@ -2404,7 +2403,6 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                 block_scores_wmma_kernel<false, true><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
             else
                 block_scores_wmma_kernel<false, false><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
->>>>>>> 939d56e1c (hip: STRATA_SELECT_GRID=2 - the selection scorer's CTA order swaps for L2 (bitwise identical))
         block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); std::exit(1); }

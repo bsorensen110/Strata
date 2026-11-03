@@ -1866,7 +1866,7 @@ __device__ __forceinline__ const uint32_t* stage_iq_grid(uint32_t* s_buf, int ti
         // the trellis types' int8 codebook: 2048 u16 (4 KB), read by 8 random lookups per 16 weights
         const uint32_t* src = (const uint32_t*) tq_lut_i8;
         for (int i = tid; i < 1024; i += nthreads) s_buf[i] = src[i];
-        __syncthreads();>>>>>>> 6cb45386c (perf(hip): optimize EXPDEC routed-expert kernels and enable by default on gfx12)
+        __syncthreads();
         return s_buf;
     } else if constexpr (TY == 21) {
         // 512 codebook words, then two 256-word tables: the byte masks of a sign byte's bits 0-3 and of its bits
@@ -4129,7 +4129,7 @@ int expdec_down_on() {
     const char* v = std::getenv("STRATA_EXPDEC_DOWN");
     if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0 ? 1 : 0;
     return expdec_default_gfx12() ? 1 : 0;
-}>>>>>>> 6cb45386c (perf(hip): optimize EXPDEC routed-expert kernels and enable by default on gfx12)
+}
 int g_expdec_rb = env_int_or("STRATA_EXPDEC_RB", 0);        // gate/up rows per block (0 = auto)
 int g_expdec_drb = env_int_or("STRATA_EXPDEC_DRB", 0);      // down rows per block (0 = auto)
 int g_expdec_minblk = env_int_or("STRATA_EXPDEC_MINBLK", 800);   // auto: the most rows per block that keep this many blocks

@@ -378,7 +378,7 @@ int main(int argc, char** argv) {
         setenv(var, "1", 1);
 #if !defined(STRATA_PARITY_RDNA2)
         setenv("STRATA_HIP_WMMA_Q4", "1", 1);   // (NAS) Q4_0-KV matrix-core kernel
-#endif   // (NAS) the Q4_0-KV matrix-core kernel>>>>>>> b9820dd56 (hip: the Q4_0-KV prompt attention on RDNA4 matrix cores (STRATA_HIP_WMMA_Q4=1, opt-in, gfx12))
+#endif   // (NAS) the Q4_0-KV matrix-core kernel
 #endif
     }
 #endif

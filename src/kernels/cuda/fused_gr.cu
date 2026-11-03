@@ -719,7 +719,7 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32_kernel(GrMulti m) {
             g[tk][c][dd] = x * sigmoidf_(mine);
         }
     }
-    gr_sync_lds();>>>>>>> ddebfd3cb (perf(hip): enable fused_gr tsum on gfx12, upgrade gr_up_q32_kernel, and use LDS-only barriers)
+    gr_sync_lds();
     // the block owns the whole q8_1 group (32 columns): quantize it here, no counter, no fence.  One warp a token, the
     // quantizer of gr_q8_tail (native_quantize_q8_1's: XOR-tree max and sum, d = amax / 127, roundf(x / d)).
     if (warp < T) {
@@ -2286,7 +2286,7 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q8_q32_kernel(GrMulti m, co
         const int r = warp + qq * Q32_WARPS;
         const int c = r / Q32_COLS, dd = r - c * Q32_COLS, i = c * N + d0 + dd;
         const uint8_t* row = m.a[0].q8_up + (size_t) i * (LR / 32) * Q8B;
-        float4 w[3];>>>>>>> ddebfd3cb (perf(hip): enable fused_gr tsum on gfx12, upgrade gr_up_q32_kernel, and use LDS-only barriers)
+        float4 w[3];
 #pragma unroll
     for (int sg = 0; sg < NG; ++sg) {
         const int bf = PL ? (sg & 1) : 0;
@@ -2326,7 +2326,7 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q8_q32_kernel(GrMulti m, co
     gr_sync_lds();
     // Since Q32_COLS == 32 and T <= 8 (T * 32 <= 256 <= Q32_THREADS), warp < T owns token k = warp and column col = lane
     // directly in registers: no second barrier and no global-memory round-trip through m.a[warp].mixed.
-    if (warp < T) {>>>>>>> ddebfd3cb (perf(hip): enable fused_gr tsum on gfx12, upgrade gr_up_q32_kernel, and use LDS-only barriers)
+    if (warp < T) {
         float sum = 0.0f;
 #pragma unroll
         for (int c = 0; c < HC; ++c) sum += g[k][c][col];
@@ -2613,7 +2613,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_q8_fast_kernel(GrMulti m, const
 
 template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cudaStream_t st, unsigned long long* stamp_buf,
                                   int stamp_i0) {
-    const bool ts = gr_tsum_on();>>>>>>> ddebfd3cb (perf(hip): enable fused_gr tsum on gfx12, upgrade gr_up_q32_kernel, and use LDS-only barriers)
+    const bool ts = gr_tsum_on();
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     static const bool pfs = [] { const char* v = std::getenv("STRATA_GR_Q8_PFS"); return v != nullptr && std::atoi(v) != 0; }();
     if (ts && pfs) gr_down_q8_fast_kernel<T, 4, true><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
