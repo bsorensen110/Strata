@@ -918,17 +918,10 @@ __device__ __forceinline__ void iq_sync_lds() {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
 #else
-    __syncthreads();   // every other target keeps the full barrier (the other HIP targets were not run for this change)
-#endif
-}
-
-__device__ __forceinline__ void iq_sync_lds() {
-#if defined(__gfx1200__) || defined(__gfx1201__)
-    asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
 #elif defined(__HIPCC__)
     asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
 #else
-    __syncthreads();
+    __syncthreads();   // every other target keeps the full barrier (the other HIP targets were not run for this change)
 #endif
 }
 
