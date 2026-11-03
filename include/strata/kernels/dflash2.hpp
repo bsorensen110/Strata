@@ -95,6 +95,11 @@ void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const flo
 void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, float* kring, float* vring, int slots, int rows,
                  int heads, float eps, void* stream, int64_t* tag = nullptr, const int32_t* epoch = nullptr);
 
+/// The same with the rings stored as fp16 (kring, vring: uint16_t head-major [k_heads][ring_slots][128]); the bitwise
+/// fp16 rounding of df2_kv_ring's values, so the fp32 attention and the fp16-ring attention agree on the ring contents.
+void df2_kv_ring_f16(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, void* kring, void* vring, int slots, int rows,
+                     int heads, float eps, void* stream, int64_t* tag = nullptr, const int32_t* epoch = nullptr);
+
 /// Top-16 per row of logits [rows][n] (value-descending; ties to the lower index).  idx_map (optional) maps a column to a token id.
 /// scratch: rows * kDf2TopBlocks * 16 * 2 words.  Outputs val[rows][16] and tok[rows][16].  n <= 4096 * kDf2TopBlocks.
 void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint32_t* scratch, float* val, int32_t* tok, void* stream);

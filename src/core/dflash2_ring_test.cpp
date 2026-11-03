@@ -23,6 +23,21 @@
 #include <string>
 #include <vector>
 
+static void set_env(const char* k, const char* v) {
+#ifdef _WIN32
+    _putenv_s(k, v);
+#else
+    setenv(k, v, 1);
+#endif
+}
+static void unset_env(const char* k) {
+#ifdef _WIN32
+    _putenv_s(k, "");
+#else
+    unsetenv(k);
+#endif
+}
+
 using strata::core::Dflash2Drafter;
 
 namespace {
@@ -187,10 +202,10 @@ int main(int argc, char** argv) {
     }
     {   // ---- 5 evicted
         std::printf("5 evicted (stash budget 0)\n");
-        setenv("STRATA_DF2_LOG_MIB", "0", 1);
+        set_env("STRATA_DF2_LOG_MIB", "0");
         Dflash2Drafter d;
         if (!fresh(d)) return 2;
-        unsetenv("STRATA_DF2_LOG_MIB");
+        unset_env("STRATA_DF2_LOG_MIB");
         if (!feed(d, dev, 1, 0, P, err)) return 2;
         const std::vector<int32_t> idsB = ids_of(2, 3000);
         bool cold = false;
