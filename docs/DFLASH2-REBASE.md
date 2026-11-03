@@ -103,3 +103,22 @@ All 32 fork-only HIP/RDNA4 candidates from `origin/main..integ/community-2026-10
 **Superseded / abort-empty (main already carries):** `d79fe8e88` fused_gr/verify/s2 wave (PR #3264 upstreamed), route-window (`51d8370a8`), select-scorer tuning (`5dcc80c62`), DFlash2-on-HIP build wiring (`f5e6e2cb9`; main relocated dflash2_parity to src/core), sm_89 IL tables (`17dd3a912` — main has `kIlRows_89` via #3453: **mmvq-il-iq3-tables = nothing to port on the CUDA side**), `a65910327` fused_gr restore (merge-seam; originals picked directly), docs-only and comment-only survivors.
 
 **Deferred to the gfx1201 rig (honest):** all gfx12-only kernels gate-build on HIP there (this host is CUDA); dflash2.cu head tiling (`TK_PER_THR`/`TM_PER_THR`, `launch_gemm8_ncols`) and pruned-head IL/Q6_K pack wiring were NOT ported — main's head path was reworked (f-0291-df2) and needs a bench-driven re-port, not a blind graft. CUDA gate (q4_parity, attn_bench, draft_cap, suffix_drafter, arch_defaults) re-run against the enlarged branch: see the build log marker below when done.
+
+### Post-sweep CUDA gate (2026-06, head 6829727cf, tree E:\\dev\\Strata-wt\\build\\df2-cu)
+
+- Full build: green after four pick-repair commits (marker-tail strip, fused_gr
+  graft undo, gr_parity.cpp rebuilt as main + the e4821bc11/b32a5ef5c hunks).
+- ctest 14/14: arch_defaults, suffix_drafter, draft_cap, gr_parity, dequant_s2,
+  mmvq_multi, mmvq_il, mmvq_il_pf, mmvq_il_89table, quantize_il, pdl,
+  iq_multi (+kq_nov2k, kq_swiglu, kq_nosub16).
+- The IL suite is CUDA-green for the first time: the 7553a8153/0dcd08151
+  every-backend IL path is bit-identical on sm_120.
+- gr_parity: main's contract plus the two fork hunks live - "fused GR Q8_0
+  dequant (vec8 + pair), finite/Inf/NaN scales: pass" (P1 port verified
+  bitwise vs scalar) and the QFUSE STRATA_TSUM A/B section, no diffs.
+- dflash2_q4_parity: PASS 40/40 vs CPU reference (matches pre-sweep baseline).
+- dflash2_attn_bench: fp16 ring 36.9us @ ctx2048 (baseline 37.1us); the
+  "bitwise = fp32 ring" label is a printf constant - ring bitwise equality is
+  enforced by the wave-1 ring tests, not this bench.
+- Still rig-only: dflash2_parity + dflash2_ring_test (drafter pack), the
+  ddebfd3cb gfx12 tsum/barrier re-tune, and the QFUSE counter-free tuning.
