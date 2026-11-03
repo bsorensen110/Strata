@@ -62,3 +62,26 @@ Rebased branch stays on the fork; the fork-unique waves are PR candidates for up
 **Wave 5 (head micro-perf `3f647f45b`): NOT applicable — HIP-only.** Head IL + Q6 pack + register top-k are the gfx12/HIP head layout; main's CUDA side already ships its own native-head Q4_0 codebook path (8ec2c8a91, b353ce7d4). No CUDA-side delta to A/B.
 
 **Net:** the fork's CUDA-relevant dflash2 perf that is *applicable to upstream's implementation* is the FP16 ring; the batch-body family is a parallel architecture, best carried to upstream as an RFC with the fork's measurement data (concurrent-serve +24–41%).
+
+## General perf waves picked (2026-11-03, user: "port any general perf optimizations also" + "pull in the hip only stuff also")
+
+All cherry-picked `-x` onto `perf/dflash2-on-main`, each individually conflict-reconciled against main's trees (fork-base drift), verified marker-free after resolve:
+
+1. `b7770864a` perf(verify,experts) bucket MoE plan by M_e — clean
+2. `998ae6dee` perf(shared_expert) fused gate+up MMVQ pair — took main's `native_mmvq_pair` guard (main already has `b6_rows_mode`)
+3. `f1b34c952` perf(moe) parallel blockIdx.y resident-group chunks — clean
+4. `1fcd39f01` perf(verify) zero-CPU-miss pool dispatch fast path — clean
+5. `7a5d4584f` perf(mmvq) register-cached activations across ROWS>1 — comment-block merge
+6. `a99f65016` perf(shared_expert,moe) SwiGLU fused into `native_mmvq_pair` — kept fork's combine restructure (ours kept both gated paths = double gate-apply)
+7. `f87da9044` perf(verify,moe) skip zero-fill hit rows — took fork side (dropped fork's debug `notef`)
+8. `a1ac0ce17` perf(verify,pool) float4 doorbell + single-pass plan — clean
+9. `734227266` + `b2a6054f2` the shipped Zen 5 CPU pair (`cpu_avx512_ok` family 0x1A gate, dpwssd, `STRATA_X86_ISA=zen5`) — both clean onto main
+10. `7513a788d` perf(hip) quantize+interleave one launch, gfx12-gated `qil_on()` — kept qil_on helper (THEIRS)
+11. `c057974cb` perf(hip) PCIe-wait fold `fetch_blobs_after` — hpp theirs, stubs both, verify.cpp keep-ours@helpers + theirs@call-site, cu both-theirs
+12. `bb7332cac` perf(hip) fold default off everywhere (+ A/B doc) — clean
+13. `9d9837ff3` fix(expert-cache) rank-major per-layer slots — clean
+14. `20a0f1ae8` perf(hip) PR#1097 decode fusions flag flip — clean
+
+HIP-only hunks ride the CUDA build structurally; gfx1201 rig gate stays deferred (honest wording per plan).
+
+**Wave-1 repair `86ddc13cc`:** the first gate build caught that the hand-merge dropped the fork's `pack/unpack_f16x4` + `RegTraits` template block and injected one corrupted identifier (`kin<U+8C17>`) in `df2_kv_ring`. Lesson: scanning for junk tokens is not enough — the compiler is the corruption detector; grep non-ASCII across merged files (`[^\x00-\x7f]`) and template-use sites, then build.
