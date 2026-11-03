@@ -2375,7 +2375,6 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
     {
         const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
         const int64_t per = (int64_t) 4 * WITER * 16;
-        const dim3 grid((unsigned) ((reach + per - 1) / per), (unsigned) ((nq + WQT - 1) / WQT));
         // STRATA_SELECT_SPLIT2=1: the hi/mid bf16 pieces only (3 wmma instead of 6), opt-in; the
         // default keeps the 6-product kernel's bits.  Measured on gfx1151: the scorer 2x at all
         // depths, selections 253-256/256 identical (qsa_select_bench); +1.3% end-to-end at 98K
@@ -2387,7 +2386,10 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
         // 6-product scorer 7.0 -> 5.1 ms at 98K blocks; at 24K blocks the whole key set is
         // L2-marginal and the swap is slower - the adaptive bound sits between the 24K loss and
         // the 98K win, and the engine A/B (interleaved x3 at 512K context) measured +1.8%.
-                static const int grid_env = [] { const char* v = std::getenv("STRATA_SELECT_GRID");
+        static const int grid_env = [] {
+            const char* v = std::getenv("STRATA_SELECT_GRID");
+            return v != nullptr ? std::atoi(v) : 0;
+        }();
         static const int64_t grid_min = [] { const char* v = std::getenv("STRATA_SELECT_GRID_MIN");
                                              return v != nullptr ? std::atoll(v) : int64_t(8192); }();
         const bool xq = grid_env == 1 || (grid_env == 2 && reach > grid_min);
@@ -2403,6 +2405,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
                 block_scores_wmma_kernel<false, true><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
             else
                 block_scores_wmma_kernel<false, false><<<grid, 128, 0, (cudaStream_t) stream>>>(pooled, q_idx, steps, nq, max_blocks, reach, scores);
+        }
         block_scores_tail_kernel<<<(unsigned) nq, 32, 0, (cudaStream_t) stream>>>(dead, q_idx, steps, max_blocks, scores);
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_tc: %s\n", cudaGetErrorString(e)); std::exit(1); }
