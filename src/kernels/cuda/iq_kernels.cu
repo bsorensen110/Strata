@@ -917,7 +917,6 @@ template<int TY> inline constexpr bool kStageIqGrid = (TY == 16 || TY == 17 || T
 __device__ __forceinline__ void iq_sync_lds() {
 #if defined(__gfx1200__) || defined(__gfx1201__)
     asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
-#else
 #elif defined(__HIPCC__)
     asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
 #else

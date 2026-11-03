@@ -3732,6 +3732,8 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
         const char* v = std::getenv("STRATA_NO_MMVQ_ROWS2");
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
+    const unsigned grid = grid_pad(unsigned(2 * n_out), WARP * WARPS, NCOLS);
+    const unsigned grid2 = grid_pad(unsigned(n_out), WARP * WARPS, NCOLS);
     if (rows1 || q8_0_rows1<F>(n_in, n_out) || (n_out & 1) != 0) {
         if (s26_tsum_on())
             native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, true><<<grid, threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
