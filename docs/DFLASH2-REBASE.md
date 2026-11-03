@@ -71,7 +71,7 @@ Re-run those two on a rig holding the pack (gfx1201 rig / dev PC). The merge fix
 
 **Net:** the fork's CUDA-relevant dflash2 perf that is *applicable to upstream's implementation* is the FP16 ring; the batch-body family is a parallel architecture, best carried to upstream as an RFC with the fork's measurement data (concurrent-serve +24–41%).
 
-## General perf waves picked (2026-11-03, user: "port any general perf optimizations also" + "pull in the hip only stuff also")
+## General perf waves picked (2026-11-03; user scope: general perf + HIP optimizations)
 
 All cherry-picked `-x` onto `perf/dflash2-on-main`, each individually conflict-reconciled against main's trees (fork-base drift), verified marker-free after resolve:
 
@@ -94,7 +94,7 @@ HIP-only hunks ride the CUDA build structurally; gfx1201 rig gate stays deferred
 
 **Wave-1 repair `86ddc13cc`:** the first gate build caught that the hand-merge dropped the fork's `pack/unpack_f16x4` + `RegTraits` template block and injected one corrupted identifier (`kin<U+8C17>`) in `df2_kv_ring`. Lesson: scanning for junk tokens is not enough — the compiler is the corruption detector; grep non-ASCII across merged files (`[^\x00-\x7f]`) and template-use sites, then build.
 
-## HIP/RDNA4/gfx1201 sweep (2026-11-03, user: "port all of our HIP/RDNA4/gfx1201 optimizations. And the mmvq-il-iq3-tables")
+## HIP/RDNA4/gfx1201 sweep (2026-11-03; user scope: full HIP/RDNA4/gfx1201 optimizations + mmvq-IL tables)
 
 All 32 fork-only HIP/RDNA4 candidates from `origin/main..integ/community-2026-10` triaged DAG-order onto this branch. Portability policy applied throughout: `cherry-pick -x` provenance; additive-only adaptations (main params/branches never dropped); fork-only behavior behind `STRATA_*`/`__HIPCC__`/gfx guards so the CUDA default stays bit-identical; commit messages carry Port-note blocks listing every adaptation site.
 
