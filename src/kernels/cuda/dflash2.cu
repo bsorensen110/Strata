@@ -2,6 +2,7 @@
 #include "strata/kernels/dflash2.hpp"
 
 #include "strata/kernels/dp4a.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 
 #include <cuda_fp16.h>
@@ -113,11 +114,41 @@ __global__ void copy_rows_kernel(const float* __restrict__ in, float* __restrict
     out[slot_mod > 0 ? ((size_t) (c / HD) * slot_mod + slot) * HD + c % HD : (size_t) slot * cols + c] = in[i];
 }
 
+__device__ __forceinline__ uint2 pack_f16x4(float4 v) {
+    return make_uint2((uint32_t) __half_as_ushort(__float2half_rn(v.x)) | ((uint32_t) __half_as_ushort(__float2half_rn(v.y)) << 16),
+                      (uint32_t) __half_as_ushort(__float2half_rn(v.z)) | ((uint32_t) __half_as_ushort(__float2half_rn(v.w)) << 16));
+}
+__device__ __forceinline__ float4 unpack_f16x4(uint2 raw) {
+    return make_float4(__half2float(__ushort_as_half((uint16_t) (raw.x & 0xffffu))),
+                       __half2float(__ushort_as_half((uint16_t) (raw.x >> 16))),
+                       __half2float(__ushort_as_half((uint16_t) (raw.y & 0xffffu))),
+                       __half2float(__ushort_as_half((uint16_t) (raw.y >> 16))));
+}
+__device__ __forceinline__ void store_ring_elem(float* dst, size_t at, float v) { dst[at] = v; }
+__device__ __forceinline__ void store_ring_elem(uint16_t* dst, size_t at, float v) { dst[at] = f16_from_f32(v); }
+
+template <typename RingT> struct RegTraits;
+template <> struct RegTraits<float> {
+    using Reg = float4;
+    static __device__ __forceinline__ Reg zero() { return make_float4(0.f, 0.f, 0.f, 0.f); }
+    static __device__ __forceinline__ Reg load_ring(const float* p) { return *reinterpret_cast<const float4*>(p); }
+    static __device__ __forceinline__ Reg load_blk(const float* p) { return *reinterpret_cast<const float4*>(p); }
+    static __device__ __forceinline__ float4 unpack(Reg r) { return r; }
+};
+template <> struct RegTraits<uint16_t> {
+    using Reg = uint2;
+    static __device__ __forceinline__ Reg zero() { return make_uint2(0u, 0u); }
+    static __device__ __forceinline__ Reg load_ring(const uint16_t* p) { return *reinterpret_cast<const uint2*>(p); }
+    static __device__ __forceinline__ Reg load_blk(const float* p) { return pack_f16x4(*reinterpret_cast<const float4*>(p)); }
+    static __device__ __forceinline__ float4 unpack(Reg r) { return unpack_f16x4(r); }
+};
+
 // ---- attention.  grid (8 K/V heads, kDf2MaxChunks), 128 threads.  The 32 queries (4 heads x 8 rows) of a K/V head share each key tile;
 // S = Q K^T in 4 x 4 register tiles (64 threads), the online softmax per query, O += P V in 4 x 8 register tiles (128 threads).
 constexpr int AS = 132;   // smem row stride of the Q / K / V tiles (float4 aligned, conflict-free for the 4 x 4 tiles)
 constexpr int PS = 36;    // stride of the transposed probabilities P[key][query]
-__global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict__ q, const float* __restrict__ kring, const float* __restrict__ vring,
+template <typename RingT>
+__global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict__ q, const RingT* __restrict__ kring, const RingT* __restrict__ vring,
                                                        const float* __restrict__ kblk, const float* __restrict__ vblk,
                                                        const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
                                                        const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
@@ -999,7 +1030,7 @@ void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const flo
 
 void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, float* kring, float* vring, int slots, int rows,
                  int heads, float eps, void* stream, int64_t* tag, const int32_t* epoch) {
-    kv_ring_kernel<float><<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin谗, kin, vin, gk, pos, table, kring, vring, slots, heads, eps, tag, epoch);
+    kv_ring_kernel<float><<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, kring, vring, slots, heads, eps, tag, epoch);
     check("kv_ring");
 }
 
