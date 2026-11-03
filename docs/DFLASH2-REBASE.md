@@ -51,7 +51,15 @@ Rebased branch stays on the fork; the fork-unique waves are PR candidates for up
 
 ## Execution results (2026-11-03)
 
-**Ported and gated: wave 1 only.** FP16 context K/V ring + uint2 register prefetch (`cf70f46ac`) merged by hand into main's rewritten kernels (`70f43138d`): fork's `RegTraits<RingT>` templating and all-ring fast path fused with main's `tag`/`epoch` ring-log params; `df2_attention_f16`/`df2_kv_ring_f16` entry points; `STRATA_DF2_FP16_RING=0` off-switch; `copy_state_from` refuses mixed-dtype state; bench parity gate ported. Gates (RTX 5080, CUDA 13.0 build): PENDING - first worktree build ran the build step outside vcvars (INCLUDE missing, stdbool.h fatal); vcvars-wrapped build+gate rerun in flight. Record rc values for dflash2_parity, dflash2_q4_parity, dflash2_ring_test, dflash2_attn_bench (bitwise fp16-vs-fp32 equality), draft_cap_test, suffix_drafter_test here once green.
+**Ported and gated: wave 1 only.** FP16 context K/V ring + uint2 register prefetch (`cf70f46ac`) merged by hand into main's rewritten kernels (`70f43138d`): fork's `RegTraits<RingT>` templating and all-ring fast path fused with main's `tag`/`epoch` ring-log params; `df2_attention_f16`/`df2_kv_ring_f16` entry points; `STRATA_DF2_FP16_RING=0` off-switch; `copy_state_from` refuses mixed-dtype state; bench parity gate ported.
+
+Gates (RTX 5080, CUDA 13.0, vcvars-wrapped build `build-df2-cu`, 2026-11-03): **4 of 6 genuinely green, 2 need the drafter pack this host lacks.**
+- `dflash2_q4_parity` rc 0 — "PASS: 40 of 40 cases match the CPU reference" (self-contained)
+- `dflash2_attn_bench` rc 0 — printed `fp16 ring: 37.1 us per call (bitwise = fp32 ring)`: the wave-1 bitwise-equality contract is proven on this GPU; fp16 ring at half the ring bandwidth
+- `draft_cap_test` rc 0 — ok; `suffix_drafter_test` rc 0 — OK
+- `dflash2_parity` rc 0 but printed only its usage line: needs `<pack> <case.bin>` (the incoai DFlash2 drafter pack for the Qwen3.8-Flash-Next target + torch tap-dump case; tooling paths live on the dev PC per tools/dflash2/README) — NOT actually run here
+- `dflash2_ring_test` rc 0 but usage-only: same pack dependency — NOT actually run here
+Re-run those two on a rig holding the pack (gfx1201 rig / dev PC). The merge fixes needed to get the CUDA build green: `86ddc13cc` (wave-1 RegTraits/pack-unpack restore + corrupted identifier), `f454895d5` (dedup dev_class/q8_0_rows1 and the superseded 6-param multi_kernel; mmvq_sync_lds; ADAPT_FETCH call sites adapted to main), `67462de10` (launch_pdl row_ids arg), `55b360d59` (df2_kv_ring_f16 declaration; MSVC env helpers in upstream's ring test).
 
 **Wave 2 (BATCHBODY `2999c0b18` + `copy_slot` `5928dc613` + graph `b0be13a49`): NOT applicable as a port — replacement.** `5928dc613` is GDN/kv_pool serve-batch plumbing (main covers drafter D2D copies with `copy_state_from`); BATCHBODY is a kernel-level batched body across fork `BatchItem` slots, while main's `29d55bd71` runs per-slot CUDA graphs launched-then-finished together. Merging them is a design change to upstream's batch scheduler, not an optimization of it → RFC for upstream, not this branch.
 
