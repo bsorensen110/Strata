@@ -697,6 +697,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                     "group-relative and window-indexed, direct and graph: %s\n", runs, REPS, g2bad ? "FAIL" : "pass");
         bad += g2bad;
         cudaFree(d_qa); cudaFree(d_qb); cudaFree(d_qabs); cudaFree(d_ref2); cudaFree(d_cnt2);
+    }
     // P1: vectorized fused_gr_dequant_q8_0 + fused_gr_dequant_q8_0_pair bitwise parity against scalar reference
     // across normal, subnormal, zero, +-Inf, and NaN fp16 scales, plus aligned and unaligned pointers.
     {
