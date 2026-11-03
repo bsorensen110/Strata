@@ -23,14 +23,15 @@ Date: 2026-11-02. Branch: `perf/dflash2-on-main` (worktree `E:\dev\Strata-wt\dfl
 
 ## Port list (dependency order, each = one reconcile commit, gated)
 
-1. **Infra**: serve-mode draft wiring (`c245a6c30` pieces absent from main), 4k/8k attention windows (`9e9569e46`).
-2. **Ring**: FP16 context K/V ring + uint2 register prefetch (`cf70f46ac`).
-3. **Batching**: `STRATA_DF2_BATCHBODY` context projection + 5-layer body across slots (`2999c0b18`) + `Dflash2Drafter::copy_slot` (`5928dc613`) + `batch_body_exec_` graph capture (`b0be13a49`) — reconcile against main's 29d55bd71 graph launching in one pass.
-4. **Verify overlap**: context projections overlap target verify layers 37–47 (`19e213789`).
-5. **Window merges**: 16 trailing prompt tokens into first verify window (`922620781`); 16-row `read_windows` on one-card DFlash2 (`941ad664f`) — reconcile with main's read_windows.
-6. **Co-draft**: per-slot n-gram co-draft (`448c0f836`) + `STRATA_DF2_BATCHHEAD` (`c983d97d1`) + BGEN admission fixups (`996650eaa`).
-7. **HIP multi-row**: multi-row QSA/GDN, batched KV/idx appends, async PLE gather (`15d4684cf`) — structural merge; CUDA side compile-verified here, HIP gate deferred to the gfx1201 rig (honest wording in the commit).
-8. **Docs**: wave measurement records (`556d7c611`, `623df1216`, `82ab07c89`, `f57bfc554`, `5e463f9bc`) — port as docs so decision history rides the branch.
+Scope (user decision 2026-11-02): **perf/optimization work only**, applied to upstream's dflash2 implementation. Upstream dflash2 is already wired to serve — no infra, no features, no docs commits ride this branch.
+
+EXCLUDED as not-applicable perf: serve-mode wiring (c245a6c30), 4k/8k windows (9e9569e46), park/restore (8b14892c4), n-gram co-draft + BATCHHEAD + BGEN fixups (448c0f836, c983d97d1, 996650eaa, 15d4684cf — fork serve-batch feature work), gfx12 rig defaults, measurement-record docs (556d7c611, 623df1216, 82ab07c89, f57bfc554, 5e463f9bc).
+
+1. **Ring**: FP16 context K/V ring + uint2 register prefetch (`cf70f46ac`).
+2. **Batching**: `STRATA_DF2_BATCHBODY` context projection + 5-layer body across slots (`2999c0b18`) + `Dflash2Drafter::copy_slot` (`5928dc613`) + `batch_body_exec_` graph capture (`b0be13a49`) — reconcile against main's 29d55bd71 graph launching in one pass.
+3. **Verify overlap**: context projections overlap target verify layers 37–47 (`19e213789`).
+4. **Window merges**: 16 trailing prompt tokens into first verify window (`922620781`); 16-row `read_windows` on one-card DFlash2 (`941ad664f`) — reconcile with main's read_windows.
+5. **Head micro-perf**: head IL + register top-k from `3f647f45b` **only if** they apply on top of main's native-head Q4_0 path (8ec2c8a91) — A/B on the same card, default keep main; the fork's pruned-head/Q6-pack layout itself is NOT ported.
 
 ## Divergent — measure, don't port blind
 
