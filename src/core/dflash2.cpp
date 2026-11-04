@@ -55,7 +55,11 @@ Dflash2Drafter::~Dflash2Drafter() {
     for (int l = 0; l < 8; ++l) { fr(kring_[l]); fr(vring_[l]); }
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
     fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
-    if (!dhead_shared_ && !blob_shared_) { fr(dvocab_); fr(dhead_); }
+    if (!dhead_shared_ && !blob_shared_) {
+        if (dhead_ != nullptr && head_type_ == 14) kernels::native_q6_k_unpack(dhead_);
+        fr(dvocab_);
+        fr(dhead_);
+    }
     if (h_meta_) cudaFreeHost(h_meta_);
     if (h_out_) cudaFreeHost(h_out_);
     if (cs_) cudaStreamDestroy(cs_);
@@ -403,6 +407,9 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         head_rows = (int64_t) vocab.size();
     }
     if (!bind_raw(embed, hw, head->type(), head_rows, vocab, err)) return false;
+    if (dhead_ != nullptr && !dhead_shared_ && !blob_shared_ && head_type_ == 14 && kernels::native_q6_k_packed_enabled()) {
+        kernels::native_q6_k_pack(dhead_, N_, (int) n_dvocab_, "DFlash2 draft head");
+    }
     std::fprintf(stderr, "strata dflash2: %lld-token draft head (%.1f MiB%s), drafter %.0f MiB of VRAM (%s weights)\n", (long long) n_dvocab_,
                  (double) (n_dvocab_ * row_bytes) / 1048576.0, dhead_shared_ ? ", the MTP drafter's copy, no second one" : "", (double) vram_ / 1048576.0, q4_ ? "Q4_0" : "Q8_0");
     // the pack's selector codebooks as Q4_0 rows (tools/dflash2_pack.py --q4_0-selector; strata_control/drafting.py reads this text from the program to know it can use that pack)
@@ -527,20 +534,31 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
             stamp("df2_conv_rms_quant");
         }
         native_quantize_q8_1(fn_ + N_, xq_, N_, ndraft_, cs);   // rows 1..7, the head's format
-        df2_quant_rows(fn_ + N_, N_, ndraft_, xqp_, xdp_, cs);   // and the selector projection's
+        // df2_conv_rms_quant on the final layer has already quantized fn_ rows 1..7 into xqp_ + N_ and xdp_ + N_ / 32
+        if (skip_part("small")) df2_quant_rows(fn_ + N_, N_, ndraft_, xqp_ + N_, xdp_ + N_ / 32, cs);
         const bool hs_fork = fork_ && cs2_ != nullptr && ev_hs_[0] != nullptr;   // the selector's projection beside the head, the top-k and their launches
         if (hs_fork) {
             cudaEventRecord(ev_hs_[0], cs);
             cudaStreamWaitEvent(cs2_, ev_hs_[0], 0);
-            gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs2_, xqp_, xdp_);
+            gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs2_, xqp_ + N_, xdp_ + N_ / 32);
             cudaEventRecord(ev_hs_[1], cs2_);
         }
         if (!skip_part("head")) {
             // the verify window's head kernel (interleaved activations, rows a warp by the card's table): bitwise native_mmvq's output, so the drafts are the same
-            static const bool il_on = [] { const char* e = std::getenv("STRATA_DF2_HEAD_IL"); return !(e && e[0] == '0'); }();
-            if (il_on && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)) {
-                native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
-                native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
+            static const int head_il = [] {
+                const char* e = std::getenv("STRATA_DF2_HEAD_IL");
+                if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
+                return e && e[0] ? (e[0] != '0' ? 1 : 0) : -1;
+            }();
+            if (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_))) {
+                if (ndraft_ >= 2) native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
+                if (head_il == 1 && !native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)) {
+                    native_mmvq_il_tune(4);
+                    native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
+                    native_mmvq_il_tune(0);
+                } else {
+                    native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
+                }
             } else
                 native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
         }
@@ -548,7 +566,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         df2_topk(logits_, (int) n_dvocab_, dvocab_, ndraft_, topscratch_, topval_, toptok_, cs);
         stamp("df2_topk");
         if (hs_fork) cudaStreamWaitEvent(cs, ev_hs_[1], 0);
-        else gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs, xqp_, xdp_);
+        else gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs, xqp_ + N_, xdp_ + N_ / 32);
         stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, out_tok_,
