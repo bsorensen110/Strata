@@ -340,6 +340,30 @@ bool batch_self_commit_on() { static const bool v = env_on("STRATA_BATCH_SELF_CO
 // streamed KV cache (a row's block resolve could evict the blocks an earlier row of the same slot selected).
 bool qsa_slots_on() { static const bool v = env_on("STRATA_QSA_SLOTS"); return v; }
 #define g_qsa_slots (qsa_slots_on())
+bool batch_attn_rows_on() {
+    static const bool v = [] {
+        if (const char* e = std::getenv("STRATA_BATCH_ATTN_ROWS")) return std::atoi(e) != 0;
+#if defined(STRATA_USE_HIP)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return v;
+}
+#define g_batch_attn_rows (batch_attn_rows_on())
+bool batch_gdn_groups_on() {
+    static const bool v = [] {
+        if (const char* e = std::getenv("STRATA_BATCH_GDN_GROUPS")) return std::atoi(e) != 0;
+#if defined(STRATA_USE_HIP)
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return v;
+}
+#define g_batch_gdn_groups (batch_gdn_groups_on())
 
 // every row of a batch window is another slot's (no slot has proposal rows)
 bool one_row_per_slot(const int* rows, int S) {
@@ -1783,10 +1807,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
-                static const bool gdn_groups_on = [] {   // STRATA_BATCH_GDN_GROUPS=1, all slots in one launch
-                    const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
+                const bool gdn_groups_on = g_batch_gdn_groups;   // STRATA_BATCH_GDN_GROUPS=1 (default on HIP), all slots in one launch
                 if (batch_rec_ && gdn_groups_on && te - tb <= 8) {
                     strata::kernels::GdnGroups gg;
                     for (int t = tb; t < te;) {
@@ -1913,11 +1934,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
                 };
                 auto idx_append = [&](cudaStream_t ns) {
-                    if (dec_batch && !g_no_batch_kv && !batch_rec_) {
-                        const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                        native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos, kStepCount,
-                                                        n, 0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                        rope_scaling(), ns);
+                    if (dec_batch && !g_no_batch_kv) {
+                        for (int t = tb; t < te;) {
+                            const int first = t;
+                            while (t < te && (!batch_rec_ || brow_[t] == brow_[first])) ++t;
+                            const QsaState& sx = slot_ss(first).qsa_states[qi];
+                            const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
+                            native_qsa_indexer_append_steps(idx_raw + first * ID, step_ + first * kStepCount + kStepPos,
+                                                            kStepCount, t - first, 0, (const float*) wikn->data, EPS, ib,
+                                                            s, sx.max_cells, rope_scaling(), ns);
+                        }
                     } else {
                         for (int t = tb; t < te; ++t) {
                             const QsaState& sx = slot_ss(t).qsa_states[qi];
@@ -2025,32 +2051,37 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 8, grp);
                 if (!sidem) idx_snap(cs);
-                // #783 PR-d (stuchapin909): the window's K/V cells in one launch per pool instead of one per token (a
-                // batch's rows each have their own K/V, so that case keeps the loop)
-                if (dec_batch && !g_no_batch_kv && !batch_rec_) {
-                    const int32_t* step_b = step_ + tb * kStepCount;
-                    const float* kc_b = kcur_ + tb * NKV * HD;
-                    const float* vc_b = vcur_ + tb * NKV * HD;
-                    if (st.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
-                        // #1188: a streamed state's host copy gets the window's cells too, as the per-token path below
-                        // writes them - without it a block that was not resident when its cells were appended came
-                        // back from the host copy without them, and free generation degenerated into repetition
-                        const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
-                        const bool mirror = st.host.present();
-                        kv_append_q8_steps(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_b, kStepCount,
-                                           kc_b, kc_b, (int) (NKV * HD), n, s, cs, mirror ? &hk : nullptr);
-                        kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_b, kStepCount, n, vc_b, vc_b, s, cs,
-                                           mirror ? &hv : nullptr);
-                    } else if (st.kv_q4)
-                        kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_b, kStepCount, n, kc_b, vc_b, s, cs,
-                                           &st.host);
-                    else if (st.kv_int8)
-                        kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_b, kStepCount,
-                                           kc_b, vc_b, (int) (NKV * HD), n, s, cs, &st.host);
-                    else
-                        for (int t = tb; t < te; ++t)
-                            kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount,
-                                           kcur_ + t * NKV * HD, vcur_ + t * NKV * HD, s, cs, &st.host);
+                // #783 PR-d (stuchapin909): the window's K/V cells in one launch per slot instead of one per token
+                if (dec_batch && !g_no_batch_kv) {
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        while (t < te && (!batch_rec_ || brow_[t] == brow_[first])) ++t;
+                        const int m = t - first;
+                        const QsaState& sx = slot_ss(first).qsa_states[qi];
+                        const int32_t* step_b = step_ + first * kStepCount;
+                        const float* kc_b = kcur_ + first * NKV * HD;
+                        const float* vc_b = vcur_ + first * NKV * HD;
+                        if (sx.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
+                            // #1188: a streamed state's host copy gets the window's cells too, as the per-token path below
+                            // writes them - without it a block that was not resident when its cells were appended came
+                            // back from the host copy without them, and free generation degenerated into repetition
+                            const KvHostPools hk = kv_hybrid_k_half(sx.host), hv = kv_hybrid_v_half(sx.host);
+                            const bool mirror = sx.host.present();
+                            kv_append_q8_steps(sx.k_q, sx.k_q, sx.k_scale, sx.k_scale, sx.page_table, step_b, kStepCount,
+                                               kc_b, kc_b, (int) (NKV * HD), m, s, cs, mirror ? &hk : nullptr);
+                            kv_append_q4_steps(sx.v_q4, sx.v_q4, sx.page_table, step_b, kStepCount, m, vc_b, vc_b, s, cs,
+                                               mirror ? &hv : nullptr);
+                        } else if (sx.kv_q4)
+                            kv_append_q4_steps(sx.k_q4, sx.v_q4, sx.page_table, step_b, kStepCount, m, kc_b, vc_b, s, cs,
+                                               &sx.host);
+                        else if (sx.kv_int8)
+                            kv_append_q8_steps(sx.k_q, sx.v_q, sx.k_scale, sx.v_scale, sx.page_table, step_b, kStepCount,
+                                               kc_b, vc_b, (int) (NKV * HD), m, s, cs, &sx.host);
+                        else
+                            for (int u = first; u < t; ++u)
+                                kv_append_step(sx.k_pool, sx.v_pool, sx.page_table, step_ + u * kStepCount,
+                                               kcur_ + u * NKV * HD, vcur_ + u * NKV * HD, s, cs, &sx.host);
+                    }
                 } else
                 for (int t = tb; t < te; ++t) {
                     const QsaState& st = slot_ss(t).qsa_states[qi];   // the row's own K/V (ss's outside a batch)
@@ -2081,19 +2112,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (!sidem) idx_query(cs);
                 }
                 stamp(l, 10, grp);
-                bool streamed = false;   // a streamed KV cache keeps the per-row resolve-then-attend order
-                if (batch_rec_ && g_qsa_slots)
-                    for (int t = tb; t < te; ++t) streamed = streamed || slot_ss(t).qsa_states[qi].kv_mode == 1;
-                // STRATA_BATCH_ATTN_ROWS=1: the window's rows in ONE launch per step - scores with each row's
-                // own indexer keys, the top-k over all rows (row-independent), attention with each row's own pools -
-                // instead of 3-4 one-row launches per row; the same per-row arithmetic.  Not with KV streaming
-                // (qsa_kv_resolve has work per slot then).
-                static const bool attn_rows = [] {
-                    const char* v = std::getenv("STRATA_BATCH_ATTN_ROWS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
-                bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
-                for (int t = tb; rows_ok && t < te; ++t) rows_ok = slot_ss(t).qsa_states[qi].kv_mode != 1;
+                // STRATA_BATCH_ATTN_ROWS=1 (default on HIP): the window's rows in ONE launch per step - scores with each
+                // row's own indexer keys, the top-k over all rows (row-independent), per-slot KV resolve when streamed,
+                // attention with each row's own pools - instead of 3-4 one-row launches per row; the same per-row arithmetic.
+                const bool attn_rows = g_batch_attn_rows;
+                const bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
                 if (rows_ok) {
                     const int n_rows = te - tb;
                     strata::kernels::QsaScoreRows sr;
@@ -2109,11 +2132,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                           scores_ + (size_t) tb * max_blocks_, cs);
                     qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n_rows, max_blocks_, cap_,
                                    s, sel_ + (size_t) tb * cap_, cs);
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        const QsaState& sx = slot_ss(first).qsa_states[qi];
+                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) first * cap_, step_ + first * kStepCount, t - first, cap_, cs);
+                    }
                     qsa_decode_attn_batch_rows(qcur_ + tb * NH * HD, pr, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount,
                                                cap_, s, attn_scratch_ + (size_t) tb * attn_scratch_floats_,
                                                attn_ + tb * NH * HD, n_rows, cs);
                 } else
-                if (batch_rec_ && g_qsa_slots && !streamed) {
+                if (batch_rec_ && g_qsa_slots) {
                     // the rows' block scores, top-k and attention, up to 8 rows per launch.  The rows only read
                     // their slots' keys and K/V here and write their own scores/sel/scratch/attn rows, so running
                     // each step for all rows before the next is the per-row loop's result
@@ -2136,6 +2165,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                  1, max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
                         qsa_block_topk(scores_ + (size_t) t0 * max_blocks_, step_ + t0 * kStepCount, m, max_blocks_,
                                        cap_, s, sel_ + (size_t) t0 * cap_, cs);
+                        for (int t = t0; t < t0 + m;) {
+                            const int first = t;
+                            while (t < t0 + m && brow_[t] == brow_[first]) ++t;
+                            const QsaState& sx = slot_ss(first).qsa_states[qi];
+                            qsa_kv_resolve(sx, *g_, sel_ + (size_t) first * cap_, step_ + first * kStepCount, t - first, cap_, cs);
+                        }
                         if (!qsa_decode_attn_slots(qcur_ + t0 * NH * HD, px, sel_ + (size_t) t0 * cap_,
                                                    step_ + t0 * kStepCount, cap_, s,
                                                    attn_scratch_ + (size_t) t0 * attn_scratch_floats_,
@@ -4086,12 +4121,9 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
             if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
-                // STRATA_BATCH_GDN_GROUPS=1: one-row groups (no --batch-mtp proposals) commit their recurrence
+                // STRATA_BATCH_GDN_GROUPS=1 (default on HIP): one-row groups (no --batch-mtp proposals) commit their recurrence
                 // in one launch for all slots; the conv commits stay per slot
-                static const bool gdn_groups_on = [] {
-                    const char* v = std::getenv("STRATA_BATCH_GDN_GROUPS");
-                    return v != nullptr && std::atoi(v) != 0;
-                }();
+                const bool gdn_groups_on = g_batch_gdn_groups;
                 bool one_row = S <= 8;
                 for (int t = 1; one_row && t < S; ++t) one_row = rows[t] != rows[t - 1];
                 strata::kernels::GdnGroups gg;
@@ -4136,11 +4168,18 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS,
                                      TS, cs_);
                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                    for (int u = first; u < t; ++u)
-                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
-                                                  commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
-                                                  0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                  rope_scaling(), cs_);
+                    if (!g_no_batch_kv && t - first > 1) {
+                        native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) (qsa_index * MT + first) * ID,
+                                                        commitb_ + (size_t) rows[first] * CB + 2, 1, t - first,
+                                                        0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                        rope_scaling(), cs_);
+                    } else {
+                        for (int u = first; u < t; ++u)
+                            native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
+                                                      commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
+                                                      0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                      rope_scaling(), cs_);
+                    }
                 }
                 ++qsa_index;
             }
