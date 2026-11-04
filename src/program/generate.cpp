@@ -6521,6 +6521,14 @@ int main(int argc, char** argv) {
     // per group = at most --spec rows).  A function, not a number: --batch (the slots that fit) and the groups are final
     // only after this point, at the verifiers' init, and the plain value must stay what it was there.
     auto batch_max_t = [&]() -> int {
+        if (batch_df2 && df2_solo && split_devs.empty()) {
+            static const int df2_read_max_t = [] {
+                const char* v = std::getenv("STRATA_BATCH_DF2_READ_MAX_T");
+                return v != nullptr && v[0] != '\0' ? std::clamp(std::atoi(v), 8, (int) strata::kernels::kVerifyMaxT)
+                                                    : (int) strata::kernels::kVerifyMaxT;
+            }();
+            return std::max(o.spec, df2_read_max_t);
+        }
         // (--batch-mtp and STRATA_PIPED_MTP draft with the draft layer's kernels, built for the narrow window: their windows
         // stay at most kVerifyNarrowT rows; only the plain batch windows are wide)
         if (batch_mtp && !piped_mtp) return (int) strata::kernels::kVerifyNarrowT;
@@ -7254,7 +7262,9 @@ int main(int argc, char** argv) {
                         int64_t mtp_b = (!o.mtp.empty() && native_head.loaded())
                                             ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
 #if defined(STRATA_HAVE_DFLASH2)
-                        if (use_df2 && native_head.loaded()) mtp_b += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);   // DFlash2's own draft head and logits (serve: and the prompt staging)
+                        if (use_df2 && native_head.loaded())
+                            mtp_b += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0) +
+                                     (((batch_max_t() > 8 ? 24 : 0) + (int64_t) slot_df2.size() * 4) << 20);   // DFlash2's own draft head and logits (serve: and the prompt staging)
 #endif
                         if (stages.empty())
                             for (const auto& d : slot_mtp) mtp_b += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
@@ -7543,7 +7553,9 @@ int main(int argc, char** argv) {
             for (const auto& d : slot_mtp)
                 mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
 #if defined(STRATA_HAVE_DFLASH2)
-        if (use_df2 && native_head.loaded()) mtp_bind += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);   // DFlash2's own draft head and logits (serve: and the prompt staging), bound after this
+        if (use_df2 && native_head.loaded())
+            mtp_bind += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0) +
+                        (((batch_max_t() > 8 ? 24 : 0) + (int64_t) slot_df2.size() * 4) << 20);   // DFlash2's own draft head and logits (serve: and the prompt staging), bound after this
 #endif
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
@@ -16405,12 +16417,13 @@ int main(int argc, char** argv) {
                     explicit NoHeadSampling(strata::core::Verifier& x) : v(x) { v.set_head_sampling(false); }
                     ~NoHeadSampling() { v.set_head_sampling(true); }
                 } no_head_sampling(ver);
-                std::vector<int32_t> win((size_t) S), outw((size_t) S), nxt((size_t) S);
+                const int S_read = (batch_df2 && !use_mtp && n_stages == 1) ? std::max(S, ver.max_t()) : S;
+                std::vector<int32_t> win((size_t) S_read), outw((size_t) S_read), nxt((size_t) S_read);
                 pp_exact = true;   // between windows the session is exactly at `a`
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
                     pp_exact = false;   // until this window and the drafter's rows are in
-                    int T = (int) std::min<int64_t>(S, b - q);
+                    int T = (int) std::min<int64_t>(S_read, b - q);
                     // --lookup-max-t: the prompt's windows take the allowed sizes too (each size is a graph of its own);
                     // one whose graph finds no VRAM is dropped as in decode
                     if (o.lookup_max_t > 0) {
