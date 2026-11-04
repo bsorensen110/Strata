@@ -538,7 +538,12 @@ def blocked_by(args: list[Any], *, split: bool = False, slots: int = 0) -> bool:
     --draft-fallback none`` on a layer split, one request at a time; paired decode 1.014 against the MTP, CI 0.994-1.033, 2 x RTX PRO 6000, RESULTS-DF2MGPU.md):
     ``split`` and a ``--layer-split`` argument are accepted and ignored so the callers keep working. The caller says what it adds later (``slots``); the arguments are looked at too."""
     items = [str(a) for a in args or []]
-    return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--pipeline-windows", "--parallel")))
+    if "--pipeline-windows" in items:
+        return True
+    batch_df2 = os.environ.get("STRATA_BATCH_DF2", "")
+    if batch_df2 and batch_df2[0] != "0":
+        return False
+    return bool(slots > 1 or any(a in items for a in ("--batch", "--slots", "--parallel")))
 
 
 def mtp_ready(args: list[Any]) -> bool | None:
