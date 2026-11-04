@@ -77,8 +77,8 @@ static bool host_has_avx512() {
     if (!((x[2] >> 27) & 1)) return false;          // OSXSAVE
     if ((_xgetbv(0) & 0xE6) != 0xE6) return false;  // the OS saves the AVX-512 state
     __cpuidex(x, 7, 0);
-    return ((x[1] >> 16) & 1) && ((x[1] >> 30) & 1) && ((x[1] >> 31) & 1) && ((x[2] >> 11) & 1) &&
-           ((x[2] >> 1) & 1);
+    return ((x[1] >> 16) & 1) && ((x[1] >> 17) & 1) && ((x[1] >> 30) & 1) && ((x[1] >> 31) & 1) &&
+           ((x[2] >> 11) & 1) && ((x[2] >> 1) & 1) && ((x[2] >> 14) & 1);
 #elif defined(__x86_64__) || defined(__i386__)
     unsigned r[4] = {0, 0, 0, 0};
     __cpuid_count(0, 0, r[0], r[1], r[2], r[3]);
@@ -89,8 +89,8 @@ static bool host_has_avx512() {
     __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
     if (((((unsigned long long) hi << 32) | lo) & 0xE6) != 0xE6) return false;
     __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
-    return ((r[1] >> 16) & 1u) && ((r[1] >> 30) & 1u) && ((r[1] >> 31) & 1u) && ((r[2] >> 11) & 1u) &&
-           ((r[2] >> 1) & 1u);
+    return ((r[1] >> 16) & 1u) && ((r[1] >> 17) & 1u) && ((r[1] >> 30) & 1u) && ((r[1] >> 31) & 1u) &&
+           ((r[2] >> 11) & 1u) && ((r[2] >> 1) & 1u) && ((r[2] >> 14) & 1u);
 #else
     return false;
 #endif
