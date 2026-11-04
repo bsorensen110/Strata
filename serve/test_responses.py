@@ -250,6 +250,29 @@ class MultiAgentV2(unittest.TestCase):
             input_messages({"input": [{"type": "multi_agent_call", "call_id": "c1", "arguments": "{}"}]})
         self.assertEqual(e.exception.param, "input[0].action")
 
+    def test_fork_turns_subagent_restores_namespace_tools_for_prefix_cache(self):
+        """A `fork_turns="all"` child inherits `collaboration.spawn_agent` in `input` while Codex
+        fallback metadata drops `collaboration` from `tools`; restoring it keeps the prefix identical."""
+        collab = {"type": "namespace", "name": "collaboration", "description": "Agents.",
+                  "tools": [{"type": "function", "name": "spawn_agent", "parameters": {
+                      "type": "object", "properties": {"message": {"type": "string"}}}}]}
+        after = {"type": "function", "name": "get_goal",
+                 "parameters": {"type": "object", "properties": {}}}
+        user = {"type": "message", "role": "user", "content": "delegate 2+2"}
+        spawn = {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "spawn_agent",
+                 "namespace": "collaboration", "arguments": "{\"message\":\"2+2\"}"}
+        parent = {"model": "m", "instructions": "You are Codex",
+                  "tools": TOOLS + [collab, after], "input": [user, spawn]}
+        child = {"model": "m", "instructions": "You are Codex", "tools": TOOLS + [after],
+                 "input": [user, spawn, {"type": "function_call_output", "call_id": "c1",
+                                         "output": "aborted"}, AM_TASK]}
+        p_tools = tools_of(parent)[1]
+        c_tools = tools_of(child)[1]
+        self.assertEqual(p_tools, c_tools)
+        p_prompt = TEMPLATE.render(input_messages(parent), tools=p_tools, add_generation_prompt=False)
+        c_prompt = TEMPLATE.render(input_messages(child), tools=c_tools, add_generation_prompt=True)
+        self.assertTrue(c_prompt.startswith(p_prompt))
+
 
 # ------------------------------------------------------------------------------------------------ Codex compaction
 HISTORY = [{"role": "user", "content": "hi"},

@@ -283,6 +283,9 @@ def _order_tool_results(messages):
             c.pop("_call_id", None)
 
 
+_FORK_NAMESPACES: dict[str, tuple[str | None, dict]] = {}  # namespace -> (preceding tool name, tool definition)
+
+
 def request_tools(req: dict):
     """-> (template tools or None, {template name: (namespace, name, kind)}, names of hosted tools left out)."""
     tools, names, skipped = [], {}, []
@@ -291,10 +294,29 @@ def request_tools(req: dict):
         raise ResponsesError("tools must be an array", "tools")
     # #782 (Codex v0.160): `additional_tools` input items carry more tool definitions (a `tools` array, as the request
     # has); they join the request's own, and an item without a usable array adds nothing
-    extra = [t for item in (req.get("input") if isinstance(req.get("input"), list) else [])
+    items = req.get("input") if isinstance(req.get("input"), list) else []
+    extra = [t for item in items
              if isinstance(item, dict) and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list)
              for t in item["tools"]]
     given = list(given) + extra
+    if given:
+        # Codex multi_agent_v2 with fallback model metadata omits `collaboration` from a forked child's `tools` even
+        # when `fork_turns="all"` inherited the parent's `collaboration.spawn_agent` call in `input`.  Restoring the
+        # namespace in place keeps `<tools>` in the system message identical so the child reuses the parent's KV prefix.
+        present = {t.get("name") for t in given if isinstance(t, dict) and isinstance(t.get("name"), str)}
+        for idx, t in enumerate(given):
+            if isinstance(t, dict) and t.get("type") == "namespace" and isinstance(t.get("name"), str):
+                prev = given[idx - 1].get("name") if idx > 0 and isinstance(given[idx - 1], dict) else None
+                _FORK_NAMESPACES[t["name"]] = (prev, t)
+        if any(isinstance(it, dict) and it.get("type") == "agent_message" for it in items):
+            for it in items:
+                ns = it.get("namespace") if isinstance(it, dict) and it.get("type") == "function_call" else None
+                if ns in _FORK_NAMESPACES and ns not in present:
+                    prev, ns_tool = _FORK_NAMESPACES[ns]
+                    at = next((i + 1 for i, t in enumerate(given)
+                               if isinstance(t, dict) and t.get("name") == prev), len(given))
+                    given.insert(at, ns_tool)
+                    present.add(ns)
 
     def add(tool, param, namespace=None, ns_description=""):
         kind = tool.get("type")
