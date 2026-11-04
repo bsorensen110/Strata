@@ -117,10 +117,16 @@ Add one helper that turns the part list into text. It maps each part type the wa
 content renderers already do:
 
 - `input_text` renders as-is. No rewrapping, no trimming.
-- `input_image` renders like the image handling in `_content`.
+- `input_image` renders as a placeholder text line in this change. The served models are
+  text-input (the capture shows text-only parts); wiring real image parts through the vision
+  path is a revisit-when-needed item, not part of unblocking v2.
 - `encrypted_content`: if the value starts with our `ENCRYPTED_PREFIX`, decrypt it the way
-  `_reasoning_text` does. Otherwise, if it decodes as text, render it as text. Otherwise emit the
-  fixed placeholder line `[encrypted payload unavailable]`.
+  `_reasoning_text` does and render its text; a damaged box costs the placeholder line
+  `[encrypted payload unavailable]`. A missing or non-string value also costs the placeholder.
+  Any other string renders verbatim: for codex against a local server that string IS the
+  plaintext payload (capture-proven), and an opaque foreign ciphertext cannot be told apart
+  from text without a heuristic we refuse to invent — junk in the prompt is the degraded state,
+  never a crash.
 
 The helper must never raise. An undecodable part costs one placeholder line; it does not cost the
 request. That is the whole point of this change, so the new failure mode has to be the opposite of
