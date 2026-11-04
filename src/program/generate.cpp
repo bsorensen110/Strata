@@ -14179,6 +14179,31 @@ int main(int argc, char** argv) {
                 }
             }
 #if defined(STRATA_HAVE_DFLASH2)
+            if (!df2_launched.empty()) std::fflush(stdout);
+            const Clock::time_point w_df2_0 = Clock::now();
+            // While the GPU executes the async slot commit (on ver.stream()) and each slot's DFlash2 draft graph
+            // (on slot_df2[b]->stream()), prefetch the host PLE anchor rows for the next batch window on the CPU.
+            if (ss.ple.ready()) {
+                for (int t = 0; t < A; ++t) {
+                    const int b = active[t];
+                    const BSlot& sl = bs[(size_t) b];
+                    if (!sl.active) continue;
+                    const strata::core::SessionState& sx = *bslot_ss[0][(size_t) b];
+                    const int kp = keep[b];
+                    const int f0 = first[t];
+                    int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
+                    if (kp == 1) {
+                        prev[0] = sx.ple_prev[1];
+                        prev[1] = tok[f0];
+                    } else if (kp >= 2) {
+                        prev[0] = tok[f0 + kp - 2];
+                        prev[1] = tok[f0 + kp - 1];
+                    }
+                    uint32_t ple_r[strata::core::PLE_N_HEADS];
+                    strata::core::ngram_rows(&sl.x, prev, 1, ss.ple.consts, ple_r);
+                    ss.ple.table->prefetch_rows(ple_r, 1);
+                }
+            }
             for (const int b : df2_launched) {
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
@@ -14189,8 +14214,52 @@ int main(int argc, char** argv) {
                 }
                 for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts && j < (int) sl.draft.size(); ++j) { sl.draft[(size_t) j] = dd[j]; sl.dprob[(size_t) j] = pp[j]; }
                 sl.draft_ready = true;
+                if (ss.ple.ready()) {
+                    const int n_pref = std::min<int>((int) strata::core::Dflash2Drafter::kDrafts,
+                                                     b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? std::max(1, df2_extra[b]) : 1);
+                    const strata::core::SessionState& sx = *bslot_ss[0][(size_t) b];
+                    int32_t prev[2] = {sx.ple_prev[1], sl.x};
+                    for (int t = 0; t < A; ++t) {
+                        if (active[t] != b) continue;
+                        const int kp = keep[b];
+                        const int f0 = first[t];
+                        prev[0] = kp >= 1 ? tok[f0 + kp - 1] : sx.ple_prev[1];
+                        prev[1] = sl.x;
+                        break;
+                    }
+                    uint32_t ple_r[strata::core::Dflash2Drafter::kDrafts * strata::core::PLE_N_HEADS];
+                    strata::core::ngram_rows(dd, prev, (size_t) n_pref, ss.ple.consts, ple_r);
+                    ss.ple.table->prefetch_rows(ple_r, (size_t) n_pref);
+                }
+            }
+            static const bool bdf2_timing = [] {
+                const char* e = std::getenv("STRATA_BATCH_DF2_TIMING");
+                return e != nullptr && e[0] != '\0' && e[0] != '0';
+            }();
+            if (bdf2_timing && batch_df2) {
+                static double sum_ver = 0.0, sum_com = 0.0, sum_df2 = 0.0;
+                static int64_t cnt_win = 0, cnt_rows = 0, cnt_acc = 0;
+                sum_ver += msd(w0, w1);
+                sum_com += msd(w1, w2);
+                sum_df2 += msd(w_df2_0, Clock::now());
+                cnt_win += 1;
+                for (int a = 0; a < A; ++a) {
+                    cnt_rows += keep[active[a]];
+                    cnt_acc += keep[active[a]] - 1;
+                }
+                if ((cnt_win & 31) == 0) {
+                    std::fprintf(stderr,
+                                 "[batch-df2-timing] win=%lld active=%d S=%d verify=%.2fms commit=%.2fms draft_wait=%.2fms rows/win=%.2f acc/win=%.2f\n",
+                                 (long long) cnt_win, A, S, sum_ver / (double) cnt_win, sum_com / (double) cnt_win,
+                                 sum_df2 / (double) cnt_win, (double) cnt_rows / (double) cnt_win,
+                                 (double) cnt_acc / (double) cnt_win);
+                }
             }
 #endif
+            if (!ver.wait_commit(err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
             if (adapt_run.th.joinable()) {
