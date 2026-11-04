@@ -57,9 +57,16 @@ ResponseItem::AgentMessage {
 }
 ```
 
-`AgentMessageInputContent` mirrors `FunctionCallOutputContentItem`. The variants are `InputText`,
-`InputImage`, `InputAudio`, and `EncryptedContent`. The server accepts that set and stays tolerant
-of anything else in the list.
+The official API reference lists `AgentMessage.content` as exactly three part types:
+`input_text`, `input_image`, and `encrypted_content`. `encrypted_content` carries an opaque
+string capped at 10,485,760 characters. (`codex-rs` shares its part enum with function-call
+outputs, which also has `InputAudio`; the official agent-message schema does not list it. Do
+not special-case audio; the tolerant fall-through below covers it.) The server accepts the
+three official parts and stays tolerant of anything else in the list.
+
+Optional item attributes, tolerated and ignored on input: `agent: {agent_name}` (the official
+"produced by" marker) and `internal_chat_message_metadata_passthrough` (codex-rs). Read parts
+by their `type`; ignore extra fields such as `prompt_cache_breakpoint` on `input_text`.
 
 ### The payload is not encrypted
 
@@ -138,6 +145,19 @@ payload parts follow, joined by newlines.
 
 The server never emits an `agent_message` output item. This change is input-only. codex sends the
 item; it does not expect one back.
+
+### Relation to the official hosted multi-agent (developers.openai.com, 2026-11)
+
+The official Responses API has a *hosted* multi-agent mode: `"multi_agent": {"enabled": true}`
+on the request, the SERVER executes six actions (`spawn_agent`, `send_message`, `followup_task`,
+`wait_agent`, `interrupt_agent`, `list_agents`), and responses carry `multi_agent_call`,
+`multi_agent_call_output` and `agent_message` as OUTPUT items, each with an `agent.agent_name`
+attribute. This spec implements NONE of that. codex's `multi_agent_v2` against a custom provider
+orchestrates on the CLIENT: collaboration actions run as ordinary namespaced `function_call` /
+`function_call_output` under `collaboration.*` (already supported), and only the inter-agent
+`agent_message` INPUT item (identical shape to the official one, parts included) reaches us. If
+hosted mode is ever wanted, that is a separate feature with its own spec; do not half-build it
+here.
 
 Out of scope, and deliberately untouched:
 
