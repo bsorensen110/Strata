@@ -4693,8 +4693,8 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
     }
+    ple_pending_b_ = false;
     if (ss_->ple.ready() && ple_stage()) {
-        uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
         for (int t = 0; t < S; ++t) {
             const SessionState& sx = *slots_[(size_t) rows[t]];
             int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
@@ -4702,9 +4702,17 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
                 prev[0] = t > 1 && rows[t - 2] == rows[t] ? tokens[t - 2] : sx.ple_prev[1];
                 prev[1] = tokens[t - 1];
             }
-            ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + t * PLE_N_HEADS);
+            ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows_b_ + t * PLE_N_HEADS);
         }
-        if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) return false;
+        static const bool defer_ple_b = [] {
+            const char* e = std::getenv("STRATA_BATCH_PLE_POSTLAUNCH");
+            return !e || e[0] != '0';
+        }();
+        if (defer_ple_b && !staging_deferred_ && lb_ == 0) {
+            ple_pending_b_ = true;
+        } else {
+            if (!ss_->ple.table->gather_batch(ple_rows_b_, (size_t) S, h_ple_, err)) return false;
+        }
     }
     // Each slot owns a contiguous group. The default commit keeps all its rows; speculative
     // decoding may change the prefix length after comparing the draft with these picks.
@@ -4773,6 +4781,14 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
+    if (ple_pending_b_) {
+        const Clock::time_point tp = Clock::now();
+        ple_pending_b_ = false;
+        if (!ss_->ple.table->gather_batch(ple_rows_b_, (size_t) S, h_ple_, err)) return false;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        strata_store_fence();
+        ms_host += ms_since(tp);
+    }
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int64_t steps = le_ - lb_;
