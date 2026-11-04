@@ -139,139 +139,196 @@ class Parsing(unittest.TestCase):
         self.assertIsNone(text_format({"text": {"format": {"type": "text"}}}))
 
 
-# ------------------------------------------------------------ multi_agent v2 agent_message items
-# two live Codex multi_agent_v2 captures (NEW_TASK to a subagent and FINAL_ANSWER back to /root)
-AM_TASK = json.loads(
-    r"""{"type": "agent_message", "id": "amsg_01a1a551-02c7-77b3-a326-066d0f5adebf","""
-    r""" "author": "/root", "recipient": "/root/arith", "content": ["""
-    r"""{"type": "input_text", "text": "Message Type: NEW_TASK\nTask name: /root/arith\n"""
-    r"""Sender: /root\nPayload:\n"}, {"type": "encrypted_content", "encrypted_content": """
-    r""""Question for you: what is 2+2? Reply with just the answer and nothing else."}]}""")
-AM_REPLY = json.loads(
-    r"""{"type": "agent_message", "id": "amsg_01a1a78f-3aae-7571-b199-3014bdd540c9","""
-    r""" "author": "/root/arith", "recipient": "/root", "content": [{"type": "input_text","""
-    r""" "text": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/arith\n"""
-    r"""Payload:\n**437**\n\nCheck: `20 * 23 = 460`, minus one `23` gives `437`."}]}""")
+# ------------------------------------------------------------------------------------------------ Codex multi_agent_v2
+# Payload shapes from codex-rs/core/src/tasks/regular.rs (`build_agent_message_from_inter_agent_communication`) and
+# codex-rs/protocol/src/models.rs (`ResponseItem::AgentMessage`, `AgentMessageContent`).  Codex splits each inter-agent
+# hop into an `input_text` envelope header and an `encrypted_content` payload part.
+def _seal(text: str) -> str:
+    return ENCRYPTED_PREFIX + base64.b64encode(
+        json.dumps({"v": 1, "text": text}).encode("utf-8")).decode("ascii")
+
+
+def _seal_raw(payload) -> str:
+    return ENCRYPTED_PREFIX + base64.b64encode(
+        json.dumps(payload).encode("utf-8")).decode("ascii")
+
+
+AM_TASK = {
+    "type": "agent_message",
+    "author": "/root",
+    "recipient": "/root/worker1",
+    "content": [
+        {"type": "input_text", "text": (
+            "Message Type: NEW_TASK\n"
+            "Task name: /root/worker1\n"
+            "Sender: /root\n"
+            "Trigger turn: false\n"
+            "Payload:\n"
+        )},
+        {"type": "encrypted_content", "encrypted_content": "Compute 2 + 2 and reply with the exact integer."},
+    ],
+}
+AM_REPLY = {
+    "type": "agent_message",
+    "author": "/root/worker1",
+    "recipient": "/root",
+    "content": [
+        {"type": "input_text", "text": (
+            "Message Type: FINAL_ANSWER\n"
+            "Task name: /root/worker1\n"
+            "Sender: /root/worker1\n"
+            "Trigger turn: true\n"
+            "Payload:\n"
+        )},
+        {"type": "encrypted_content", "encrypted_content": _seal("4")},
+    ],
+}
 
 
 class MultiAgentV2(unittest.TestCase):
-    """Codex with features.multi_agent_v2 (and the Responses multi-agent API) sends inter-agent
-    `agent_message` and `multi_agent_call(_output)` input items."""
-
     def test_agent_message_item_parses(self):
-        self.assertEqual(input_messages({"input": [AM_TASK]}), [
-            {"role": "user", "content": (
-                "[agent_message from /root to /root/arith]\n"
-                "Message Type: NEW_TASK\nTask name: /root/arith\nSender: /root\nPayload:\n"
-                "Question for you: what is 2+2? Reply with just the answer and nothing else.")}])
+        msgs = input_messages({"instructions": "You are Codex", "input": [AM_TASK]})
+        self.assertEqual([m["role"] for m in msgs], ["system", "user"])
+        self.assertIn("[agent_message from /root to /root/worker1]", msgs[1]["content"])
+        self.assertIn("Message Type: NEW_TASK", msgs[1]["content"])
+        self.assertIn("Payload:\nCompute 2 + 2 and reply with the exact integer.", msgs[1]["content"])
+        # OpenAI Responses API reference also nests recipient under `agent.agent_name`
+        ref_shape = {"type": "agent_message", "author": "orchestrator",
+                     "agent": {"type": "agent_reference", "agent_name": "researcher"},
+                     "content": [{"type": "input_text", "text": "Summarize module A."}]}
+        msgs2 = input_messages({"input": [ref_shape]})
+        self.assertIn("[agent_message from orchestrator to researcher]", msgs2[0]["content"])
+        self.assertIn("Summarize module A.", msgs2[0]["content"])
 
     def test_agent_message_encrypted_ciphertext_degrades(self):
-        """An unreadable payload costs a line, not the request: the helper never raises."""
-        def sent(part):
-            item = {"type": "agent_message", "author": "/root", "recipient": "/root/x",
-                    "content": [part]}
-            return input_messages({"input": [item]})[0]["content"]
-        head = "[agent_message from /root to /root/x]"
-        ours = ENCRYPTED_PREFIX + "gAAAAAB-not-a-box"   # our prefix: the box will not decode
-        for part in ({"type": "encrypted_content", "encrypted_content": ours},
-                     {"type": "encrypted_content"},
-                     {"type": "encrypted_content", "encrypted_content": {}}):
-            self.assertEqual(sent(part), head + "\n[encrypted payload unavailable]")
-        # our own valid box decodes to its text
-        good_box = ENCRYPTED_PREFIX + base64.b64encode(json.dumps({"text": "decoded body"}).encode()).decode()
-        self.assertEqual(sent({"type": "encrypted_content", "encrypted_content": good_box}),
-                         head + "\ndecoded body")
-        # another server's blob is not ours to decrypt, but it is a string: it renders as that
-        # text, and the request still runs; the placeholder is for a part with nothing to read
-        blob = {"type": "encrypted_content", "encrypted_content": "gAAAAAB-someone-elses-blob"}
-        self.assertEqual(sent(blob), head + "\ngAAAAAB-someone-elses-blob")
-        # input_image, unknown part types, non-dict parts, and non-list content never raise
-        self.assertEqual(sent({"type": "input_image", "image_url": "https://example.com/a.png"}),
-                         head + "\n[image]")
-        self.assertEqual(sent({"type": "unknown_part"}), head + "\n[payload part not rendered]")
-        self.assertEqual(input_messages({"input": [{"type": "agent_message", "author": "/root",
-                                                    "agent": {"agent_name": "/root/sub"},
-                                                    "content": "plain string"}]})[0]["content"],
-                         "[agent_message from /root to /root/sub]\nplain string")
-        self.assertEqual(input_messages({"input": [{"type": "agent_message", "author": "/root",
-                                                    "recipient": "/root/x", "content": 123}]})[0]["content"],
-                         head + "\n[payload part not rendered]")
+        """Our own `strata.r1:` box decrypts; a damaged/non-string box or non-string text part degrades to a placeholder."""
+        msgs = input_messages({"input": [AM_REPLY]})
+        self.assertIn("[agent_message from /root/worker1 to /root]", msgs[0]["content"])
+        self.assertTrue(msgs[0]["content"].endswith("Payload:\n4"))
+        bad = {"type": "agent_message", "author": "/root/w", "recipient": "/root", "content": [
+            {"type": "encrypted_content", "encrypted_content": ENCRYPTED_PREFIX + "!!!not-base64!!!"},
+            {"type": "encrypted_content", "encrypted_content": _seal_raw({"text": None})},
+            {"type": "encrypted_content", "encrypted_content": _seal_raw({"text": 123})},
+            {"type": "encrypted_content", "encrypted_content": _seal_raw(["not", "a", "dict"])},
+            {"type": "encrypted_content", "encrypted_content": None},
+            {"type": "input_text", "text": 123},
+            {"type": "unknown_part"},
+        ]}
+        degraded = input_messages({"input": [bad]})[0]["content"]
+        self.assertEqual(degraded.count("[encrypted payload unavailable]"), 5)
+        self.assertEqual(degraded.count("[payload part not rendered]"), 2)
 
     def test_agent_message_prompt_golden(self):
-        """The routing line survives to the prompt, so the model sees who is writing to whom."""
-        agents = {"type": "namespace", "name": "multi_agent_v1", "description": "Agents.",
-                  "tools": [{"type": "function", "name": "spawn_agent", "parameters": {
-                      "type": "object", "properties": {"message": {"type": "string"}}}}]}
-        user = {"type": "message", "role": "user",
-                "content": [{"type": "input_text", "text": "ask the subagent"}]}
-        req = {"model": "m", "instructions": "You are Codex", "tools": TOOLS + [agents],
-               "input": [user, AM_TASK]}
-        shown = tools_of(req)[1]              # the harness the multi_agent v1 golden test uses
-        prompt = TEMPLATE.render(input_messages(req), tools=shown, add_generation_prompt=False)
-        self.assertIn("[agent_message from /root to /root/arith]", prompt)
-        self.assertIn("Question for you: what is 2+2?", prompt)
+        """Full multi-agent turn sequence renders through the Qwen3 chat template without error."""
+        agents = {"type": "namespace", "name": "multi_agent_v1", "description": "Sub-agent tools.",
+                  "tools": [{"type": "function", "name": "spawn_agent", "description": "Spawn a worker.",
+                             "parameters": {"type": "object", "properties": {"message": {"type": "string"}}}}]}
+        req = {
+            "model": "m",
+            "instructions": "You are Codex.",
+            "tools": TOOLS + [agents],
+            "input": [
+                {"type": "message", "role": "user", "content": "Delegate 2 + 2 to worker1."},
+                {"type": "reasoning", "summary": [], "encrypted_content": _seal("spawning worker1")},
+                {"type": "function_call", "name": "spawn_agent", "namespace": "multi_agent_v1",
+                 "arguments": "{\"message\":\"2+2\"}", "call_id": "c_spawn"},
+                {"type": "function_call_output", "call_id": "c_spawn",
+                 "output": "{\"task_name\":\"/root/worker1\"}"},
+                AM_REPLY,
+            ],
+        }
+        shown = tools_of(req)[1]
+        rendered = TEMPLATE.render(input_messages(req), tools=shown, add_generation_prompt=True)
+        self.assertIn("<function=multi_agent_v1.spawn_agent>", rendered)
+        self.assertIn("[agent_message from /root/worker1 to /root]", rendered)
+        self.assertIn("Message Type: FINAL_ANSWER", rendered)
+        self.assertIn("Payload:\n4<|im_end|>\n<|im_start|>assistant\n<think>\n", rendered)
 
     def test_agent_message_between_turns_keeps_tool_pairing(self):
-        """The item closes the open turn between calls and their results: _order_tool_results
-        orders the results by the assistant turn's call_ids even across the hop."""
-        user = {"type": "message", "role": "user",
-                "content": [{"type": "input_text", "text": "list the files"}]}
-        c1 = {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "exec_command",
-              "arguments": "{\"cmd\":\"ls\"}"}
-        c2 = {"type": "function_call", "id": "fc_2", "call_id": "c2", "name": "exec_command",
-              "arguments": "{\"cmd\":\"pwd\"}"}
-        out1 = {"type": "function_call_output", "call_id": "c1", "output": "ok_ls"}
-        out2 = {"type": "function_call_output", "call_id": "c2", "output": "ok_pwd"}
-        self.assertEqual(input_messages({"input": [user, c1, c2, AM_REPLY, out2, out1]}), [
-            {"role": "user", "content": "list the files"},
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"function": {"name": "exec_command", "arguments": {"cmd": "ls"}}},
-                {"function": {"name": "exec_command", "arguments": {"cmd": "pwd"}}}]},
-            {"role": "user", "content": "[agent_message from /root/arith to /root]\n"
-                                        + AM_REPLY["content"][0]["text"]},
-            {"role": "tool", "content": "ok_ls"},
-            {"role": "tool", "content": "ok_pwd"}])
+        """An `agent_message` arriving between parallel `function_call` items and their `function_call_output`
+        items must not break `_order_tool_results()` call-id ordering or merge subsequent tool calls."""
+        inp = [
+            {"type": "message", "role": "user", "content": "start"},
+            {"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"a\"}", "call_id": "c1"},
+            {"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"b\"}", "call_id": "c2"},
+            AM_TASK,
+            {"type": "function_call_output", "call_id": "c2", "output": "out2"},
+            {"type": "function_call_output", "call_id": "c1", "output": "out1"},
+            {"type": "function_call", "name": "exec_command", "arguments": "{\"cmd\":\"c\"}", "call_id": "c3"},
+            {"type": "function_call_output", "call_id": "c3", "output": "out3"},
+        ]
+        msgs = input_messages({"input": inp})
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant", "user", "tool", "tool", "assistant", "tool"])
+        self.assertEqual([m["content"] for m in msgs if m["role"] == "tool"], ["out1", "out2", "out3"])
 
     def test_multi_agent_call_and_output_items_parse(self):
-        """Official Responses API `multi_agent_call` and `multi_agent_call_output` input items
-        replay into assistant tool_calls and ordered tool messages."""
-        items = [
-            {"type": "message", "role": "user", "content": "delegate this"},
-            {"type": "multi_agent_call", "id": "mac_1", "call_id": "call_ma1",
-             "action": "spawn_agent", "arguments": "{\"task_name\":\"arith\",\"message\":\"2+2\"}"},
-            {"type": "multi_agent_call_output", "id": "maco_1", "call_id": "call_ma1",
-             "action": "spawn_agent", "output": [{"type": "output_text", "text": "{\"task_name\":\"/root/arith\"}"}]}]
-        self.assertEqual(input_messages({"input": items}), [
-            {"role": "user", "content": "delegate this"},
-            {"role": "assistant", "content": "", "tool_calls": [
-                {"function": {"name": "spawn_agent", "arguments": {"task_name": "arith", "message": "2+2"}}}]},
-            {"role": "tool", "content": "{\"task_name\":\"/root/arith\"}"}])
+        """OpenAI Responses `multi_agent_call` and `multi_agent_call_output` items map to assistant tool_calls and tool results."""
+        inp = [
+            {"type": "message", "role": "user", "content": "spawn"},
+            {"type": "multi_agent_call", "call_id": "ma_1", "action": "spawn_agent",
+             "namespace": "collaboration", "arguments": "{\"task_name\":\"w1\",\"message\":\"hi\"}"},
+            {"type": "multi_agent_call_output", "call_id": "ma_1",
+             "output": {"task_name": "/root/w1", "status": "spawned"}},
+        ]
+        msgs = input_messages({"input": inp})
+        self.assertEqual([m["role"] for m in msgs], ["user", "assistant", "tool"])
+        self.assertEqual(msgs[1]["tool_calls"], [{
+            "function": {"name": "collaboration.spawn_agent",
+                         "arguments": {"task_name": "w1", "message": "hi"}}
+        }])
+        self.assertEqual(json.loads(msgs[2]["content"]), {"task_name": "/root/w1", "status": "spawned"})
         with self.assertRaises(ResponsesError) as e:
             input_messages({"input": [{"type": "multi_agent_call", "call_id": "c1", "arguments": "{}"}]})
         self.assertEqual(e.exception.param, "input[0].action")
 
     def test_fork_turns_subagent_restores_namespace_tools_for_prefix_cache(self):
         """A `fork_turns="all"` child inherits `collaboration.spawn_agent` in `input` while Codex
-        fallback metadata drops `collaboration` from `tools`; restoring it keeps the prefix identical."""
-        collab = {"type": "namespace", "name": "collaboration", "description": "Agents.",
-                  "tools": [{"type": "function", "name": "spawn_agent", "parameters": {
-                      "type": "object", "properties": {"message": {"type": "string"}}}}]}
+        fallback metadata drops `collaboration` from `tools`.  `prompt_tools` restores the identified
+        parent session's namespace tools for prompt rendering only, keeping `request_tools`'s callable
+        tools and `names` map restricted to the child's declared tools and isolating across sessions."""
+        responses._kept_prompt_tools = (None, None)
+        collab_a = {"type": "namespace", "name": "collaboration", "description": "Session A agents.",
+                    "tools": [{"type": "function", "name": "spawn_agent", "description": "Spawn in A.",
+                               "parameters": {"type": "object", "properties": {"message": {"type": "string"}}}}]}
+        collab_b = {"type": "namespace", "name": "collaboration", "description": "Session B agents.",
+                    "tools": [{"type": "function", "name": "spawn_agent", "description": "Spawn in B.",
+                               "parameters": {"type": "object", "properties": {"task": {"type": "string"}}}}]}
         after = {"type": "function", "name": "get_goal",
                  "parameters": {"type": "object", "properties": {}}}
         user = {"type": "message", "role": "user", "content": "delegate 2+2"}
         spawn = {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "spawn_agent",
                  "namespace": "collaboration", "arguments": "{\"message\":\"2+2\"}"}
-        parent = {"model": "m", "instructions": "You are Codex",
-                  "tools": TOOLS + [collab, after], "input": [user, spawn]}
-        child = {"model": "m", "instructions": "You are Codex", "tools": TOOLS + [after],
-                 "input": [user, spawn, {"type": "function_call_output", "call_id": "c1",
-                                         "output": "aborted"}, AM_TASK]}
-        p_tools = tools_of(parent)[1]
-        c_tools = tools_of(child)[1]
-        self.assertEqual(p_tools, c_tools)
-        p_prompt = TEMPLATE.render(input_messages(parent), tools=p_tools, add_generation_prompt=False)
-        c_prompt = TEMPLATE.render(input_messages(child), tools=c_tools, add_generation_prompt=True)
+        parent_a = {"model": "m", "instructions": "You are Codex",
+                    "tools": TOOLS + [collab_a, after], "input": [user, spawn],
+                    "client_metadata": codex_meta("turn", A)}
+        parent_b = {"model": "m", "instructions": "You are Codex",
+                    "tools": TOOLS + [collab_b, after], "input": [user, spawn],
+                    "client_metadata": codex_meta("turn", B)}
+        child_meta_a = {"session_id": A[0], "thread_id": "019a-a-sub", "x-codex-turn-metadata": json.dumps(
+            {"session_id": A[0], "thread_id": "019a-a-sub", "parent_thread_id": A[1], "request_kind": "turn"})}
+        child_a = {"model": "m", "instructions": "You are Codex", "tools": TOOLS + [after],
+                   "input": [user, spawn, {"type": "function_call_output", "call_id": "c1",
+                                           "output": "aborted"}, AM_TASK],
+                   "client_metadata": child_meta_a}
+        # Order: A's parent, then B's parent, then A's child -> A's child must get A's tools, not B's
+        p_own, p_shown = tools_of(parent_a)
+        tools_of(parent_b)
+        c_own, c_shown = tools_of(child_a)
+        _, c_names, _ = request_tools(child_a)
+        self.assertNotIn("collaboration.spawn_agent", c_names)
+        self.assertEqual([t["name"] for t in c_own], ["exec_command", "get_goal"])
+        self.assertEqual(c_shown, p_shown)
+        p_prompt = TEMPLATE.render(input_messages(parent_a), tools=p_shown, add_generation_prompt=False)
+        c_prompt = TEMPLATE.render(input_messages(child_a), tools=c_shown, add_generation_prompt=True)
         self.assertTrue(c_prompt.startswith(p_prompt))
+        # Without established parent ownership (missing metadata or unknown parent), request tools stay unchanged
+        for unowned_meta in ({}, codex_meta("turn", ("019a-a", "019a-a-sub")),
+                             {"x-codex-turn-metadata": json.dumps(
+                                 {"session_id": "019a-c", "thread_id": "sub", "parent_thread_id": A[1],
+                                  "request_kind": "turn"})}):
+            unowned = {**child_a, "client_metadata": unowned_meta}
+            u_own, u_shown = tools_of(unowned)
+            self.assertEqual(u_shown, u_own)
 
 
 # ------------------------------------------------------------------------------------------------ Codex compaction
