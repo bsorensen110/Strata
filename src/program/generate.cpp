@@ -14090,7 +14090,13 @@ int main(int argc, char** argv) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
             }
-            std::vector<int> df2_launched;   // batch DFlash2: slots whose draft graph is queued
+            struct Df2LaunchEntry {
+                int b = 0;
+                int kp = 0;
+                int64_t pos0 = 0;
+                int32_t anchor = 0;
+            };
+            std::vector<Df2LaunchEntry> df2_launched;   // batch DFlash2: slots to draft this round
             for (int t = 0; t < A; ++t) {
                 const int b = active[t];
                 BSlot& sl = bs[(size_t) b];
@@ -14132,8 +14138,6 @@ int main(int argc, char** argv) {
                     // from the last committed token.  The window's host sync is behind us, so the taps are final.
                     strata::core::Dflash2Drafter& d = *slot_df2[(size_t) b];
                     const int kp = keep[b];
-                    int32_t dd[strata::core::Dflash2Drafter::kDrafts];
-                    float pp[strata::core::Dflash2Drafter::kDrafts];
                     d.note_rows(tok + first[t], kp, pos[first[t]]);
                     if (nrow[t] > 1 || !batch_df2_defer) {
                         // this window carried drafts for the slot: its drafter takes the committed rows' taps and drafts again
@@ -14142,13 +14146,11 @@ int main(int argc, char** argv) {
                             return false;
                         }
                         d.clear_deferred();
-                        if (!ver.gather_taps(d.landing(), d.device(), first[t], kp, 0, d.stream(), err) ||
-                            !d.draft_launch(d.landing(), kp, pos[first[t]], outb[first[t] + kp - 1], err)) {
+                        if (!ver.gather_taps(d.landing(), d.device(), first[t], kp, 0, d.stream(), err)) {
                             std::printf("ERR batch DFlash2 slot %d: %s\n", b, err.c_str());
                             return false;
                         }
-                        df2_launched.push_back(b);   // finished after the loop: the slots' graphs run at the same time
-                        (void) dd; (void) pp;
+                        df2_launched.push_back({b, kp, pos[first[t]], outb[first[t] + kp - 1]});
                     } else {
                         // no spare row for the slot: no draft, no drafter work; the rows' taps wait on the host until spare rows return
                         float* dst = d.defer_rows(pos[first[t]], kp, err);
@@ -14179,6 +14181,42 @@ int main(int argc, char** argv) {
                 }
             }
 #if defined(STRATA_HAVE_DFLASH2)
+            static const bool df2_batch_head = [] {
+                const char* e = std::getenv("STRATA_DF2_BATCHHEAD");
+                return e == nullptr || e[0] == '\0' || std::strcmp(e, "0") != 0;
+            }();
+            const bool use_bhead = df2_batch_head && stages.empty() && df2_launched.size() >= 2 &&
+                                   df2_launched.size() <= (size_t) strata::core::Dflash2Drafter::kBatchMaxSlots;
+            strata::core::Dflash2Drafter::BatchSlotItem df2_bitems[strata::core::Dflash2Drafter::kBatchMaxSlots] = {};
+            int32_t df2_bdd[strata::core::Dflash2Drafter::kBatchMaxSlots][strata::core::Dflash2Drafter::kDrafts] = {};
+            float df2_bpp[strata::core::Dflash2Drafter::kBatchMaxSlots][strata::core::Dflash2Drafter::kDrafts] = {};
+            if (use_bhead) {
+                int nact_next = 0;
+                for (const auto& q : bs) nact_next += q.active ? 1 : 0;
+                const int spare_next = std::max(0, win_cap - std::max(1, nact_next));
+                const int max_per_slot = std::max(1, (spare_next + std::max(1, nact_next) - 1) / std::max(1, nact_next));
+                for (size_t idx = 0; idx < df2_launched.size(); ++idx) {
+                    const Df2LaunchEntry& le = df2_launched[idx];
+                    strata::core::Dflash2Drafter& d = *slot_df2[(size_t) le.b];
+                    const BSlot& q = bs[(size_t) le.b];
+                    int kw = std::min(d.max_drafts(), std::min(df2_cap, max_per_slot));
+                    kw = std::min<int>(kw, (int) std::max<int64_t>(1, q.max_new - q.produced));
+                    kw = std::min<int>(kw, (int) std::max<int64_t>(1, (int64_t) o.max_context - q.p - 1));
+                    df2_bitems[idx] = {&d, d.landing(), le.kp, le.pos0, le.anchor, std::max(1, kw), df2_bdd[idx], df2_bpp[idx]};
+                }
+                if (!df2.draft_batch_slots_launch(df2_bitems, (int) df2_launched.size(), err)) {
+                    std::printf("ERR batch DFlash2: %s\n", err.c_str());
+                    return false;
+                }
+            } else {
+                for (const Df2LaunchEntry& le : df2_launched) {
+                    strata::core::Dflash2Drafter& d = *slot_df2[(size_t) le.b];
+                    if (!d.draft_launch(d.landing(), le.kp, le.pos0, le.anchor, err)) {
+                        std::printf("ERR batch DFlash2 slot %d: %s\n", le.b, err.c_str());
+                        return false;
+                    }
+                }
+            }
             if (!df2_launched.empty()) std::fflush(stdout);
             const Clock::time_point w_df2_0 = Clock::now();
             // While the GPU executes the async slot commit (on ver.stream()) and each slot's DFlash2 draft graph
@@ -14204,19 +14242,32 @@ int main(int argc, char** argv) {
                     ss.ple.table->prefetch_rows(ple_r, 1);
                 }
             }
-            for (const int b : df2_launched) {
+            if (use_bhead) {
+                if (!df2.draft_batch_slots_finish(df2_bitems, (int) df2_launched.size(), err)) {
+                    std::printf("ERR batch DFlash2: %s\n", err.c_str());
+                    return false;
+                }
+            }
+            for (size_t idx = 0; idx < df2_launched.size(); ++idx) {
+                const int b = df2_launched[idx].b;
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
                 BSlot& sl = bs[(size_t) b];
-                if (!slot_df2[(size_t) b]->draft_finish(dd, pp, err)) {
+                if (use_bhead) {
+                    for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts; ++j) {
+                        dd[j] = df2_bdd[idx][j];
+                        pp[j] = df2_bpp[idx][j];
+                    }
+                } else if (!slot_df2[(size_t) b]->draft_finish(dd, pp, err)) {
                     std::printf("ERR batch DFlash2 slot %d: %s\n", b, err.c_str());
                     return false;
                 }
                 for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts && j < (int) sl.draft.size(); ++j) { sl.draft[(size_t) j] = dd[j]; sl.dprob[(size_t) j] = pp[j]; }
                 sl.draft_ready = true;
                 if (ss.ple.ready()) {
-                    const int n_pref = std::min<int>((int) strata::core::Dflash2Drafter::kDrafts,
-                                                     b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? std::max(1, df2_extra[b]) : 1);
+                    const int n_pref = use_bhead ? df2_bitems[idx].k_want
+                                                 : std::min<int>((int) strata::core::Dflash2Drafter::kDrafts,
+                                                                 b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? std::max(1, df2_extra[b]) : 1);
                     const strata::core::SessionState& sx = *bslot_ss[0][(size_t) b];
                     int32_t prev[2] = {sx.ple_prev[1], sl.x};
                     for (int t = 0; t < A; ++t) {

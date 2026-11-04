@@ -38,8 +38,21 @@ class Dflash2Drafter {
 public:
     static constexpr int kRows = 8;           ///< block rows: the anchor + 7 masks
     static constexpr int kDrafts = kRows - 1;
+    static constexpr int kBatchMaxSlots = 8;
+    static constexpr int kBatchMaxRows = kBatchMaxSlots * kDrafts;
     static constexpr int kRing2048 = 2048;    ///< positions the deferred-rows buffer holds
     static constexpr int kRing = 2064;        ///< K/V slots per layer: the 2048 window + slack for rows written ahead of a rejection
+
+    struct BatchSlotItem {
+        Dflash2Drafter* slot = nullptr; ///< cloned slot drafter (must share this parent's device and head)
+        const float* taps = nullptr;    ///< device pointer to this slot's committed tap rows [n_new][n_taps * N]
+        int n_new = 0;                  ///< committed tap rows (1 .. kRows)
+        int64_t pos0 = 0;               ///< position of the first committed row
+        int32_t anchor = 0;             ///< last committed token (the block's row 0 token)
+        int k_want = kDrafts;           ///< proposals to produce for this slot (1 .. kDrafts)
+        int32_t* drafts = nullptr;      ///< host output [kDrafts]
+        float* probs = nullptr;         ///< optional host output [kDrafts]
+    };
 
     Dflash2Drafter() = default;
     ~Dflash2Drafter();
@@ -142,6 +155,14 @@ public:
     bool draft_launch(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, std::string& err);
     bool draft_finish(int32_t* drafts, float* probs, std::string& err);
 
+    /// Co-drafts `n_items` active slot drafters (1 .. kBatchMaxSlots) in two halves (launch + finish): each slot's
+    /// context update and 5-layer transformer body run on its own captured body graph (`body_exec_[n_new]`) on its
+    /// own stream, pack `k_want` rows into the parent drafter's `fn_batch_` / `hsel_batch_`, and join onto the
+    /// parent stream where the draft head GEMM, top-16 reduction, and multi-slot selector walk run once across all
+    /// slots.  Bitwise equal to calling draft() on each slot for `k_want` rows.
+    bool draft_batch_slots_launch(const BatchSlotItem* items, int n_items, std::string& err);
+    bool draft_batch_slots_finish(const BatchSlotItem* items, int n_items, std::string& err);
+
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
 
@@ -149,6 +170,7 @@ public:
     /// many rows only: the first `n` drafts and probabilities are bitwise the ones a full block makes (every row is its own column, the walk goes left to right);
     /// draft() returns token 0 with probability 0 for the rest.  Before prepare() / the first draft(); a later change drops the captured graphs.
     void set_max_drafts(int n);
+    int max_drafts() const { return ndraft_; }
 
     /// The drafter's context K/V ring is fp16 (2 bytes per element) by default; off with set_fp16_ring(false) / STRATA_DF2_FP16_RING=0.
     /// Set before alloc(); the slot drafters refuse a state copy whose ring dtype differs.
@@ -176,8 +198,10 @@ private:
     /// planar Q8 matrices (1..3 of them, same input width) times the planar activations in xqp_ / xdp_ (ncols columns)
     void gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd);
     bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope = true);
+    bool record_block_body(cudaStream_t cs, std::string& err, bool rope = true);
     bool record_block(cudaStream_t cs, std::string& err, bool rope = true);
     bool capture(int n, const float* taps, std::string& err);
+    bool capture_body(int n, const float* taps, std::string& err);
     bool alloc(std::string& err);
     struct Prof;
     Prof* prof_ = nullptr;
@@ -235,10 +259,15 @@ private:
     float *fcy_ = nullptr, *hctx_ = nullptr, *kc_ = nullptr, *vc_ = nullptr;
     float *h_ = nullptr, *xn_ = nullptr, *xc_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *qn_ = nullptr, *k_ = nullptr, *v_ = nullptr, *kblk_ = nullptr;
     float *ao_ = nullptr, *o_ = nullptr, *gate_ = nullptr, *up_ = nullptr, *mlp_ = nullptr, *part_ = nullptr, *fn_ = nullptr;
+    float *fn_batch_ = nullptr, *hsel_batch_ = nullptr;
     float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr;
     int32_t *toptok_ = nullptr, *out_tok_ = nullptr;
+    int32_t *h_bmeta_ = nullptr, *m_bmeta_ = nullptr;
+    int32_t *h_bout_ = nullptr, *out_btok_ = nullptr;
+    float *out_bprob_ = nullptr;
     uint32_t* topscratch_ = nullptr;
     cudaGraphExec_t exec_[kRows + 1] = {};
+    cudaGraphExec_t body_exec_[kRows + 1] = {};
     const float* graph_taps_ = nullptr;
     int ndraft_ = kDrafts;          ///< drafts a window can use (set_max_drafts)
     int64_t have_ctx_ = 0;

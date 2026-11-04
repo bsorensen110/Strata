@@ -936,16 +936,16 @@ __device__ __forceinline__ float q4row_at(const uint8_t* row, int i) {
     return (float) ((j < 16 ? (byte & 15) : (byte >> 4)) - 8) * d;
 }
 
-// ---- the selector's walk: one block of 256 threads
+// ---- the selector's walk: one block of 256 threads per slot
 template <bool Q4>
-__global__ void select_kernel(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
-                              const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
-                              const int32_t* __restrict__ anchor_tok, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+__device__ void select_slot_walk(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
+                                 const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
+                                 int prev0, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
     __shared__ float vp[256];
     __shared__ float sc[kDf2TopK];
     __shared__ int prev;
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
-    if (tid == 0) prev = *anchor_tok;
+    if (tid == 0) prev = prev0;
     __syncthreads();
     for (int i = 0; i < rows; ++i) {
         if (Q4) vp[tid] = q4row_at(reinterpret_cast<const uint8_t*>(pred_cb) + (size_t) prev * (rank / 32 * 18), tid) * hp[(size_t) i * rank + tid];
@@ -984,6 +984,35 @@ __global__ void select_kernel(const float* __restrict__ hp, const float* __restr
         }
         __syncthreads();
     }
+}
+
+template <bool Q4>
+__global__ void select_kernel(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
+                              const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
+                              const int32_t* __restrict__ anchor_tok, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+    select_slot_walk<Q4>(hp, unary, tok, pred_cb, succ_cb, rank, rows, *anchor_tok, out_tok, out_prob);
+}
+
+template <bool Q4>
+__global__ void select_multi_kernel(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
+                                    const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank,
+                                    const int32_t* __restrict__ batch_meta, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+    const int s = blockIdx.x;
+    const int row_off = batch_meta[s * 4 + 0];
+    const int rows = batch_meta[s * 4 + 1];
+    const int prev0 = batch_meta[s * 4 + 2];
+    select_slot_walk<Q4>(hp + (size_t) row_off * rank, unary + (size_t) row_off * kDf2TopK, tok + (size_t) row_off * kDf2TopK,
+                         pred_cb, succ_cb, rank, rows, prev0, out_tok + s * 8, out_prob + s * 8);
+}
+
+__global__ void pack_head_rows_kernel(const float* __restrict__ fn_in, const float* __restrict__ hsel_in,
+                                      float* __restrict__ fn_out, float* __restrict__ hsel_out, int N, int rank) {
+    const int i = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    const int r = blockIdx.y;
+    if (i < N)
+        fn_out[(size_t) r * N + i] = fn_in[(size_t) r * N + i];
+    else if (i < N + rank)
+        hsel_out[(size_t) r * rank + (i - N)] = hsel_in[(size_t) r * rank + (i - N)];
 }
 
 __global__ void tap_rows_kernel(const float* __restrict__ R, float* __restrict__ out, int64_t out_stride, int64_t n, int hc) {
@@ -1265,6 +1294,22 @@ void df2_select(const float* hp, const float* unary, const int32_t* tok, const u
     if (cb_q4) select_kernel<true><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
     else select_kernel<false><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
     check("select");
+}
+
+void df2_select_multi(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank,
+                      const int32_t* batch_meta, int n_items, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4) {
+    if (rank != 256) throw std::invalid_argument("df2_select_multi: the selector rank must be 256");
+    if (n_items <= 0) return;
+    if (cb_q4) select_multi_kernel<true><<<n_items, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, batch_meta, out_tok, out_prob);
+    else select_multi_kernel<false><<<n_items, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, batch_meta, out_tok, out_prob);
+    check("select_multi");
+}
+
+void df2_pack_head_rows(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out, int rows, int N, int rank, void* stream) {
+    if (rows <= 0) return;
+    pack_head_rows_kernel<<<dim3((unsigned) ((N + rank + 255) / 256), (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(
+        fn_in, hsel_in, fn_out, hsel_out, N, rank);
+    check("pack_head_rows");
 }
 
 void df2_tap_rows(const float* R, float* out, int64_t out_stride, int64_t n_embd, int hc, int rows, void* stream) {
