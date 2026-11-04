@@ -16768,6 +16768,11 @@ int main(int argc, char** argv) {
                     const char* v = std::getenv("STRATA_BATCH_PREFILL_CHUNK");
                     return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) -1;
                 }();
+                static const int prefill_layer_yield = [&] {
+                    const char* v = std::getenv("STRATA_BATCH_PREFILL_LAYER_YIELD");
+                    if (v != nullptr && v[0] != '\0') return std::max(0, std::atoi(v));
+                    return batch_mtp ? 12 : 0;
+                }();
                 auto active_slot_count = [&]() -> int {
                     int n_act = 0;
                     for (const auto& x : bs) n_act += x.active ? 1 : 0;
@@ -16783,6 +16788,28 @@ int main(int argc, char** argv) {
                         sp.force_chunk(eff_c, b0 - a0 <= eff_c, eff_c < std::min(b0 - a0, sp.chunk()));
                     }
                     if (!conc_read) share_gate();   // STRATA_PREFILL_CPU_SHARE_BATCH: re-decided for every run (a piece beside decoding slots too)
+                    const bool use_layer_yield =
+                        !conc_read && o.batch > 0 && stages.empty() && prefill_layer_yield > 0 && (r - q) >= 512;
+                    if (use_layer_yield) {
+                        sp.set_layer_yield(
+                            [&]() -> bool {
+                                if (decode_share <= 0.0 || !batch_on()) return true;
+                                const auto td = Clock::now();
+                                in_prompt_read = true;
+                                const bool ok = batch_step();
+                                in_prompt_read = false;
+                                if (!ok) {
+                                    batch_fatal = true;
+                                    return false;
+                                }
+                                ++il_parts;
+                                il_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
+                                return true;
+                            },
+                            prefill_layer_yield);
+                    } else {
+                        sp.set_layer_yield(nullptr, 0);
+                    }
                     bool run_ok;
                     if (!co_set.empty() && !co_tried && admit_slot >= 0 && req_imgs.empty()) {
                         co_tried = true;
@@ -16790,6 +16817,7 @@ int main(int argc, char** argv) {
                     } else {
                         run_ok = sp.run(ids.data() + q, r - q, q, e);
                     }
+                    sp.set_layer_yield(nullptr, 0);
                     if (run_ok && q == 0 && sp.kva_floor() > 0) {   // KVA approximated the start of this prompt: remember which tokens
                         kva_floors.note(ids.data(), sp.kva_floor());
                         if (use_mtp && mtp.cell_floor_enabled()) mtp.set_cell_floor(sp.kva_floor());

@@ -296,6 +296,13 @@ public:
     /// (its windows use the pool), so no chunk of that read takes the share; false lets the read's chunks take it.
     static void set_share_blocked(bool blocked);
 
+    /// Mid-chunk decode yield hook (single GPU, batch slots active): called every `layer_yield_every_` layers
+    /// inside a prompt chunk so active decode slots can run a verify/draft window without waiting for all 48 layers.
+    void set_layer_yield(std::function<bool()> fn, int every) {
+        layer_yield_fn_ = std::move(fn);
+        layer_yield_every_ = every;
+    }
+
     /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
     /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.
     /// On a layer split it is the last stage's (the one that reports the rows), asked through the first.
@@ -373,6 +380,8 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     PrefillStats stats_;
+    std::function<bool()> layer_yield_fn_;
+    int layer_yield_every_ = 0;
 };
 
 }  // namespace strata::prefill

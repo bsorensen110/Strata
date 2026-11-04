@@ -6047,6 +6047,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                   (int) HC, (int) tap_rows, m.cs);
 #endif
             }
+            if (layer_yield_fn_ && layer_yield_every_ > 0 && (l - LB + 1) % layer_yield_every_ == 0 && l + 1 < LE) {
+                cudaStreamSynchronize(m.cs);
+                if (!layer_yield_fn_()) {
+                    if (issuer.joinable()) issuer.join();
+                    err = "prefill: mid-chunk decode yield failed";
+                    return false;
+                }
+            }
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
         if (issuer.joinable()) {
