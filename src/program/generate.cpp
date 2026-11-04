@@ -6527,6 +6527,15 @@ int main(int argc, char** argv) {
     // STRATA_PIPED_MTP, a group's rows: its slots, each its token and its proposals ((slots) * (1 + proposals), one slot
     // per group = at most --spec rows).  A function, not a number: --batch (the slots that fit) and the groups are final
     // only after this point, at the verifiers' init, and the plain value must stay what it was there.
+#if defined(STRATA_HAVE_DFLASH2)
+    strata::core::Dflash2Drafter df2;   // --draft dflash2
+    bool use_df2 = false;
+    std::vector<std::unique_ptr<strata::core::Dflash2Drafter>> slot_df2;   // STRATA_BATCH_DF2: one drafter per batch slot (shared pack, own ring)
+    bool batch_df2 = false;             // the slots draft with DFlash2 (set once the slot drafters are allocated)
+#else
+    constexpr bool use_df2 = false;
+    constexpr bool batch_df2 = false;
+#endif
     auto batch_max_t = [&]() -> int {
         if (batch_df2 && df2_solo && split_devs.empty()) {
             static const int df2_read_max_t = [] {
@@ -6696,15 +6705,6 @@ int main(int argc, char** argv) {
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
-#if defined(STRATA_HAVE_DFLASH2)
-    strata::core::Dflash2Drafter df2;   // --draft dflash2
-    bool use_df2 = false;
-    std::vector<std::unique_ptr<strata::core::Dflash2Drafter>> slot_df2;   // STRATA_BATCH_DF2: one drafter per batch slot (shared pack, own ring)
-    bool batch_df2 = false;             // the slots draft with DFlash2 (set once the slot drafters are allocated)
-#else
-    constexpr bool use_df2 = false;
-    constexpr bool batch_df2 = false;
-#endif
     // the draft layer's geometry (the canonical model's MTP head), `static` because MtpDrafter keeps a reference; the batch
     // slots' draft-KV copies use this one too
     static const strata::core::ModelGeometry draft_geometry{};
@@ -14256,9 +14256,9 @@ int main(int argc, char** argv) {
                         prev[0] = tok[f0 + kp - 2];
                         prev[1] = tok[f0 + kp - 1];
                     }
-                    uint32_t ple_r[strata::core::PLE_N_HEADS];
-                    strata::core::ngram_rows(&sl.x, prev, 1, ss.ple.consts, ple_r);
-                    ss.ple.table->prefetch_rows(ple_r, 1);
+                    uint32_t ple_r[strata::kernels::PLE_N_HEADS];
+                    strata::kernels::ngram_rows(&sl.x, prev, 1, ss.ple.consts, ple_r);
+                    ss.ple.table->prefetch_rows(ple_r);
                 }
             }
             if (use_bhead) {
@@ -14283,7 +14283,7 @@ int main(int argc, char** argv) {
                 }
                 for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts && j < (int) sl.draft.size(); ++j) { sl.draft[(size_t) j] = dd[j]; sl.dprob[(size_t) j] = pp[j]; }
                 sl.draft_ready = true;
-                if (ss.ple.ready()) {
+                if (ss.ple.ready() && ss.ple.table != nullptr) {
                     const int n_pref = use_bhead ? df2_bitems[idx].k_want
                                                  : std::min<int>((int) strata::core::Dflash2Drafter::kDrafts,
                                                                  b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? std::max(1, df2_extra[b]) : 1);
@@ -14297,9 +14297,13 @@ int main(int argc, char** argv) {
                         prev[1] = sl.x;
                         break;
                     }
-                    uint32_t ple_r[strata::core::Dflash2Drafter::kDrafts * strata::core::PLE_N_HEADS];
-                    strata::core::ngram_rows(dd, prev, (size_t) n_pref, ss.ple.consts, ple_r);
-                    ss.ple.table->prefetch_rows(ple_r, (size_t) n_pref);
+                    for (int pi = 0; pi < n_pref; ++pi) {
+                        uint32_t ple_r[strata::kernels::PLE_N_HEADS];
+                        strata::kernels::ngram_rows(&dd[pi], prev, 1, ss.ple.consts, ple_r);
+                        prev[0] = prev[1];
+                        prev[1] = dd[pi];
+                        ss.ple.table->prefetch_rows(ple_r);
+                    }
                 }
             }
             static const bool bdf2_timing = [] {
