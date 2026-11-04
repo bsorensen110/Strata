@@ -1297,6 +1297,7 @@ class StrataEngine:
         if "slot_cv" not in self.__dict__:
             self.slot_cv = threading.Condition()
             self.waiting = 0                            # requests waiting for the control lines (ctl)
+            self._preparing = 0                         # requests in Service.prepare() before _take_control
             self.admitting = 0                          # #1603: ... and those that gave the lines back to wait for a slot
             self.par_counters = {"queued": 0, "queue_wait_s": 0.0}
             self.wait_lens: list[list[int]] = []        # ... their prompt lengths (a long read gives way to short ones)
@@ -1903,6 +1904,9 @@ class StrataEngine:
         `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
         entry = [plen, time.monotonic(), new, prompt, cancel]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST; the prompt and request, for STRATA_COALESCE_PREFILL)
         with self.slot_cv:
+            if getattr(cancel, "_strata_prep_counted", False):
+                cancel._strata_prep_counted = False
+                self._preparing = max(0, getattr(self, "_preparing", 0) - 1)
             self.waiting += 1
             self.wait_lens.append(entry)
             self.arrivals.append(entry[1])
@@ -2090,7 +2094,8 @@ class StrataEngine:
                         return
                     holding, born = True, self.gen                  # (the engine it now has the control lines of)
                 with self.slot_cv:
-                    alone = not any(self.slot_busy) and self.waiting == 0
+                    alone = (not any(self.slot_busy) and self.waiting == 0 and
+                             (getattr(self, "_preparing", 0) == 0 or os.environ.get("STRATA_SOLO_BURST") == "1"))
                 if alone and left > 1:
                     pf = self.pen_from_key(orig_len, len(prompt))
                     head = f"GENI {left}{keys}{pf} {embeddings}" if embeddings else f"GEN {left}{keys}{pf}"
@@ -5556,10 +5561,38 @@ class Service:
             self.prompts.forget(ids)
 
 
+    @staticmethod
+    def _clear_prep_cancel(cancel) -> None:
+        if cancel is None or not getattr(cancel, "_strata_prep_counted", False):
+            return
+        eng = getattr(cancel, "_strata_prep_engine", None)
+        cv = getattr(eng, "slot_cv", None)
+        if cv is not None:
+            with cv:
+                if getattr(cancel, "_strata_prep_counted", False):
+                    cancel._strata_prep_counted = False
+                    eng._preparing = max(0, getattr(eng, "_preparing", 0) - 1)
+        else:
+            cancel._strata_prep_counted = False
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
+        if (cancel is not None and bool(getattr(self.engine, "batch", 0)) and
+                hasattr(self.engine, "slot_cv") and not getattr(cancel, "_strata_prep_counted", False)):
+            with self.engine.slot_cv:
+                self.engine._preparing = getattr(self.engine, "_preparing", 0) + 1
+                cancel._strata_prep_counted = True
+                cancel._strata_prep_engine = self.engine
+            self.embeddings.prep_cancel = cancel
+        try:
+            return self._prepare_inner(messages, tools, kwargs, max_new=max_new, force=force, req=req, cancel=cancel)
+        except BaseException:
+            self._clear_prep_cancel(cancel)
+            raise
+
+    def _prepare_inner(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
@@ -5823,6 +5856,8 @@ class Service:
         """Delete the combined image file prepare() wrote when no run() took it over (a run deletes its own as it
         ends): a request can end before its answer starts - its client gone, anything raised after prepare() - and
         then nothing else would.  The handler calls this when a request is done."""
+        prep_c, self.embeddings.prep_cancel = getattr(self.embeddings, "prep_cancel", None), None
+        self._clear_prep_cancel(prep_c)
         path, self.embeddings.path = getattr(self.embeddings, "path", None), None
         if path is not None:
             Path(path).unlink(missing_ok=True)
@@ -6385,6 +6420,7 @@ class Service:
             finish = "error"
             raise
         finally:
+            self._clear_prep_cancel(cancel)
             with self.status_lock:
                 if queued_counted:
                     self.status["queued"] -= 1
