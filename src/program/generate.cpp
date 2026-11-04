@@ -16713,9 +16713,24 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - tco).count());
                     return true;
                 };
+                static const int64_t batch_chunk_env = [] {
+                    const char* v = std::getenv("STRATA_BATCH_PREFILL_CHUNK");
+                    return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) -1;
+                }();
+                auto active_slot_count = [&]() -> int {
+                    int n_act = 0;
+                    for (const auto& x : bs) n_act += x.active ? 1 : 0;
+                    return n_act;
+                };
                 bool conc_read = false;   // run_conc: the slots decode beside the read, so the share stays off for all of it
                 auto run = [&](int64_t q, int64_t r) -> bool {
-                    if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
+                    if (planned) {
+                        sp.force_chunk(plan.chunk, plan_single, plan.chunked);
+                    } else if (o.batch > 0 && stages.empty()) {
+                        const int n_act = active_slot_count();
+                        const int64_t eff_c = strata::program::batch_prefill_chunk(sp.chunk(), n_act, batch_chunk_env);
+                        sp.force_chunk(eff_c, b0 - a0 <= eff_c, eff_c < std::min(b0 - a0, sp.chunk()));
+                    }
                     if (!conc_read) share_gate();   // STRATA_PREFILL_CPU_SHARE_BATCH: re-decided for every run (a piece beside decoding slots too)
                     bool run_ok;
                     if (!co_set.empty() && !co_tried && admit_slot >= 0 && req_imgs.empty()) {
@@ -17135,9 +17150,13 @@ int main(int argc, char** argv) {
                 }();
                 const bool pr_on = piped && pr_piece > 0;
                 auto piece_now = [&]() -> int64_t {
-                    return pr_on ? strata::program::piped_read_piece(pr_piece, C)
-                                 : strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), batch_on(), C,
-                                                                     yield_chunks);
+                    if (pr_on) return strata::program::piped_read_piece(pr_piece, C);
+                    const int n_act = active_slot_count();
+                    const int64_t C_eff = (!planned && stages.empty())
+                                              ? strata::program::batch_prefill_chunk(C, n_act, batch_chunk_env)
+                                              : C;
+                    return strata::program::batch_read_piece(o.batch > 0, piped, !stages.empty(), n_act > 0, C_eff,
+                                                             yield_chunks);
                 };
                 // the slots decode through the pipeline for budget_ms, drained before the next read
                 auto piped_decode = [&](double budget_ms, std::string& err) -> bool {
@@ -17227,8 +17246,10 @@ int main(int argc, char** argv) {
                                      std::chrono::duration<double, std::milli>(Clock::now() - td).count());
                         continue;
                     }
-                    if (decode_share <= 0.0 || !batch_on()) continue;
-                    const double budget = decode_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    const int n_act = active_slot_count();
+                    const double eff_share = strata::program::batch_decode_share(decode_share, n_act);
+                    if (eff_share <= 0.0 || n_act <= 0) continue;
+                    const double budget = eff_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
                     const auto td = Clock::now();
                     in_prompt_read = true;
                     do {

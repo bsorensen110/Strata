@@ -27,6 +27,32 @@ inline int64_t batch_read_piece(bool batch, bool piped, bool layer_split, bool b
     return chunks_per_piece > 0 ? chunk * chunks_per_piece : 0;
 }
 
+/// Default prefill chunk cap on a single GPU when active batch decode slots are running alongside a prompt read.
+/// An 8192-token chunk blocks active decode slots for ~2.5-3.5 s on a single card; capping the chunk to 2048 tokens
+/// (aligned to the 2048-token Q2/Q4 KV group and checkpoint grid) yields to active decode slots 4x more often.
+///   full_chunk: the prefill engine's configured max chunk (sp.chunk())
+///   active_slots: number of currently decoding batch slots
+///   env_chunk: STRATA_BATCH_PREFILL_CHUNK override (> 0: explicit cap; 0: disable cap; < 0: use default 2048)
+inline constexpr int64_t kDefaultBatchPrefillChunk = 2048;
+inline int64_t batch_prefill_chunk(int64_t full_chunk, int active_slots, int64_t env_chunk = -1) {
+    full_chunk = std::max<int64_t>(full_chunk, 1);
+    if (active_slots <= 0 || env_chunk == 0) return full_chunk;
+    const int64_t cap = env_chunk > 0 ? env_chunk : kDefaultBatchPrefillChunk;
+    return std::min(full_chunk, std::max<int64_t>(cap, 256));
+}
+
+/// Scales the decode budget share between prompt chunks by the number of active decoding slots so 2-3 concurrent
+/// decoding slots get proportionally more GPU time between prefill chunks without starving incoming prompt reads:
+///   1 slot  -> base_share (default 0.50)
+///   2 slots -> min(1.0, base_share * 1.5) (0.75 at default 0.50)
+///   3+ slots -> min(1.5, base_share * 2.0) (1.00 at default 0.50)
+inline double batch_decode_share(double base_share, int active_slots) {
+    if (base_share <= 0.0 || active_slots <= 0) return 0.0;
+    if (active_slots == 1) return base_share;
+    if (active_slots == 2) return std::min(std::max(base_share, 1.0), base_share * 1.5);
+    return std::min(std::max(base_share, 1.5), base_share * 2.0);
+}
+
 /// What a configuration has that keeps the concurrent read (STRATA_PIPED_CONCURRENT=1) off.
 struct ConcurrentReadSetup {
     bool prefill_help = false;      ///< STRATA_PREFILL_HELP: the idle stage's help allocates on the read's thread
