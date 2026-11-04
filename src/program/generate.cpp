@@ -345,7 +345,7 @@ bool pipe_byield_nodrain_env() {
     }();
     return on;
 }
-// STRATA_ADMIT_MERGE_FIRST=1 (read once; off by default): a batch admission reads the last prompt tokens of its last
+// STRATA_ADMIT_MERGE_FIRST=1 (read once; on by default, =0 disables): a batch admission reads the last prompt tokens of its last
 // windowed part (up to a window's max_t, the last prompt token included) and its first token in ONE window instead of
 // the part's last windows and a window of the last token alone.  A row computes what it computes in any window while
 // every expert is in VRAM, and row T-1 is the first window's position with its history and its Philox draw, so the
@@ -353,7 +353,14 @@ bool pipe_byield_nodrain_env() {
 bool admit_merge_first_env() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_ADMIT_MERGE_FIRST");
-        return v && v[0] != '0';
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
+    }();
+    return on;
+}
+bool admit_merge_df2_env() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_ADMIT_MERGE_DF2");
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
     }();
     return on;
 }
@@ -17502,7 +17509,9 @@ int main(int argc, char** argv) {
             // and the serial loop with nothing else reading its windows
             int64_t merge_at = -1;
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
-                if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
+                if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 ||
+                    (batch_mtp && !(batch_df2 && admit_merge_df2_env())) || pipe)
+                    return -1;
                 if (hist_n > 0 && !pen_prompt) return -1;   // #4590: the merged window's prompt rows would join the reply-only penalty window
                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
@@ -17638,6 +17647,7 @@ int main(int argc, char** argv) {
             strata::core::MtpDrafter::DraftResult generation;
             strata::core::gated::Packet proposal; // immutable through the synchronous verifier call
             bool first_window = true;
+            int last_adm_rows = 1;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
 #if defined(STRATA_USE_HIP)
             // on by default (HIP, where it was measured: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16 continuations fell back to the older
@@ -18770,6 +18780,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
+                last_adm_rows = a + 1;
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
 #if defined(STRATA_HAVE_DFLASH2)
                 if (use_df2) df2.note_rows(window.data(), a + 1, p);
@@ -18815,8 +18826,11 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_DFLASH2)
                 // The request ends here, so no draft follows and the window's committed rows would never reach the drafter's ring or its log: every turn would
                 // leave a hole of a + 1 positions behind it, which a later turn that resumes after this one finds blank (and cannot rebuild). Update them now.
+                // On BGEN admission that continues in slot_df2[admit_slot], skip updating the solo drafter: copy_to_slot copies the prefix and slot_df2 consumes
+                // the admission window's taps directly when producing its first drafts.
                 static const bool df2_end_update = std::getenv("STRATA_DF2_END_UPDATE") == nullptr || std::getenv("STRATA_DF2_END_UPDATE")[0] != '0';   // =0: the pre-fix behaviour (diagnostics)
-                if (df2_end_update && use_df2 && req_df2 && !merged && (eos || produced_n >= max_new)) {
+                const bool will_admit_df2 = admit_slot >= 0 && batch_df2 && !eos && admit_max_new > 1;
+                if (df2_end_update && use_df2 && req_df2 && !will_admit_df2 && (eos || produced_n >= max_new)) {
                     const float* tp_end = df2_win_taps(a + 1, err);   // (on a layer split: every stage's taps gathered onto the drafter's card)
                     if (tp_end == nullptr || !df2.context(tp_end, a + 1, p, err)) { if (adapt_thr.joinable()) adapt_thr.join(); std::printf("ERR %s\n", err.c_str()); return 1; }
                 }
@@ -19176,12 +19190,24 @@ int main(int argc, char** argv) {
                     }
 #if defined(STRATA_HAVE_DFLASH2)
                     if (batch_df2) {
-                        // the slot's first drafts: the last prompt row's taps (still in the verifiers from the admission's window) and the token it produced
+                        // the slot's first drafts: the admission window's taps (1 row unmerged, up to max_t rows with STRATA_ADMIT_MERGE_FIRST) and the token it produced
                         strata::core::Dflash2Drafter& d = *slot_df2[(size_t) admit_slot];
                         int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                         float pp[strata::core::Dflash2Drafter::kDrafts];
-                        if (!ver.gather_taps(d.landing(), d.device(), 0, 1, 0, d.stream(), err) ||
-                            !d.draft(d.landing(), 1, sl.p - 1, sl.x, dd, pp, err)) {
+                        const int adm_rows = std::max(1, last_adm_rows);
+                        const int kR = (int) strata::core::Dflash2Drafter::kRows;
+                        const int tail_m = std::min(adm_rows, kR);
+                        const int head_n = adm_rows - tail_m;
+                        for (int r0 = 0; r0 < head_n; r0 += kR) {
+                            const int chunk = std::min(kR, head_n - r0);
+                            if (!ver.gather_taps(d.landing(), d.device(), r0, chunk, 0, d.stream(), err) ||
+                                !d.context(d.landing(), chunk, sl.p - adm_rows + r0, err)) {
+                                std::fprintf(stderr, "strata batch: DFlash2 admission context for slot %d failed: %s\n", admit_slot, err.c_str());
+                                return 1;
+                            }
+                        }
+                        if (!ver.gather_taps(d.landing(), d.device(), head_n, tail_m, 0, d.stream(), err) ||
+                            !d.draft(d.landing(), tail_m, sl.p - tail_m, sl.x, dd, pp, err)) {
                             std::fprintf(stderr, "strata batch: DFlash2 admission for slot %d failed: %s\n", admit_slot, err.c_str());
                             return 1;
                         }
