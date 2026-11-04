@@ -161,7 +161,10 @@ def _agent_message_parts(item, author, recipient):
                 lines.append(enc)
         else:
             lines.append("[payload part not rendered]")
-    return "\n".join(lines)
+    out = f"[agent_message from {author} to {recipient}]"
+    for line in lines[1:]:
+        out += line if out.endswith("\n") else "\n" + line
+    return out
 
 
 def input_messages(req: dict) -> list[dict]:
@@ -233,8 +236,8 @@ def input_messages(req: dict) -> list[dict]:
             thinking.clear()
         elif kind == "agent_message":
             agent = item.get("agent")
-            author = item.get("author") or ""
-            recipient = item.get("recipient") or (agent.get("agent_name") if isinstance(agent, dict) else "") or ""
+            author = item.get("author") or item.get("sender") or "agent"
+            recipient = item.get("recipient") or (agent.get("agent_name") if isinstance(agent, dict) else "") or "agent"
             messages.append({"role": "user", "content": _agent_message_parts(item, author, recipient)})
             open_turn = None
             thinking.clear()
@@ -269,7 +272,7 @@ def _order_tool_results(messages):
         j = i
         while j < len(messages) and messages[j]["role"] == "tool":
             j += 1
-        prev = messages[i - 1] if i else {}
+        prev = next((messages[k] for k in range(i - 1, -1, -1) if messages[k]["role"] == "assistant"), {})
         order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
         rank = {cid: k for k, cid in enumerate(order) if cid}
         messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))

@@ -148,14 +148,10 @@ AM_TASK = json.loads(
     r"""Sender: /root\nPayload:\n"}, {"type": "encrypted_content", "encrypted_content": """
     r""""Question for you: what is 2+2? Reply with just the answer and nothing else."}]}""")
 AM_REPLY = json.loads(
-    r"""{"type": "agent_message", "id": "amsg_01a1a551-0e41-7490-9c27-69c5c0de83be","""
+    r"""{"type": "agent_message", "id": "amsg_01a1a78f-3aae-7571-b199-3014bdd540c9","""
     r""" "author": "/root/arith", "recipient": "/root", "content": [{"type": "input_text","""
     r""" "text": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/arith\n"""
-    r"""Payload:\nAgent errored: {\"error\": {\"message\": \"input items of type """
-    r"""'agent_message' are not supported\", \"type\": \"invalid_request_error\", """
-    r"""\"param\": \"input[6].type\", \"code\": \"unsupported_parameter\"}}\n\nThis agent's """
-    r"""turn failed. If you still need this agent, use the available collaboration tools to """
-    r"""give it another task."}]}""")
+    r"""Payload:\n**437**\n\nCheck: `20 * 23 = 460`, minus one `23` gives `437`."}]}""")
 
 
 class MultiAgentV2(unittest.TestCase):
@@ -164,10 +160,10 @@ class MultiAgentV2(unittest.TestCase):
 
     def test_agent_message_item_parses(self):
         self.assertEqual(input_messages({"input": [AM_TASK]}), [
-            {"role": "user", "content": "\n".join([
-                "[agent_message from /root to /root/arith]",
-                "Message Type: NEW_TASK\nTask name: /root/arith\nSender: /root\nPayload:\n",
-                "Question for you: what is 2+2? Reply with just the answer and nothing else."])}])
+            {"role": "user", "content": (
+                "[agent_message from /root to /root/arith]\n"
+                "Message Type: NEW_TASK\nTask name: /root/arith\nSender: /root\nPayload:\n"
+                "Question for you: what is 2+2? Reply with just the answer and nothing else.")}])
 
     def test_agent_message_encrypted_ciphertext_degrades(self):
         """An unreadable payload costs a line, not the request: the helper never raises."""
@@ -216,20 +212,25 @@ class MultiAgentV2(unittest.TestCase):
         self.assertIn("Question for you: what is 2+2?", prompt)
 
     def test_agent_message_between_turns_keeps_tool_pairing(self):
-        """The item closes the open turn between a call and its result: _order_tool_results leaves
-        the result with the turn that made the call, and the hop is a user message of its own."""
+        """The item closes the open turn between calls and their results: _order_tool_results
+        orders the results by the assistant turn's call_ids even across the hop."""
         user = {"type": "message", "role": "user",
                 "content": [{"type": "input_text", "text": "list the files"}]}
-        call = {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "exec_command",
-                "arguments": "{\"cmd\":\"ls\"}"}
-        out = {"type": "function_call_output", "call_id": "c1", "output": "ok"}
-        self.assertEqual(input_messages({"input": [user, call, AM_REPLY, out]}), [
+        c1 = {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "exec_command",
+              "arguments": "{\"cmd\":\"ls\"}"}
+        c2 = {"type": "function_call", "id": "fc_2", "call_id": "c2", "name": "exec_command",
+              "arguments": "{\"cmd\":\"pwd\"}"}
+        out1 = {"type": "function_call_output", "call_id": "c1", "output": "ok_ls"}
+        out2 = {"type": "function_call_output", "call_id": "c2", "output": "ok_pwd"}
+        self.assertEqual(input_messages({"input": [user, c1, c2, AM_REPLY, out2, out1]}), [
             {"role": "user", "content": "list the files"},
             {"role": "assistant", "content": "", "tool_calls": [
-                {"function": {"name": "exec_command", "arguments": {"cmd": "ls"}}}]},
+                {"function": {"name": "exec_command", "arguments": {"cmd": "ls"}}},
+                {"function": {"name": "exec_command", "arguments": {"cmd": "pwd"}}}]},
             {"role": "user", "content": "[agent_message from /root/arith to /root]\n"
                                         + AM_REPLY["content"][0]["text"]},
-            {"role": "tool", "content": "ok"}])
+            {"role": "tool", "content": "ok_ls"},
+            {"role": "tool", "content": "ok_pwd"}])
 
     def test_multi_agent_call_and_output_items_parse(self):
         """Official Responses API `multi_agent_call` and `multi_agent_call_output` input items
