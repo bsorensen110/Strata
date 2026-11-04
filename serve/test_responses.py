@@ -139,6 +139,117 @@ class Parsing(unittest.TestCase):
         self.assertIsNone(text_format({"text": {"format": {"type": "text"}}}))
 
 
+# ------------------------------------------------------------ multi_agent v2 agent_message items
+# two live Codex multi_agent_v2 captures (NEW_TASK to a subagent and FINAL_ANSWER back to /root)
+AM_TASK = json.loads(
+    r"""{"type": "agent_message", "id": "amsg_01a1a551-02c7-77b3-a326-066d0f5adebf","""
+    r""" "author": "/root", "recipient": "/root/arith", "content": ["""
+    r"""{"type": "input_text", "text": "Message Type: NEW_TASK\nTask name: /root/arith\n"""
+    r"""Sender: /root\nPayload:\n"}, {"type": "encrypted_content", "encrypted_content": """
+    r""""Question for you: what is 2+2? Reply with just the answer and nothing else."}]}""")
+AM_REPLY = json.loads(
+    r"""{"type": "agent_message", "id": "amsg_01a1a551-0e41-7490-9c27-69c5c0de83be","""
+    r""" "author": "/root/arith", "recipient": "/root", "content": [{"type": "input_text","""
+    r""" "text": "Message Type: FINAL_ANSWER\nTask name: /root\nSender: /root/arith\n"""
+    r"""Payload:\nAgent errored: {\"error\": {\"message\": \"input items of type """
+    r"""'agent_message' are not supported\", \"type\": \"invalid_request_error\", """
+    r"""\"param\": \"input[6].type\", \"code\": \"unsupported_parameter\"}}\n\nThis agent's """
+    r"""turn failed. If you still need this agent, use the available collaboration tools to """
+    r"""give it another task."}]}""")
+
+
+class MultiAgentV2(unittest.TestCase):
+    """Codex with features.multi_agent_v2 (and the Responses multi-agent API) sends inter-agent
+    `agent_message` and `multi_agent_call(_output)` input items."""
+
+    def test_agent_message_item_parses(self):
+        self.assertEqual(input_messages({"input": [AM_TASK]}), [
+            {"role": "user", "content": "\n".join([
+                "[agent_message from /root to /root/arith]",
+                "Message Type: NEW_TASK\nTask name: /root/arith\nSender: /root\nPayload:\n",
+                "Question for you: what is 2+2? Reply with just the answer and nothing else."])}])
+
+    def test_agent_message_encrypted_ciphertext_degrades(self):
+        """An unreadable payload costs a line, not the request: the helper never raises."""
+        def sent(part):
+            item = {"type": "agent_message", "author": "/root", "recipient": "/root/x",
+                    "content": [part]}
+            return input_messages({"input": [item]})[0]["content"]
+        head = "[agent_message from /root to /root/x]"
+        ours = ENCRYPTED_PREFIX + "gAAAAAB-not-a-box"   # our prefix: the box will not decode
+        for part in ({"type": "encrypted_content", "encrypted_content": ours},
+                     {"type": "encrypted_content"},
+                     {"type": "encrypted_content", "encrypted_content": {}}):
+            self.assertEqual(sent(part), head + "\n[encrypted payload unavailable]")
+        # our own valid box decodes to its text
+        good_box = ENCRYPTED_PREFIX + base64.b64encode(json.dumps({"text": "decoded body"}).encode()).decode()
+        self.assertEqual(sent({"type": "encrypted_content", "encrypted_content": good_box}),
+                         head + "\ndecoded body")
+        # another server's blob is not ours to decrypt, but it is a string: it renders as that
+        # text, and the request still runs; the placeholder is for a part with nothing to read
+        blob = {"type": "encrypted_content", "encrypted_content": "gAAAAAB-someone-elses-blob"}
+        self.assertEqual(sent(blob), head + "\ngAAAAAB-someone-elses-blob")
+        # input_image, unknown part types, non-dict parts, and non-list content never raise
+        self.assertEqual(sent({"type": "input_image", "image_url": "https://example.com/a.png"}),
+                         head + "\n[image]")
+        self.assertEqual(sent({"type": "unknown_part"}), head + "\n[payload part not rendered]")
+        self.assertEqual(input_messages({"input": [{"type": "agent_message", "author": "/root",
+                                                    "agent": {"agent_name": "/root/sub"},
+                                                    "content": "plain string"}]})[0]["content"],
+                         "[agent_message from /root to /root/sub]\nplain string")
+        self.assertEqual(input_messages({"input": [{"type": "agent_message", "author": "/root",
+                                                    "recipient": "/root/x", "content": 123}]})[0]["content"],
+                         head + "\n[payload part not rendered]")
+
+    def test_agent_message_prompt_golden(self):
+        """The routing line survives to the prompt, so the model sees who is writing to whom."""
+        agents = {"type": "namespace", "name": "multi_agent_v1", "description": "Agents.",
+                  "tools": [{"type": "function", "name": "spawn_agent", "parameters": {
+                      "type": "object", "properties": {"message": {"type": "string"}}}}]}
+        user = {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "ask the subagent"}]}
+        req = {"model": "m", "instructions": "You are Codex", "tools": TOOLS + [agents],
+               "input": [user, AM_TASK]}
+        shown = tools_of(req)[1]              # the harness the multi_agent v1 golden test uses
+        prompt = TEMPLATE.render(input_messages(req), tools=shown, add_generation_prompt=False)
+        self.assertIn("[agent_message from /root to /root/arith]", prompt)
+        self.assertIn("Question for you: what is 2+2?", prompt)
+
+    def test_agent_message_between_turns_keeps_tool_pairing(self):
+        """The item closes the open turn between a call and its result: _order_tool_results leaves
+        the result with the turn that made the call, and the hop is a user message of its own."""
+        user = {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "list the files"}]}
+        call = {"type": "function_call", "id": "fc_1", "call_id": "c1", "name": "exec_command",
+                "arguments": "{\"cmd\":\"ls\"}"}
+        out = {"type": "function_call_output", "call_id": "c1", "output": "ok"}
+        self.assertEqual(input_messages({"input": [user, call, AM_REPLY, out]}), [
+            {"role": "user", "content": "list the files"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "exec_command", "arguments": {"cmd": "ls"}}}]},
+            {"role": "user", "content": "[agent_message from /root/arith to /root]\n"
+                                        + AM_REPLY["content"][0]["text"]},
+            {"role": "tool", "content": "ok"}])
+
+    def test_multi_agent_call_and_output_items_parse(self):
+        """Official Responses API `multi_agent_call` and `multi_agent_call_output` input items
+        replay into assistant tool_calls and ordered tool messages."""
+        items = [
+            {"type": "message", "role": "user", "content": "delegate this"},
+            {"type": "multi_agent_call", "id": "mac_1", "call_id": "call_ma1",
+             "action": "spawn_agent", "arguments": "{\"task_name\":\"arith\",\"message\":\"2+2\"}"},
+            {"type": "multi_agent_call_output", "id": "maco_1", "call_id": "call_ma1",
+             "action": "spawn_agent", "output": [{"type": "output_text", "text": "{\"task_name\":\"/root/arith\"}"}]}]
+        self.assertEqual(input_messages({"input": items}), [
+            {"role": "user", "content": "delegate this"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "spawn_agent", "arguments": {"task_name": "arith", "message": "2+2"}}}]},
+            {"role": "tool", "content": "{\"task_name\":\"/root/arith\"}"}])
+        with self.assertRaises(ResponsesError) as e:
+            input_messages({"input": [{"type": "multi_agent_call", "call_id": "c1", "arguments": "{}"}]})
+        self.assertEqual(e.exception.param, "input[0].action")
+
+
 # ------------------------------------------------------------------------------------------------ Codex compaction
 HISTORY = [{"role": "user", "content": "hi"},
            {"type": "function_call", "name": "exec_command", "arguments": "{}", "call_id": "c1"},
