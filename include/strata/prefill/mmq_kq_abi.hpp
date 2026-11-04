@@ -3,7 +3,7 @@
 // meaning changes; the argument block (ggml's mmq_args) is checked by its size.
 #pragma once
 
-#define STRATA_KQ_ABI_VERSION 1
+#define STRATA_KQ_ABI_VERSION 2
 
 #if defined(_WIN32)
 #define STRATA_KQ_LIB_NAME "strata_kq.dll"

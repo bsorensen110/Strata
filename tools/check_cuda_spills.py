@@ -296,8 +296,8 @@ def kernel_key(demangled):
 
 
 def vendored(key):
-    """llama.cpp's ggml-cuda kernels (mul_mat_q, quantize_* ...) are the only ones at global scope with no namespace."""
-    return "::" not in key
+    """llama.cpp's ggml-cuda kernels (mul_mat_q, quantize_* ...), and its mirrored pointer-table copy mul_mat_q_tab."""
+    return "::" not in key or key == "strata::prefill::mmq::mul_mat_q_tab"
 
 
 def find_tools(cuobjdump_hint):

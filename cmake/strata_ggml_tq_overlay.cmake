@@ -75,7 +75,12 @@ function(strata_ggml_tq_overlay LLAMA OUT)
 
   # ---- ggml.h: the three enumerators (values above GGML_TYPE_COUNT: ggml's own tables never see them) ---------------------
   _tq_read(_h "${_inc}/ggml.h")
-  _tq_edit(_h BEFORE "        GGML_TYPE_COUNT   = 43,"
+  set(_cnt_anchor "        GGML_TYPE_COUNT   = 44,")
+  string(FIND "${_h}" "${_cnt_anchor}" _cnt_pos)
+  if(_cnt_pos LESS 0)
+    set(_cnt_anchor "        GGML_TYPE_COUNT   = 43,")
+  endif()
+  _tq_edit(_h BEFORE "${_cnt_anchor}"
     "        GGML_TYPE_TQ2_T   = 144, // Agention trellis types (Strata overlay; the fork's ids)
         GGML_TYPE_TQK6    = 145,
         GGML_TYPE_TQK7    = 146,
@@ -88,11 +93,13 @@ function(strata_ggml_tq_overlay LLAMA OUT)
   # ---- mmq.cuh: routing of the trellis types as IQ2_XS ----------------------------------------------------------------
   _tq_read(_m "${_cu}/mmq.cuh")
   # #3217: llama.cpp from b11xxx on gives the MMQ helpers a ggml_prec argument (template <..., ggml_prec prec_src1> for the write-back and
-  # MMA dot callbacks, a fourth parameter for ggml_cuda_mmq_get_nthreads / get_I / get_sram_stride).  The pinned commit has neither.  The
+  # MMA dot callbacks, a fourth parameter for ggml_cuda_mmq_get_nthreads / get_I / get_sram_stride), and b12xxx adds has_fusion
+  # (false for non-fused types) to ggml_cuda_mmq_write_back_mma plus x_gate to ggml_cuda_mmq_load_tiles_t.  The pinned commit has neither.  The
   # generated routing and the loader follow whichever signature mmq.cuh has; one that is neither turns the overlay off at configure time
   # (the engine then reads trellis prompts through the FP16 path) instead of failing later inside nvcc.
   set(_ps "")        # ", prec_src1" in the generated callbacks
   set(_pa "")        # ", GGML_PREC_Q8" in the loader's calls (the value upstream's own IQ2_XS loader passes)
+  set(_pf "")        # ", false" in ggml_cuda_mmq_write_back_mma when it takes has_fusion
   string(FIND "${_m}" "ggml_cuda_mmq_get_nthreads(ggml_type type, int J, bool fallback, ggml_prec prec_src1)" _sig_new)
   string(FIND "${_m}" "ggml_cuda_mmq_get_nthreads(ggml_type type, int J, bool fallback)" _sig_old)
   if(NOT _sig_new LESS 0)
@@ -101,6 +108,10 @@ function(strata_ggml_tq_overlay LLAMA OUT)
   elseif(_sig_old LESS 0)
     set(_tq_fail "the MMQ helper signatures of this ggml-cuda are not the ones the overlay knows (ggml_cuda_mmq_get_nthreads)")
   endif()
+  string(FIND "${_m}" "template<ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>" _sig_fus)
+  if(NOT _sig_fus LESS 0)
+    set(_pf ", false")
+  endif()
   _tq_edit(_m AFTER "        case GGML_TYPE_IQ2_XXS:\n        case GGML_TYPE_IQ2_XS:\n"
     "        case GGML_TYPE_TQ2_T:\n        case GGML_TYPE_TQK6:\n        case GGML_TYPE_TQK7:\n        case GGML_TYPE_TQP5:\n        case GGML_TYPE_TQP6:\n        case GGML_TYPE_TQP7:\n")
   _tq_edit(_m AFTER "        case GGML_TYPE_IQ2_XS:  return MMQ_DP4A_TXS_Q8_0_16;\n"
@@ -108,7 +119,7 @@ function(strata_ggml_tq_overlay LLAMA OUT)
   _tq_edit(_m BEFORE "            case GGML_TYPE_IQ3_XXS:\n                return ggml_cuda_mmq_util_funcs(\n                    VDR_IQ3_XXS_Q8_1_MMQ,"
     "            case GGML_TYPE_TQ2_T:\n            case GGML_TYPE_TQK6:\n            case GGML_TYPE_TQK7:\n            case GGML_TYPE_TQP5:\n            case GGML_TYPE_TQP6:\n            case GGML_TYPE_TQP7:\n                return ggml_cuda_mmq_util_funcs(\n                    VDR_IQ2_XS_Q8_1_MMQ,\n                    ggml_cuda_mmq_load_tiles_tq<type, J, fallback>,\n                    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a<type, J, fallback>,\n                    ggml_cuda_mmq_write_back_dp4a<type, J, fallback${_ps}>);\n")
   _tq_edit(_m BEFORE "        case GGML_TYPE_IQ3_XXS:\n            return ggml_cuda_mmq_util_funcs(\n                -1,\n                ggml_cuda_mmq_load_tiles_iq3_xxs<type, J, fallback>,"
-    "        case GGML_TYPE_TQ2_T:\n        case GGML_TYPE_TQK6:\n        case GGML_TYPE_TQK7:\n        case GGML_TYPE_TQP5:\n        case GGML_TYPE_TQP6:\n        case GGML_TYPE_TQP7:\n            return ggml_cuda_mmq_util_funcs(\n                -1,\n                ggml_cuda_mmq_load_tiles_tq<type, J, fallback>,\n                ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback${_ps}>,\n                ggml_cuda_mmq_write_back_mma<type, J, fallback${_ps}>);\n")
+    "        case GGML_TYPE_TQ2_T:\n        case GGML_TYPE_TQK6:\n        case GGML_TYPE_TQK7:\n        case GGML_TYPE_TQP5:\n        case GGML_TYPE_TQP6:\n        case GGML_TYPE_TQP7:\n            return ggml_cuda_mmq_util_funcs(\n                -1,\n                ggml_cuda_mmq_load_tiles_tq<type, J, fallback>,\n                ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback${_ps}>,\n                ggml_cuda_mmq_write_back_mma<type, J, fallback${_ps}${_pf}>);\n")
   _tq_edit(_m AFTER "extern DECL_MMQ_CASE(GGML_TYPE_IQ4_XS);\n"
     "extern DECL_MMQ_CASE(GGML_TYPE_TQ2_T);\nextern DECL_MMQ_CASE(GGML_TYPE_TQK6);\nextern DECL_MMQ_CASE(GGML_TYPE_TQK7);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP5);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP6);\nextern DECL_MMQ_CASE(GGML_TYPE_TQP7);\n")
   file(WRITE "${OUT}/mmq.cuh" "${_m}")
@@ -117,11 +128,16 @@ function(strata_ggml_tq_overlay LLAMA OUT)
   _tq_read(_l "${_cu}/mmq-load-tiles.cuh")
   file(WRITE "${OUT}/mmq-load-tiles.cuh" "${_l}\n#include \"tq-mmq-tiles.cuh\"\n")
   configure_file("${_tq}/tq.cuh" "${OUT}/tq.cuh" COPYONLY)
-  file(READ "${_tq}/tq-mmq-tiles.cuh" _tiles)
-  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_tq}/tq-mmq-tiles.cuh")
+  _tq_read(_tiles "${_tq}/tq-mmq-tiles.cuh")
   foreach(_fn get_nthreads get_I get_sram_stride)
     string(REPLACE "ggml_cuda_mmq_${_fn}(type, J, fallback)" "ggml_cuda_mmq_${_fn}(type, J, fallback${_pa})" _tiles "${_tiles}")
   endforeach()
+  string(FIND "${_m}" "const char * __restrict__ x, const char * __restrict__ x_gate, int * x_tile" _sig_gate)
+  if(NOT _sig_gate LESS 0)
+    string(REPLACE "const char * __restrict__ x, int * __restrict__ x_tile,"
+                   "const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile," _tiles "${_tiles}")
+    string(REPLACE "const int stride) {\n" "const int stride) {\n    GGML_UNUSED(x_gate);\n" _tiles "${_tiles}")
+  endif()
   file(WRITE "${OUT}/tq-mmq-tiles.cuh" "${_tiles}")
 
   # ---- mmq-config-*.cuh: every IQ2_XS CASE line gets one copy per trellis type ---------------------------------------

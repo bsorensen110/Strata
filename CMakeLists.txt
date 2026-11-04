@@ -2324,7 +2324,7 @@ if(STRATA_NATIVE_EXPERTS)
     include(FetchContent)
     FetchContent_Declare(strata_llamacpp
       GIT_REPOSITORY https://github.com/ggml-org/llama.cpp.git
-      GIT_TAG 3cf03257f219afbe7334045ff7c6a06ac68c627d
+      GIT_TAG 2c93f0b6e1f8417d898e21a729ba324032ed16d4
       GIT_SHALLOW FALSE)
     FetchContent_GetProperties(strata_llamacpp)
     if(NOT strata_llamacpp_POPULATED)
@@ -2594,7 +2594,7 @@ if(STRATA_NATIVE_EXPERTS)
     # fetched pin; the vendored third_party/llama.cpp tree has the same mmq.cuh).
     set(_strata_mmq_tab_on OFF)
     if(STRATA_MMQ_TAB AND NOT STRATA_HIP_GFX906)   # gfx906 compiles no .cu from here (its HIP glob): no tab at all
-      set(_strata_mmq_tab_known 36e4dc716c504470ec09cc0852d29a6ac5eace257f6e5e72db3805ca4f043eb0)
+      set(_strata_mmq_tab_known 9e64aa415dfd6d4a6ce2270964709d96e5989e5912992378d5a1153d0a97b4d8)
       set(_strata_mmq_tab_hash "")
       if(EXISTS ${_strata_mmq}/mmq.cuh)
         file(READ ${_strata_mmq}/mmq.cuh _strata_mmq_src)
