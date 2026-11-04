@@ -129,8 +129,8 @@ Test surface: `serve/test_responses.py` (unittest; golden-prompt assertions like
 ## 6. Reproduction (exact)
 
 ```bash
-# proxy at ~/.hermes/cache/scratch/amo-proxy.py forwards :8099 -> :8086 and logs bodies
-python3 ~/.hermes/cache/scratch/amo-proxy.py &
+# proxy at tools/agent_message_capture_proxy.py forwards :8099 -> :8086 and logs bodies
+python3 tools/agent_message_capture_proxy.py &
 cd "$(mktemp -d)" && git init -q
 codex -c features.multi_agent_v2=true \
       -c model_providers.strata.base_url="http://localhost:8099/v1" \
