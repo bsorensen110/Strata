@@ -368,7 +368,7 @@ bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapsho
 bool ckpt_pool_env() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_CKPT_POOL");
-        return v && v[0] != '0';
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
     }();
     return on;
 }
@@ -405,18 +405,18 @@ bool ckpt_threads_env() {
 bool slot_ckpt_move_env() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_SLOT_CKPT_MOVE");
-        return v && v[0] != '0';
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
     }();
     return on;
 }
-// STRATA_SLOT_COPY_BATCHSYNC=1 (read once; off by default): the direct slot copy (STRATA_SLOT_COPY_DIRECT) only queues
+// STRATA_SLOT_COPY_BATCHSYNC=1 (read once; on by default, =0 disables): the direct slot copy (STRATA_SLOT_COPY_DIRECT) only queues
 // its copies on each device's private copy stream and synchronizes every device once at the end, instead of waiting
 // for each of its ~116 copies.  A streamed K/V state's residency refresh waits for its copies through an event.  The
 // same copies in the same order on one stream, so the slot holds the same bytes
 bool slot_copy_batchsync_env() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_SLOT_COPY_BATCHSYNC");
-        return v && v[0] != '0';
+        return v == nullptr || v[0] == '\0' || v[0] != '0';
     }();
     return on;
 }
@@ -13707,10 +13707,10 @@ int main(int argc, char** argv) {
         // the main sessions and the slot sessions of a stage live on the same device and are carved alike, so
         // a slot copy can go device to device (the same bytes into the same places as the checkpoint/K-V image
         // round trip through host memory, which costs ~40-90 ms per admission on a 4-card split); each device is
-        // synchronized once before and once after.  Opt-in: STRATA_SLOT_COPY_DIRECT=1 (default: the host path).
+        // synchronized once before and once after.  Default: on (STRATA_SLOT_COPY_DIRECT=0 restores the host path).
         static const bool slot_copy_direct = [] {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
+            return v == nullptr || v[0] == '\0' || v[0] != '0';
         }();
         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
@@ -16259,7 +16259,12 @@ int main(int argc, char** argv) {
             // read batched and its header still goes through the windows.  Picture rows need the batched path.
             // STRATA_CKPT_REREAD compares a restored checkpoint with a batched re-read, so it keeps every read batched.
             static const bool no_short = std::getenv("STRATA_CKPT_REREAD") != nullptr;
-            int64_t req_short_read = o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
+            static const int64_t batch_short_read = [] {
+                const char* v = std::getenv("STRATA_BATCH_SHORT_READ");
+                if (!v || !v[0]) v = std::getenv("STRATA_BATCH_VERIFY_PREFILL_MAX");
+                return v != nullptr && v[0] != '\0' ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) 256;
+            }();
+            int64_t req_short_read = (o.batch > 0 && o.short_read == 64) ? batch_short_read : o.short_read;   // STRATA_PIPELINE_SWITCH may set it per request (short_read=)
             if (short_read_off_once) {   // #3465: the request after non-finite logits in a prompt window
                 short_read_off_once = false;
                 req_short_read = 0;
