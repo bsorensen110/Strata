@@ -871,7 +871,7 @@ class EffortAtTheEnd(unittest.TestCase):
         self.assertTrue(text.endswith("<|im_end|>\n<|im_start|>system\nReasoning effort is set to low. Keep your "
                                       "thinking brief and focused, moving directly to the conclusion without "
                                       "unnecessary elaboration.<|im_end|>\n<|im_start|>assistant\n<think>\n"), text[-300:])
-        self.assertIn("Reasoning effort is set to xhigh", text)          # the top stays the default's
+        self.assertNotIn("Reasoning effort is set to xhigh", text)       # no extra xhigh prompt injected at the top
         text = self.tok.decode(self.ids(self.CHAT, True, enable_thinking=False))
         self.assertTrue(text.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
         self.assertNotIn("<|im_start|>system\nReasoning effort", text[-200:])
@@ -884,8 +884,8 @@ class EffortAtTheEnd(unittest.TestCase):
     def test_changing_the_effort_keeps_the_conversation(self):
         efforts = [{}, {"reasoning_effort": "low"}, {"enable_thinking": False}, {"reasoning_effort": "medium"}, {}]
         history = len(self.checkpoint(self.ids(self.CHAT, False), False))
-        # at the top (the default): another effort differs a few tokens in, and the whole prompt is read again
-        self.assertEqual(self.session([(self.CHAT, kw) for kw in efforts], False, False)[:2], [0, 0])
+        # at the top (the default): low effort differs a few tokens in, while none/medium/default share the clean start
+        self.assertEqual(self.session([(self.CHAT, kw) for kw in efforts], False, False), [0, history, history, history])
         # at the end, with the engine's rule: every request reuses the whole conversation
         self.assertEqual(self.session([(self.CHAT, kw) for kw in efforts], True, True), [history] * 4)
 
