@@ -1175,6 +1175,23 @@ void ExpertPool::wait_done(int n) {
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     const int s = numa_n_ == 0 ? 0 : id >= 0 ? wslice_[(size_t) id] : hslice_;
+    if ((mode_ == 5 || mode_ == 3) && act_count_ > 0) {
+        for (;;) {
+            const int qi = act_next_.fetch_add(1, std::memory_order_relaxed);
+            if (qi >= act_count_) break;
+            const int t = act_toks_[qi];
+            if (mode_ == 5 && act_native_) {
+                if (q2_native_kernels(nfmt_->gu_type))
+                    act_quant_any(act_xf_ + (size_t) t * H, H, act_q_[(size_t) t]);
+                else
+                    native_quant_act(*nfmt_, act_xf_ + (size_t) t * H, act_nact_ + (size_t) t * kNativeActBytes);
+            } else {
+                act_quant_q8_1(act_xf_ + (size_t) t * H, H, act_q_[(size_t) t]);
+            }
+            act_done_.fetch_add(1, std::memory_order_release);
+        }
+        while (act_done_.load(std::memory_order_acquire) < (uint32_t) act_count_) strata_cpu_pause();
+    }
     for (;;) {
         // STRATA_NUMA_SPLIT: a mode-5/6 batch lives on the slice heads, any other on `head_`; the epoch tag makes the
         // other family's claim fail, so `mode_` is never read before a claim has succeeded (pool.hpp)
@@ -1237,17 +1254,43 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                         native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
                 } else if (q2_native_kernels(nfmt->d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
+                    const int nt = mjobs_[e].nt;
+                    for (int t = 0; t < nt; ++t) {
+                        if (sb.q_state[t].load(std::memory_order_acquire) == 0) {
+                            uint8_t expected = 0;
+                            if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                                act_quant_any(sb.ff[t], FF, sb.a2[t]);
+                                sb.q_state[t].store(2, std::memory_order_release);
+                            }
+                        }
+                    }
                     const ActQ* a2[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
+                    for (int t = 0; t < nt; ++t) {
+                        while (sb.q_state[t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
+                        a2[t] = &sb.a2[t];
+                    }
                     q2_rows_any(mjobs_[e].blob + nfmt->down_off, nfmt->d_row, (int) (nfmt->n_ff / 64), a2,
-                                mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                                nt, mjobs_[e].out, r0, r1);
                 } else {
+                    const int nt = mjobs_[e].nt;
+                    for (int t = 0; t < nt; ++t) {
+                        if (sb.q_state[t].load(std::memory_order_acquire) == 0) {
+                            uint8_t expected = 0;
+                            if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                                native_quant_h(*nfmt, sb.ff[t], sb.hq[t]);
+                                sb.q_state[t].store(2, std::memory_order_release);
+                            }
+                        }
+                    }
                     const void* hq[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+                    for (int t = 0; t < nt; ++t) {
+                        while (sb.q_state[t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
+                        hq[t] = sb.hq[t];
+                    }
                     if (narithmetic_ == NativeArithmetic::WindowInvariant)
-                        native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                        native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, nt, mjobs_[e].out, r0, r1);
                     else
-                        native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                        native_down_rows(*nfmt, mjobs_[e].blob, hq, nt, mjobs_[e].out, r0, r1);
                 }
                 g += l1 - l0;
             }
@@ -1264,9 +1307,22 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
                     s2_expert_gu_rows_multi(mjobs_[e].blob, mjobs_[e].act, mjobs_[e].nt, ff, r0, r1);
                 } else {
+                    const int nt = mjobs_[e].nt;
+                    for (int t = 0; t < nt; ++t) {
+                        if (sb.q_state[t].load(std::memory_order_acquire) == 0) {
+                            uint8_t expected = 0;
+                            if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                                act_quant_q8_1(sb.ff[t], FF, sb.a2[t]);
+                                sb.q_state[t].store(2, std::memory_order_release);
+                            }
+                        }
+                    }
                     const ActQ* a2[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    s2_expert_down_rows_multi(mjobs_[e].blob, a2, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+                    for (int t = 0; t < nt; ++t) {
+                        while (sb.q_state[t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
+                        a2[t] = &sb.a2[t];
+                    }
+                    s2_expert_down_rows_multi(mjobs_[e].blob, a2, nt, mjobs_[e].out, r0, r1);
                 }
                 r += r1 - r0;
             }
@@ -1324,8 +1380,15 @@ int ExpertPool::phase_tasks(int64_t rows) const {
 }
 
 void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
-    if (n <= 0) return;
+    if (n <= 0) { act_count_ = 0; return; }
     if (n > kMaxSplitMulti || expert_oracle_q8_0_enabled()) {
+        if (act_count_ > 0) {
+            for (int qi = 0; qi < act_count_; ++qi) {
+                const int t = act_toks_[qi];
+                act_quant_q8_1(act_xf_ + (size_t) t * H, H, act_q_[(size_t) t]);
+            }
+            act_count_ = 0;
+        }
         // one token at a time through the single-token path (the oracle contract has no multi kernel)
         std::vector<ExpertJob> single;
         for (int e = 0; e < n; ++e)
@@ -1342,13 +1405,24 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     mjobs_ = jobs;
+    int total_pairs = 0;
+    for (int e = 0; e < n; ++e) {
+        total_pairs += jobs[e].nt;
+        for (int t = 0; t < jobs[e].nt; ++t)
+            split_multi_[(size_t) e].q_state[t].store(0, std::memory_order_relaxed);
+    }
     mrows_ = (int64_t) n * FF;
     mtasks_ = phase_tasks(mrows_);
     run_phase(3, mtasks_);
+    act_count_ = 0;
     const auto t1 = std::chrono::steady_clock::now();
-    for (int e = 0; e < n; ++e)
-        for (int t = 0; t < jobs[e].nt; ++t)
-            act_quant_q8_1(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+    if (n_ == 1 || total_pairs < 32) {
+        for (int e = 0; e < n; ++e)
+            for (int t = 0; t < jobs[e].nt; ++t) {
+                act_quant_q8_1(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                split_multi_[(size_t) e].q_state[t].store(2, std::memory_order_relaxed);
+            }
+    }
     const auto t2 = std::chrono::steady_clock::now();
     mrows_ = (int64_t) n * H;
     mtasks_ = phase_tasks(mrows_);
@@ -1371,15 +1445,26 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         mjobs_ = jobs + b0;
         nfmt_ = &f;
         narithmetic_ = arithmetic;
+        int total_pairs = 0;
+        for (int e = 0; e < nb; ++e) {
+            total_pairs += mjobs_[e].nt;
+            for (int t = 0; t < mjobs_[e].nt; ++t)
+                split_multi_[(size_t) e].q_state[t].store(0, std::memory_order_relaxed);
+        }
         mrows_ = (int64_t) nb * f.n_ff;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, nb) : phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
+        act_count_ = 0;
         const auto b = std::chrono::steady_clock::now();
-        for (int e = 0; e < nb; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        if (n_ == 1 || total_pairs < 32) {
+            for (int e = 0; e < nb; ++e)
+                for (int t = 0; t < mjobs_[e].nt; ++t) {
+                    if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
+                    else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+                    split_multi_[(size_t) e].q_state[t].store(2, std::memory_order_relaxed);
+                }
+        }
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, nb) : phase_tasks(mrows_);

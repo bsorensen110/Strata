@@ -156,7 +156,7 @@ __device__ void attn_part_slot(const float* __restrict__ q, const RingT* __restr
     const int k_begin = chunk * kDf2Chunk;
     float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32) * 130;
     if (k_begin >= nkeys) {
-        for (int i = tid; i < 32 * 130; i += 128) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
+        if (tid < 32) pbase[tid * 130] = -INFINITY;
         return;
     }
     const float scale = rsqrtf((float) HD);
@@ -333,7 +333,8 @@ __global__ void attn_merge_kernel(const float* __restrict__ part, int n_chunks, 
     for (int c = 0; c < n_chunks; ++c) {
         const float* p = p_item + (((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130;
         const float mc = p[0];
-        const float w = (mc == -INFINITY) ? 0.0f : __expf(mc - M);
+        if (mc == -INFINITY) continue;
+        const float w = __expf(mc - M);
         L += p[1] * w;
         o = fmaf(p[2 + d], w, o);
     }
@@ -348,8 +349,9 @@ __global__ void attn_merge_kernel(const float* __restrict__ part, int n_chunks, 
 // 16 Q8 blocks) the group stores the 8 rows' 512 int8 one after the other (4 KB), so a warp that works on a group reads 4 KB contiguous per step
 // (lane = block * 2 + half: one 16-byte load per row).  The fp16 block scales follow all the int8 of the matrix, in the same tile order (8 rows x 16
 // blocks = 256 bytes a step).  Activations: x_q (int8 [col][n_in]) and x_d (float [col][n_in / 32]); a column's 512 bytes of a step are contiguous.
+constexpr int kDf2MaxSegs = 10;
 struct Df2Seg { const int8_t* q; const __half* d; float* y; int n_out; int row0; };
-struct Df2Segs { Df2Seg s[3]; int n; };
+struct Df2Segs { Df2Seg s[kDf2MaxSegs]; int n; };
 
 template <int WARPS, bool COMPUTE, int UNR = 2, int NCOLS = 8, int R = 8>
 __global__ void __launch_bounds__(WARPS * 32) gemm8_kernel(Df2Segs segs, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n_in, int ncols) {
@@ -608,6 +610,53 @@ __global__ void kv_ring_batch_kernel(const float* __restrict__ kin, const float*
     RingT* kring = static_cast<RingT*>(ring_table[slot * 16 + 0]);
     RingT* vring = static_cast<RingT*>(ring_table[slot * 16 + 1]);
     kv_ring_row_head<RingT>(kin, vin, gk, pos, table, kring, vring, c0 + r_local, h, slots, heads, eps);
+}
+
+template <typename RingT>
+__global__ void kv_ring_multi_kernel(const float* __restrict__ kin, const float* __restrict__ vin, int64_t layer_stride,
+                                     void* const* __restrict__ ring_table, int slot, const int32_t* __restrict__ pos,
+                                     const float* __restrict__ table, int slots, int heads, float eps) {
+    const int r = blockIdx.x, h = blockIdx.y, l = blockIdx.z;
+    const float* gk = static_cast<const float*>(ring_table[128 + l]);
+    RingT* kring = static_cast<RingT*>(ring_table[slot * 16 + l * 2 + 0]);
+    RingT* vring = static_cast<RingT*>(ring_table[slot * 16 + l * 2 + 1]);
+    kv_ring_row_head<RingT>(kin + (size_t) l * (size_t) layer_stride, vin + (size_t) l * (size_t) layer_stride,
+                            gk, pos, table, kring, vring, r, h, slots, heads, eps);
+}
+
+template <typename RingT>
+__global__ void kv_ring_batch_multi_kernel(const float* __restrict__ kin, const float* __restrict__ vin, int64_t layer_stride,
+                                           const int32_t* __restrict__ pos, const float* __restrict__ table,
+                                           void* const* __restrict__ ring_table, const int32_t* __restrict__ slot_info,
+                                           int slots, int heads, int n_items, int n_layers, float eps,
+                                           const int32_t* __restrict__ blk_pos, int blk_rows, float theta, float* __restrict__ blk_table) {
+    const int z = blockIdx.z;
+    if (z >= n_items * n_layers) {
+        const int r = (int) blockIdx.x * (int) gridDim.y + (int) blockIdx.y;
+        const int i = threadIdx.x;
+        if (r < blk_rows && i < 64 && blk_pos != nullptr && blk_table != nullptr) {
+            const double inv = pow((double) theta, -(double) (2 * i) / (double) HD);
+            double ang = (double) blk_pos[r] * inv;
+            const double two_pi = 6.283185307179586476925286766559;
+            ang -= two_pi * rint(ang / two_pi);
+            float s, c;
+            sincosf((float) ang, &s, &c);
+            blk_table[(r * 2 + 0) * 64 + i] = c;
+            blk_table[(r * 2 + 1) * 64 + i] = s;
+        }
+        return;
+    }
+    const int r_local = blockIdx.x, h = blockIdx.y;
+    const int l = z / n_items, idx = z % n_items;
+    const int slot = slot_info[idx * 4 + 0];
+    const int c0 = slot_info[idx * 4 + 1];
+    const int m = slot_info[idx * 4 + 2];
+    if (r_local >= m) return;
+    const float* gk = static_cast<const float*>(ring_table[128 + l]);
+    RingT* kring = static_cast<RingT*>(ring_table[slot * 16 + l * 2 + 0]);
+    RingT* vring = static_cast<RingT*>(ring_table[slot * 16 + l * 2 + 1]);
+    kv_ring_row_head<RingT>(kin + (size_t) l * (size_t) layer_stride, vin + (size_t) l * (size_t) layer_stride,
+                            gk, pos, table, kring, vring, c0 + r_local, h, slots, heads, eps);
 }
 
 // silu(gate) * up then the planar quantization: grid (ceil(I / 32 / 8), rows), 256 threads
@@ -973,11 +1022,47 @@ void df2_kv_ring_batch_f16(const float* kin, const float* vin, const float* gk, 
     check("kv_ring_batch_f16");
 }
 
+void df2_kv_ring_multi(const float* kin, const float* vin, int64_t layer_stride, void* const* ring_table, int slot,
+                       const int32_t* pos, const float* table, int slots, int rows, int heads, int n_layers, float eps, void* stream) {
+    if (rows <= 0 || n_layers <= 0) return;
+    kv_ring_multi_kernel<float><<<dim3((unsigned) rows, (unsigned) heads, (unsigned) n_layers), HD, 0, (cudaStream_t) stream>>>(
+        kin, vin, layer_stride, ring_table, slot, pos, table, slots, heads, eps);
+    check("kv_ring_multi");
+}
+
+void df2_kv_ring_multi_f16(const float* kin, const float* vin, int64_t layer_stride, void* const* ring_table, int slot,
+                           const int32_t* pos, const float* table, int slots, int rows, int heads, int n_layers, float eps, void* stream) {
+    if (rows <= 0 || n_layers <= 0) return;
+    kv_ring_multi_kernel<uint16_t><<<dim3((unsigned) rows, (unsigned) heads, (unsigned) n_layers), HD, 0, (cudaStream_t) stream>>>(
+        kin, vin, layer_stride, ring_table, slot, pos, table, slots, heads, eps);
+    check("kv_ring_multi_f16");
+}
+
+void df2_kv_ring_batch_multi(const float* kin, const float* vin, int64_t layer_stride, const int32_t* pos, const float* table,
+                             void* const* ring_table, const int32_t* slot_info, int slots, int heads, int n_items, int n_layers, float eps,
+                             const int32_t* blk_pos, int blk_rows, float theta, float* blk_table, void* stream) {
+    if (n_items <= 0 || n_layers <= 0) return;
+    const unsigned gz = (unsigned) (n_items * n_layers + (blk_pos != nullptr && blk_table != nullptr && blk_rows > 0 ? 1 : 0));
+    kv_ring_batch_multi_kernel<float><<<dim3(kDf2Rows, (unsigned) heads, gz), HD, 0, (cudaStream_t) stream>>>(
+        kin, vin, layer_stride, pos, table, ring_table, slot_info, slots, heads, n_items, n_layers, eps, blk_pos, blk_rows, theta, blk_table);
+    check("kv_ring_batch_multi");
+}
+
+void df2_kv_ring_batch_multi_f16(const float* kin, const float* vin, int64_t layer_stride, const int32_t* pos, const float* table,
+                                 void* const* ring_table, const int32_t* slot_info, int slots, int heads, int n_items, int n_layers, float eps,
+                                 const int32_t* blk_pos, int blk_rows, float theta, float* blk_table, void* stream) {
+    if (n_items <= 0 || n_layers <= 0) return;
+    const unsigned gz = (unsigned) (n_items * n_layers + (blk_pos != nullptr && blk_table != nullptr && blk_rows > 0 ? 1 : 0));
+    kv_ring_batch_multi_kernel<uint16_t><<<dim3(kDf2Rows, (unsigned) heads, gz), HD, 0, (cudaStream_t) stream>>>(
+        kin, vin, layer_stride, pos, table, ring_table, slot_info, slots, heads, n_items, n_layers, eps, blk_pos, blk_rows, theta, blk_table);
+    check("kv_ring_batch_multi_f16");
+}
+
 void df2_gemm_variant(int v) { g_gemm_variant = v; }
 void df2_attention_variant(int v) { g_attn_variant = v; }
 
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream) {
-    if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1 || ncols > 32) throw std::invalid_argument("df2_gemm: unsupported shape");
+    if (n < 1 || n > kDf2MaxSegs || n_in % 512 != 0 || ncols < 1 || ncols > 32) throw std::invalid_argument("df2_gemm: unsupported shape");
     Df2Segs segs;
     int rows = 0;
     for (int i = 0; i < n; ++i) {
@@ -989,10 +1074,10 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
     segs.n = n;
     const int8_t* xqp = static_cast<const int8_t*>(xq);
     cudaStream_t st = (cudaStream_t) stream;
-    const int variant = g_gemm_variant != 0 ? g_gemm_variant : (rows % 32 == 0 ? 1 : 2);
+    const int variant = g_gemm_variant != 0 ? g_gemm_variant : (rows <= 640 && ncols <= 8 ? 4 : (rows <= 2048 || rows % 32 != 0 ? 2 : 1));
     switch (variant) {
         case 3: gemm8_kernel<2, false><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
-        case 4: gemm8_kernel<1, true, 2><<<rows / 8, 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
+        case 4: launch_gemm8_ncols<1>(rows, st, segs, xqp, xd, n_in, ncols); break;
         case 5: gemm8_kernel<2, true, 1><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         case 6: gemm8_kernel<2, true, 4><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         case 7: gemm8_kernel<4, true, 4><<<rows / 32, 128, 0, st>>>(segs, xqp, xd, n_in, ncols); break;

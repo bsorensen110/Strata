@@ -2219,9 +2219,13 @@ class StrataEngine:
     def _may_go_solo(self, left: int, times: int, embeddings) -> bool:
         """A request decoding in a slot that is alone now (no other slot busy, nobody waiting) goes back to the solo
         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
-        slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
+        slot_cache=1).  When batch DFlash2 is active (dflash_block > 0), a lone slot already decodes at full
+        speculative window depth in-place without a BSTOP + copy_from_slot round-trip.  STRATA_PARALLEL_SOLO=0 keeps
+        it in the slot; STRATA_PARALLEL_SOLO=1 forces the solo handoff even with batch DFlash2."""
+        env_solo = os.environ.get("STRATA_PARALLEL_SOLO")
+        has_batch_df2 = ((self.info or {}).get("dflash_block") or 0) > 0 and os.environ.get("STRATA_BATCH_DFLASH2") != "0"
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
-                not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
+                not (self.info or {}).get("slot_cache") or env_solo == "0" or (has_batch_df2 and env_solo != "1")):
             return False
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0 and not self._others_admitted()

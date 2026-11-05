@@ -26,7 +26,8 @@ int main() {
     check(kWindowMaxT == 8 || kWindowMaxT == 16, "a window holds 8 or 16 rows");
     check(kVerifyMaxT == kWindowMaxT, "kVerifyMaxT is the window limit");
     check(kVerifyMaxT >= kVerifyNarrowT, "the wide window is not narrower than the narrow one");
-    check(cpu::MAXT == 8, "the CPU kernels' tokens per job stay 8 (a wider window is split into jobs)");
+    check(cpu::MAXT == 16, "the CPU expert workspace holds the full wide window");
+    check(cpu::kMultiTokenKernelMaxT == 8, "CPU multi-token kernels keep an eight-row tile");
     check(kFusedGrMaxT == 8, "the hyper-connection kernels are built for 8 tokens (a wider window is read in slices)");
     check(kFusedGrWideT == kWindowMaxT, "the caller's token arrays follow the window");
     check(kVerifyMaxT * 10 <= 256, "the resident plan's block holds a full window of 10 routed experts a row");

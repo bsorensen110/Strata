@@ -135,6 +135,8 @@ void s2_expert_vnni(const uint8_t* blob, const float* x, float* out, ExpertScrat
 /// is the entry point that matches it.
 void s2_expert_vnni_q(const uint8_t* blob, const ActQ& a1, float* out, ExpertScratch& ws);
 
+/// The per-call multi-token kernel tile. Wider windows are accepted by the workspace below and processed in tiles.
+inline constexpr int kMultiTokenKernelMaxT = 8;
 /// Plan v0.3 P6: ONE expert applied to up to 16 verify tokens. Keep this workspace ceiling aligned with
 /// kVerifyMaxT; the AVX2 Q/K dot kernel still internally chunks work in groups of 8.
 inline constexpr int MAXT = 16;

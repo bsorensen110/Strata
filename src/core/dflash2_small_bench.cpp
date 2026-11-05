@@ -289,6 +289,70 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::printf("df2_kv_ring_batch_f16 + df2_attention_batch_f16 + df2_pack_head_rows_batch (4 slots) parity: PASS\n");
+
+        // Multi-layer KV ring + fused block RoPE table parity across 5 layers
+        const int L5 = 5;
+        const int64_t l_stride = (int64_t) B4 * 8 * 128;
+        float *kc5 = dev(L5 * B4 * 8 * 128, 0.31f), *vc5 = dev(L5 * B4 * 8 * 128, -0.19f);
+        uint16_t *kr5_ref[4][5] = {}, *vr5_ref[4][5] = {}, *kr5_got[4][5] = {}, *vr5_got[4][5] = {};
+        void* h_rt5[136] = {};
+        for (int idx = 0; idx < 4; ++idx) {
+            for (int l = 0; l < L5; ++l) {
+                cudaMalloc((void**) &kr5_ref[idx][l], (size_t) rslots * 8 * 128 * 2);
+                cudaMalloc((void**) &vr5_ref[idx][l], (size_t) rslots * 8 * 128 * 2);
+                cudaMalloc((void**) &kr5_got[idx][l], (size_t) rslots * 8 * 128 * 2);
+                cudaMalloc((void**) &vr5_got[idx][l], (size_t) rslots * 8 * 128 * 2);
+                cudaMemset(kr5_ref[idx][l], 0, (size_t) rslots * 8 * 128 * 2);
+                cudaMemset(vr5_ref[idx][l], 0, (size_t) rslots * 8 * 128 * 2);
+                cudaMemset(kr5_got[idx][l], 0, (size_t) rslots * 8 * 128 * 2);
+                cudaMemset(vr5_got[idx][l], 0, (size_t) rslots * 8 * 128 * 2);
+                h_rt5[idx * 16 + l * 2 + 0] = kr5_got[idx][l];
+                h_rt5[idx * 16 + l * 2 + 1] = vr5_got[idx][l];
+            }
+        }
+        for (int l = 0; l < L5; ++l) h_rt5[128 + l] = gamma + l * 128;
+        void** d_rt5 = nullptr;
+        cudaMalloc((void**) &d_rt5, sizeof(h_rt5));
+        cudaMemcpy(d_rt5, h_rt5, sizeof(h_rt5), cudaMemcpyHostToDevice);
+        float *rt_blk_ref = dev(B4 * 128, 0.0f), *rt_blk_got = dev(B4 * 128, 0.0f);
+        for (int l = 0; l < L5; ++l) {
+            for (int idx = 0; idx < 4; ++idx) {
+                const int co = h_sinfo[idx * 4 + 1], m_i = h_sinfo[idx * 4 + 2];
+                df2_kv_ring_f16(kc5 + l * l_stride + co * 8 * 128, vc5 + l * l_stride + co * 8 * 128,
+                                gamma + l * 128, d_cpos + co, rt_in + co * 128,
+                                kr5_ref[idx][l], vr5_ref[idx][l], rslots, m_i, 8, 1e-6f, nullptr);
+            }
+        }
+        df2_rope_table(d_cpos, B4, 10000.0f, rt_blk_ref, nullptr);
+        df2_kv_ring_batch_multi_f16(kc5, vc5, l_stride, d_cpos, rt_in, d_rt5, d_sinfo, rslots, 8, 4, L5, 1e-6f,
+                                    d_cpos, B4, 10000.0f, rt_blk_got, nullptr);
+        cudaDeviceSynchronize();
+        std::vector<float> hrt_r(B4 * 128), hrt_g(B4 * 128);
+        cudaMemcpy(hrt_r.data(), rt_blk_ref, hrt_r.size() * 4, cudaMemcpyDeviceToHost);
+        cudaMemcpy(hrt_g.data(), rt_blk_got, hrt_g.size() * 4, cudaMemcpyDeviceToHost);
+        if (hrt_r != hrt_g) {
+            std::fprintf(stderr, "FAIL: df2_kv_ring_batch_multi_f16 fused blk_table parity\n");
+            return 1;
+        }
+        for (int idx = 0; idx < 4; ++idx) {
+            for (int l = 0; l < L5; ++l) {
+                std::vector<uint16_t> hk_r((size_t) rslots * 8 * 128), hk_g((size_t) rslots * 8 * 128);
+                std::vector<uint16_t> hv_r((size_t) rslots * 8 * 128), hv_g((size_t) rslots * 8 * 128);
+                cudaMemcpy(hk_r.data(), kr5_ref[idx][l], hk_r.size() * 2, cudaMemcpyDeviceToHost);
+                cudaMemcpy(hk_g.data(), kr5_got[idx][l], hk_g.size() * 2, cudaMemcpyDeviceToHost);
+                cudaMemcpy(hv_r.data(), vr5_ref[idx][l], hv_r.size() * 2, cudaMemcpyDeviceToHost);
+                cudaMemcpy(hv_g.data(), vr5_got[idx][l], hv_g.size() * 2, cudaMemcpyDeviceToHost);
+                if (hk_r != hk_g || hv_r != hv_g) {
+                    std::fprintf(stderr, "FAIL: df2_kv_ring_batch_multi_f16 ring parity slot %d layer %d\n", idx, l);
+                    return 1;
+                }
+            }
+        }
+        std::printf("df2_kv_ring_batch_multi_f16 (4 slots x 5 layers + fused blk RoPE) parity: PASS\n");
+        time("kv_ring_batch_multi_f16 (4 slots x 5 layers + blk_rope)", [&] {
+            df2_kv_ring_batch_multi_f16(kc5, vc5, l_stride, d_cpos, rt_in, d_rt5, d_sinfo, rslots, 8, 4, L5, 1e-6f,
+                                        d_cpos, B4, 10000.0f, rt_blk_got, nullptr);
+        });
     }
     time("conv (resid)", [&] { df2_conv(o, dyn, 640, base, h, h, B, N, 16, nullptr); });
     time("attention merge+quant only", [&] { df2_attention(q, kr, vr, kr, vr, pos, 2064, 2048, part, xq, xd, nullptr); });

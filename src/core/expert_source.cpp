@@ -1712,7 +1712,7 @@ void FileExpertSource::close() {
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         // the buffers' last copies end before they are freed (#1237)
-        if (!stage_ev_.empty()) (void) cudaDeviceSynchronize();
+        if (!stage_fence_.empty()) (void) cudaDeviceSynchronize();
         stage_free_events();
         stage_buf_.clear();
         stage_key_.clear();
@@ -1723,6 +1723,7 @@ void FileExpertSource::close() {
         stage_of_.clear();
         stage_blob_ = 0;
         stage_seq_ = 0;
+        stage_fence_seq_ = 0;
         epoch_ = 0;
         last_layer_ = -1;
         stage_grew_ = false;
@@ -1928,6 +1929,38 @@ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
 //
 // `claim_stage` finds or reserves the buffer of `key` (stage_mu_ held): true when the blob is already there (or
 // being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
+void FileExpertSource::wait_stage_fence(StageFence& fence, bool& waited) noexcept {
+    if (!fence.live) return;
+    const auto ev = static_cast<cudaEvent_t>(fence.event);
+    const auto stream = static_cast<cudaStream_t>(fence.stream);
+    if (ev == nullptr) {
+        waited = true;
+        if (stream != nullptr) (void) cudaStreamSynchronize(stream);
+        else (void) cudaDeviceSynchronize();
+        fence.live = false;
+        return;
+    }
+    const cudaError_t query = cudaEventQuery(ev);
+    if (query == cudaErrorNotReady) {
+        waited = true;
+        if (cudaEventSynchronize(ev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            if (stream != nullptr && cudaStreamSynchronize(stream) != cudaSuccess) {
+                (void) cudaGetLastError();
+                (void) cudaDeviceSynchronize();
+            }
+        }
+    } else if (query != cudaSuccess) {
+        waited = true;
+        (void) cudaGetLastError();
+        if (stream != nullptr && cudaStreamSynchronize(stream) != cudaSuccess) {
+            (void) cudaGetLastError();
+            (void) cudaDeviceSynchronize();
+        }
+    }
+    fence.live = false;
+}
+
 bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahead) {
     constexpr uint64_t kStageSeq = 256;
     const uint64_t seq = ++stage_seq_;
@@ -1974,8 +2007,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         if (raw == nullptr) return false;
         stage_buf_.emplace_back(raw, StageBufFree{pinned});
         stage_idx_[raw] = stage_buf_.size() - 1;
-        stage_ev_.push_back(nullptr);
-        stage_ev_live_.push_back(0);
+        stage_fence_.push_back({});
         if (pinned && !stage_pin_said_) {
             stage_pin_said_ = true;
             std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
@@ -1997,18 +2029,12 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     } else {
         stage_of_.erase(stage_key_[v]);
         if (stage_pf_[v]) { stage_pf_[v] = 0; io_pf_unused_.fetch_add(1, std::memory_order_relaxed); }   // read ahead, never asked for
-        // #1237: a page-locked buffer is read by the DMA after the copy call returned: it is refilled only once the
-        // last copy queued out of it (note_async_read) has finished.  Rare: the pool is sized so that a buffer asked
-        // for has long been consumed; a wait here means the stream is more than a pool behind.
-        if (v < stage_ev_live_.size() && stage_ev_live_[v]) {
-            stage_ev_live_[v] = 0;
-            if (stage_ev_[v] != nullptr) {
-                if (cudaEventQuery((cudaEvent_t) stage_ev_[v]) == cudaErrorNotReady) {
-                    stage_fence_waits_.fetch_add(1, std::memory_order_relaxed);
-                    (void) cudaEventSynchronize((cudaEvent_t) stage_ev_[v]);
-                }
-                (void) cudaGetLastError();
-            }
+        // #1237: one read fence per stream. A buffer shared by streams must remain untouched until every stream's
+        // queued DMA has finished; waiting only on the last event can let an earlier stream observe a refill.
+        if (v < stage_fence_.size()) {
+            bool waited = false;
+            for (StageFence& fence : stage_fence_[v]) wait_stage_fence(fence, waited);
+            if (waited) stage_fence_waits_.fetch_add(1, std::memory_order_relaxed);
         }
     }
     stage_key_[v] = key;
@@ -2161,28 +2187,68 @@ void FileExpertSource::note_async_read(const uint8_t* blob, void* stream) {
     if (it == stage_idx_.end()) return;                 // not a stage buffer: the mapping or the resident arena
     const size_t v = it->second;
     if (!stage_buf_[v].get_deleter().pinned) return;    // pageable: the driver copied it before the call returned
-    if (stage_ev_[v] == nullptr) {
-        cudaEvent_t ev = nullptr;
-        if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
-            (void) cudaGetLastError();
-            (void) cudaStreamSynchronize((cudaStream_t) stream);   // no event: wait for the copy itself
-            return;
-        }
-        stage_ev_[v] = ev;
-    }
-    if (cudaEventRecord((cudaEvent_t) stage_ev_[v], (cudaStream_t) stream) != cudaSuccess) {
-        (void) cudaGetLastError();
+    if (v >= stage_fence_.size()) {
         (void) cudaStreamSynchronize((cudaStream_t) stream);
         return;
     }
-    stage_ev_live_[v] = 1;
+
+    auto& fences = stage_fence_[v];
+    StageFence* fence = nullptr;
+    for (StageFence& candidate : fences) {
+        if (candidate.event != nullptr && candidate.stream == stream) {
+            fence = &candidate;
+            break;
+        }
+    }
+    if (fence == nullptr) {
+        for (StageFence& candidate : fences) {
+            if (!candidate.live) {
+                fence = &candidate;
+                break;
+            }
+        }
+        if (fence == nullptr) {
+            // More than kStageFences streams read this same stage buffer. Reuse only after the oldest
+            // event has completed; never discard an outstanding DMA fence.
+            fence = &fences[0];
+            for (StageFence& candidate : fences)
+                if (candidate.sequence < fence->sequence) fence = &candidate;
+            bool waited = false;
+            wait_stage_fence(*fence, waited);
+            if (waited) stage_fence_waits_.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (fence->event == nullptr) {
+            cudaEvent_t ev = nullptr;
+            if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (stream != nullptr) (void) cudaStreamSynchronize((cudaStream_t) stream);
+                else (void) cudaDeviceSynchronize();
+                return;
+            }
+            fence->event = (void*) ev;
+        }
+        fence->stream = stream;
+    }
+
+    if (cudaEventRecord((cudaEvent_t) fence->event, (cudaStream_t) stream) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (stream != nullptr) (void) cudaStreamSynchronize((cudaStream_t) stream);
+        else (void) cudaDeviceSynchronize();
+        fence->live = false;
+        return;
+    }
+    fence->sequence = ++stage_fence_seq_;
+    fence->live = true;
 }
 
 void FileExpertSource::stage_free_events() {
-    for (void*& e : stage_ev_)
-        if (e != nullptr) { (void) cudaEventDestroy((cudaEvent_t) e); e = nullptr; }
-    stage_ev_.clear();
-    stage_ev_live_.clear();
+    for (auto& fences : stage_fence_) {
+        for (StageFence& fence : fences) {
+            if (fence.event != nullptr) (void) cudaEventDestroy((cudaEvent_t) fence.event);
+            fence = StageFence{};
+        }
+    }
+    stage_fence_.clear();
     stage_idx_.clear();
 }
 
@@ -5694,17 +5760,29 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (!published) ++d.stale_x;
     }
     const auto c1 = std::chrono::steady_clock::now();
+    d.pool->clear_act_quant();
     if (any_cpu) {
         // Any token whose routed experts all run on a GPU (kind >= 0) or are tail-skipped (kind == -2) has no local CPU
         // expert job (kind == -1) and never reads act_multi[t] / nact_multi[t]; skip quantizing its row over PCIe.
+        int act_toks[strata::kernels::cpu::MAXT] = {};
+        int n_act_toks = 0;
         for (int64_t t = 0; t < n_tok; ++t) {
             if (std::none_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v == -1; })) continue;
-            if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
-                act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
-            else if (native)
-                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
-            else
-                act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+            if (t < strata::kernels::cpu::MAXT) act_toks[n_act_toks++] = (int) t;
+        }
+        if (n_act_toks > strata::kernels::cpu::kMultiTokenKernelMaxT && d.pool->workers() > 1 && d.cold_mode == 0) {
+            d.pool->defer_act_quant(x_f, native ? d.nact_multi.data() : nullptr, d.act_multi.data(),
+                                    act_toks, n_act_toks, native);
+        } else {
+            for (int qi = 0; qi < n_act_toks; ++qi) {
+                const int t = act_toks[qi];
+                if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))
+                    act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                else if (native)
+                    native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+                else
+                    act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+            }
         }
     }
     const auto c2 = std::chrono::steady_clock::now();

@@ -10742,7 +10742,8 @@ int main(int argc, char** argv) {
         strata::prefill::KvaFloorRegistry kva_floors;
         // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused.  STRATA_SLOT_CKPT_MOVE turns it on too: a moved
         // checkpoint frees nothing at the next prune, so every save would fault in fresh pages (17 -> 40-60 ms)
-        CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env(), ckpt_pool_cap_env());
+        CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env(),
+                                 std::max<size_t>(ckpt_pool_cap_env(), (size_t) std::min(std::max(o.batch, 2) + 2, 8)));
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         // --prefill-pipe: the plan of the prompt segment being read (read_part sets it around its runs), for the
@@ -19170,7 +19171,7 @@ int main(int argc, char** argv) {
                             df2_n = 1;
                             df2_p = p + a;
                         }
-                        if (df2_stage) {
+                        if (df2_stage && !df2.has_precomputed_context(df2_taps, df2_n, df2_p)) {
                             // --batch or layer split: the round graphs were captured on the shared draft row buffer in
                             // VRAM on the drafter's device, so this window's committed rows are staged there first
                             const strata::core::OnDevice on_df2(df2.device());

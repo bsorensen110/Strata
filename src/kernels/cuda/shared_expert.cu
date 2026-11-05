@@ -262,7 +262,8 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
             bf16_gemv_fp32_mmvf_multi(x, n_embd, gate_inp_bf16, g, 1, n_embd, 1, n_tok, stream);
         launch_sigmoid_scale_rows(out, g, (int) n_embd, n_tok, cs);
     } else if (native_bf16 && n_tok == 1) {
-        bf16_gemv_fp32_mmvf(x, gate_inp_bf16, g, n_embd, 1, stream);
+        if (!gate_precomputed)
+            bf16_gemv_fp32_mmvf(x, gate_inp_bf16, g, n_embd, 1, stream);
         launch_sigmoid_scale_rows(out, g, (int) n_embd, 1, cs);
     } else {
         for (int t = 0; t < n_tok; ++t) {
@@ -437,43 +438,57 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
         native_quantize_q8_1(x_f32, native->q8_1, (int) n_embd, 1, stream);
         x_q8_1 = native->q8_1;
     }
-    if (native_gate)
-        native_mmvq(native->gate_type, native->gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, 1, stream);
-    else
-        gemv(gate_form, gate_codes, gate_scales, gate_off, x_q8_0, x_q8k, gate, n_embd, n_ff);
-    if (native_up)
-        native_mmvq(native->up_type, native->up_data, x_q8_1, up, (int) n_embd, (int) n_ff, 1, stream);
-    else
-        gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
-    if (native_projection && native_down && fused_swiglu_q81_enabled()) {
-        native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int) n_ff, 1, stream);
+    static const bool default_pair = [] {
+        const char* v = std::getenv("STRATA_LFUSE_PAIR");
+        return v == nullptr || v[0] != '0';
+    }();
+    const bool can_pair = default_pair && native_gate && native_up && native->gate_type == native->up_type;
+    if (can_pair && native_down && fused_swiglu_q81_enabled() &&
+        native_mmvq_pair_swiglu(native->gate_type, native->gate_data, native->up_data, x_q8_1, gate, (int) n_embd, (int) n_ff, 1, stream)) {
+        native_quantize_q8_1(gate, native->q8_1, (int) n_ff, 1, stream);
         native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);
     } else {
-        if (native_projection)
-            native_swiglu_kernel<<<g_ff, THREADS, 0, (cudaStream_t) stream>>>(gate, up, gate, (int) n_ff);
-        else
-            swiglu_kernel<<<g_ff, THREADS, 0, (cudaStream_t) stream>>>(gate, up, gate, (int) n_ff);
-
-        // down: (n_ff) -> (n_embd), and THE INTERMEDIATE IS QUANTIZED TO THE DOWN WEIGHT'S OWN CONTRACT - which is
-        // what `ggml_mul_mat` does for every matmul in the model.  It used to be rounded to fp16 with no
-        // justification beyond "the kernel takes fp16".
-        if (native_down) {
-            native_quantize_q8_1(gate, native->q8_1, (int) n_ff, 1, stream);
+        if (!(can_pair &&
+              native_mmvq_pair(native->gate_type, native->gate_data, native->up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, 1, stream))) {
+            if (native_gate)
+                native_mmvq(native->gate_type, native->gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, 1, stream);
+            else
+                gemv(gate_form, gate_codes, gate_scales, gate_off, x_q8_0, x_q8k, gate, n_embd, n_ff);
+            if (native_up)
+                native_mmvq(native->up_type, native->up_data, x_q8_1, up, (int) n_embd, (int) n_ff, 1, stream);
+            else
+                gemv(up_form, up_codes, up_scales, up_off, x_q8_0, x_q8k, up, n_embd, n_ff);
+        }
+        if (native_projection && native_down && fused_swiglu_q81_enabled()) {
+            native_swiglu_quantize_q8_1(gate, up, native->q8_1, (int) n_ff, 1, stream);
             native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);
-        } else if (down_form.act_kind == 1) {
-            if (n_ff % 256 != 0) {
-                std::fprintf(stderr, "shared_expert: the down weight wants Q8_K but n_ff %lld is not a multiple "
-                                     "of 256; Q8_K is structurally impossible here\n", (long long) n_ff);
-                std::exit(1);
-            }
-            quantize_q8_K(gate, h_q8k, n_ff, stream);
-            gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
-        } else if (down_form.code_bits == 2) {
-            quantize_q8_0(gate, h_q8_0, n_ff, stream);
-            gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
         } else {
-            quantize_q8_0(gate, h_q8_0, n_ff, stream);
-            gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+            if (native_projection)
+                native_swiglu_kernel<<<g_ff, THREADS, 0, (cudaStream_t) stream>>>(gate, up, gate, (int) n_ff);
+            else
+                swiglu_kernel<<<g_ff, THREADS, 0, (cudaStream_t) stream>>>(gate, up, gate, (int) n_ff);
+
+            // down: (n_ff) -> (n_embd), and THE INTERMEDIATE IS QUANTIZED TO THE DOWN WEIGHT'S OWN CONTRACT - which is
+            // what `ggml_mul_mat` does for every matmul in the model.  It used to be rounded to fp16 with no
+            // justification beyond "the kernel takes fp16".
+            if (native_down) {
+                native_quantize_q8_1(gate, native->q8_1, (int) n_ff, 1, stream);
+                native_mmvq(native->down_type, native->down_data, native->q8_1, out, (int) n_ff, (int) n_embd, 1, stream);
+            } else if (down_form.act_kind == 1) {
+                if (n_ff % 256 != 0) {
+                    std::fprintf(stderr, "shared_expert: the down weight wants Q8_K but n_ff %lld is not a multiple "
+                                         "of 256; Q8_K is structurally impossible here\n", (long long) n_ff);
+                    std::exit(1);
+                }
+                quantize_q8_K(gate, h_q8k, n_ff, stream);
+                gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+            } else if (down_form.code_bits == 2) {
+                quantize_q8_0(gate, h_q8_0, n_ff, stream);
+                gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+            } else {
+                quantize_q8_0(gate, h_q8_0, n_ff, stream);
+                gemv(down_form, down_codes, down_scales, down_off, h_q8_0, h_q8k, out, n_ff, n_embd);
+            }
         }
     }
         }

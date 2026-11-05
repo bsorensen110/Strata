@@ -1231,6 +1231,7 @@ private:
     std::unordered_map<int64_t, size_t> stage_of_;
     uint64_t stage_blob_ = 0;
     uint64_t stage_seq_ = 0;
+    uint64_t stage_fence_seq_ = 0;
     int64_t ram_adapts_ = 0;                  ///< replace_resident(_staged): experts moved into the compact copy
     int64_t ram_staged_ = 0;                  ///< replace_resident_staged: of those, copied out of a stage buffer
     std::vector<uint8_t> ram_adapt_buf_;      ///< ...one blob, read here before it replaces another
@@ -1258,15 +1259,13 @@ private:
     struct StageFence {
         void* stream = nullptr;
         void* event = nullptr;
+        uint64_t sequence = 0;
         bool live = false;          ///< a copy was queued and not yet waited for
     };
     static constexpr size_t kStageFences = 4;
     std::vector<std::array<StageFence, kStageFences>> stage_fence_;
-    // #1237: per stage buffer, the event recorded after the last asynchronous copy out of it (note_async_read); a
-    // buffer is refilled only once that event has completed.  cudaEvent_t, stored untyped (no cuda_runtime.h here).
-    std::vector<void*> stage_ev_;
-    std::vector<char> stage_ev_live_;                 ///< a copy was queued since the buffer was last waited for
     std::unordered_map<const uint8_t*, size_t> stage_idx_;   ///< buffer address -> index (the buffers never move)
+    void wait_stage_fence(StageFence& fence, bool& waited) noexcept;
     void stage_free_events();
     std::atomic<uint64_t> stage_fence_waits_{0};      ///< refills that had to wait for a queued copy
     std::atomic<int64_t> ram_reads_{0};

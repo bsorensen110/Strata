@@ -471,29 +471,35 @@ void down_rows_multi(const uint8_t* blob, const ActQ* const* a2, float* const* o
 
 void s2_expert_gu_rows_multi(const uint8_t* blob, const ActQ* const* a1, int n_tokens, float* const* ff, int r0,
                              int r1) {
-    switch (n_tokens) {
-        case 1: gu_rows_multi<1>(blob, a1, ff, r0, r1); break;
-        case 2: gu_rows_multi<2>(blob, a1, ff, r0, r1); break;
-        case 3: gu_rows_multi<3>(blob, a1, ff, r0, r1); break;
-        case 4: gu_rows_multi<4>(blob, a1, ff, r0, r1); break;
-        case 5: gu_rows_multi<5>(blob, a1, ff, r0, r1); break;
-        case 6: gu_rows_multi<6>(blob, a1, ff, r0, r1); break;
-        case 7: gu_rows_multi<7>(blob, a1, ff, r0, r1); break;
-        default: gu_rows_multi<8>(blob, a1, ff, r0, r1); break;
+    for (int first = 0; first < n_tokens; first += kMultiTokenKernelMaxT) {
+        const int count = n_tokens - first < kMultiTokenKernelMaxT ? n_tokens - first : kMultiTokenKernelMaxT;
+        switch (count) {
+            case 1: gu_rows_multi<1>(blob, a1 + first, ff + first, r0, r1); break;
+            case 2: gu_rows_multi<2>(blob, a1 + first, ff + first, r0, r1); break;
+            case 3: gu_rows_multi<3>(blob, a1 + first, ff + first, r0, r1); break;
+            case 4: gu_rows_multi<4>(blob, a1 + first, ff + first, r0, r1); break;
+            case 5: gu_rows_multi<5>(blob, a1 + first, ff + first, r0, r1); break;
+            case 6: gu_rows_multi<6>(blob, a1 + first, ff + first, r0, r1); break;
+            case 7: gu_rows_multi<7>(blob, a1 + first, ff + first, r0, r1); break;
+            default: gu_rows_multi<kMultiTokenKernelMaxT>(blob, a1 + first, ff + first, r0, r1); break;
+        }
     }
 }
 
 void s2_expert_down_rows_multi(const uint8_t* blob, const ActQ* const* a2, int n_tokens, float* const* out, int r0,
                                int r1) {
-    switch (n_tokens) {
-        case 1: down_rows_multi<1>(blob, a2, out, r0, r1); break;
-        case 2: down_rows_multi<2>(blob, a2, out, r0, r1); break;
-        case 3: down_rows_multi<3>(blob, a2, out, r0, r1); break;
-        case 4: down_rows_multi<4>(blob, a2, out, r0, r1); break;
-        case 5: down_rows_multi<5>(blob, a2, out, r0, r1); break;
-        case 6: down_rows_multi<6>(blob, a2, out, r0, r1); break;
-        case 7: down_rows_multi<7>(blob, a2, out, r0, r1); break;
-        default: down_rows_multi<8>(blob, a2, out, r0, r1); break;
+    for (int first = 0; first < n_tokens; first += kMultiTokenKernelMaxT) {
+        const int count = n_tokens - first < kMultiTokenKernelMaxT ? n_tokens - first : kMultiTokenKernelMaxT;
+        switch (count) {
+            case 1: down_rows_multi<1>(blob, a2 + first, out + first, r0, r1); break;
+            case 2: down_rows_multi<2>(blob, a2 + first, out + first, r0, r1); break;
+            case 3: down_rows_multi<3>(blob, a2 + first, out + first, r0, r1); break;
+            case 4: down_rows_multi<4>(blob, a2 + first, out + first, r0, r1); break;
+            case 5: down_rows_multi<5>(blob, a2 + first, out + first, r0, r1); break;
+            case 6: down_rows_multi<6>(blob, a2 + first, out + first, r0, r1); break;
+            case 7: down_rows_multi<7>(blob, a2 + first, out + first, r0, r1); break;
+            default: down_rows_multi<kMultiTokenKernelMaxT>(blob, a2 + first, out + first, r0, r1); break;
+        }
     }
 }
 
@@ -768,15 +774,18 @@ void s2_expert_vnni_multi(const uint8_t* blob, const ActQ* const* a1, int n_toke
         for (int t = 0; t < n_tokens; ++t) s2_expert_vnni_q(blob, *a1[t], out[t], ws.single);
         return;
     }
-    switch (n_tokens) {
-        case 1: expert_multi<1>(blob, a1, out, ws); break;
-        case 2: expert_multi<2>(blob, a1, out, ws); break;
-        case 3: expert_multi<3>(blob, a1, out, ws); break;
-        case 4: expert_multi<4>(blob, a1, out, ws); break;
-        case 5: expert_multi<5>(blob, a1, out, ws); break;
-        case 6: expert_multi<6>(blob, a1, out, ws); break;
-        case 7: expert_multi<7>(blob, a1, out, ws); break;
-        default: expert_multi<8>(blob, a1, out, ws); break;
+    for (int first = 0; first < n_tokens; first += kMultiTokenKernelMaxT) {
+        const int count = n_tokens - first < kMultiTokenKernelMaxT ? n_tokens - first : kMultiTokenKernelMaxT;
+        switch (count) {
+            case 1: expert_multi<1>(blob, a1 + first, out + first, ws); break;
+            case 2: expert_multi<2>(blob, a1 + first, out + first, ws); break;
+            case 3: expert_multi<3>(blob, a1 + first, out + first, ws); break;
+            case 4: expert_multi<4>(blob, a1 + first, out + first, ws); break;
+            case 5: expert_multi<5>(blob, a1 + first, out + first, ws); break;
+            case 6: expert_multi<6>(blob, a1 + first, out + first, ws); break;
+            case 7: expert_multi<7>(blob, a1 + first, out + first, ws); break;
+            default: expert_multi<kMultiTokenKernelMaxT>(blob, a1 + first, out + first, ws); break;
+        }
     }
 }
 

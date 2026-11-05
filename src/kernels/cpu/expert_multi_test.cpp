@@ -1,12 +1,14 @@
 // src/kernels/cpu/expert_multi_test.cpp - plan v0.3 P6: one expert, several tokens (CPU only, synthetic data).
 //
-//   expert_multi_test              bitwise check: s2_expert_vnni_multi vs s2_expert_vnni_q per token, n = 1..8
+//   expert_multi_test              bitwise check: s2_expert_vnni_multi and the pooled row path vs per-token reference,
+//                                  n = 1..16 (synthetic data)
 //   expert_multi_test --bench [E]  time per expert for n = 1..5 over E synthetic experts (default 256 = 354 MB,
 //                                  far beyond L3, so the blob comes from DRAM as it does in the engine); 1 thread
 //
 // The bench measures the speculation model's `extra_use_cost`: the CPU time of each extra token routed to an
 // expert, as a fraction of reading the expert once (tools/spec_economics.py assumes 0.2).
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -94,7 +96,62 @@ int main(int argc, char** argv) {
                     }
             }
         }
-        std::printf("expert_multi_test: %s\n", fail ? "FAILED" : "OK (every token bitwise equal to the single-token kernel)");
+
+        // Exercise the actual multi-expert pool path, including its deferred input quantization and the
+        // per-token hidden-state quantization shared by row workers. Compare each result against an independently
+        // quantized single-expert call for every window width through MAXT.
+        if (E == 4) {
+            constexpr int pool_experts = 4;
+            std::vector<c::ActQ> expected_act(c::MAXT);
+            for (int t = 0; t < c::MAXT; ++t) std::memcpy(&expected_act[t], &acts[t], sizeof acts[t]);
+            std::vector<float> expected_out((size_t) pool_experts * c::MAXT * c::H);
+            std::vector<float> pooled_out(expected_out.size());
+            c::ExpertPool pool(4, false, true);
+            int token_ids[c::MAXT];
+            for (int t = 0; t < c::MAXT; ++t) token_ids[t] = t;
+            for (int n = 1; n <= c::MAXT; ++n) {
+                c::ExpertJobMulti jobs[pool_experts];
+                for (int e = 0; e < pool_experts; ++e) {
+                    const uint8_t* blob = &blobs[(size_t) e * c::BLOB];
+                    jobs[e].blob = blob;
+                    jobs[e].nt = n;
+                    for (int t = 0; t < n; ++t) {
+                        jobs[e].act[t] = &acts[t];
+                        jobs[e].out[t] = &pooled_out[((size_t) e * c::MAXT + t) * c::H];
+                        c::s2_expert_vnni_q(blob, expected_act[t],
+                                            &expected_out[((size_t) e * c::MAXT + t) * c::H], ws);
+                    }
+                }
+                for (int t = 0; t < n; ++t) {
+                    std::memset(acts[t].q, 0x5a, sizeof acts[t].q);
+                    std::memset(acts[t].scale, 0x5a, sizeof acts[t].scale);
+                    std::memset(acts[t].sum, 0x5a, sizeof acts[t].sum);
+                    std::memset(acts[t].hx, 0x5a, sizeof acts[t].hx);
+                    acts[t].nchunks = -1;
+                }
+                pool.defer_act_quant(&xs[0][0], nullptr, acts, token_ids, n, false);
+                pool.run_split_multi(jobs, pool_experts);
+                for (int t = 0; t < n; ++t) {
+                    const bool act_ok = acts[t].nchunks == expected_act[t].nchunks &&
+                                        std::memcmp(acts[t].q, expected_act[t].q, sizeof acts[t].q) == 0 &&
+                                        std::memcmp(acts[t].scale, expected_act[t].scale, sizeof acts[t].scale) == 0 &&
+                                        std::memcmp(acts[t].sum, expected_act[t].sum, sizeof acts[t].sum) == 0 &&
+                                        std::memcmp(acts[t].hx, expected_act[t].hx, sizeof acts[t].hx) == 0;
+                    if (!act_ok) {
+                        std::fprintf(stderr, "FAIL pool input quantization n=%d token %d differs\n", n, t);
+                        ++fail;
+                    }
+                    for (int e = 0; e < pool_experts; ++e) {
+                        const size_t ix = ((size_t) e * c::MAXT + t) * c::H;
+                        if (std::memcmp(&expected_out[ix], &pooled_out[ix], c::H * sizeof(float)) != 0) {
+                            std::fprintf(stderr, "FAIL pool split n=%d expert %d token %d differs\n", n, e, t);
+                            ++fail;
+                        }
+                    }
+                }
+            }
+        }
+        std::printf("expert_multi_test: %s\n", fail ? "FAILED" : "OK (single and pooled paths bitwise equal for 1..16 tokens)");
         return fail ? 1 : 0;
     }
 

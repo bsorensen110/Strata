@@ -3772,6 +3772,12 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             }
         }
         strata_load_fence();   // the layer rang: the GPU's activations are read after it (a no-op on x86)
+        if (grp == 0 && G == 1 && taps_ready_cb_ != nullptr && tap_on_ && !tap_layers_.empty() &&
+            l == (int64_t) tap_layers_.back() + 1) {
+            int64_t pos_seq[kernels::kVerifyMaxT] = {};
+            for (int t = 0; t < T; ++t) pos_seq[t] = pos0 + t;
+            taps_ready_cb_(taps_ready_user_, tap_dev_, T, pos_seq);
+        }
         const Clock::time_point b = Clock::now();
         if (g_trace) trace_ev("RANG", k, l, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(b - a).count());
         VDBG("layer %lld rang\n", (long long) l);

@@ -98,6 +98,8 @@ public:
     /// Precomputes the window's DFlash2 context projections (`fc.weight` + 5-layer `k_proj`/`v_proj`) on `cs_` as soon
     /// as the target verifier finishes its last tap layer (layer 36), overlapping with target layers 37..47.
     void precompute_batch_context(const float* taps, int n_rows, const int64_t* pos);
+    /// Returns true if `precompute_batch_context` already holds the context projections for `[taps, taps + n_rows * tap_stride)` at `pos0`.
+    bool has_precomputed_context(const float* taps, int n_rows, int64_t pos0) const noexcept;
 
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
@@ -196,11 +198,13 @@ private:
     bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err);
     bool record_block_body(cudaStream_t cs, std::string& err);
     bool record_batch_body(int n_items, cudaStream_t cs, std::string& err);
+    bool record_batch_head(int n_items, int total_rows, const int32_t* bmeta_dev, cudaStream_t cs, std::string& err);
     bool record_block_head(cudaStream_t cs, std::string& err);
     bool record_block(cudaStream_t cs, std::string& err);
     bool capture(int n, const float* taps, std::string& err);
     bool capture_body(int n, const float* taps, std::string& err);
     bool capture_batch_body(int n_items, std::string& err);
+    bool capture_batch_full(int n_items, int total_rows, std::string& err);
     bool alloc(std::string& err);
     struct Prof;
     Prof* prof_ = nullptr;
@@ -253,8 +257,9 @@ private:
     float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr;
     int32_t *toptok_ = nullptr, *out_tok_ = nullptr;
     uint32_t* topscratch_ = nullptr;
-    void** d_ring_table_ = nullptr;              ///< device table [kDf2MaxSlots][8][2] of (kring_[l], vring_[l]) pointers
+    void** d_ring_table_ = nullptr;              ///< device table [kDf2MaxSlots][8][2] of (kring_[l], vring_[l]) + [8] k_norm.weight pointers
     cudaGraphExec_t batch_body_exec_[5] = {};    ///< captured multi-slot batch body graphs for n_items = 1..4 (when precomputed context is active)
+    cudaGraphExec_t batch_full_exec_[5][kDrafts + 1] = {}; ///< captured unified body+head graphs for n_items = 1..4 and total_rows = 1..kDrafts
     std::vector<std::unique_ptr<Slot>> slots_;   ///< one per conversation; the constructor makes slot 0
     int cur_ = 0;                                ///< the active slot (set_slot); each slot keeps its own captured taps pointer (Slot::taps_)
     std::string pack_path_;          ///< the pack's path at load (restore refuses a moved pack)

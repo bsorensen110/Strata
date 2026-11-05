@@ -96,6 +96,20 @@ void df2_kv_ring_batch(const float* kin, const float* vin, const float* gk, cons
                        const int32_t* slot_info, int slots, int heads, float eps, int n_items, void* stream);
 void df2_kv_ring_batch_f16(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, void* const* ring_table,
                            const int32_t* slot_info, int slots, int heads, float eps, int n_items, void* stream);
+/// Multi-layer single-slot context KV ring write across `n_layers` layers in one launch (`kin`/`vin` layers `layer_stride` floats apart;
+/// `ring_table[slot * 16 + l * 2 + 0..1]` holds layer `l`'s K/V rings and `ring_table[128 + l]` holds layer `l`'s `k_norm.weight`).
+void df2_kv_ring_multi(const float* kin, const float* vin, int64_t layer_stride, void* const* ring_table, int slot,
+                       const int32_t* pos, const float* table, int slots, int rows, int heads, int n_layers, float eps, void* stream);
+void df2_kv_ring_multi_f16(const float* kin, const float* vin, int64_t layer_stride, void* const* ring_table, int slot,
+                           const int32_t* pos, const float* table, int slots, int rows, int heads, int n_layers, float eps, void* stream);
+/// Multi-layer batched context KV ring write across `n_items` slots and `n_layers` layers in one launch, optionally computing
+/// the block RoPE table `blk_table[0..blk_rows-1]` from `blk_pos` in an extra CTA slice when `blk_pos != nullptr && blk_table != nullptr`.
+void df2_kv_ring_batch_multi(const float* kin, const float* vin, int64_t layer_stride, const int32_t* pos, const float* table,
+                             void* const* ring_table, const int32_t* slot_info, int slots, int heads, int n_items, int n_layers, float eps,
+                             const int32_t* blk_pos, int blk_rows, float theta, float* blk_table, void* stream);
+void df2_kv_ring_batch_multi_f16(const float* kin, const float* vin, int64_t layer_stride, const int32_t* pos, const float* table,
+                                 void* const* ring_table, const int32_t* slot_info, int slots, int heads, int n_items, int n_layers, float eps,
+                                 const int32_t* blk_pos, int blk_rows, float theta, float* blk_table, void* stream);
 
 /// Top-16 per row of logits [rows][n] (value-descending; ties to the lower index).  idx_map (optional) maps a column to a token id.
 /// scratch: rows * kDf2TopBlocks * 16 * 2 words.  Outputs val[rows][16] and tok[rows][16].  n <= 4096 * kDf2TopBlocks.
