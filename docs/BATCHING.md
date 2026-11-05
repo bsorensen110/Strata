@@ -536,6 +536,40 @@ run without it; inside one run every slot still equals its own solo decode.
 Not run: AMD (HIP), the draft layer on the first stage, helper expert caches, more than two stages, SYCL (the SYCL
 tree has its own copy of the batch code and does not have this).
 
+## One flag for the batched DFlash2 drafter (`--batch-dflash2`, opt-in)
+
+The batched DFlash2 drafter - one drafter, one K/V ring per slot, every active slot its anchor row and the
+rows left to the slots that have a draft ready - is a flag set, not a flag:
+
+```
+--serve --batch 4 --draft dflash2 --draft-model <pack> --dflash-no-mtp --mtp-draft-vocab <draft_vocab.bin> \
+--batch-draft-window 16 --batch-draft-depth 1
+```
+
+`--batch-dflash2` writes that set: `--serve --batch 4 --batch-dflash2 --draft-model <pack>`. It sets
+`--draft dflash2` and `--dflash-no-mtp` (a batch drafter needs no MTP layer; its VRAM is the slots'), defaults
+the batch draft window to 16 rows and `--batch-draft-depth 1`, and takes `draft_vocab.bin` from beside the
+pack, from `../mtp/rt/`, from `../mtp/`, or from `--mtp-draft-vocab`. `--spec` gets 2 (cap 2 at depth 1, the
+best-measured batch shape) when you did not give one. Every flag of the set stays as it is and an explicit
+value wins in either order, so `--batch-dflash2 --batch-draft-window 8` is 8 and so is
+`--batch-draft-window 8 --batch-dflash2`. A build whose windows hold 8 rows (the CUDA and SYCL default,
+`-DSTRATA_WINDOW_MAX_T=8`) keeps 8 and says so in one line. The start prints what it turned on: the rows, the
+depth, the width and the vocabulary file, then the slots it set up and the shape the windows begin with.
+
+It refuses, naming what it needs, when `--serve` is off, `--batch` is 0 (the drafter is one slot per batch
+slot), `--draft-model` is empty, `--spec` is below 2 (a slot's window row would carry no proposal), the head
+is not native (`--native`), the pruned `draft_vocab.bin` cannot be found, or the drafter will not run here
+(more than one card, `--peer-device`, remote expert caches, `--batch-mtp`, a layer split). It does not fall
+back: `--dflash-no-mtp` leaves no MTP layer behind, so a drafter that cannot draft would be plain batch
+windows with no drafts at all, and that reads like a run that drafts. The pruned vocabulary is required for
+this flag for the same reason - the head rows it drops are the bytes the slots' rings and graphs need.
+
+Measured, and why the flag is not a recommendation: on a HIP gfx1201/gfx1200 build, four slots, 16-row
+windows and production tuning, every DFlash2 batch arm was slower than plain batch - depth 1 at cap 2 gave
+80.96 tok/s against plain batch's 96.61 and batch MTP's 107.40 (three trials each, medians) - see
+[DFLASH2_BATCH_TUNING_2026-10-29.md](DFLASH2_BATCH_TUNING_2026-10-29.md). The flag makes the set one flag to
+type; it promotes nothing, and a run without it is byte-identical to the one before.
+
 ## Windows of 16 rows, and the four-card AMD profile
 
 A verify or batch window held at most 8 rows. On a layer split every group of the pipeline is its own window, so 32 slots ran as
