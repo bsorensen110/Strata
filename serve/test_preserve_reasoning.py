@@ -31,6 +31,17 @@ class PreserveReasoning(unittest.TestCase):
     def render(self, history):
         return self.template.render(history, preserve_thinking=True, preserve_reasoning=True)
 
+    def test_xhigh_and_default_effort_do_not_inject_extra_system_prompt(self):
+        repo_tpl = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        messages = [{"role": "user", "content": "Hello"}]
+        for kw in ({}, {"reasoning_effort": "xhigh"}, {"reasoning_effort": "high"}, {"reasoning_effort": "medium"}):
+            with self.subTest(kw=kw):
+                rendered = repo_tpl.render(messages, **kw)
+                self.assertEqual(rendered, "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n")
+                self.assertNotIn("Reasoning effort is set to", rendered)
+        low_rendered = repo_tpl.render(messages, reasoning_effort="low")
+        self.assertIn("Reasoning effort is set to low.", low_rendered)
+
 
 if __name__ == "__main__":
     unittest.main()
