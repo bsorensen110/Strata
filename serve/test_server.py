@@ -23,7 +23,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
-                          PP_DONE_TAIL, Service,
+                          PP_DONE_TAIL, Service, clean_shared_defaults,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
                           prompt_tokens_seen,
                           request_stats, request_timings, serve, start_failure_hint)
@@ -738,7 +738,7 @@ class LiteralThinkTags(unittest.TestCase):
                 {"role": "assistant", "content": "<think>\nplan: say </x> hello\n</think>\n\nHello, </think> is a tag."},
                 {"role": "user", "content": "again"}]
         ids = self.ids(msgs)
-        self.assertEqual((ids.count(self.open), ids.count(self.close)), (3, 2))   # template's + the inline block's
+        self.assertEqual((ids.count(self.open), ids.count(self.close)), (2, 1))   # inline markers as literal text
         self.assertIn("Hello, </think> is a tag.", self.tok.decode(ids))
 
     def test_the_real_tokenizer_reads_the_tag_as_text(self):
@@ -889,7 +889,7 @@ class EffortAtTheEnd(unittest.TestCase):
         self.assertTrue(text.endswith("<|im_end|>\n<|im_start|>system\nReasoning effort is set to low. Keep your "
                                       "thinking brief and focused, moving directly to the conclusion without "
                                       "unnecessary elaboration.<|im_end|>\n<|im_start|>assistant\n<think>\n"), text[-300:])
-        self.assertIn("Reasoning effort is set to xhigh", text)          # the top stays the default's
+        self.assertNotIn("Reasoning effort is set to xhigh", text)       # no extra xhigh prompt injected at the top
         text = self.tok.decode(self.ids(self.CHAT, True, enable_thinking=False))
         self.assertTrue(text.endswith("<|im_start|>assistant\n<think>\n\n</think>\n\n"))
         self.assertNotIn("<|im_start|>system\nReasoning effort", text[-200:])
@@ -902,8 +902,8 @@ class EffortAtTheEnd(unittest.TestCase):
     def test_changing_the_effort_keeps_the_conversation(self):
         efforts = [{}, {"reasoning_effort": "low"}, {"enable_thinking": False}, {"reasoning_effort": "medium"}, {}]
         history = len(self.checkpoint(self.ids(self.CHAT, False), False))
-        # at the top (the default): another effort differs a few tokens in, and the whole prompt is read again
-        self.assertEqual(self.session([(self.CHAT, kw) for kw in efforts], False, False)[:2], [0, 0])
+        # at the top (the default): low effort differs a few tokens in, while none/medium/default share the clean start
+        self.assertEqual(self.session([(self.CHAT, kw) for kw in efforts], False, False), [0, history, history, history])
         # at the end, with the engine's rule: every request reuses the whole conversation
         self.assertEqual(self.session([(self.CHAT, kw) for kw in efforts], True, True), [history] * 4)
 
@@ -3261,6 +3261,20 @@ class ConfigReasoningEffort(unittest.TestCase):
         svc.config_effort = effort
         svc.shared = shared or {}
         return svc
+
+    def test_template_preserves_reasoning_by_default_and_request_can_override(self):
+        svc = self.svc()
+        svc.template = ChatTemplate(ROOT / "serve/chat_template.jinja")
+        svc.shared = {"preserve_reasoning": True}
+        req = svc.with_shared({"messages": [{"role": "user", "content": "hi"}]}, "openai")
+        self.assertIs(req["chat_template_kwargs"]["preserve_reasoning"], True)
+        overridden = svc.with_shared({"messages": [{"role": "user", "content": "hi"}],
+                                      "chat_template_kwargs": {"preserve_thinking": False}}, "openai")
+        self.assertIs(overridden["chat_template_kwargs"]["preserve_thinking"], False)
+        clean = clean_shared_defaults({"preserve_reasoning": True})
+        self.assertEqual(clean, {"preserve_reasoning": True})
+        with self.assertRaises(ValueError):
+            clean_shared_defaults({"preserve_reasoning": "false"})
 
     def test_default_changes_nothing(self):
         req = {"messages": []}
