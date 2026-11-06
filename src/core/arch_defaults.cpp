@@ -60,6 +60,7 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         t.push_back({"STRATA_SMALL_UNR", "3"});
         t.push_back({"STRATA_GR_Q32_G", "2"});
         t.push_back({"STRATA_GR_Q8_PFS", "1"});
+        t.push_back({"STRATA_MMVF_ROWS", "1"});
         return t;
     }
     if (!strata::kernels::gfx_arch_is_gfx1151(gcn_arch)) return t;

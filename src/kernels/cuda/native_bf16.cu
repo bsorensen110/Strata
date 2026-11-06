@@ -115,13 +115,19 @@ __global__ void bf16_f32_mmvf_kernel(const float* __restrict__ x, const uint16_t
 // the same kernel for up to 8 activation rows - the weight row is read ONCE and every
 // token keeps its own accumulator with exactly the single-row kernel's order (pairs, two ordered FMAs, the same warp
 // and block reductions), so each output is bit-identical to a bf16_f32_mmvf_kernel launch of its own.
-template <int BLOCK_SIZE, int NT, bool EXACT_T = true>
+template <int BLOCK_SIZE, int NT, bool EXACT_T = true, bool AUX = false>
 __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const uint16_t* __restrict__ w,
-                                          float* y_, int64_t ldy, int n_in, int n_tok, int fast) {
+                                          float* y_, int64_t ldy, int n_in, int n_tok, int fast,
+                                          const uint16_t* __restrict__ w_aux = nullptr, float* y_aux = nullptr,
+                                          int64_t ldy_aux = 0) {
     const float* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
     float* STRATA_PDL_RESTRICT y = y_;
     const int t = threadIdx.x;
-    const uint16_t* row = w + (size_t) blockIdx.x * n_in;
+    size_t row_idx = (size_t) blockIdx.x;
+    if constexpr (AUX) {
+        if (blockIdx.x == gridDim.x - 1) { w = w_aux; y = y_aux; ldy = ldy_aux; row_idx = 0; }
+    }
+    const uint16_t* row = w + row_idx * n_in;
     const uint32_t* weights2 = reinterpret_cast<const uint32_t*>(row);
     __shared__ float partials[NT][32];
     if (t < 32) {
@@ -213,7 +219,7 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const u
     if (t == 0)
 #pragma unroll
         for (int k = 0; k < NT; ++k)
-            if (EXACT_T || k < n_tok) y[(size_t) k * ldy + blockIdx.x] = acc[k];
+            if (EXACT_T || k < n_tok) y[(size_t) k * ldy + row_idx] = acc[k];
 }
 
 // S25 (STRATA_MMVF_ROWS=1): RPB output rows per block. Each block read its row's weights once but all T activation
@@ -222,45 +228,83 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const u
 // ordered FMAs and the same warp and block reductions: bit-identical to bf16_f32_mmvf_multi_kernel.
 // S26 STRATA_LFUSE=1 (AUX): one more block computes row 0 of w_aux into y_aux[k * ldy_aux] - the same per-output
 // code, so each aux output is bitwise what its own bf16_f32_mmvf_multi_kernel launch gave (the shared expert's gate)
-template <int BLOCK_SIZE, int NT, int RPB, bool TS = false, bool AUX = false>
+template <int BLOCK_SIZE, int NT, int RPB, bool TS = false, bool AUX = false, bool EXACT_T = true>
 __global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w,
                                           float* __restrict__ y, int64_t ldy, int n_in, int n_out, int n_tok,
                                           const uint16_t* __restrict__ w_aux = nullptr, float* __restrict__ y_aux = nullptr,
                                           int64_t ldy_aux = 0) {
+    constexpr int NW = BLOCK_SIZE / 32;
     const int t = threadIdx.x;
     int o0 = blockIdx.x * RPB;
     if constexpr (AUX) {
         if (blockIdx.x == gridDim.x - 1) { w = w_aux; y = y_aux; ldy = ldy_aux; n_out = 1; o0 = 0; }
     }
-    __shared__ float partials[RPB][NT][32];
-    if constexpr (BLOCK_SIZE > 32) {
-        if (t < 32)
-#pragma unroll
-            for (int r = 0; r < RPB; ++r)
-#pragma unroll
-                for (int k = 0; k < NT; ++k) partials[r][k][t] = 0.0f;
-        __syncthreads();
-    }
+    __shared__ float partials[RPB][NT][NW > 1 ? NW : 1];
     float acc[RPB][NT];
 #pragma unroll
     for (int r = 0; r < RPB; ++r)
 #pragma unroll
         for (int k = 0; k < NT; ++k) acc[r][k] = 0.0f;
-    for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
-        float2 in[NT];
+    if (BLOCK_SIZE == 256 && n_in == 2560 && o0 + RPB <= n_out) {
 #pragma unroll
-        for (int k = 0; k < NT; ++k)
-            if (k < n_tok) in[k] = reinterpret_cast<const float2*>(x + (size_t) k * ldx)[pair];
+        for (int qq = 0; qq < 5; ++qq) {
+            const int pair = t + qq * 256;
+            float2 in[NT];
 #pragma unroll
-        for (int r = 0; r < RPB; ++r) {
-            if (o0 + r >= n_out) break;
-            const uint32_t weight = reinterpret_cast<const uint32_t*>(w + (size_t) (o0 + r) * n_in)[pair];
-            const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
+            for (int k = 0; k < NT; ++k)
+                if (EXACT_T || k < n_tok) in[k] = __ldg(reinterpret_cast<const float2*>(x + (size_t) k * ldx) + pair);
+            uint32_t wv[RPB];
 #pragma unroll
-            for (int k = 0; k < NT; ++k) {
-                if (k < n_tok) {
-                    acc[r][k] = __fmaf_rn(w0, in[k].x, acc[r][k]);
-                    acc[r][k] = __fmaf_rn(w1, in[k].y, acc[r][k]);
+            for (int r = 0; r < RPB; ++r)
+                wv[r] = __ldg(reinterpret_cast<const uint32_t*>(w + (size_t) (o0 + r) * 2560) + pair);
+#pragma unroll
+            for (int r = 0; r < RPB; ++r) {
+                const float w0 = f32_from_bf16((uint16_t) wv[r]), w1 = f32_from_bf16((uint16_t) (wv[r] >> 16));
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    if (EXACT_T || k < n_tok) {
+                        acc[r][k] = __fmaf_rn(w0, in[k].x, acc[r][k]);
+                        acc[r][k] = __fmaf_rn(w1, in[k].y, acc[r][k]);
+                    }
+                }
+            }
+        }
+    } else if (o0 + RPB <= n_out) {
+        for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+            float2 in[NT];
+#pragma unroll
+            for (int k = 0; k < NT; ++k)
+                if (EXACT_T || k < n_tok) in[k] = __ldg(reinterpret_cast<const float2*>(x + (size_t) k * ldx) + pair);
+#pragma unroll
+            for (int r = 0; r < RPB; ++r) {
+                const uint32_t weight = __ldg(reinterpret_cast<const uint32_t*>(w + (size_t) (o0 + r) * n_in) + pair);
+                const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    if (EXACT_T || k < n_tok) {
+                        acc[r][k] = __fmaf_rn(w0, in[k].x, acc[r][k]);
+                        acc[r][k] = __fmaf_rn(w1, in[k].y, acc[r][k]);
+                    }
+                }
+            }
+        }
+    } else {
+        for (int pair = t; pair < n_in / 2; pair += BLOCK_SIZE) {
+            float2 in[NT];
+#pragma unroll
+            for (int k = 0; k < NT; ++k)
+                if (EXACT_T || k < n_tok) in[k] = __ldg(reinterpret_cast<const float2*>(x + (size_t) k * ldx) + pair);
+#pragma unroll
+            for (int r = 0; r < RPB; ++r) {
+                if (o0 + r >= n_out) break;
+                const uint32_t weight = __ldg(reinterpret_cast<const uint32_t*>(w + (size_t) (o0 + r) * n_in) + pair);
+                const float w0 = f32_from_bf16((uint16_t) weight), w1 = f32_from_bf16((uint16_t) (weight >> 16));
+#pragma unroll
+                for (int k = 0; k < NT; ++k) {
+                    if (EXACT_T || k < n_tok) {
+                        acc[r][k] = __fmaf_rn(w0, in[k].x, acc[r][k]);
+                        acc[r][k] = __fmaf_rn(w1, in[k].y, acc[r][k]);
+                    }
                 }
             }
         }
@@ -278,29 +322,39 @@ __global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t l
             __syncthreads();
             if (t >= 32) return;
 #pragma unroll
-            for (int q = 0; q < P; ++q) v[q] = q < V ? partials[q / NT][q % NT][t] : 0.0f;
+            for (int q = 0; q < P; ++q) v[q] = (q < V && t < NW) ? partials[q / NT][q % NT][t] : 0.0f;
             sum = s26ts::tsum<P>(v, lane);
         }
         const int r = j / NT, k = j % NT;
-        if (own && o0 + r < n_out && k < n_tok) y[(size_t) k * ldy + o0 + r] = sum;
+        if (own && o0 + r < n_out && (EXACT_T || k < n_tok)) y[(size_t) k * ldy + o0 + r] = sum;
         return;
     }
 #pragma unroll
     for (int r = 0; r < RPB; ++r)
 #pragma unroll
-        for (int k = 0; k < NT; ++k) acc[r][k] = mmvf_warp_sum(acc[r][k]);
+        for (int k = 0; k < NT; ++k)
+            if (EXACT_T || k < n_tok) acc[r][k] = mmvf_warp_sum(acc[r][k]);
     if constexpr (BLOCK_SIZE > 32) {
-        if ((t & 31) == 0)
+        const int lane = t & 31, wid = t >> 5;
+        if (lane == 0)
 #pragma unroll
             for (int r = 0; r < RPB; ++r)
 #pragma unroll
-                for (int k = 0; k < NT; ++k) partials[r][k][t / 32] = acc[r][k];
+                for (int k = 0; k < NT; ++k)
+                    if (EXACT_T || k < n_tok) partials[r][k][wid] = acc[r][k];
         __syncthreads();
-        if (t < 32)
 #pragma unroll
-            for (int r = 0; r < RPB; ++r)
-#pragma unroll
-                for (int k = 0; k < NT; ++k) acc[r][k] = mmvf_warp_sum(partials[r][k][t]);
+        for (int idx = 0; idx < RPB * NT; ++idx) {
+            if (idx % NW == wid) {
+                const int r = idx / NT, k = idx % NT;
+                if ((EXACT_T || k < n_tok) && o0 + r < n_out) {
+                    const float v = lane < NW ? partials[r][k][lane] : 0.0f;
+                    const float sum = mmvf_warp_sum(v);
+                    if (lane == 0) y[(size_t) k * ldy + o0 + r] = sum;
+                }
+            }
+        }
+        return;
     }
     if (t == 0)
 #pragma unroll
@@ -308,7 +362,23 @@ __global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t l
             if (o0 + r < n_out)
 #pragma unroll
                 for (int k = 0; k < NT; ++k)
-                    if (k < n_tok) y[(size_t) k * ldy + o0 + r] = acc[r][k];
+                    if (EXACT_T || k < n_tok) y[(size_t) k * ldy + o0 + r] = acc[r][k];
+}
+
+template <int B, bool TSV, bool AUX>
+void launch_rows_dispatch(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out,
+                          int n_tok, unsigned grid, cudaStream_t st, const uint16_t* w_aux, float* y_aux, int64_t ldy_aux) {
+    constexpr int RPB = 4;
+    switch (n_tok) {
+        case 1: bf16_f32_mmvf_rows_kernel<B, 1, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 2: bf16_f32_mmvf_rows_kernel<B, 2, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 3: bf16_f32_mmvf_rows_kernel<B, 3, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 4: bf16_f32_mmvf_rows_kernel<B, 4, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 5: bf16_f32_mmvf_rows_kernel<B, 5, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 6: bf16_f32_mmvf_rows_kernel<B, 6, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); break;
+        case 7: bf16_f32_mmvf_rows_kernel<B, 7, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); break;
+        default: bf16_f32_mmvf_rows_kernel<B, 8, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); break;
+    }
 }
 
 template <int B>
@@ -322,20 +392,12 @@ void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64
     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
 #endif
     if (w_aux != nullptr) {   // S26 STRATA_LFUSE: + one aux row block
-#define S26_AUX(TSV) \
-        if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB, TSV, true><<<nb + 1, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); \
-        else bf16_f32_mmvf_rows_kernel<B, 8, RPB, TSV, true><<<nb + 1, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux);
-        if (ts) { S26_AUX(true) } else { S26_AUX(false) }
-#undef S26_AUX
+        if (ts) launch_rows_dispatch<B, true, true>(x, ldx, w, y, ldy, n_in, n_out, n_tok, nb + 1, st, w_aux, y_aux, ldy_aux);
+        else launch_rows_dispatch<B, false, true>(x, ldx, w, y, ldy, n_in, n_out, n_tok, nb + 1, st, w_aux, y_aux, ldy_aux);
         return;
     }
-    if (ts) {
-        if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB, true><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
-        else bf16_f32_mmvf_rows_kernel<B, 8, RPB, true><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
-        return;
-    }
-    if (n_tok <= 4) bf16_f32_mmvf_rows_kernel<B, 4, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
-    else bf16_f32_mmvf_rows_kernel<B, 8, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+    if (ts) launch_rows_dispatch<B, true, false>(x, ldx, w, y, ldy, n_in, n_out, n_tok, nb, st, nullptr, nullptr, 0);
+    else launch_rows_dispatch<B, false, false>(x, ldx, w, y, ldy, n_in, n_out, n_tok, nb, st, nullptr, nullptr, 0);
 }
 
 void mmvf_chk_report() {
@@ -388,27 +450,57 @@ int mmvf_block_size(int64_t n_in) {
     return best;
 }
 
+bool mmvf_rows_on() {
+    static const bool rows = [] {
+        const char* v = std::getenv("STRATA_MMVF_ROWS");
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+        return v == nullptr ? true : (v[0] != '0');
+#else
+        return v != nullptr && v[0] == '1';
+#endif
+    }();
+    return rows;
+}
+
 }  // namespace
 
 bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream) {
-    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
     // exactly the conditions under which both calls would take the rows / multi kernels at the same block size
-    if (!rows || n_out < 64 || n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 || x == nullptr ||
+    if (n_out < 64 || n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || w_aux == nullptr || y_aux == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         return false;
     const cudaStream_t st = (cudaStream_t) stream;
     const int ni = (int) n_in, no = (int) n_out;
-    switch (mmvf_block_size(n_in)) {
-        case 32: launch_rows<32>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 64: launch_rows<64>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 96: launch_rows<96>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 128: launch_rows<128>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 160: launch_rows<160>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 192: launch_rows<192>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        case 224: launch_rows<224>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
-        default: launch_rows<256>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+    if (mmvf_rows_on()) {
+        switch (mmvf_block_size(n_in)) {
+            case 32: launch_rows<32>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+            case 64: launch_rows<64>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+            case 96: launch_rows<96>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+            case 128: launch_rows<128>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+            case 160: launch_rows<160>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+            case 192: launch_rows<192>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+            case 224: launch_rows<224>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+            default: launch_rows<256>(x, ldx, w, y, ldy, ni, no, n_tok, st, w_aux, y_aux, ldy_aux); break;
+        }
+    } else {
+        const dim3 grid((unsigned) (n_out + 1));
+#define STRATA_MMVF_AUX_M(N) case N: \
+        switch (n_tok) { \
+            case 1: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 1, true, true>, grid, dim3(N), 0, st, x, ldx, w, y, ldy, ni, n_tok, mmvf_fast(), w_aux, y_aux, ldy_aux); break; \
+            case 2: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 2, true, true>, grid, dim3(N), 0, st, x, ldx, w, y, ldy, ni, n_tok, mmvf_fast(), w_aux, y_aux, ldy_aux); break; \
+            case 3: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 3, true, true>, grid, dim3(N), 0, st, x, ldx, w, y, ldy, ni, n_tok, mmvf_fast(), w_aux, y_aux, ldy_aux); break; \
+            case 4: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4, true, true>, grid, dim3(N), 0, st, x, ldx, w, y, ldy, ni, n_tok, mmvf_fast(), w_aux, y_aux, ldy_aux); break; \
+            case 5: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 5, true, true>, grid, dim3(N), 0, st, x, ldx, w, y, ldy, ni, n_tok, mmvf_fast(), w_aux, y_aux, ldy_aux); break; \
+            case 6: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 6, true, true>, grid, dim3(N), 0, st, x, ldx, w, y, ldy, ni, n_tok, mmvf_fast(), w_aux, y_aux, ldy_aux); break; \
+            default: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8, false, true>, grid, dim3(N), 0, st, x, ldx, w, y, ldy, ni, n_tok, mmvf_fast(), w_aux, y_aux, ldy_aux); break; \
+        } break
+        switch (mmvf_block_size(n_in)) {
+            STRATA_MMVF_AUX_M(32); STRATA_MMVF_AUX_M(64); STRATA_MMVF_AUX_M(96); STRATA_MMVF_AUX_M(128);
+            STRATA_MMVF_AUX_M(160); STRATA_MMVF_AUX_M(192); STRATA_MMVF_AUX_M(224); STRATA_MMVF_AUX_M(256);
+        }
+#undef STRATA_MMVF_AUX_M
     }
     const cudaError_t result = cudaGetLastError();
     if (result != cudaSuccess)
@@ -418,13 +510,11 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
 
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
-    if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
     if (n_tok < 1 || n_tok > STRATA_VERIFY_MAX_T || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 ||
         x == nullptr || w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows (16 in a wide build), even n_in/ldx, aligned pointers");
     const cudaStream_t st = (cudaStream_t) stream;
-    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
-    if (rows && n_out >= 64 && n_tok <= 8) {   // (the opt-in rows kernels hold 8 columns: a wider window takes the switch below)
+    if (mmvf_rows_on() && n_out >= 64 && n_tok <= 8) {   // (the rows kernels hold 1..8 columns: a wider window takes the switch below)
         const int ni = (int) n_in, no = (int) n_out;
         switch (mmvf_block_size(n_in)) {
             case 32: launch_rows<32>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;
@@ -441,10 +531,11 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
             throw std::runtime_error(std::string("bf16_gemv_fp32_mmvf_multi launch: ") + cudaGetErrorString(result));
         return;
     }
+    if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
     // 9..16 rows (wide builds only): one exact instantiation per row count, each row's dot independent of the others.  7 and 8
     // rows stay with the default case below, the instantiation they always had.
 #if STRATA_VERIFY_MAX_T > 8
-#define STRATA_MMVF_W(N, T) case T: launch_pdl(bf16_f32_mmvf_multi_kernel<N, T, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break;
+#define STRATA_MMVF_W(N, T) case T: launch_pdl(bf16_f32_mmvf_multi_kernel<N, T, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), (const uint16_t*) nullptr, (float*) nullptr, int64_t(0)); break;
 #if STRATA_VERIFY_MAX_T > 12
 #define STRATA_MMVF_W13(N) STRATA_MMVF_W(N, 13) STRATA_MMVF_W(N, 14) STRATA_MMVF_W(N, 15) STRATA_MMVF_W(N, 16)
 #else
@@ -459,13 +550,13 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
 #define STRATA_MMVF_M(N) case N: \
     switch (n_tok) { \
         STRATA_MMVF_WIDE(N) \
-        case 1: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 1, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        case 2: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 2, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        case 3: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 3, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        case 4: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        case 5: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 5, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        case 6: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 6, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
-        default: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8, false>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast()); break; \
+        case 1: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 1, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), (const uint16_t*) nullptr, (float*) nullptr, int64_t(0)); break; \
+        case 2: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 2, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), (const uint16_t*) nullptr, (float*) nullptr, int64_t(0)); break; \
+        case 3: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 3, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), (const uint16_t*) nullptr, (float*) nullptr, int64_t(0)); break; \
+        case 4: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 4, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), (const uint16_t*) nullptr, (float*) nullptr, int64_t(0)); break; \
+        case 5: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 5, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), (const uint16_t*) nullptr, (float*) nullptr, int64_t(0)); break; \
+        case 6: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 6, true>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), (const uint16_t*) nullptr, (float*) nullptr, int64_t(0)); break; \
+        default: launch_pdl(bf16_f32_mmvf_multi_kernel<N, 8, false>, dim3((unsigned) n_out), dim3(N), 0, st, x, ldx, w, y, ldy, (int) n_in, n_tok, mmvf_fast(), (const uint16_t*) nullptr, (float*) nullptr, int64_t(0)); break; \
     } break
     switch (mmvf_block_size(n_in)) {
         STRATA_MMVF_M(32); STRATA_MMVF_M(64); STRATA_MMVF_M(96); STRATA_MMVF_M(128);
@@ -518,9 +609,8 @@ void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64
     // up to 8 rows per launch
     for (int c0 = 0; c0 < ncols; c0 += 8) {
         const int nc = ncols - c0 < 8 ? ncols - c0 : 8;
-        if (nc == 1) bf16_gemv_fp32_mmvf(x + (size_t) c0 * n_in, w, y + (size_t) c0 * n_out, n_in, n_out, stream);
-        else bf16_gemv_fp32_mmvf_multi(x + (size_t) c0 * n_in, n_in, w, y + (size_t) c0 * n_out, n_out, n_in, n_out, nc,
-                                       stream);
+        bf16_gemv_fp32_mmvf_multi(x + (size_t) c0 * n_in, n_in, w, y + (size_t) c0 * n_out, n_out, n_in, n_out, nc,
+                                  stream);
     }
 }
 
