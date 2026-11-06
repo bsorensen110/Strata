@@ -1409,9 +1409,22 @@ bool lm_head_mix(const WeightTable& tables, const ModelGeometry& g, const BlockB
         err = "lm_head: the output_hc_* weights have the wrong engine forms";
         return false;
     }
+    if (wd->hc_q8 != nullptr && wu->hc_q8 != nullptr &&
+        strata::kernels::fused_gr_supported(g.n_embd, g.hc, g.hc_lr)) {
+        strata::kernels::FusedGrArgs fa;
+        fa.R = bb.R; fa.R_out = bb.R; fa.apply = false;
+        fa.w_norm = (const float*) wn->data;
+        fa.w_down = (const uint16_t*) wd->data; fa.w_up = (const uint16_t*) wu->data;
+        fa.q8_down = (const uint8_t*) wd->hc_q8; fa.q8_up = (const uint8_t*) wu->hc_q8;
+        fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.mixed = bb.mixed;
+        strata::kernels::fused_gr_read(fa, stream);
+        return true;
+    }
+    const uint16_t *vd = nullptr, *vu = nullptr;
+    NativeDense::hc_bf16_view_pair(*wd, *wu, stream, vd, vu, 1);
     const strata::kernels::GrShapes gs{g.n_embd, g.hc, g.hc_lr};
-    strata::kernels::gr_read(bb.R, (const float*) wn->data, (const uint16_t*) wd->data,
-                            (const uint16_t*) wu->data, nullptr, RMS_EPS, gs, bb.gr,
+    strata::kernels::gr_read(bb.R, (const float*) wn->data, vd,
+                            vu, nullptr, RMS_EPS, gs, bb.gr,
                             bb.mixed, bb.inject, stream);
     return true;
 }
@@ -1554,13 +1567,16 @@ float* R = bb.R;
     // and 0 is what every caller before this used.
     if (run0) {
 st_begin(layer, 0, stream);
+    const bool q8_0 = fused && w_down[0]->hc_q8 != nullptr && w_up[0]->hc_q8 != nullptr;
     const uint16_t *vd0 = nullptr, *vu0 = nullptr;
-    NativeDense::hc_bf16_view_pair(*w_down[0], *w_up[0], stream, vd0, vu0, 1);
+    if (!q8_0) NativeDense::hc_bf16_view_pair(*w_down[0], *w_up[0], stream, vd0, vu0, 1);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = pending_ffn; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject2;
         fa.w_norm = (const float*) w_norm[0]->data; fa.w_down = vd0;
         fa.w_up = vu0; fa.s_down = w_down[0]->q8_scale; fa.s_up = w_up[0]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[0]->data;
+        fa.q8_down = (const uint8_t*) w_down[0]->hc_q8; fa.q8_up = (const uint8_t*) w_up[0]->hc_q8;
+        fa.q8_inject = (const uint8_t*) w_inject[0]->hc_q8;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {
@@ -1579,13 +1595,16 @@ st_begin(layer, 0, stream);
     // the same contract `block_layer_post` has, and the reason the two are only meaningful in order.
     if (run3) {
 st_begin(layer, 3, stream);
+    const bool q8_1 = fused && w_down[1]->hc_q8 != nullptr && w_up[1]->hc_q8 != nullptr;
     const uint16_t *vd1 = nullptr, *vu1 = nullptr;
-    NativeDense::hc_bf16_view_pair(*w_down[1], *w_up[1], stream, vd1, vu1, 1);
+    if (!q8_1) NativeDense::hc_bf16_view_pair(*w_down[1], *w_up[1], stream, vd1, vu1, 1);
     if (fused) {
         strata::kernels::FusedGrArgs fa;
         fa.R = R; fa.R_out = R; fa.apply = true; fa.bo_prev = bb.block_out; fa.inj_prev = bb.inject;
         fa.w_norm = (const float*) w_norm[1]->data; fa.w_down = vd1;
         fa.w_up = vu1; fa.s_down = w_down[1]->q8_scale; fa.s_up = w_up[1]->q8_scale; fa.w_inject = (const uint16_t*) w_inject[1]->data;
+        fa.q8_down = (const uint8_t*) w_down[1]->hc_q8; fa.q8_up = (const uint8_t*) w_up[1]->hc_q8;
+        fa.q8_inject = (const uint8_t*) w_inject[1]->hc_q8;
         fa.eps = RMS_EPS; fa.lo = bb.gr.lo; fa.rs = bb.gr_rs; fa.inject_out = bb.inject2; fa.mixed = bb.mixed;
         strata::kernels::fused_gr_read(fa, stream);
     } else {

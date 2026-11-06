@@ -139,8 +139,20 @@ __device__ __forceinline__ float dotw(const bool q8, const uint4 w, const float*
     }
     return dot8(w, x);
 }
+__device__ __forceinline__ Bf16x8 unpack8_q8_0(const uint8_t* q8, size_t e) {
+    const uint8_t* blk = q8 + (e >> 5) * 34;
+    const float d = __half2float(__ushort_as_half(*(const uint16_t*) blk));
+    const uint8_t* qs = blk + 2 + (e & 31);
+    const uint32_t q0 = (uint32_t) (*(const uint16_t*) qs) | ((uint32_t) (*(const uint16_t*) (qs + 2)) << 16);
+    const uint32_t q1 = (uint32_t) (*(const uint16_t*) (qs + 4)) | ((uint32_t) (*(const uint16_t*) (qs + 6)) << 16);
+    const float4 a = make_float4(d * (float) (int8_t) (q0 & 255u), d * (float) (int8_t) ((q0 >> 8) & 255u),
+                                 d * (float) (int8_t) ((q0 >> 16) & 255u), d * (float) (int8_t) (q0 >> 24));
+    const float4 b = make_float4(d * (float) (int8_t) (q1 & 255u), d * (float) (int8_t) ((q1 >> 8) & 255u),
+                                 d * (float) (int8_t) ((q1 >> 16) & 255u), d * (float) (int8_t) (q1 >> 24));
+    return {a, b};
+}
 
-template <bool Q8 = false>
+template <bool Q8 = false, bool Q8_0 = false>
 __global__ void __launch_bounds__(THREADS) gr_down_kernel(FusedGrArgs a) {
     __shared__ __align__(16) float xn[D];
     __shared__ float part[WARPS][HC];
@@ -183,13 +195,23 @@ __global__ void __launch_bounds__(THREADS) gr_down_kernel(FusedGrArgs a) {
     // 2. one warp per output row: 10240 bf16 = 1280 chunks of 8, 40 per lane.
     const bool inject_block = blockIdx.x == DOWN_BLOCKS;
     const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
-    if (inject_block && (a.w_inject == nullptr || warp >= HC)) return;
+    if (inject_block && ((a.w_inject == nullptr && a.q8_inject == nullptr) || warp >= HC)) return;
     const uint16_t* wmat = inject_block ? a.w_inject : a.w_down;
+    const uint8_t* q8mat = inject_block ? a.q8_inject : a.q8_down;
     const float* sq = (Q8 && !inject_block) ? a.s_down : nullptr;   // the inject rows stay bf16
     const bool q8 = Q8 && !inject_block;
     float acc = 0.0f;
 #pragma unroll 4
-    for (int j = lane; j < D / 8; j += 32) acc += dotw<Q8>(q8, ldw<Q8>(wmat, sq, (size_t) row * D + (size_t) j * 8), xn + j * 8);
+    for (int j = lane; j < D / 8; j += 32) {
+        const size_t e = (size_t) row * D + (size_t) j * 8;
+        if constexpr (Q8_0) {
+            if (q8mat != nullptr) {
+                acc += dot8u_ptr(unpack8_q8_0(q8mat, e), xn + j * 8);
+                continue;
+            }
+        }
+        acc += dotw<Q8>(q8, ldw<Q8>(wmat, sq, e), xn + j * 8);
+    }
     acc = warp_sum(acc);
     if (lane != 0) return;
     if (inject_block) {
@@ -200,7 +222,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_kernel(FusedGrArgs a) {
     }
 }
 
-template <bool Q8 = false>
+template <bool Q8 = false, bool Q8_0 = false>
 __global__ void __launch_bounds__(THREADS) gr_up_kernel(FusedGrArgs a) {
     __shared__ __align__(16) float lo[LR];
     __shared__ float g[HC][UP_COLS];
@@ -212,9 +234,16 @@ __global__ void __launch_bounds__(THREADS) gr_up_kernel(FusedGrArgs a) {
     for (int r = warp; r < HC * UP_COLS; r += WARPS) {
         const int c = r / UP_COLS, dd = r - c * UP_COLS, i = c * N + d0 + dd;
         const bool q8 = Q8;
-        float acc = dotw<Q8>(q8, ldw<Q8>(a.w_up, a.s_up, (size_t) i * LR + (size_t) lane * 8), lo + lane * 8);
-        if (lane < LR / 8 - 32)
-            acc += dotw<Q8>(q8, ldw<Q8>(a.w_up, a.s_up, (size_t) i * LR + (size_t) (32 + lane) * 8), lo + (32 + lane) * 8);
+        float acc;
+        if constexpr (Q8_0) {
+            acc = dot8u_ptr(unpack8_q8_0(a.q8_up, (size_t) i * LR + (size_t) lane * 8), lo + lane * 8);
+            if (lane < LR / 8 - 32)
+                acc += dot8u_ptr(unpack8_q8_0(a.q8_up, (size_t) i * LR + (size_t) (32 + lane) * 8), lo + (32 + lane) * 8);
+        } else {
+            acc = dotw<Q8>(q8, ldw<Q8>(a.w_up, a.s_up, (size_t) i * LR + (size_t) lane * 8), lo + lane * 8);
+            if (lane < LR / 8 - 32)
+                acc += dotw<Q8>(q8, ldw<Q8>(a.w_up, a.s_up, (size_t) i * LR + (size_t) (32 + lane) * 8), lo + (32 + lane) * 8);
+        }
         acc = warp_sum(acc);
         if (lane == 0) {
             float rv = a.R[i];
@@ -3146,16 +3175,21 @@ bool fused_gr_supported(int64_t n_embd, int64_t hc, int64_t hc_lr) {
 }
 
 void fused_gr_read(const FusedGrArgs& a, void* stream) {
-    if (!a.R || !a.w_norm || !a.w_down || !a.w_up || !a.lo || !a.rs || !a.mixed ||
-        (a.w_inject && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev || !a.R_out)) ||
+    const bool has_bf16 = a.w_down != nullptr && a.w_up != nullptr;
+    const bool has_q8_0 = a.q8_down != nullptr && a.q8_up != nullptr;
+    if (!a.R || !a.w_norm || (!has_bf16 && !has_q8_0) || !a.lo || !a.rs || !a.mixed ||
+        ((a.w_inject || a.q8_inject) && !a.inject_out) || (a.apply && (!a.bo_prev || !a.inj_prev || !a.R_out)) ||
         (a.apply && a.inj_prev == a.inject_out)) {
         std::fprintf(stderr, "fused_gr_read: invalid arguments\n");
         std::exit(1);
     }
     cudaStream_t st = (cudaStream_t) stream;
-    if (a.s_down != nullptr) {   // STRATA_HC_REQ8
-        gr_down_kernel<true><<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(a);
-        gr_up_kernel<true><<<UP_BLOCKS, THREADS, 0, st>>>(a);
+    if (has_q8_0) {   // STRATA_HC_Q8
+        gr_down_kernel<false, true><<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(a);
+        gr_up_kernel<false, true><<<UP_BLOCKS, THREADS, 0, st>>>(a);
+    } else if (a.s_down != nullptr) {   // STRATA_HC_REQ8
+        gr_down_kernel<true, false><<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(a);
+        gr_up_kernel<true, false><<<UP_BLOCKS, THREADS, 0, st>>>(a);
     } else {
         gr_down_kernel<<<DOWN_BLOCKS + 1, THREADS, 0, st>>>(a);
         gr_up_kernel<<<UP_BLOCKS, THREADS, 0, st>>>(a);

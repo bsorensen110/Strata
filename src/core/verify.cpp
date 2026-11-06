@@ -2626,7 +2626,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = h0; t < h0 + HT; ++t) {
                 FusedGrArgs& a = fa[t - h0];
-                a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
+                a.R = Rt(t); a.R_out = Rt(t); a.apply = fuse_head_gr;
+                if (fuse_head_gr) { a.bo_prev = bo_ + t * N; a.inj_prev = inj2_ + t * HC; a.inject_out = head_inj_; }
                 a.w_norm = (const float*) hn->data; a.w_down = (const uint16_t*) hd->data;
                 a.w_up = (const uint16_t*) hu->data; a.w_inject = nullptr;
                 a.q8_down = (const uint8_t*) hd->hc_q8; a.q8_up = (const uint8_t*) hu->hc_q8;

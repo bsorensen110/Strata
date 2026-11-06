@@ -762,6 +762,61 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         check(cudaFree(d_out_0), "free deq out_0");
         check(cudaFree(d_out_1), "free deq out_1");
     }
+    // Single-token fused_gr_read direct Q8_0 (q8_down / q8_up, w_down == nullptr, w_up == nullptr):
+    // For power-of-two FP16 block scales, d * int8 is exact in both BF16 and FP32, so fused_gr_read with
+    // q8_down/q8_up must match fused_gr_read with BF16 w_down/w_up bit-for-bit (both with w_inject and without).
+    {
+        const int64_t n_elems = (int64_t) LR * D;
+        const int64_t nb = n_elems / 32;
+        std::vector<uint8_t> h_qd((size_t) nb * 34), h_qu((size_t) nb * 34);
+        for (int64_t b = 0; b < nb; ++b) {
+            const uint16_t d_pow2 = (b & 1) ? 0x2000u : 0x1C00u; // 2^-7 or 2^-8 (exact in BF16 and FP32)
+            h_qd[(size_t) b * 34 + 0] = (uint8_t) (d_pow2 & 0xFFu);
+            h_qd[(size_t) b * 34 + 1] = (uint8_t) (d_pow2 >> 8);
+            h_qu[(size_t) b * 34 + 0] = (uint8_t) (d_pow2 & 0xFFu);
+            h_qu[(size_t) b * 34 + 1] = (uint8_t) (d_pow2 >> 8);
+            for (int j = 0; j < 32; ++j) {
+                h_qd[(size_t) b * 34 + 2 + j] = (uint8_t) (int8_t) (((b * 19 + j * 7) % 127) - 63);
+                h_qu[(size_t) b * 34 + 2 + j] = (uint8_t) (int8_t) (((b * 11 + j * 23) % 127) - 63);
+            }
+        }
+        uint8_t *d_qd = nullptr, *d_qu = nullptr;
+        uint16_t *d_bd = nullptr, *d_bu = nullptr;
+        check(cudaMalloc(&d_qd, h_qd.size()), "s1 qd");
+        check(cudaMalloc(&d_qu, h_qu.size()), "s1 qu");
+        check(cudaMalloc(&d_bd, (size_t) n_elems * sizeof(uint16_t)), "s1 bd");
+        check(cudaMalloc(&d_bu, (size_t) n_elems * sizeof(uint16_t)), "s1 bu");
+        check(cudaMemcpyAsync(d_qd, h_qd.data(), h_qd.size(), cudaMemcpyHostToDevice, stream), "s1 cp qd");
+        check(cudaMemcpyAsync(d_qu, h_qu.data(), h_qu.size(), cudaMemcpyHostToDevice, stream), "s1 cp qu");
+        strata::kernels::fused_gr_dequant_q8_0_pair(d_qd, d_bd, d_qu, d_bu, nb, stream);
+        int s1bad = 0;
+        for (int mode = 0; mode < 2; ++mode) {
+            FusedGrArgs a_bf16 = args[0];
+            a_bf16.apply = (mode == 0);
+            if (mode == 1) { a_bf16.w_inject = nullptr; a_bf16.inject_out = nullptr; }
+            a_bf16.w_down = d_bd; a_bf16.w_up = d_bu;
+            a_bf16.q8_down = nullptr; a_bf16.q8_up = nullptr;
+            check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "s1 r bf16");
+            fused_gr_read(a_bf16, stream);
+            check(cudaStreamSynchronize(stream), "s1 sync bf16");
+            const Snapshot snap_bf16 = snapshot();
+
+            FusedGrArgs a_q8 = a_bf16;
+            a_q8.w_down = nullptr; a_q8.w_up = nullptr;
+            a_q8.q8_down = d_qd; a_q8.q8_up = d_qu;
+            check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "s1 r q8");
+            fused_gr_read(a_q8, stream);
+            check(cudaStreamSynchronize(stream), "s1 sync q8");
+            const Snapshot snap_q8 = snapshot();
+            if (!same(snap_bf16, snap_q8)) ++s1bad;
+        }
+        std::printf("  fused GR single-token direct Q8_0 (layer + final-mixer forms): %s\n", s1bad ? "FAIL" : "pass");
+        bad += s1bad;
+        check(cudaFree(d_qd), "free s1 qd");
+        check(cudaFree(d_qu), "free s1 qu");
+        check(cudaFree(d_bd), "free s1 bd");
+        check(cudaFree(d_bu), "free s1 bu");
+    }
     std::printf("  fused GR multi max-T=8 LDS launch and changing graph replay %s\n",
                 bad == 0 ? "pass" : "FAIL");
     check(cudaGraphExecDestroy(graph_exec), "multi graph exec destroy");

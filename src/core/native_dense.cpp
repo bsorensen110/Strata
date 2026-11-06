@@ -73,8 +73,8 @@ bool hc_q8_env() {
         const bool g12 = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
                          strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
         (void) cudaGetLastError();
-        if (g12) std::fprintf(stderr, "strata: gfx12 (RDNA4): the hyper-connection projections are read as Q8_0 (quantized at load, "
-                                      "decode faster, answers differ slightly); STRATA_HC_Q8=0 keeps the bf16 read\n");
+        if (g12) std::fprintf(stderr, "strata: gfx12 (RDNA4): the hyper-connection projections are read as Q8_0 (native GGUF Q8_0 when present, "
+                                      "else quantized at load); STRATA_HC_Q8=0 keeps the bf16 read\n");
         return g12;
 #else
         return false;
@@ -450,18 +450,19 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                         err = "native dense (STRATA_HC_Q8) upload " + tensor.name; return false;
                     }
                     ref.hc_q8 = p;
+                    ref.hc_q8_from_gguf = tensor.type == 8;
                     weights_.push_back(p);
                     hc_q8_bytes += bytes;
                 }
         }
         if (hc_q8_env()) {
-            // a bf16 pack stores no Q8_0 copy: quantize the layers' down / up projections. A row the arena kept
-            // (--keep-canonical, a layer split) is quantized on the GPU from the arena's bf16; a skipped row (the
-            // single-GPU default: add_hc_skip) from the pack file on the host, and has no bf16 copy at all. The
-            // inject rows stay bf16 (82 KB), the final mixer stays bf16 (it runs once a window).
+            // a bf16 pack stores no Q8_0 copy: quantize the layers' and final mixer's down / up projections. A row the
+            // arena kept (--keep-canonical, a layer split) is quantized on the GPU from the arena's bf16; a skipped row
+            // (the single-GPU default: add_hc_skip) from the pack file on the host, and has no bf16 copy at all. The
+            // inject rows stay bf16 (82 KB).
             uint64_t made = 0;
             for (auto& [name, ref] : table.table_) {
-                if (ref.hc_q8 != nullptr || name.rfind("blk.", 0) != 0 || !in_range(name) ||
+                if (ref.hc_q8 != nullptr || outside(name) ||
                     !hc_q8_name(name) || !(name.ends_with("_down.weight") || name.ends_with("_up.weight"))) continue;
                 const bool skipped = ref.data == nullptr;
                 if (skipped && ref.resident) continue;
@@ -483,6 +484,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     strata::kernels::fused_gr_quantize_q8_0((const uint16_t*) ref.data, (uint8_t*) p, (int64_t) nb, nullptr);
                 }
                 ref.hc_q8 = p;
+                ref.hc_q8_from_gguf = false;
                 hc_q8_bytes += bytes;
                 allocated += alloc_bytes(bytes);
                 ++made;
@@ -539,9 +541,20 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         scratch_ = scratch.release();
         bytes_ = total + hc_q8_bytes;
         allocated_ = allocated;
-        if (hc_q8_env())
-            std::fprintf(stderr, "strata: STRATA_HC_Q8=1: %.2f GiB of Q8_0 hyper-connection projections for the verify read\n",
-                         (double) hc_q8_bytes / 1073741824.0);
+        if (hc_q8_env()) {
+            uint64_t gguf_q8_bytes = 0, bf16_pack_bytes = 0;
+            for (const auto& [name, ref] : table.table_) {
+                if (!hc_q8_name(name) || ref.hc_q8 == nullptr) continue;
+                const uint64_t bytes = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1;
+                if (ref.hc_q8_from_gguf) gguf_q8_bytes += bytes;
+                else bf16_pack_bytes += bytes;
+            }
+            std::fprintf(stderr,
+                         "strata: STRATA_HC_Q8=1: %.2f GiB native GGUF Q8_0, %.2f GiB quantized from pack "
+                         "hyper-connection projections\n",
+                         (double) gguf_q8_bytes / 1073741824.0,
+                         (double) bf16_pack_bytes / 1073741824.0);
+        }
         return true;
     } catch (const std::exception& error) {
         err = std::string("native dense: ") + error.what();
@@ -557,7 +570,7 @@ bool NativeDense::add_hc_skip(const std::string& pack_dir, std::set<std::string>
     while (std::fgets(line, sizeof line, f)) {
         if (line[0] == '#' || std::sscanf(line, "%255s", name) != 1) continue;
         const std::string n = name;
-        if (n.rfind("blk.", 0) == 0 && hc_q8_name(n) && (n.ends_with("_down.weight") || n.ends_with("_up.weight"))) skip.insert(n);
+        if (hc_q8_name(n) && (n.ends_with("_down.weight") || n.ends_with("_up.weight"))) skip.insert(n);
     }
     std::fclose(f);
     return true;
