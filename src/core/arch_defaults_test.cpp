@@ -159,12 +159,26 @@ int main() {
         for (const auto& kv : t) {
             CHECK(kv.first != "STRATA_Q8_PACKED" && kv.first != "STRATA_SH_STREAM" && kv.first != "STRATA_PF_GEMM" &&
                   kv.first != "STRATA_PF_FUSED");
+            // STRATA_HIP_WMMA stays out of the process-wide env table (hip_wmma_usable resolves kGfx12PromptDefaultsOn per device)
+            CHECK(kv.first != "STRATA_HIP_WMMA");
         }
     }
     CHECK(arch_default_env("gfx12010").empty());
     put("STRATA_GFX12_DEFAULTS", "0");
     CHECK(arch_default_env("gfx1201").empty());
     unset("STRATA_GFX12_DEFAULTS");
+    // apply_arch_defaults("gfx1201") leaves STRATA_HIP_WMMA unset in the process environment so mixed-GPU gfx11 stages
+    // do not inherit STRATA_HIP_WMMA=1 from device 0, while an explicit STRATA_HIP_WMMA value is preserved.
+    // Every gfx12 table entry is cleared first so the count below does not depend on the caller's environment.
+    for (const auto& kv : arch_default_env("gfx1201")) unset(kv.first.c_str());
+    for (const char* k : {"STRATA_GFX12_DEFAULTS", "STRATA_HIP_WMMA"}) unset(k);
+    const auto gfx12_defaults = arch_default_env("gfx1201");
+    CHECK(apply_arch_defaults("gfx1201").size() == gfx12_defaults.size());
+    CHECK(std::getenv("STRATA_HIP_WMMA") == nullptr);
+    put("STRATA_HIP_WMMA", "1");
+    CHECK(apply_arch_defaults("gfx1201").empty());
+    CHECK(std::string(std::getenv("STRATA_HIP_WMMA")) == "1");
+    unset("STRATA_HIP_WMMA");
     // a user's setting wins, whatever it is; the rest are set
     put("STRATA_TSUM", "0");
     unset("STRATA_QFUSE");
