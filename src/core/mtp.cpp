@@ -1264,12 +1264,16 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }
         // #783 PR-c (stuchapin909): a multi-token window routes in two launches (one router GEMV reading the weight once,
         // one top-10 over all rows - each row bitwise the single-token call) and combines in one
-        if (T > 1 && native_router_enabled() && g.n_expert == 512 && K == 10) {
+        if (T >= 1 && native_router_enabled() && g.n_expert == 512 && K == 10) {
             bf16_gemv_fp32_mmvf_multi(mixed_, N, bf16("mlp.gate.weight"), logits_, g.n_expert, (int) N, (int) g.n_expert, T, cs);
-            native_router_top10_multi(logits_, ids_, w_, T, cs);
+            if (T == 1) native_router_top10(logits_, ids_, w_, cs);
+            else native_router_top10_multi(logits_, ids_, w_, T, cs);
+        } else if (T > 1) {
+            bf16_gemv_fp32_mmvf_cols(mixed_, bf16("mlp.gate.weight"), logits_, (int) N, (int) g.n_expert, T, cs);
+            router_top10(logits_, T, (int) g.n_expert, (int) K, ids_, w_, cs);
         } else {
         for (int t = 0; t < T; ++t) {
-            bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
+            bf16_gemv_fp32_mmvf_multi(mixed_ + t * N, N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, g.n_expert, (int) N, (int) g.n_expert, 1, cs);
             if (native_router_enabled() && g.n_expert == 512 && K == 10) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }

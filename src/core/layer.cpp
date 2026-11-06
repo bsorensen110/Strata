@@ -103,7 +103,12 @@ bool native_flash_attn_short = false;
 void project_bf16(const float* x, const uint16_t* x_bf16, const uint16_t* weights, float* out,
                   int64_t n_in, int64_t n_out, bool split, void* stream) {
     using namespace strata::kernels;
-    if (native_bf16_projections) bf16_gemv_fp32_mmvf(x, weights, out, n_in, n_out, stream);
+    if (native_bf16_projections) {
+        if ((n_in & 1) == 0 && n_out >= 64)
+            bf16_gemv_fp32_mmvf_multi(x, n_in, weights, out, n_out, n_in, n_out, 1, stream);
+        else
+            bf16_gemv_fp32_mmvf(x, weights, out, n_in, n_out, stream);
+    }
     else if (split) bf16_gemv_split(x_bf16, weights, out, n_in, n_out, TPR, stream);
     else bf16_gemv(x_bf16, weights, out, n_in, n_out, stream);
 }
@@ -116,8 +121,10 @@ void project_bf16_pair(const float* x, const uint16_t* x_bf16, const uint16_t* w
                        const uint16_t* w2, float* o2, int64_t n_out2, int64_t n_in, bool split, void* stream) {
     using namespace strata::kernels;
     if (native_bf16_projections) {
-        bf16_gemv_fp32_mmvf(x, w1, o1, n_in, n_out1, stream);
-        bf16_gemv_fp32_mmvf(x, w2, o2, n_in, n_out2, stream);
+        if ((n_in & 1) == 0 && n_out1 >= 64) bf16_gemv_fp32_mmvf_multi(x, n_in, w1, o1, n_out1, n_in, n_out1, 1, stream);
+        else bf16_gemv_fp32_mmvf(x, w1, o1, n_in, n_out1, stream);
+        if ((n_in & 1) == 0 && n_out2 >= 64) bf16_gemv_fp32_mmvf_multi(x, n_in, w2, o2, n_out2, n_in, n_out2, 1, stream);
+        else bf16_gemv_fp32_mmvf(x, w2, o2, n_in, n_out2, stream);
     } else if (split || (n_out1 >= 64 && n_out2 >= 64)) {
         bf16_gemv_pair(x_bf16, w1, o1, n_out1, w2, o2, n_out2, n_in, stream);
     } else {
