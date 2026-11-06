@@ -11519,7 +11519,6 @@ int main(int argc, char** argv) {
         }
         if (prefill_head_alias_bound) mtp.set_window_R(ver.final_R_all());
 #if defined(STRATA_HAVE_DFLASH2)
-#if defined(STRATA_HAVE_DFLASH2)
         // DFlash2 prompt taps on a layer split.  Every stage's prompt path taps the requested layers it runs into its own staging and hands them to its
         // on_taps callback (on that stage's thread).  The callback lands the rows in a landing [2048][taps][n_embd] on the drafter's card at their
         // position, and the drafter's context is updated for every position all stages have delivered (in position order, the solo path's per-chunk calls).
@@ -11597,7 +11596,6 @@ int main(int argc, char** argv) {
             for (auto& r : dland.reached) r = -1;
             for (int k = 0; k < n_stages; ++k) df2_stage_prefill(k).set_taps(df2.tap_layers(), first, 2048);
         };
-#endif
         if (use_df2) {   // DFlash2 in the serve loop: one card or a layer split (taps gathered onto the drafter's card), one request at a time
             std::string why_not;
             df2.set_max_drafts((o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec) - 1);   // the widest window - 1: the head and the walk run for that many rows
@@ -11700,7 +11698,6 @@ int main(int argc, char** argv) {
             split_drive.plan[st] = stage_ver(st).plan_sink();
             if (st > 0) {
                 stage_ver(st).set_split(o.spec_split);
-                stage_ver(st).set_pcie_mode(eff_pcie_mode);
             }
         }
         if (pipe) {   // the odd windows' pool routing: the same as the even ones', with their plans
@@ -11708,7 +11705,6 @@ int main(int argc, char** argv) {
             for (int st = 0; st < n_stages; ++st) {
                 split_drive_b.plan[st] = stage_ver_p(st, 1).plan_sink();
                 stage_ver_p(st, 1).set_split(o.spec_split);
-                stage_ver_p(st, 1).set_pcie_mode(eff_pcie_mode);
             }
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
@@ -11717,11 +11713,6 @@ int main(int argc, char** argv) {
         void* const win_pool_user = n_stages > 1 ? (void*) &split_drive : (void*) &drive;
         mem_mark("the verifier and the drafter's binding");
         ver.set_split(o.spec_split);
-        // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
-        // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
-        // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
-        // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
-        ver.set_pcie_mode(eff_pcie_mode);
         // --pipeline-windows 2: stage 0's GDN state before a speculative commit, restored when the guess was wrong.
         // Window W reads the state its snapshot must hold and no window writes it (only commits do), so it is copied
         // on a side stream while W runs, into the buffer of W's parity, and only W's speculative commit waits for it
@@ -20416,11 +20407,6 @@ int main(int argc, char** argv) {
         ver.set_sampling(sp);   // the CLI's own sampling (until 0.1.19 this loop was always greedy); no penalties here
         if (use_mtp) mtp.set_draft_sampling(sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
         ver.set_split(o.spec_split);
-        // auto: the copy kernel for every pack.  DMA (the native packs' default until 0.1.13) has the host call
-        // cudaMemcpyAsync + cudaLaunchHostFunc inside a verify window while the GPU spins on the flag they raise;
-        // issue #31's thread dumps show the host stuck in that cudaMemcpyAsync on a driver lock for good.  The copy
-        // kernel needs no host CUDA call there, and costs ~1-3% decode on IQ3_S (45.3 -> 44.8 tok/s, 8 requests).
-        ver.set_pcie_mode(eff_pcie_mode_cli);
         drive.d.plan = ver.plan_sink();
         drive.d.pcie_num = (int) (o.pcie_frac * 256.0 + 0.5);
         if (drive.d.pcie_num < 0) drive.d.pcie_num = 0;

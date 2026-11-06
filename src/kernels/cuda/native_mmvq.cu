@@ -1421,7 +1421,8 @@ __global__ void native_mmvq_multi_kernel(const typename F::Block* __restrict__ w
     const Q81Block* STRATA_PDL_RESTRICT x = x_;   // __restrict__ below sm_70 only (pdl.hpp, #1469)
     float* STRATA_PDL_RESTRICT y = y_;
     constexpr int BPI = F::BPI * NW / WARPS;           // blocks per iteration scale with the warp count
-    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);    if constexpr (NCOLS == 1) {
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    if constexpr (NCOLS == 1) {
         const unsigned pad_blocks = (unsigned(n_out) + ROWS - 1) / ROWS;
         if (blockIdx.x >= pad_blocks * (PAIR ? 2u : 1u)) return;   // grid_pad's empty blocks
     }

@@ -7402,9 +7402,12 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                     core::WeightRef wd_q8, wu_q8;
                     if (!wd->data && wd->hc_q8 && !wu->data && wu->hc_q8) {
                         wd_q8 = *wd; wu_q8 = *wu;
-                        wd_q8.data = core::NativeDense::hc_bf16_view(*wd, cs, 0, 0);
-                        wu_q8.data = core::NativeDense::hc_bf16_view(*wu, cs, 1, 0);
-                        if (!wd_q8.data || !wu_q8.data) { err = "prefill: the Q8_0 hyper-connection projections could not be dequantized"; return false; }
+                        const uint16_t *vd = nullptr, *vu = nullptr;
+                        if (!core::NativeDense::hc_bf16_view_pair(*wd, *wu, cs, vd, vu, 0)) {
+                            err = "prefill: the Q8_0 hyper-connection projections could not be dequantized";
+                            return false;
+                        }
+                        wd_q8.data = vd; wu_q8.data = vu;
                         wd = &wd_q8; wu = &wu_q8;
                     }
                     // the stream is not optional: under STRATA_HC_REQ8 bf16_proj expands the int8 codes into one static
@@ -7421,8 +7424,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                     else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h,
                                   m.mixed_bf_lo);
                     if (wd_q8.data) {   // the HC GEMMs that read the scratch are enqueued: the next user waits for them
-                        core::NativeDense::hc_bf16_release(cs, 0, 0);
-                        core::NativeDense::hc_bf16_release(cs, 1, 0);
+                        core::NativeDense::hc_bf16_release_pair(cs, 0);
                     }
                     if (half == 0 && !core::is_qsa_layer(g, l)) {
                         // ======================= GDN (run_impl's) =======================
