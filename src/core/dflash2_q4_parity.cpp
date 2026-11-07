@@ -106,24 +106,24 @@ int main() {
             strata::kernels::df2_q4_tile(tmp, dev_w[m], dev_w[m] + (size_t) n_out * n_in / 2, n_in, (int64_t) n_out * nb, nullptr);
             cudaDeviceSynchronize();
             cudaFree(tmp);
-            cudaMalloc((void**) &dev_y[m], (size_t) 8 * n_out * 4);
+            cudaMalloc((void**) &dev_y[m], (size_t) 32 * n_out * 4);
         }
-        std::vector<float> x((size_t) 8 * n_in);
+        std::vector<float> x((size_t) 32 * n_in);
         for (float& v : x) v = nd(rng) * 4.0f;
         float* dx;
         int8_t* dxq;
         float* dxd;
         cudaMalloc((void**) &dx, x.size() * 4);
-        cudaMalloc((void**) &dxq, (size_t) 8 * n_in + 4096);
-        cudaMalloc((void**) &dxd, (size_t) 8 * nb * 4 + 64);
+        cudaMalloc((void**) &dxq, (size_t) 32 * n_in + 4096);
+        cudaMalloc((void**) &dxd, (size_t) 32 * nb * 4 + 64);
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
-        strata::kernels::df2_quant_rows(dx, n_in, 8, dxq, dxd, nullptr);
+        strata::kernels::df2_quant_rows(dx, n_in, 32, dxq, dxd, nullptr);
         cudaDeviceSynchronize();
-        std::vector<int8_t> xq((size_t) 8 * n_in);
-        std::vector<float> xd((size_t) 8 * nb);
+        std::vector<int8_t> xq((size_t) 32 * n_in);
+        std::vector<float> xd((size_t) 32 * nb);
         cudaMemcpy(xq.data(), dxq, xq.size(), cudaMemcpyDeviceToHost);
         cudaMemcpy(xd.data(), dxd, xd.size() * 4, cudaMemcpyDeviceToHost);
-        for (int ncols : {1, 2, 3, 5, 8}) {
+        for (int ncols : {1, 2, 3, 5, 8, 12, 16, 24}) {
             strata::kernels::Df2Mat mats[3];
             for (int m = 0; m < nm; ++m) mats[m] = strata::kernels::Df2Mat{dev_w[m], dev_y[m], cs.n_out[m], true};
             strata::kernels::df2_gemm(mats, nm, dxq, dxd, n_in, ncols, nullptr);
@@ -131,7 +131,7 @@ int main() {
             double worst = 0, big = 0;
             for (int m = 0; m < nm; ++m) {
                 const int n_out = cs.n_out[m];
-                std::vector<float> y((size_t) 8 * n_out);
+                std::vector<float> y((size_t) ncols * n_out);
                 cudaMemcpy(y.data(), dev_y[m], y.size() * 4, cudaMemcpyDeviceToHost);
                 for (int c = 0; c < ncols; ++c)
                     for (int r = 0; r < n_out; ++r) {
@@ -185,26 +185,26 @@ int main() {
         cudaMemcpy(raw_q8, q8_blocks.data(), q8_blocks.size(), cudaMemcpyHostToDevice);
         strata::kernels::df2_q8_tile(raw_q8, tiled_q8, tiled_q8 + wq.size(), n_in, (int64_t) n_out * nb, nullptr);
         cudaFree(raw_q8);
-        std::vector<float> x((size_t) 8 * n_in);
+        std::vector<float> x((size_t) 32 * n_in);
         for (float& v : x) v = nd(rng) * 4.0f;
         float *dx, *dxd, *dy;
         int8_t* dxq;
         cudaMalloc((void**) &dx, x.size() * 4);
-        cudaMalloc((void**) &dxq, (size_t) 8 * n_in + 4096);
-        cudaMalloc((void**) &dxd, (size_t) 8 * nb * 4 + 64);
-        cudaMalloc((void**) &dy, (size_t) 8 * n_out * 4);
+        cudaMalloc((void**) &dxq, (size_t) 32 * n_in + 4096);
+        cudaMalloc((void**) &dxd, (size_t) 32 * nb * 4 + 64);
+        cudaMalloc((void**) &dy, (size_t) 32 * n_out * 4);
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
-        strata::kernels::df2_quant_rows(dx, n_in, 8, dxq, dxd, nullptr);
+        strata::kernels::df2_quant_rows(dx, n_in, 32, dxq, dxd, nullptr);
         cudaDeviceSynchronize();
-        std::vector<int8_t> xq((size_t) 8 * n_in);
-        std::vector<float> xd((size_t) 8 * nb);
+        std::vector<int8_t> xq((size_t) 32 * n_in);
+        std::vector<float> xd((size_t) 32 * nb);
         cudaMemcpy(xq.data(), dxq, xq.size(), cudaMemcpyDeviceToHost);
         cudaMemcpy(xd.data(), dxd, xd.size() * 4, cudaMemcpyDeviceToHost);
-        for (int ncols : {1, 2, 3, 5, 8}) {
+        for (int ncols : {1, 2, 3, 5, 8, 12, 16, 24}) {
             strata::kernels::Df2Mat mat{tiled_q8, dy, n_out, false};
             strata::kernels::df2_gemm(&mat, 1, dxq, dxd, n_in, ncols, nullptr);
             cudaDeviceSynchronize();
-            std::vector<float> y((size_t) 8 * n_out);
+            std::vector<float> y((size_t) ncols * n_out);
             cudaMemcpy(y.data(), dy, y.size() * 4, cudaMemcpyDeviceToHost);
             double worst = 0, big = 0;
             for (int c = 0; c < ncols; ++c)

@@ -33,7 +33,7 @@ struct QsaAttnPools {
 };
 
 /// Batch windows: every query's own K/V pools - query z reads p[z] (z < n).  n = 0: the call's one `pools`.
-inline constexpr int kAttnRowsMax = 8;
+inline constexpr int kAttnRowsMax = 16;
 struct QsaAttnPoolsRows {
     QsaAttnPools p[kAttnRowsMax];
     int n = 0;

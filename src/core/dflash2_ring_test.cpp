@@ -12,6 +12,8 @@
 //   5 evicted    : a stash too small to keep A: the resume is cold (missing rows reported, *cold set)
 // Exit 0 when every assertion holds.
 #include "strata/core/dflash2.hpp"
+#include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -216,6 +218,109 @@ int main(int argc, char** argv) {
         d.begin_request(ids.data(), N, P, &cold);
         std::printf("    stash hits %lld, rebuilt %lld, missing %lld, cold %d\n", (long long) d.ring_stats.stash_hits, (long long) d.last_rebuilt, (long long) d.last_missing, (int) cold);
         check(cold && d.last_missing > 0 && d.last_rebuilt == 0, "no log of the lineage: cold, the missing rows are reported");
+    }
+    {   // ---- 6 batch_body vs single-slot draft parity
+        std::printf("6 batch_body (2 slots, n_new=(5, 8) and (8, 3), STRATA_DF2_BATCHBODY=1 vs single-slot draft)\n");
+        Dflash2Drafter d, sl0, sl1, ref0, ref1;
+        if (!fresh(d)) return 2;
+        const int n_vocab = 256;
+        std::vector<uint8_t> h_head((size_t) n_vocab * (2560 / 32) * 34, 0);
+        for (int r = 0; r < n_vocab; ++r) {
+            for (int b = 0; b < 2560 / 32; ++b) {
+                uint8_t* blk = &h_head[((size_t) r * (2560 / 32) + b) * 34];
+                blk[0] = 0x00; blk[1] = 0x30;   // small fp16 scale
+                for (int i = 0; i < 32; ++i)
+                    blk[2 + i] = (uint8_t) (int8_t) (((r * 131 + b * 17 + i * 7) % 63) - 31);
+            }
+        }
+        uint8_t* d_head = nullptr;
+        cudaMalloc((void**) &d_head, h_head.size());
+        cudaMemcpy(d_head, h_head.data(), h_head.size(), cudaMemcpyHostToDevice);
+        const int n_emb = std::max(60000, d.mask_token() + 16);
+        std::vector<float> h_emb((size_t) n_emb * 2560);
+        for (size_t i = 0; i < h_emb.size(); ++i)
+            h_emb[i] = 0.01f * (float) (((i * 31 + 13) % 101) - 50);
+        float* d_emb = nullptr;
+        cudaMalloc((void**) &d_emb, h_emb.size() * 4);
+        cudaMemcpy(d_emb, h_emb.data(), h_emb.size() * 4, cudaMemcpyHostToDevice);
+        std::vector<int32_t> vocab(n_vocab);
+        for (int i = 0; i < n_vocab; ++i) vocab[i] = i;
+        auto embed_fn = [d_emb](const int32_t* tok, int n, float* out, cudaStream_t cs) {
+            strata::kernels::gather_rows((const uint8_t*) d_emb, 2560 * 4, tok, n, (uint8_t*) out, cs);
+        };
+        if (!sl0.clone_alloc(d, err) || !sl1.clone_alloc(d, err) ||
+            !ref0.clone_alloc(d, err) || !ref1.clone_alloc(d, err)) {
+            std::printf("clone_alloc: %s\n", err.c_str());
+            return 2;
+        }
+        if (!d.bind_raw(embed_fn, d_head, 8, n_vocab, vocab, err)) {
+            std::printf("bind_raw: %s\n", err.c_str());
+            return 2;
+        }
+        if (!sl0.clone_bind(d, err) || !sl1.clone_bind(d, err) ||
+            !ref0.clone_bind(d, err) || !ref1.clone_bind(d, err)) {
+            std::printf("clone_bind: %s\n", err.c_str());
+            return 2;
+        }
+        float *taps0 = nullptr, *taps1 = nullptr;
+        cudaMalloc((void**) &taps0, (size_t) 16 * kTap * 4);
+        cudaMalloc((void**) &taps1, (size_t) 16 * kTap * 4);
+        if (!feed(sl0, dev, 1, 0, 256, err) || !feed(ref0, dev, 1, 0, 256, err) ||
+            !feed(sl1, dev, 2, 0, 192, err) || !feed(ref1, dev, 2, 0, 192, err)) {
+            std::printf("feed: %s\n", err.c_str());
+            return 2;
+        }
+        bool tok_ok = true, ring_ok = true;
+        const int n0_cases[2] = {5, 8};
+        const int n1_cases[2] = {8, 3};
+        int64_t pos0 = 256, pos1 = 192;
+        for (int c = 0; c < 2; ++c) {
+            const int n0 = n0_cases[c], n1 = n1_cases[c];
+            std::vector<float> h0((size_t) n0 * kTap), h1((size_t) n1 * kTap);
+            for (int r = 0; r < n0; ++r)
+                for (int i = 0; i < kTap; ++i) h0[(size_t) r * kTap + i] = tap_value(1, pos0 + r, i);
+            for (int r = 0; r < n1; ++r)
+                for (int i = 0; i < kTap; ++i) h1[(size_t) r * kTap + i] = tap_value(2, pos1 + r, i);
+            cudaMemcpy(taps0, h0.data(), h0.size() * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(taps1, h1.data(), h1.size() * 4, cudaMemcpyHostToDevice);
+            int32_t r_tok0[8] = {}, r_tok1[8] = {}, b_tok0[8] = {}, b_tok1[8] = {};
+            float r_prob0[8] = {}, r_prob1[8] = {}, b_prob0[8] = {}, b_prob1[8] = {};
+            if (!ref0.draft(taps0, n0, pos0, 17 + c, r_tok0, r_prob0, err) ||
+                !ref1.draft(taps1, n1, pos1, 42 + c, r_tok1, r_prob1, err)) {
+                std::printf("ref draft: %s\n", err.c_str());
+                return 2;
+            }
+            Dflash2Drafter::BatchSlotItem items[2] = {
+                {&sl0, taps0, n0, pos0, 17 + c, 7, b_tok0, b_prob0},
+                {&sl1, taps1, n1, pos1, 42 + c, 7, b_tok1, b_prob1},
+            };
+            if (!d.draft_batch_slots_launch(items, 2, err) ||
+                !d.draft_batch_slots_finish(items, 2, err)) {
+                std::printf("batch draft: %s\n", err.c_str());
+                return 2;
+            }
+            for (int i = 0; i < 7; ++i) {
+                if (r_tok0[i] != b_tok0[i] || r_tok1[i] != b_tok1[i] ||
+                    std::fabs(r_prob0[i] - b_prob0[i]) > 1e-5f ||
+                    std::fabs(r_prob1[i] - b_prob1[i]) > 1e-5f) {
+                    std::printf("    case %d i=%d: sl0 ref=(%d,%.6f) bat=(%d,%.6f) | sl1 ref=(%d,%.6f) bat=(%d,%.6f)\n",
+                                c, i, r_tok0[i], r_prob0[i], b_tok0[i], b_prob0[i], r_tok1[i], r_prob1[i], b_tok1[i], b_prob1[i]);
+                    tok_ok = false;
+                }
+            }
+            pos0 += n0;
+            pos1 += n1;
+        }
+        std::vector<float> r_ring0, r_ring1;
+        std::vector<int64_t> r_tag0, r_tag1;
+        ref0.debug_ring(r_ring0, r_tag0, err);
+        ref1.debug_ring(r_ring1, r_tag1, err);
+        int wt0 = 0, wt1 = 0;
+        if (count_bad(sl0, r_ring0, 0, pos0, &wt0) != 0 || count_bad(sl1, r_ring1, 0, pos1, &wt1) != 0)
+            ring_ok = false;
+        check(tok_ok, "batch_body 2-slot draft tokens and probs match single-slot draft()");
+        check(ring_ok, "batch_body 2-slot K/V rings match single-slot draft() bitwise");
+        cudaFree(taps0); cudaFree(taps1); cudaFree(d_head); cudaFree(d_emb);
     }
     std::printf(g_fail == 0 ? "dflash2_ring_test: ok\n" : "dflash2_ring_test: FAILED\n");
     return g_fail == 0 ? 0 : 1;

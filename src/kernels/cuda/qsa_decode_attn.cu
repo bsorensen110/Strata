@@ -327,7 +327,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_slots_kernel(const float* 
 }
 
 // Batch windows: query blockIdx.z attends over its own slot's pools (rows.p[z]); the default kernel otherwise.
-template <int KV_MODE>
+template <int KV_MODE, bool LANE_CELL>
 __global__ void __launch_bounds__(THREADS) attn_chunk_rows_kernel(const float* __restrict__ q, QsaAttnPoolsRows rows,
                                                                   const int32_t* __restrict__ ids,
                                                                   const int32_t* __restrict__ step, int n_kv_heads,
@@ -336,8 +336,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_rows_kernel(const float* _
                                                                   float* __restrict__ part_m,
                                                                   float* __restrict__ part_l, int n_chunks, int cap,
                                                                   long long scratch_stride) {
-    attn_chunk_body<KV_MODE, false, false, false>(q, rows.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale,
-                                                  part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
+    attn_chunk_body<KV_MODE, LANE_CELL, false, false>(q, rows.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale,
+                                                      part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
 }
 
 #if !defined(__HIPCC__)
@@ -1379,12 +1379,12 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
     cudaStream_t st = (cudaStream_t) stream;
-    // The plain kernel is what qsa_decode_attn_batch runs unless one of its variants is on (lane-cell scoring, the
+    // The plain or lane-cell kernel is what qsa_decode_attn_batch runs unless one of its other variants is on (the
     // pre-sm_75 / gfx103x kernel, the gfx906 swizzle): there each row goes through that call, one launch per row.
-    static const bool lane_cell_rows = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
-    bool per_row = lane_cell_rows;
+    const bool lane_cell = lane_cell_attn();
+    bool per_row = false;
 #if defined(STRATA_ATTN_PRE75_BUILT)
-    per_row = per_row || pre75_attn();
+    per_row = per_row || (!lane_cell && pre75_attn());
 #endif
 #if defined(STRATA_HIP_GFX906)
     per_row = true;
@@ -1396,12 +1396,19 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
                                   attn + (size_t) r * s.n_head * HD, 1, stream);
         return;
     }
-#define STRATA_ATTN_ROWS(M) attn_chunk_rows_kernel<M><<<grid, THREADS, 0, st>>>(q, rows, ids, steps, (int) s.n_head_kv, \
+#define STRATA_ATTN_ROWS(M, LC) attn_chunk_rows_kernel<M, LC><<<grid, THREADS, 0, st>>>(q, rows, ids, steps, (int) s.n_head_kv, \
         (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride)
-    if (kv_mode == 3) STRATA_ATTN_ROWS(3);
-    else if (kv_mode == 2) STRATA_ATTN_ROWS(2);
-    else if (kv_mode == 1) STRATA_ATTN_ROWS(1);
-    else STRATA_ATTN_ROWS(0);
+    if (lane_cell) {
+        if (kv_mode == 3) STRATA_ATTN_ROWS(3, true);
+        else if (kv_mode == 2) STRATA_ATTN_ROWS(2, true);
+        else if (kv_mode == 1) STRATA_ATTN_ROWS(1, true);
+        else STRATA_ATTN_ROWS(0, true);
+    } else {
+        if (kv_mode == 3) STRATA_ATTN_ROWS(3, false);
+        else if (kv_mode == 2) STRATA_ATTN_ROWS(2, false);
+        else if (kv_mode == 1) STRATA_ATTN_ROWS(1, false);
+        else STRATA_ATTN_ROWS(0, false);
+    }
 #undef STRATA_ATTN_ROWS
     launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, steps, attn, stride, (unsigned) s.n_head,
                  (unsigned) n_q, st);

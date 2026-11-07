@@ -862,11 +862,17 @@ bool Verifier::gather_taps_host(float* dst, int row0, int rows, std::string& err
             int slot0 = 0;
             for (int l : tap_req_) if (l >= 0 && l < g_->n_layers - 1 && l < v->lb_) ++slot0;
             const int64_t nv = (int64_t) v->tap_layers_.size();
-            for (int r = 0; r < rows; ++r) {
-                const cudaError_t ce = cudaMemcpyAsync(dst + ((size_t) r * (size_t) nt_all + (size_t) slot0) * (size_t) N,
-                                                       v->tap_dev_ + (size_t) (row0 + r) * (size_t) (nv * N), (size_t) (nv * N) * 4,
-                                                       cudaMemcpyDeviceToHost, v->tap_cs_);
+            if (nv == nt_all) {
+                const cudaError_t ce = cudaMemcpyAsync(dst, v->tap_dev_ + (size_t) row0 * (size_t) (nv * N),
+                                                       (size_t) rows * (size_t) (nv * N) * 4, cudaMemcpyDeviceToHost, v->tap_cs_);
                 if (ce != cudaSuccess) { err = std::string("verify: the tap gather to the host: ") + cudaGetErrorString(ce); return false; }
+            } else {
+                for (int r = 0; r < rows; ++r) {
+                    const cudaError_t ce = cudaMemcpyAsync(dst + ((size_t) r * (size_t) nt_all + (size_t) slot0) * (size_t) N,
+                                                           v->tap_dev_ + (size_t) (row0 + r) * (size_t) (nv * N), (size_t) (nv * N) * 4,
+                                                           cudaMemcpyDeviceToHost, v->tap_cs_);
+                    if (ce != cudaSuccess) { err = std::string("verify: the tap gather to the host: ") + cudaGetErrorString(ce); return false; }
+                }
             }
             if (cudaStreamSynchronize(v->tap_cs_) != cudaSuccess) { err = "verify: the tap gather to the host did not finish"; return false; }
         }
@@ -891,13 +897,23 @@ bool Verifier::gather_taps(float* landing, int landing_device, int row0, int row
             int slot0 = 0;
             for (int l : tap_req_) if (l >= 0 && l < g_->n_layers - 1 && l < v->lb_) ++slot0;
             const int64_t nv = (int64_t) v->tap_layers_.size();
-            for (int r = 0; r < rows; ++r) {
-                const float* src = v->tap_dev_ + (size_t) (row0 + r) * (size_t) (nv * N);
-                float* dst = landing + ((size_t) (dst_row0 + r) * (size_t) nt_all + (size_t) slot0) * (size_t) N;
+            if (nv == nt_all) {
+                const float* src = v->tap_dev_ + (size_t) row0 * (size_t) (nv * N);
+                float* dst = landing + (size_t) dst_row0 * (size_t) (nv * N);
+                const size_t bytes = (size_t) rows * (size_t) (nv * N) * 4;
                 const cudaError_t ce = v->device_ == landing_device
-                    ? cudaMemcpyAsync(dst, src, (size_t) (nv * N) * 4, cudaMemcpyDeviceToDevice, v->tap_cs_)
-                    : cudaMemcpyPeerAsync(dst, landing_device, src, v->device_, (size_t) (nv * N) * 4, v->tap_cs_);
+                    ? cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, v->tap_cs_)
+                    : cudaMemcpyPeerAsync(dst, landing_device, src, v->device_, bytes, v->tap_cs_);
                 if (ce != cudaSuccess) { err = std::string("verify: the tap gather copy: ") + cudaGetErrorString(ce); return false; }
+            } else {
+                for (int r = 0; r < rows; ++r) {
+                    const float* src = v->tap_dev_ + (size_t) (row0 + r) * (size_t) (nv * N);
+                    float* dst = landing + ((size_t) (dst_row0 + r) * (size_t) nt_all + (size_t) slot0) * (size_t) N;
+                    const cudaError_t ce = v->device_ == landing_device
+                        ? cudaMemcpyAsync(dst, src, (size_t) (nv * N) * 4, cudaMemcpyDeviceToDevice, v->tap_cs_)
+                        : cudaMemcpyPeerAsync(dst, landing_device, src, v->device_, (size_t) (nv * N) * 4, v->tap_cs_);
+                    if (ce != cudaSuccess) { err = std::string("verify: the tap gather copy: ") + cudaGetErrorString(ce); return false; }
+                }
             }
             if (cudaEventRecord(v->tap_ev_, v->tap_cs_) != cudaSuccess) { err = "verify: the tap gather event"; return false; }
             const OnDevice on_dst(landing_device);
@@ -1808,7 +1824,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
                 const bool gdn_groups_on = g_batch_gdn_groups;   // STRATA_BATCH_GDN_GROUPS=1 (default on HIP), all slots in one launch
-                if (batch_rec_ && gdn_groups_on && te - tb <= 8) {
+                int n_gdn_groups = 0;
+                if (batch_rec_ && gdn_groups_on) {
+                    for (int t = tb; t < te;) {
+                        const int first = t;
+                        while (t < te && brow_[t] == brow_[first]) ++t;
+                        ++n_gdn_groups;
+                    }
+                }
+                if (batch_rec_ && gdn_groups_on && n_gdn_groups >= 1 && n_gdn_groups <= 8) {
                     strata::kernels::GdnGroups gg;
                     for (int t = tb; t < te;) {
                         const int first = t;
@@ -2119,17 +2143,24 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
                 if (rows_ok) {
                     const int n_rows = te - tb;
-                    strata::kernels::QsaScoreRows sr;
+                    for (int s0 = tb; s0 < te; s0 += 8) {
+                        const int s1 = std::min(te, s0 + 8);
+                        strata::kernels::QsaScoreRows sr;
+                        sr.n = s1 - s0;
+                        for (int t = s0; t < s1; ++t) {
+                            const QsaState& sx = slot_ss(t).qsa_states[qi];
+                            sr.pooled[t - s0] = sx.idx_pooled;
+                            sr.dead[t - s0] = sx.idx_dead;
+                        }
+                        qsa_block_scores_rows(sr, qidx_ + s0 * IQ * ID, step_ + s0 * kStepCount, sr.n, max_blocks_, s,
+                                              scores_ + (size_t) s0 * max_blocks_, cs);
+                    }
                     strata::kernels::QsaAttnPoolsRows pr;
-                    sr.n = pr.n = n_rows;
+                    pr.n = n_rows;
                     for (int t = tb; t < te; ++t) {
                         const QsaState& sx = slot_ss(t).qsa_states[qi];
-                        sr.pooled[t - tb] = sx.idx_pooled;
-                        sr.dead[t - tb] = sx.idx_dead;
                         pr.p[t - tb] = qsa_attn_pools(sx);
                     }
-                    qsa_block_scores_rows(sr, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n_rows, max_blocks_, s,
-                                          scores_ + (size_t) tb * max_blocks_, cs);
                     qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n_rows, max_blocks_, cap_,
                                    s, sel_ + (size_t) tb * cap_, cs);
                     for (int t = tb; t < te;) {

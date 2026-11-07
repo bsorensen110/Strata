@@ -215,11 +215,13 @@ private:
     const float* f32(const std::string& name) const { return reinterpret_cast<const float*>(blob_ + find(name).off); }
     /// planar Q8 matrices (1..3 of them, same input width) times the planar activations in xqp_ / xdp_ (ncols columns)
     void gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd);
-    bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope = true);
+    bool record_context(const float* taps, int n, cudaStream_t cs, std::string& err, bool rope = true, int log_off = 0);
     bool record_block_body(cudaStream_t cs, std::string& err, bool rope = true);
     bool record_block(cudaStream_t cs, std::string& err, bool rope = true);
+    bool record_batch_body(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err);
     bool capture(int n, const float* taps, std::string& err);
     bool capture_body(int n, const float* taps, std::string& err);
+    bool capture_batch_body(const BatchSlotItem* items, int n_items, std::string& err);
     bool alloc(std::string& err);
     struct Prof;
     Prof* prof_ = nullptr;
@@ -263,6 +265,7 @@ private:
     float* hp_out_ = nullptr;
     float *kring_[8] = {}, *vring_[8] = {};
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;   ///< rope tables of the context rows and of the block rows: one allocation, rt_blk_ = rt_ctx_ + 8 * 128
+    float *rt_bctx_ = nullptr, *rt_bblk_ = nullptr; ///< multi-slot batch rope tables: rt_bblk_ = rt_bctx_ + 32 * 128
     double* rope_inv_ = nullptr;   ///< theta^(-2 i / 128), once
     cudaEvent_t ev_hs_[2] = {};     ///< the selector's projection runs beside the head
     uint8_t* xq_ = nullptr;         ///< the head's q8_1 activations
@@ -286,6 +289,9 @@ private:
     uint32_t* topscratch_ = nullptr;
     cudaGraphExec_t exec_[kRows + 1] = {};
     cudaGraphExec_t body_exec_[kRows + 1] = {};
+    cudaGraphExec_t batch_body_exec_[kRows + 1][kRows + 1] = {};
+    Dflash2Drafter* batch_slots_[2] = {};
+    const float* batch_taps_[2] = {};
     const float* graph_taps_ = nullptr;
     int ndraft_ = kDrafts;          ///< drafts a window can use (set_max_drafts)
     int64_t have_ctx_ = 0;

@@ -121,6 +121,34 @@ void df2_select_multi(const float* hp, const float* unary, const int32_t* tok, c
 /// Packs `rows` rows of `fn_in` ([rows][N]) and `hsel_in` ([rows][rank]) into `fn_out` and `hsel_out` in one launch.
 void df2_pack_head_rows(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out, int rows, int N, int rank, void* stream);
 
+struct Df2BatchKvRing {
+    void* kring[4];
+    void* vring[4];
+    int64_t* tag[4];
+    uint8_t row_slot[32];
+};
+
+struct Df2BatchAttn {
+    const void* kring[4];
+    const void* vring[4];
+    const int64_t* tag[4];
+};
+
+void df2_kv_ring_batch(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table,
+                       Df2BatchKvRing bkv, int slots, int total_rows, int heads, float eps, void* stream,
+                       const int32_t* epoch_base);
+void df2_kv_ring_batch_f16(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table,
+                           Df2BatchKvRing bkv, int slots, int total_rows, int heads, float eps, void* stream,
+                           const int32_t* epoch_base);
+void df2_attention_batch(const float* q, Df2BatchAttn ba, const float* kblk, const float* vblk,
+                         const int32_t* anchor_pos_base, int ring_slots, int window, float* part,
+                         void* xq, float* xd, int n_slots, void* stream, const int32_t* epoch_base);
+void df2_attention_batch_f16(const float* q, Df2BatchAttn ba, const float* kblk, const float* vblk,
+                             const int32_t* anchor_pos_base, int ring_slots, int window, float* part,
+                             void* xq, float* xd, int n_slots, void* stream, const int32_t* epoch_base);
+void df2_pack_head_rows_batch(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out,
+                              const int32_t* batch_meta, int n_items, int N, int rank, void* stream);
+
 /// The verify window's tap: out[r][d] = mean over the hc streams c of (R[r][c][d] + bo[r][d] * 2 * sigmoid(inject[r][c] / hc)) - the layer output with
 /// its pending FFN write (gr_write) applied, averaged over the streams.  R rows are `R_stride` floats apart, bo rows `bo_stride`, inject rows
 /// `inj_stride`, out rows `out_stride`.

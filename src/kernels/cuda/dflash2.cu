@@ -42,7 +42,7 @@ __global__ void conv_kernel(const float* __restrict__ x, const float* __restrict
     float acc = 0.0f;
 #pragma unroll
     for (int o = 0; o < 2; ++o) {
-        if (b - o < 0) continue;
+        if ((b & 7) - o < 0) continue;
         const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + o * groups + c / group];
         acc = fmaf(k, x[(size_t) (b - o) * H + c], acc);
     }
@@ -148,10 +148,10 @@ template <> struct RegTraits<uint16_t> {
 constexpr int AS = 132;   // smem row stride of the Q / K / V tiles (float4 aligned, conflict-free for the 4 x 4 tiles)
 constexpr int PS = 36;    // stride of the transposed probabilities P[key][query]
 template <typename RingT>
-__global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict__ q, const RingT* __restrict__ kring, const RingT* __restrict__ vring,
-                                                       const float* __restrict__ kblk, const float* __restrict__ vblk,
-                                                       const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
-                                                       const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
+__device__ void attn_part_device(const float* __restrict__ q, const RingT* __restrict__ kring, const RingT* __restrict__ vring,
+                                 const float* __restrict__ kblk, const float* __restrict__ vblk,
+                                 const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
+                                 const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
     using Traits = RegTraits<RingT>;
     using Reg = typename Traits::Reg;
     __shared__ __align__(16) float Qs[32 * AS];
@@ -314,6 +314,31 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
     }
 }
 
+template <typename RingT>
+__global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict__ q, const RingT* __restrict__ kring, const RingT* __restrict__ vring,
+                                                       const float* __restrict__ kblk, const float* __restrict__ vblk,
+                                                       const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
+                                                       const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
+    attn_part_device<RingT>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, variant, tag, epoch_ptr);
+}
+
+template <typename RingT>
+__global__ void __launch_bounds__(128) attn_part_batch_kernel(const float* __restrict__ q, Df2BatchAttn ba,
+                                                             const float* __restrict__ kblk, const float* __restrict__ vblk,
+                                                             const int32_t* __restrict__ anchor_pos_base, int ring_slots, int window,
+                                                             float* __restrict__ part, int variant, const int32_t* __restrict__ epoch_base) {
+    const int s_idx = blockIdx.z;
+    const size_t part_stride = (size_t) kDf2MaxChunks * kDf2Kv * 32 * 130;
+    attn_part_device<RingT>(q + (size_t) s_idx * kDf2Rows * 32 * HD,
+                            static_cast<const RingT*>(ba.kring[s_idx]),
+                            static_cast<const RingT*>(ba.vring[s_idx]),
+                            kblk + (size_t) s_idx * kDf2Rows * kDf2Kv * HD,
+                            vblk + (size_t) s_idx * kDf2Rows * kDf2Kv * HD,
+                            anchor_pos_base + s_idx, ring_slots, window,
+                            part + (size_t) s_idx * part_stride, variant,
+                            ba.tag[s_idx], epoch_base + s_idx);
+}
+
 __device__ __forceinline__ void quant_block(float v, int blk, int col, int K, int8_t* __restrict__ xq, float* __restrict__ xd);
 
 __global__ void attn_merge_kernel(const float* __restrict__ part, int8_t* __restrict__ xq, float* __restrict__ xd) {
@@ -332,6 +357,25 @@ __global__ void attn_merge_kernel(const float* __restrict__ part, int8_t* __rest
     const int row = qi >> 2, g = qi & 3;
     // the output row `row`, head kvh * 4 + g, dims d: quant block (kvh * 4 + g) * 4 + d / 32 of the 4096-wide row
     quant_block(L > 0.0f ? o / L : 0.0f, (kvh * kDf2Gqa + g) * (HD / 32) + (d >> 5), row, 32 * HD, xq, xd);
+}
+
+__global__ void attn_merge_batch_kernel(const float* __restrict__ part, int8_t* __restrict__ xq, float* __restrict__ xd) {
+    const int a = blockIdx.x, s_idx = blockIdx.y;
+    const int kvh = a >> 5, qi = a & 31, d = threadIdx.x;
+    const size_t part_stride = (size_t) kDf2MaxChunks * kDf2Kv * 32 * 130;
+    const float* part_s = part + (size_t) s_idx * part_stride;
+    float M = -INFINITY;
+    for (int c = 0; c < kDf2MaxChunks; ++c) M = fmaxf(M, part_s[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130]);
+    float L = 0.0f, o = 0.0f;
+    for (int c = 0; c < kDf2MaxChunks; ++c) {
+        const float* p = part_s + (((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130;
+        const float mc = p[0];
+        const float w = (mc == -INFINITY) ? 0.0f : __expf(mc - M);
+        L += p[1] * w;
+        o = fmaf(p[2 + d], w, o);
+    }
+    const int row = qi >> 2, g = qi & 3;
+    quant_block(L > 0.0f ? o / L : 0.0f, (kvh * kDf2Gqa + g) * (HD / 32) + (d >> 5), s_idx * kDf2Rows + row, 32 * HD, xq, xd);
 }
 
 // ---- Q8 GEMM for up to 8 activation columns (the drafter's matrices)
@@ -422,7 +466,8 @@ void launch_gemm8_ncols(int rows, cudaStream_t st, const Df2Segs& segs, const in
         case 5: gemm8_kernel<WARPS, true, 2, 5><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 5); break;
         case 6: gemm8_kernel<WARPS, true, 2, 6><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 6); break;
         case 7: gemm8_kernel<WARPS, true, 2, 7><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 7); break;
-        default: gemm8_kernel<WARPS, true, 2, 8><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
+        case 8: gemm8_kernel<WARPS, true, 2, 8><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 8); break;
+        default: gemm8_kernel<WARPS, true, 2, 16><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
     }
 }
 
@@ -430,7 +475,7 @@ void launch_gemm8_ncols(int rows, cudaStream_t st, const Df2Segs& segs, const in
 // the arithmetic of gemm8_kernel (lane l's partial sums run over the same steps in the same order, the same shuffle tree), so the result is bitwise the same;
 // what changes is the number of warps in flight: the small matrices (fc 2560 rows = 320 groups, the 640-row convolution kernels) fill only a third of the
 // card with one warp per group, and a warp that waits for its 4 KB step per row stalls the group.
-template <int WARPS, int R, int UNR>
+template <int WARPS, int R, int UNR, int MAX_COLS = 8>
 __global__ void __launch_bounds__(WARPS * 32) gemm_rows_kernel(Df2Segs segs, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n_in, int ncols) {
     constexpr int SUBS = 8 / R;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -442,11 +487,11 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_rows_kernel(Df2Segs segs, con
     const int4* wq = reinterpret_cast<const int4*>(sg.q + (size_t) row0 * n_in) + lane + sub * R * 32;
     const __half* wd = sg.d + (size_t) row0 * nb + (lane >> 1) + sub * R * 16;
     const int4* xv = reinterpret_cast<const int4*>(xq) + lane;
-    float acc[R][8];
+    float acc[R][MAX_COLS];
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int c = 0; c < 8; ++c) acc[r][c] = 0.0f;
+        for (int c = 0; c < MAX_COLS; ++c) acc[r][c] = 0.0f;
 #pragma unroll UNR
     for (int st = 0; st < steps; ++st) {
         int4 w[R];
@@ -456,11 +501,12 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_rows_kernel(Df2Segs segs, con
             w[r] = wq[(size_t) st * 256 + r * 32];
             dw[r] = __half2float(wd[(size_t) st * 128 + r * 16]);
         }
-        float xs[8];
+        float xs[MAX_COLS];
 #pragma unroll
-        for (int c = 0; c < 8; ++c) xs[c] = xd[(size_t) c * nb + st * 16 + (lane >> 1)];
+        for (int c = 0; c < MAX_COLS; ++c) xs[c] = (c < ncols) ? xd[(size_t) c * nb + st * 16 + (lane >> 1)] : 0.0f;
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < MAX_COLS; ++c) {
+            if (c >= ncols) break;
             const int4 x = xv[(size_t) c * (n_in / 16) + st * 32];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
@@ -475,7 +521,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_rows_kernel(Df2Segs segs, con
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < MAX_COLS; ++c) {
             float v = acc[r][c];
             v += __shfl_xor_sync(0xffffffffu, v, 16);
             v += __shfl_xor_sync(0xffffffffu, v, 8);
@@ -493,7 +539,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_rows_kernel(Df2Segs segs, con
 // 4-7 in its four high nibbles, word 1 holds 8-11 and 12-15, so (w & 0x0F0F0F0F) and ((w >> 4) & 0x0F0F0F0F) are the int8 words dp4a wants, as
 // unsigned q = 0..15 (value = (q - 8) * d, ggml Q4_0).  sum((q - 8) x) = sum(q x) - 8 sum(x): the sum of the lane's 16 activations is one more dp4a
 // per word and column, shared by the 8 rows.  The fp16 block scales follow the nibble plane (n_out * n_in / 2 bytes) in the Q8 plane's order.
-template <int WARPS, int UNR = 2>
+template <int WARPS, int UNR = 2, int MAX_COLS = 8>
 __global__ void __launch_bounds__(WARPS * 32) gemm4_kernel(Df2Segs segs, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n_in, int ncols) {
     constexpr int R = 8;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -504,11 +550,11 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_kernel(Df2Segs segs, const i
     const uint2* wq = reinterpret_cast<const uint2*>(sg.q + (size_t) row0 * (n_in / 2)) + lane;
     const __half* wd = sg.d + (size_t) row0 * nb + (lane >> 1);
     const int4* xv = reinterpret_cast<const int4*>(xq) + lane;
-    float acc[R][8];
+    float acc[R][MAX_COLS];
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int c = 0; c < 8; ++c) acc[r][c] = 0.0f;
+        for (int c = 0; c < MAX_COLS; ++c) acc[r][c] = 0.0f;
 #pragma unroll UNR
     for (int st = 0; st < steps; ++st) {
         int4 w[R];
@@ -519,11 +565,12 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_kernel(Df2Segs segs, const i
             w[r] = make_int4((int) (raw.x & 0x0F0F0F0Fu), (int) ((raw.x >> 4) & 0x0F0F0F0Fu), (int) (raw.y & 0x0F0F0F0Fu), (int) ((raw.y >> 4) & 0x0F0F0F0Fu));
             dw[r] = __half2float(wd[(size_t) st * 128 + r * 16]);
         }
-        float xs[8];
+        float xs[MAX_COLS];
 #pragma unroll
-        for (int c = 0; c < 8; ++c) xs[c] = xd[(size_t) c * nb + st * 16 + (lane >> 1)];
+        for (int c = 0; c < MAX_COLS; ++c) xs[c] = (c < ncols) ? xd[(size_t) c * nb + st * 16 + (lane >> 1)] : 0.0f;
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < MAX_COLS; ++c) {
+            if (c >= ncols) break;
             const int4 x = xv[(size_t) c * (n_in / 16) + st * 32];
             int xsum = STRATA_DP4A(0x01010101, x.x, 0);
             xsum = STRATA_DP4A(0x01010101, x.y, xsum);
@@ -542,7 +589,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_kernel(Df2Segs segs, const i
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < MAX_COLS; ++c) {
             float v = acc[r][c];
             v += __shfl_xor_sync(0xffffffffu, v, 16);
             v += __shfl_xor_sync(0xffffffffu, v, 8);
@@ -556,7 +603,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_kernel(Df2Segs segs, const i
 // The Q4_0 GEMM with R rows a warp (R = 4, 2, 1) instead of 8, as gemm_rows_kernel is to gemm8_kernel: a group of 8 rows is shared by 8 / R warps, each reading only its
 // rows' nibbles and scales; every output keeps the arithmetic of gemm4_kernel (same steps in the same order per lane, the same xsum and shuffle tree), so the result is bitwise
 // the same.  The activations' per-column sum is recomputed by each of the group's warps (4 dp4a a column and step).
-template <int WARPS, int R, int UNR>
+template <int WARPS, int R, int UNR, int MAX_COLS = 8>
 __global__ void __launch_bounds__(WARPS * 32) gemm4_rows_kernel(Df2Segs segs, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n_in, int ncols) {
     constexpr int SUBS = 8 / R;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -568,11 +615,11 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_rows_kernel(Df2Segs segs, co
     const uint2* wq = reinterpret_cast<const uint2*>(sg.q + (size_t) row0 * (n_in / 2)) + lane + sub * R * 32;
     const __half* wd = sg.d + (size_t) row0 * nb + (lane >> 1) + sub * R * 16;
     const int4* xv = reinterpret_cast<const int4*>(xq) + lane;
-    float acc[R][8];
+    float acc[R][MAX_COLS];
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int c = 0; c < 8; ++c) acc[r][c] = 0.0f;
+        for (int c = 0; c < MAX_COLS; ++c) acc[r][c] = 0.0f;
 #pragma unroll UNR
     for (int st = 0; st < steps; ++st) {
         int4 w[R];
@@ -583,11 +630,12 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_rows_kernel(Df2Segs segs, co
             w[r] = make_int4((int) (raw.x & 0x0F0F0F0Fu), (int) ((raw.x >> 4) & 0x0F0F0F0Fu), (int) (raw.y & 0x0F0F0F0Fu), (int) ((raw.y >> 4) & 0x0F0F0F0Fu));
             dw[r] = __half2float(wd[(size_t) st * 128 + r * 16]);
         }
-        float xs[8];
+        float xs[MAX_COLS];
 #pragma unroll
-        for (int c = 0; c < 8; ++c) xs[c] = xd[(size_t) c * nb + st * 16 + (lane >> 1)];
+        for (int c = 0; c < MAX_COLS; ++c) xs[c] = (c < ncols) ? xd[(size_t) c * nb + st * 16 + (lane >> 1)] : 0.0f;
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < MAX_COLS; ++c) {
+            if (c >= ncols) break;
             const int4 x = xv[(size_t) c * (n_in / 16) + st * 32];
             int xsum = STRATA_DP4A(0x01010101, x.x, 0);
             xsum = STRATA_DP4A(0x01010101, x.y, xsum);
@@ -606,7 +654,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_rows_kernel(Df2Segs segs, co
 #pragma unroll
     for (int r = 0; r < R; ++r)
 #pragma unroll
-        for (int c = 0; c < 8; ++c) {
+        for (int c = 0; c < MAX_COLS; ++c) {
             float v = acc[r][c];
             v += __shfl_xor_sync(0xffffffffu, v, 16);
             v += __shfl_xor_sync(0xffffffffu, v, 8);
@@ -666,7 +714,7 @@ __global__ void conv_quant_kernel(const float* __restrict__ x, const float* __re
     float acc = 0.0f;
 #pragma unroll
     for (int o = 0; o < 2; ++o) {
-        if (b - o < 0) continue;
+        if ((b & 7) - o < 0) continue;
         const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + o * groups + c / group];
         acc = fmaf(k, x[(size_t) (b - o) * H + c], acc);
     }
@@ -749,6 +797,35 @@ __global__ void kv_ring_kernel(const float* __restrict__ kin, const float* __res
                                const float* __restrict__ table, RingT* __restrict__ kring, RingT* __restrict__ vring, int slots, int heads, float eps,
                                int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
     const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    __shared__ float red[4];
+    __shared__ float y[HD];
+    const float x = kin[((size_t) r * heads + h) * HD + d];
+    float ss = x * x;
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((d & 31) == 0) red[d >> 5] = ss;
+    __syncthreads();
+    const float v = x * rsqrtf((red[0] + red[1] + red[2] + red[3]) / (float) HD + eps) * gk[d];
+    y[d] = v;
+    __syncthreads();
+    const int i = d & 63;
+    const float c = table[(r * 2 + 0) * 64 + i], sn = table[(r * 2 + 1) * 64 + i];
+    const int slot = (int) (pos[r] % slots);
+    const size_t at = ((size_t) h * slots + slot) * HD + d;
+    store_ring_elem(kring, at, d < 64 ? v * c - y[d + 64] * sn : v * c + y[d - 64] * sn);
+    store_ring_elem(vring, at, vin[((size_t) r * heads + h) * HD + d]);
+    if (tag != nullptr && h == 0 && d == 0) tag[slot] = ((int64_t) *epoch_ptr << 32) | (int64_t) pos[r];
+}
+
+template <typename RingT>
+__global__ void kv_ring_batch_kernel(const float* __restrict__ kin, const float* __restrict__ vin, const float* __restrict__ gk,
+                                     const int32_t* __restrict__ pos, const float* __restrict__ table, Df2BatchKvRing bkv,
+                                     int slots, int heads, float eps, const int32_t* __restrict__ epoch_base) {
+    const int r = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    const int s_idx = bkv.row_slot[r];
+    RingT* kring = static_cast<RingT*>(bkv.kring[s_idx]);
+    RingT* vring = static_cast<RingT*>(bkv.vring[s_idx]);
+    int64_t* tag = bkv.tag[s_idx];
+    const int32_t* epoch_ptr = epoch_base + s_idx;
     __shared__ float red[4];
     __shared__ float y[HD];
     const float x = kin[((size_t) r * heads + h) * HD + d];
@@ -1015,6 +1092,22 @@ __global__ void pack_head_rows_kernel(const float* __restrict__ fn_in, const flo
         hsel_out[(size_t) r * rank + (i - N)] = hsel_in[(size_t) r * rank + (i - N)];
 }
 
+__global__ void pack_head_rows_batch_kernel(const float* __restrict__ fn_in, const float* __restrict__ hsel_in,
+                                            float* __restrict__ fn_out, float* __restrict__ hsel_out,
+                                            const int32_t* __restrict__ batch_meta, int N, int rank) {
+    const int i = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    const int r = blockIdx.y, s = blockIdx.z;
+    const int row_off = batch_meta[s * 4 + 0];
+    const int k_want = batch_meta[s * 4 + 1];
+    if (r >= k_want) return;
+    const size_t src_r = (size_t) s * kDf2Rows + 1 + r;
+    const size_t dst_r = (size_t) (row_off + r);
+    if (i < N)
+        fn_out[dst_r * N + i] = fn_in[src_r * N + i];
+    else if (i < N + rank)
+        hsel_out[dst_r * rank + (i - N)] = hsel_in[src_r * rank + (i - N)];
+}
+
 __global__ void tap_rows_kernel(const float* __restrict__ R, float* __restrict__ out, int64_t out_stride, int64_t n, int hc) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     const int r = blockIdx.y;
@@ -1148,7 +1241,18 @@ static int df2_q4_auto(int rows) {
 #define DF2_Q4_AUTO(rows) df2_q4_auto(rows)
 #endif
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream) {
-    if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1 || ncols > 8) throw std::invalid_argument("df2_gemm: unsupported shape");
+    if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1 || ncols > 32) throw std::invalid_argument("df2_gemm: unsupported shape");
+    if (ncols > 16) {
+        for (int c0 = 0; c0 < ncols; c0 += 16) {
+            const int nc = std::min(16, ncols - c0);
+            Df2Mat sub[3];
+            for (int i = 0; i < n; ++i) {
+                sub[i] = Df2Mat{mats[i].w, mats[i].y + (size_t) c0 * mats[i].n_out, mats[i].n_out, mats[i].q4};
+            }
+            df2_gemm(sub, n, static_cast<const int8_t*>(xq) + (size_t) c0 * n_in, xd + (size_t) c0 * (n_in / 32), n_in, nc, stream);
+        }
+        return;
+    }
     Df2Segs segs;
     int rows = 0;
     for (int i = 0; i < n; ++i) {
@@ -1164,7 +1268,7 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
     if (mats[0].q4) {   // the Q4_0 pack: 4 warps a block when the rows allow, else 2; the rows-a-warp variants (bitwise the same results) by matrix size
         static const int tune4 = [] { const char* e = std::getenv("STRATA_DF2_GEMM4"); return e ? std::atoi(e) : 0; }();   // 0: the table; 1: 8 rows a warp as before; 10 and up: that variant for every matrix (bench / A/B)
         int v4 = g_gemm_variant != 0 ? g_gemm_variant : tune4 >= 10 ? tune4 : tune4 != 0 ? 1 : DF2_Q4_AUTO(rows);
-#define DF2_ROWS4_CASE(V, W, R, U) case V: gemm4_rows_kernel<W, R, U><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
+#define DF2_ROWS4_CASE(V, W, R, U) case V: if (ncols <= 8) gemm4_rows_kernel<W, R, U, 8><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); else gemm4_rows_kernel<W, R, U, 16><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         switch (v4) {
             DF2_ROWS4_CASE(10, 4, 4, 2)
             DF2_ROWS4_CASE(11, 4, 2, 2)
@@ -1202,11 +1306,12 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
             DF2_ROWS4_CASE(43, 4, 4, 1)
             DF2_ROWS4_CASE(44, 8, 1, 1)
             DF2_ROWS4_CASE(45, 1, 8, 1)
-            case 2: gemm4_kernel<2><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
-            default: if (rows % 32 == 0) gemm4_kernel<4><<<rows / 32, 128, 0, st>>>(segs, xqp, xd, n_in, ncols);
-                     else gemm4_kernel<2><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols);
+            case 2: if (ncols <= 8) gemm4_kernel<2, 2, 8><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); else gemm4_kernel<2, 2, 16><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
+            default: if (rows % 32 == 0) { if (ncols <= 8) gemm4_kernel<4, 2, 8><<<rows / 32, 128, 0, st>>>(segs, xqp, xd, n_in, ncols); else gemm4_kernel<4, 2, 16><<<rows / 32, 128, 0, st>>>(segs, xqp, xd, n_in, ncols); }
+                     else { if (ncols <= 8) gemm4_kernel<2, 2, 8><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); else gemm4_kernel<2, 2, 16><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); }
                      break;
         }
+#undef DF2_ROWS4_CASE
         check("gemm4");
         return;
     }
@@ -1217,7 +1322,7 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
                         : rows <= 3072      ? 13
                         : rows >= 15000     ? 10
                                             : (rows % 32 == 0 ? 1 : 2);
-#define DF2_ROWS_CASE(V, W, R, U) case V: gemm_rows_kernel<W, R, U><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
+#define DF2_ROWS_CASE(V, W, R, U) case V: if (ncols <= 8) gemm_rows_kernel<W, R, U, 8><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); else gemm_rows_kernel<W, R, U, 16><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
     switch (variant) {
         DF2_ROWS_CASE(10, 4, 4, 2)
         DF2_ROWS_CASE(11, 4, 2, 2)
@@ -1243,6 +1348,7 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
         case 2: launch_gemm8_ncols<2>(rows, st, segs, xqp, xd, n_in, ncols); break;   // 16 rows a block: every n_out is a multiple of 16
         default: launch_gemm8_ncols<4>(rows, st, segs, xqp, xd, n_in, ncols); break;
     }
+#undef DF2_ROWS_CASE
     check("gemm8");
 }
 
@@ -1310,6 +1416,56 @@ void df2_pack_head_rows(const float* fn_in, const float* hsel_in, float* fn_out,
     pack_head_rows_kernel<<<dim3((unsigned) ((N + rank + 255) / 256), (unsigned) rows), 256, 0, (cudaStream_t) stream>>>(
         fn_in, hsel_in, fn_out, hsel_out, N, rank);
     check("pack_head_rows");
+}
+
+void df2_pack_head_rows_batch(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out,
+                              const int32_t* batch_meta, int n_items, int N, int rank, void* stream) {
+    if (n_items <= 0) return;
+    pack_head_rows_batch_kernel<<<dim3((unsigned) ((N + rank + 255) / 256), (unsigned) (kDf2Rows - 1), (unsigned) n_items), 256, 0, (cudaStream_t) stream>>>(
+        fn_in, hsel_in, fn_out, hsel_out, batch_meta, N, rank);
+    check("pack_head_rows_batch");
+}
+
+void df2_kv_ring_batch(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table,
+                       Df2BatchKvRing bkv, int slots, int total_rows, int heads, float eps, void* stream,
+                       const int32_t* epoch_base) {
+    if (total_rows <= 0) return;
+    kv_ring_batch_kernel<float><<<dim3((unsigned) total_rows, (unsigned) heads), HD, 0, (cudaStream_t) stream>>>(
+        kin, vin, gk, pos, table, bkv, slots, heads, eps, epoch_base);
+    check("kv_ring_batch");
+}
+
+void df2_kv_ring_batch_f16(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table,
+                           Df2BatchKvRing bkv, int slots, int total_rows, int heads, float eps, void* stream,
+                           const int32_t* epoch_base) {
+    if (total_rows <= 0) return;
+    kv_ring_batch_kernel<uint16_t><<<dim3((unsigned) total_rows, (unsigned) heads), HD, 0, (cudaStream_t) stream>>>(
+        kin, vin, gk, pos, table, bkv, slots, heads, eps, epoch_base);
+    check("kv_ring_batch_f16");
+}
+
+void df2_attention_batch(const float* q, Df2BatchAttn ba, const float* kblk, const float* vblk,
+                         const int32_t* anchor_pos_base, int ring_slots, int window, float* part,
+                         void* xq, float* xd, int n_slots, void* stream, const int32_t* epoch_base) {
+    if (n_slots <= 0) return;
+    attn_part_batch_kernel<float><<<dim3(kDf2Kv, kDf2MaxChunks, (unsigned) n_slots), 128, 0, (cudaStream_t) stream>>>(
+        q, ba, kblk, vblk, anchor_pos_base, ring_slots, window, part, g_attn_variant, epoch_base);
+    check("attn_part_batch");
+    attn_merge_batch_kernel<<<dim3(kDf2Kv * 32, (unsigned) n_slots), HD, 0, (cudaStream_t) stream>>>(
+        part, static_cast<int8_t*>(xq), xd);
+    check("attn_merge_batch");
+}
+
+void df2_attention_batch_f16(const float* q, Df2BatchAttn ba, const float* kblk, const float* vblk,
+                             const int32_t* anchor_pos_base, int ring_slots, int window, float* part,
+                             void* xq, float* xd, int n_slots, void* stream, const int32_t* epoch_base) {
+    if (n_slots <= 0) return;
+    attn_part_batch_kernel<uint16_t><<<dim3(kDf2Kv, kDf2MaxChunks, (unsigned) n_slots), 128, 0, (cudaStream_t) stream>>>(
+        q, ba, kblk, vblk, anchor_pos_base, ring_slots, window, part, g_attn_variant, epoch_base);
+    check("attn_part_batch_f16");
+    attn_merge_batch_kernel<<<dim3(kDf2Kv * 32, (unsigned) n_slots), HD, 0, (cudaStream_t) stream>>>(
+        part, static_cast<int8_t*>(xq), xd);
+    check("attn_merge_batch");
 }
 
 void df2_tap_rows(const float* R, float* out, int64_t out_stride, int64_t n_embd, int hc, int rows, void* stream) {

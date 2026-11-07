@@ -752,7 +752,7 @@ private:
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
-    uint32_t ple_rows_b_[strata::kernels::kVerifyMaxT * 4] = {};
+    uint32_t ple_rows_b_[strata::kernels::kVerifyLongT * strata::kernels::PLE_N_HEADS] = {};
     bool ple_pending_b_ = false;
 };
 
