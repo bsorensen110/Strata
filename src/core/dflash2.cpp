@@ -924,12 +924,169 @@ void Dflash2Drafter::reset() {
 }
 
 void Dflash2Drafter::copy_log_state_from(const Dflash2Drafter& src) {
+    if (this != &src && !cur_.hist.empty()) stash_push(std::move(cur_));
     cur_.hist = src.cur_.hist;
     cur_.chunks = src.cur_.chunks;
     std::memcpy(slot_pos_, src.slot_pos_, sizeof(slot_pos_));
     epoch_ = src.epoch_;
     ring_hi_ = src.ring_hi_;
     have_ctx_ = src.have_ctx_;
+}
+
+size_t Dflash2Drafter::lineage_bytes(int64_t upto) const {
+    if (!log_on_ || N_ != 2560) return 0;
+    const int64_t L = upto < 0 ? (int64_t) cur_.hist.size() : std::min<int64_t>(upto, (int64_t) cur_.hist.size());
+    if (L <= 0) return 0;
+    size_t n_runs = 0, n_rows = 0;
+    int64_t p = 0;
+    while (p < L) {
+        if (!cur_.logged(p)) { ++p; continue; }
+        int64_t q = p + 1;
+        while (q < L && cur_.logged(q)) ++q;
+        ++n_runs;
+        n_rows += (size_t) (q - p);
+        p = q;
+    }
+    if (n_rows == 0) return 0;
+    return 32 + (size_t) L * sizeof(int32_t) + n_runs * 8 + n_rows * (2560 + 80 * sizeof(float));
+}
+
+bool Dflash2Drafter::save_lineage(std::vector<uint8_t>& out, std::string& err, int64_t upto) const {
+    const size_t total = lineage_bytes(upto);
+    if (total == 0) { out.clear(); return true; }
+    const int64_t L = upto < 0 ? (int64_t) cur_.hist.size() : std::min<int64_t>(upto, (int64_t) cur_.hist.size());
+    struct Run { int32_t pos0, count; };
+    std::vector<Run> runs;
+    int64_t p = 0;
+    while (p < L) {
+        if (!cur_.logged(p)) { ++p; continue; }
+        int64_t q = p + 1;
+        while (q < L && cur_.logged(q)) ++q;
+        runs.push_back({(int32_t) p, (int32_t) (q - p)});
+        p = q;
+    }
+    try { out.resize(total); } catch (const std::bad_alloc&) { err = "dflash2: out of host memory saving lineage"; return false; }
+    uint8_t* dst = out.data();
+    auto put = [&](const void* s, size_t n) { std::memcpy(dst, s, n); dst += n; };
+    const uint32_t magic = kLineageMagic, ver = kLineageVersion;
+    const int32_t n_embd = N_, win = window_;
+    const uint64_t hist_len = (uint64_t) L, n_runs = (uint64_t) runs.size();
+    put(&magic, 4); put(&ver, 4); put(&n_embd, 4); put(&win, 4);
+    put(&hist_len, 8); put(&n_runs, 8);
+    put(cur_.hist.data(), (size_t) L * sizeof(int32_t));
+    for (const Run& r : runs) {
+        put(&r.pos0, 4); put(&r.count, 4);
+        for (int32_t i = 0; i < r.count; ++i) {
+            const int64_t pos = (int64_t) r.pos0 + i;
+            const LogChunk& ch = *cur_.chunks[(size_t) (pos / kLogChunk)];
+            put(&ch.q[(size_t) (pos % kLogChunk) * 2560], 2560);
+        }
+        for (int32_t i = 0; i < r.count; ++i) {
+            const int64_t pos = (int64_t) r.pos0 + i;
+            const LogChunk& ch = *cur_.chunks[(size_t) (pos / kLogChunk)];
+            put(&ch.d[(size_t) (pos % kLogChunk) * 80], 80 * sizeof(float));
+        }
+    }
+    return true;
+}
+
+bool Dflash2Drafter::restore_lineage(const std::vector<uint8_t>& in, std::string& err) {
+    if (in.empty()) return true;
+    if (in.size() < 32) { err = "dflash2: truncated lineage header"; return false; }
+    const uint8_t* src = in.data();
+    const uint8_t* end = src + in.size();
+    auto get = [&](void* d, size_t n) -> bool {
+        if ((size_t) (end - src) < n) return false;
+        std::memcpy(d, src, n); src += n; return true;
+    };
+    uint32_t magic = 0, ver = 0;
+    int32_t n_embd = 0, win = 0;
+    uint64_t hist_len = 0, n_runs = 0;
+    get(&magic, 4); get(&ver, 4); get(&n_embd, 4); get(&win, 4);
+    get(&hist_len, 8); get(&n_runs, 8);
+    if (magic != kLineageMagic || ver != kLineageVersion) { err = "dflash2: incompatible lineage header"; return false; }
+    if (n_embd != 2560 || (N_ != 0 && n_embd != N_)) { err = "dflash2: lineage embedding dimension mismatch"; return false; }
+    if (hist_len == 0 || hist_len > (1ull << 24) || n_runs > hist_len) { err = "dflash2: invalid lineage bounds"; return false; }
+    Lineage l;
+    try {
+        l.hist.resize((size_t) hist_len);
+        if (!get(l.hist.data(), (size_t) hist_len * sizeof(int32_t))) { err = "dflash2: truncated lineage token history"; return false; }
+        int64_t prev_end = 0;
+        for (uint64_t r = 0; r < n_runs; ++r) {
+            int32_t pos0 = 0, count = 0;
+            if (!get(&pos0, 4) || !get(&count, 4)) { err = "dflash2: truncated lineage run header"; return false; }
+            if (pos0 < prev_end || count <= 0 || (uint64_t) pos0 + (uint64_t) count > hist_len) {
+                err = "dflash2: out-of-range lineage run"; return false;
+            }
+            prev_end = (int64_t) pos0 + count;
+            const size_t q_bytes = (size_t) count * 2560;
+            const size_t d_bytes = (size_t) count * 80 * sizeof(float);
+            if ((size_t) (end - src) < q_bytes + d_bytes) { err = "dflash2: truncated lineage run payload"; return false; }
+            const uint8_t* q_src = src;
+            const uint8_t* d_src = src + q_bytes;
+            src += q_bytes + d_bytes;
+            for (int32_t i = 0; i < count; ++i) {
+                const int64_t pos = (int64_t) pos0 + i;
+                LogChunk& ch = l.writable((size_t) (pos / kLogChunk));
+                const size_t row = (size_t) (pos % kLogChunk);
+                std::memcpy(&ch.q[row * 2560], q_src + (size_t) i * 2560, 2560);
+                std::memcpy(&ch.d[row * 80], d_src + (size_t) i * 80 * sizeof(float), 80 * sizeof(float));
+                ch.ok[row] = 1;
+            }
+        }
+    } catch (const std::bad_alloc&) {
+        err = "dflash2: out of host memory restoring lineage";
+        return false;
+    }
+    if (src != end) { err = "dflash2: trailing bytes in lineage blob"; return false; }
+    if (!log_on_) return true;
+    if (!cur_.hist.empty()) {
+        stash_push(std::move(cur_));
+        cur_ = Lineage{};
+        invalidate_ring();
+    }
+    for (size_t i = stash_.size(); i-- > 0;) {
+        const size_t m = std::min(stash_[i].hist.size(), l.hist.size());
+        if (m > 0 && std::memcmp(stash_[i].hist.data(), l.hist.data(), m * sizeof(int32_t)) == 0) {
+            if (stash_[i].hist.size() <= l.hist.size()) stash_.erase(stash_.begin() + (std::ptrdiff_t) i);
+        }
+    }
+    stash_.push_back(std::move(l));
+    ++ring_stats.stash_stores;
+    if (stash_budget_ > 0) {
+        uint64_t total = ring_stash_bytes();
+        while (stash_.size() > 1 && total > stash_budget_) {
+            total -= std::min(total, stash_.front().bytes());
+            stash_.pop_front();
+            ++ring_stats.stash_evictions;
+        }
+    }
+    return true;
+}
+
+void Dflash2Drafter::harvest_slot(const Dflash2Drafter& slot) {
+    if (!log_on_ || slot.cur_.hist.empty() || slot.cur_.chunks.empty()) return;
+    bool any_chunk = false;
+    for (const auto& c : slot.cur_.chunks) if (c) { any_chunk = true; break; }
+    if (!any_chunk) return;
+    Lineage l = slot.cur_;
+    for (size_t i = stash_.size(); i-- > 0;) {
+        const size_t m = std::min(stash_[i].hist.size(), l.hist.size());
+        if (m > 0 && std::memcmp(stash_[i].hist.data(), l.hist.data(), m * sizeof(int32_t)) == 0) {
+            if (stash_[i].hist.size() <= l.hist.size()) stash_.erase(stash_.begin() + (std::ptrdiff_t) i);
+            else return;
+        }
+    }
+    stash_.push_back(std::move(l));
+    ++ring_stats.stash_stores;
+    if (stash_budget_ > 0) {
+        uint64_t total = ring_stash_bytes();
+        while (stash_.size() > 1 && total > stash_budget_) {
+            total -= std::min(total, stash_.front().bytes());
+            stash_.pop_front();
+            ++ring_stats.stash_evictions;
+        }
+    }
 }
 
 void Dflash2Drafter::invalidate_ring() {

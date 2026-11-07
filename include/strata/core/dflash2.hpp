@@ -127,6 +127,23 @@ public:
     int64_t last_rebuilt = 0, last_missing = 0;   ///< the last begin_request: ring rows rebuilt, rows that could not be
     double last_ms = 0;
     bool last_swapped = false;                    ///< ... and whether a parked lineage was brought back
+
+    // ---- the drafter's ring-log lineage: save at park, restore at restore, harvest from batch slots ----
+    static constexpr uint32_t kLineageMagic = 0x4c324644;   // "DF2L"
+    static constexpr uint32_t kLineageVersion = 1;
+    /// Exact byte size `save_lineage` produces for `cur_` up to `upto` tokens (-1 = cur_.hist.size()).
+    /// Returns 0 when `!log_on_` or `cur_.hist` has no tokens / no logged rows below `upto`.
+    size_t lineage_bytes(int64_t upto = -1) const;
+    /// Serializes `cur_` (tokens and logged rows below `upto`, or all of `cur_.hist` when `upto < 0`) into `out`.
+    /// If `lineage_bytes(upto) == 0`, clears `out` and returns true.
+    bool save_lineage(std::vector<uint8_t>& out, std::string& err, int64_t upto = -1) const;
+    /// Deserializes a lineage blob written by `save_lineage` and places it at the back of `stash_` (first stashing
+    /// any non-empty `cur_` and calling `invalidate_ring()` so the upcoming `begin_request` swaps the restored
+    /// lineage in from `stash_` and rebuilds the window).
+    bool restore_lineage(const std::vector<uint8_t>& in, std::string& err);
+    /// Harvests a batch slot drafter's `cur_` lineage into this drafter's `stash_` so decoded slot tokens survive
+    /// slot overwrite/park. Accepts any non-empty lineage with at least one logged row (even if `< 128` tokens).
+    void harvest_slot(const Dflash2Drafter& slot);
     bool ring_log_on() const { return log_on_; }
     /// Allocates the log's pinned staging and turns the log on (STRATA_DF2_RING_LOG=0 keeps it off). alloc() calls it; a clone that skips alloc() calls it after its
     /// own allocation, on its device. Without it the log stays off and begin_request uses the pre-log rule.
