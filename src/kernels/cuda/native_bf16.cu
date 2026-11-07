@@ -369,6 +369,13 @@ template <int B, bool TSV, bool AUX>
 void launch_rows_dispatch(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out,
                           int n_tok, unsigned grid, cudaStream_t st, const uint16_t* w_aux, float* y_aux, int64_t ldy_aux) {
     constexpr int RPB = 4;
+    while (n_tok > 8) {
+        bf16_f32_mmvf_rows_kernel<B, 8, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, 8, w_aux, y_aux, ldy_aux);
+        x += (size_t) 8 * ldx;
+        y += (size_t) 8 * ldy;
+        if (y_aux != nullptr) y_aux += (size_t) 8 * ldy_aux;
+        n_tok -= 8;
+    }
     switch (n_tok) {
         case 1: bf16_f32_mmvf_rows_kernel<B, 1, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); break;
         case 2: bf16_f32_mmvf_rows_kernel<B, 2, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok, w_aux, y_aux, ldy_aux); break;
@@ -468,7 +475,7 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream) {
     // exactly the conditions under which both calls would take the rows / multi kernels at the same block size
-    if (n_out < 64 || n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 || x == nullptr ||
+    if (n_out < 64 || n_tok < 2 || n_tok > (mmvf_rows_on() ? STRATA_VERIFY_MAX_T : 8) || n_in <= 0 || (n_in & 1) != 0 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || w_aux == nullptr || y_aux == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         return false;
     const cudaStream_t st = (cudaStream_t) stream;
@@ -514,7 +521,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
         x == nullptr || w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows (16 in a wide build), even n_in/ldx, aligned pointers");
     const cudaStream_t st = (cudaStream_t) stream;
-    if (mmvf_rows_on() && n_out >= 64 && n_tok <= 8) {   // (the rows kernels hold 1..8 columns: a wider window takes the switch below)
+    if (mmvf_rows_on() && n_out >= 64) {   // (the rows kernels chunk >8 columns in 8-column slices)
         const int ni = (int) n_in, no = (int) n_out;
         switch (mmvf_block_size(n_in)) {
             case 32: launch_rows<32>(x, ldx, w, y, ldy, ni, no, n_tok, st); break;

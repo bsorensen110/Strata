@@ -3096,7 +3096,7 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     n_expert_ = n_expert;
     k_ = k < 1 ? 1 : k > (int) n_expert ? (int) n_expert : k;
     src_ = src;
-    x_.assign((size_t) (8 * n_embd), 0.f);
+    x_.assign((size_t) (16 * n_embd), 0.f);
     thread_ = std::thread([this] {
         strata::platform::name_this_thread("strata-lookahead");
         strata::aux_cpus::pin_current_thread();
@@ -3110,7 +3110,7 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
-        n_tok_ = std::min<int64_t>(n_tok, 8);
+        n_tok_ = std::min<int64_t>(n_tok, 16);
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
         layer_ = layer + 1;
         host_res_ = host_res;
@@ -3216,7 +3216,7 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
 }
 
 void RouterLookahead::run() {
-    std::vector<float> logits((size_t) (8 * n_expert_));
+    std::vector<float> logits((size_t) (16 * n_expert_));
     std::vector<int32_t> order((size_t) n_expert_);
     std::vector<int64_t> want;
     std::vector<float> wconf;   // 149-prefetch: per wanted expert, its best rank's confidence (warm_scored)

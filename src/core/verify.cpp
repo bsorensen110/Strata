@@ -1453,7 +1453,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     // S26 STRATA_LFUSE=1: where the shared expert's gate / scale fusions apply (the paths they replace are the ones taken)
     auto lfuse_on = [&](int n) {
-        return g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 &&
+        return g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= kVerifyMaxT &&
                shared_expert_native_bf16_enabled();
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
@@ -2294,8 +2294,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         // S26 STRATA_LFUSE=1: the shared expert's gate row rides in the router GEMV launch, its sigmoid + row scale
-        // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
-        const bool sg_aux_ok = dec_batch && n > 1 && n <= 8 && shared_expert_native_bf16_enabled() && g_lfuse_gate() &&
+        // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-16 rows)
+        const bool sg_aux_ok = dec_batch && n > 1 && n <= kVerifyMaxT && shared_expert_native_bf16_enabled() && g_lfuse_gate() &&
                                (!sh_fork || sh_fork_late);
         const WeightRef* w_sgi = sg_aux_ok ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_aux = false;
@@ -2398,7 +2398,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             try {
                 const bool can_hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && dec_batch && n > 1 &&
-                                                 native_moe_combine_enabled() && n <= 8 &&
+                                                 native_moe_combine_enabled() && n <= kVerifyMaxT &&
                                                  native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
                 const bool sg_ready = sg_aux && (lfuse_on(n) || (g_lfuse() && can_hits_in_combine));
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
@@ -2537,7 +2537,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             } else {
                 // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
                 hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && dec_batch && n > 1 &&
-                                  native_moe_combine_enabled() && n <= 8 &&
+                                  native_moe_combine_enabled() && n <= kVerifyMaxT &&
                                   native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
                 const bool fuse_rows = fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr;   // 143-amdk
                 if (!fuse_rows) {
