@@ -675,7 +675,12 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         static const int head_il = [] {
             const char* e = std::getenv("STRATA_DF2_HEAD_IL");
             if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
-            return e && e[0] ? (e[0] != '0' ? 1 : 0) : -1;
+            if (e && e[0]) return e[0] != '0' ? 1 : 0;
+#if defined(STRATA_USE_HIP)
+            return 1;
+#else
+            return -1;
+#endif
         }();
         const bool use_il = !skip_part("head") && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)));
         if (use_il && ndraft_ >= 2 && ndraft_ <= 4)
@@ -1761,12 +1766,21 @@ bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t
         static const int head_il = [] {
             const char* e = std::getenv("STRATA_DF2_HEAD_IL");
             if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
-            return e && e[0] ? (e[0] != '0' ? 1 : 0) : -1;
+            if (e && e[0]) return e[0] != '0' ? 1 : 0;
+#if defined(STRATA_USE_HIP)
+            return 1;
+#else
+            return -1;
+#endif
         }();
         static const int head_chunk = [] {
             const char* e = std::getenv("STRATA_DF2_HEAD_CHUNK");
             if (e && e[0]) return std::max(1, std::min(14, std::atoi(e)));
+#if defined(STRATA_USE_HIP)
+            return 8;
+#else
             return (int) (2 * kDrafts);
+#endif
         }();
         for (int c0 = 0; c0 < total_rows; c0 += head_chunk) {
             const int nc = std::min(head_chunk, total_rows - c0);
