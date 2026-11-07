@@ -973,34 +973,40 @@ constexpr int TK_CHUNK_MAX = 4096;
 constexpr int TK_PER_THR = TK_CHUNK_MAX / 256;
 __device__ __forceinline__ bool better(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
 
-__global__ void topk_part_kernel(const float* __restrict__ logits, int n, float* __restrict__ cval, int32_t* __restrict__ cidx) {
+template <int MAX_PER_THR>
+__global__ void __launch_bounds__(256) topk_part_kernel(const float* __restrict__ logits, int n, float* __restrict__ cval, int32_t* __restrict__ cidx) {
     __shared__ float wv[8];
     __shared__ int wi[8];
     __shared__ int win;
     const int row = blockIdx.x, blk = blockIdx.y, tid = threadIdx.x;
+    const int warp = tid >> 5;
     const int cs = (n + kDf2TopBlocks - 1) / kDf2TopBlocks;
     const int c0 = blk * cs, c1 = min(c0 + cs, n);
-    float rv[TK_PER_THR];
+    float rv[MAX_PER_THR];
 #pragma unroll
-    for (int j = 0; j < TK_PER_THR; ++j) {
+    for (int j = 0; j < MAX_PER_THR; ++j) {
         const int i = tid + j * 256;
         rv[j] = (i < cs && c0 + i < c1) ? logits[(size_t) row * n + c0 + i] : -INFINITY;
     }
-    for (int k = 0; k < kDf2TopK; ++k) {
-        float bv = -INFINITY;
-        int bi = 0x7fffffff;
+    float bv = -INFINITY;
+    int bi = 0x7fffffff;
 #pragma unroll
-        for (int j = 0; j < TK_PER_THR; ++j) {
-            const int i = tid + j * 256;
-            if (i < cs && better(rv[j], i, bv, bi)) { bv = rv[j]; bi = i; }
-        }
+    for (int j = 0; j < MAX_PER_THR; ++j) {
+        const int i = tid + j * 256;
+        if (i < cs && better(rv[j], i, bv, bi)) { bv = rv[j]; bi = i; }
+    }
+    {
+        float r_bv = bv;
+        int r_bi = bi;
         for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            if (better(ov, oi, bv, bi)) { bv = ov; bi = oi; }
+            const float ov = __shfl_xor_sync(0xffffffffu, r_bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, r_bi, o);
+            if (better(ov, oi, r_bv, r_bi)) { r_bv = ov; r_bi = oi; }
         }
-        if ((tid & 31) == 0) { wv[tid >> 5] = bv; wi[tid >> 5] = bi; }
-        __syncthreads();
+        if ((tid & 31) == 0) { wv[warp] = r_bv; wi[warp] = r_bi; }
+    }
+    __syncthreads();
+    for (int k = 0; k < kDf2TopK; ++k) {
         if (tid == 0) {
             float v = wv[0];
             int ix = wi[0];
@@ -1013,23 +1019,42 @@ __global__ void topk_part_kernel(const float* __restrict__ logits, int n, float*
         }
         __syncthreads();
         const int w_ix = win;
-        if (w_ix >= 0 && (w_ix & 255) == tid) {
-            const int w_j = w_ix >> 8;
+        if (w_ix >= 0 && ((w_ix & 255) >> 5) == warp) {
+            if ((w_ix & 255) == tid) {
+                const int w_j = w_ix >> 8;
 #pragma unroll
-            for (int j = 0; j < TK_PER_THR; ++j)
-                if (j == w_j) rv[j] = -INFINITY;
+                for (int j = 0; j < MAX_PER_THR; ++j)
+                    if (j == w_j) rv[j] = -INFINITY;
+                bv = -INFINITY;
+                bi = 0x7fffffff;
+#pragma unroll
+                for (int j = 0; j < MAX_PER_THR; ++j) {
+                    const int i = tid + j * 256;
+                    if (i < cs && better(rv[j], i, bv, bi)) { bv = rv[j]; bi = i; }
+                }
+            }
+            float r_bv = bv;
+            int r_bi = bi;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, r_bv, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, r_bi, o);
+                if (better(ov, oi, r_bv, r_bi)) { r_bv = ov; r_bi = oi; }
+            }
+            if ((tid & 31) == 0) { wv[warp] = r_bv; wi[warp] = r_bi; }
         }
+        __syncthreads();
     }
 }
 
-__global__ void topk_merge_kernel(const float* __restrict__ cval, const int32_t* __restrict__ cidx, const int32_t* __restrict__ idx_map,
-                                  float* __restrict__ val, int32_t* __restrict__ tok) {
+__global__ void __launch_bounds__(256) topk_merge_kernel(const float* __restrict__ cval, const int32_t* __restrict__ cidx, const int32_t* __restrict__ idx_map,
+                                                         float* __restrict__ val, int32_t* __restrict__ tok) {
     constexpr int NC = kDf2TopBlocks * kDf2TopK;
     constexpr int TM_PER_THR = NC / 256;
     __shared__ float wv[8];
     __shared__ int wi[8], wp[8];
     __shared__ int win_p;
     const int row = blockIdx.x, tid = threadIdx.x;
+    const int warp = tid >> 5;
     float rv[TM_PER_THR];
     int ri[TM_PER_THR];
 #pragma unroll
@@ -1038,22 +1063,26 @@ __global__ void topk_merge_kernel(const float* __restrict__ cval, const int32_t*
         rv[j] = cval[(size_t) row * NC + i];
         ri[j] = cidx[(size_t) row * NC + i];
     }
-    for (int k = 0; k < kDf2TopK; ++k) {
-        float bv = -INFINITY;
-        int bi = 0x7fffffff, bp = -1;
+    float bv = -INFINITY;
+    int bi = 0x7fffffff, bp = -1;
 #pragma unroll
-        for (int j = 0; j < TM_PER_THR; ++j) {
-            const int i = tid + j * 256;
-            if (ri[j] >= 0 && better(rv[j], ri[j], bv, bi)) { bv = rv[j]; bi = ri[j]; bp = i; }
-        }
+    for (int j = 0; j < TM_PER_THR; ++j) {
+        const int i = tid + j * 256;
+        if (ri[j] >= 0 && better(rv[j], ri[j], bv, bi)) { bv = rv[j]; bi = ri[j]; bp = i; }
+    }
+    {
+        float r_bv = bv;
+        int r_bi = bi, r_bp = bp;
         for (int o = 16; o > 0; o >>= 1) {
-            const float ov = __shfl_xor_sync(0xffffffffu, bv, o);
-            const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
-            const int op = __shfl_xor_sync(0xffffffffu, bp, o);
-            if (better(ov, oi, bv, bi)) { bv = ov; bi = oi; bp = op; }
+            const float ov = __shfl_xor_sync(0xffffffffu, r_bv, o);
+            const int oi = __shfl_xor_sync(0xffffffffu, r_bi, o);
+            const int op = __shfl_xor_sync(0xffffffffu, r_bp, o);
+            if (better(ov, oi, r_bv, r_bi)) { r_bv = ov; r_bi = oi; r_bp = op; }
         }
-        if ((tid & 31) == 0) { wv[tid >> 5] = bv; wi[tid >> 5] = bi; wp[tid >> 5] = bp; }
-        __syncthreads();
+        if ((tid & 31) == 0) { wv[warp] = r_bv; wi[warp] = r_bi; wp[warp] = r_bp; }
+    }
+    __syncthreads();
+    for (int k = 0; k < kDf2TopK; ++k) {
         if (tid == 0) {
             float v = wv[0];
             int ix = wi[0], p = wp[0];
@@ -1065,12 +1094,32 @@ __global__ void topk_merge_kernel(const float* __restrict__ cval, const int32_t*
         }
         __syncthreads();
         const int p = win_p;
-        if (p >= 0 && (p & 255) == tid) {
-            const int p_j = p >> 8;
+        if (p >= 0 && ((p & 255) >> 5) == warp) {
+            if ((p & 255) == tid) {
+                const int p_j = p >> 8;
 #pragma unroll
-            for (int j = 0; j < TM_PER_THR; ++j)
-                if (j == p_j) ri[j] = -1;
+                for (int j = 0; j < TM_PER_THR; ++j)
+                    if (j == p_j) ri[j] = -1;
+                bv = -INFINITY;
+                bi = 0x7fffffff;
+                bp = -1;
+#pragma unroll
+                for (int j = 0; j < TM_PER_THR; ++j) {
+                    const int i = tid + j * 256;
+                    if (ri[j] >= 0 && better(rv[j], ri[j], bv, bi)) { bv = rv[j]; bi = ri[j]; bp = i; }
+                }
+            }
+            float r_bv = bv;
+            int r_bi = bi, r_bp = bp;
+            for (int o = 16; o > 0; o >>= 1) {
+                const float ov = __shfl_xor_sync(0xffffffffu, r_bv, o);
+                const int oi = __shfl_xor_sync(0xffffffffu, r_bi, o);
+                const int op = __shfl_xor_sync(0xffffffffu, r_bp, o);
+                if (better(ov, oi, r_bv, r_bi)) { r_bv = ov; r_bi = oi; r_bp = op; }
+            }
+            if ((tid & 31) == 0) { wv[warp] = r_bv; wi[warp] = r_bi; wp[warp] = r_bp; }
         }
+        __syncthreads();
     }
 }
 
@@ -1454,10 +1503,14 @@ void df2_q8_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t coun
 }
 
 void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint32_t* scratch, float* val, int32_t* tok, void* stream) {
-    if ((n + kDf2TopBlocks - 1) / kDf2TopBlocks > TK_CHUNK_MAX) throw std::invalid_argument("df2_topk: too many logits per row");
+    const int cs = (n + kDf2TopBlocks - 1) / kDf2TopBlocks;
+    if (cs > TK_CHUNK_MAX) throw std::invalid_argument("df2_topk: too many logits per row");
     float* cval = reinterpret_cast<float*>(scratch);
     int32_t* cidx = reinterpret_cast<int32_t*>(scratch + (size_t) rows * kDf2TopBlocks * kDf2TopK);
-    topk_part_kernel<<<dim3(rows, kDf2TopBlocks), 256, 0, (cudaStream_t) stream>>>(logits, n, cval, cidx);
+    if (cs <= 8 * 256)
+        topk_part_kernel<8><<<dim3(rows, kDf2TopBlocks), 256, 0, (cudaStream_t) stream>>>(logits, n, cval, cidx);
+    else
+        topk_part_kernel<TK_PER_THR><<<dim3(rows, kDf2TopBlocks), 256, 0, (cudaStream_t) stream>>>(logits, n, cval, cidx);
     check("topk_part");
     topk_merge_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>(cval, cidx, idx_map, val, tok);
     check("topk_merge");
