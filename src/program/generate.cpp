@@ -14773,6 +14773,10 @@ int main(int argc, char** argv) {
             drive.d.layers = 0;
             drive.d.experts = 0;
             drive.d.failed = false;
+            if (!ver.wait_commit(err)) {
+                std::printf("ERR %s\n", err.c_str());
+                return false;
+            }
             apply_pending(false);
             // --adapt-async: the round in flight moves on a step when its job and copies are done (or a due round starts).
             // Never between a prompt's chunks (its loan of cache slots and its chunks read the tables); a request drains
@@ -15129,9 +15133,15 @@ int main(int argc, char** argv) {
                 }
             }
 #endif
-            if (!ver.wait_commit(err)) {
-                std::printf("ERR %s\n", err.c_str());
-                return false;
+            static const bool defer_wait_commit = [] {
+                const char* e = std::getenv("STRATA_DF2_DEFER_WAITCOMMIT");
+                return !e || e[0] != '0';
+            }();
+            if (!defer_wait_commit || adapt_run.th.joinable() || !batch_on()) {
+                if (!ver.wait_commit(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return false;
+                }
             }
             std::fflush(stdout);
             bt_emit += msd(w2, Clock::now());
@@ -15766,6 +15776,13 @@ int main(int argc, char** argv) {
             }
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
+            {
+                std::string wc_err;
+                if (!ver.wait_commit(wc_err)) {
+                    std::printf("ERR %s\n", wc_err.c_str());
+                    return 1;
+                }
+            }
             if (!adapt_tick(true)) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
