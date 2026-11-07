@@ -6849,6 +6849,9 @@ int main(int argc, char** argv) {
     constexpr bool use_df2 = false;
     constexpr bool batch_df2 = false;
 #endif
+    // --serve: the DFlash2 drafter's context (its ring's K/V and the lineage's logged rows) parks and restores with
+    // each conversation; set with the drafter below (STRATA_DF2_CTX=0 turns it off; never with a layer split).
+    [[maybe_unused]] bool df2_park_ok = false;
     auto batch_max_t = [&]() -> int {
         if (batch_df2 && df2_solo && split_devs.empty()) {
             static const int df2_read_max_t = [] {
@@ -11638,6 +11641,14 @@ int main(int argc, char** argv) {
                                           " stage), the other stages' taps are gathered onto it").c_str() : "");
             }
         }
+        {   // the drafter's context (the ring and its lineage) parks and restores with each conversation, in
+            // park_source / the restore paths below; STRATA_DF2_CTX=0 turns it off.  The ring is one drafter's
+            // context: never a layer split's.
+            static const bool df2_ctx_env = [] { const char* e = std::getenv("STRATA_DF2_CTX"); return !(e && e[0] == '0'); }();
+            df2_park_ok = use_df2 && df2_ctx_env && stages.empty();
+            if (df2_park_ok)
+                std::fprintf(stderr, "strata serve: DFlash2 lineage parks with each conversation\n");
+        }
         // the taps of the window just run (rows 0..rows-1), where the drafter reads them: the verifier's own buffer on one card; on a layer split every
         // stage's share landed on the drafter's card (Verifier::gather_taps; the drafter's stream waits on the copies)
         auto df2_win_taps = [&](int rows, std::string& e) -> const float* {
@@ -11983,6 +11994,11 @@ int main(int argc, char** argv) {
             const strata::core::QsaState* draft_last;     ///< ... with the last stage's image (a split: the drafter's GPU)
             bool with_reuse;                              ///< the retained K/V describes this source (the main session's)
             std::string what;                             ///< the log's words after the token count ("", " from slot 1")
+#if defined(STRATA_HAVE_DFLASH2)
+            /// the drafter whose lineage parks with this conversation (the solo one, or this slot's when the batch
+            /// drafts with DFlash2): nullptr when the drafter is off or its park is turned off (STRATA_DF2_CTX=0)
+            strata::core::Dflash2Drafter* df2 = nullptr;
+#endif
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
@@ -12048,6 +12064,15 @@ int main(int argc, char** argv) {
             // saved with that stage's image, under its device; stage 0's image holds none
             const strata::core::QsaState* draft0 = src.draft0;   // no --mtp: no draft K/V (snapshots accept null)
             auto draft_of = [&](size_t k) -> const strata::core::QsaState* { return k + 1 == n_st ? src.draft_last : nullptr; };
+#if defined(STRATA_HAVE_DFLASH2)
+            if (src.df2 != nullptr && !src.df2->context_wait(err)) return false;
+#endif
+            const size_t df2_estimate =
+#if defined(STRATA_HAVE_DFLASH2)
+                (src.df2 != nullptr && n_st == 0) ? src.df2->lineage_bytes((int64_t) src.ids.size()) : 0;
+#else
+                0;
+#endif
             std::vector<ConvCheckpoint>& checks = src.checks;
             strata::core::ConversationCheckpointSplit cs;
             if (n_st > 0) cs = strata::core::conversation_checkpoints_split(std::move(checks), n_st);   // #752: two-phase; a bad_alloc leaves `checks` whole
@@ -12107,7 +12132,7 @@ int main(int argc, char** argv) {
                 estimate = fresh_estimate;
                 err.clear();
             }
-            estimate += stage_estimate;
+            estimate += stage_estimate + df2_estimate;
             // A park carrying its own retained K/V replaces memory the cache
             // already held, so capacity is make_room's call - it runs next either
             // way, and put()'s accounting still bounds the budget. The with-reuse
@@ -12192,6 +12217,15 @@ int main(int argc, char** argv) {
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
+#if defined(STRATA_HAVE_DFLASH2)
+                if (src.df2 != nullptr && n_st == 0) {
+                    std::string de;
+                    if (!src.df2->save_lineage(image.df2_state, de, (int64_t) src.ids.size())) {
+                        std::fprintf(stderr, "strata serve: conversation cache: DFlash2 lineage not saved (%s)\n", de.c_str());
+                        image.df2_state.clear();
+                    }
+                }
+#endif
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
@@ -12212,12 +12246,22 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        const bool df2_ctx_park =
+#if defined(STRATA_HAVE_DFLASH2)
+            use_df2 && (std::getenv("STRATA_DF2_CTX") == nullptr || std::atoi(std::getenv("STRATA_DF2_CTX")) != 0);
+#else
+            false;
+#endif
         auto park_current_body = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             const size_t n_st = stages.size();
             ParkSource src{live, live_imgs, checks, cvec_cached, ss, {},
                            (n_st > 0 && !mtp_first) || !use_mtp ? nullptr : &mtp.kv_state(),
-                           use_mtp && !mtp_first && n_st > 0 ? &mtp.kv_state() : nullptr, true, ""};
+                           use_mtp && !mtp_first && n_st > 0 ? &mtp.kv_state() : nullptr, true, ""
+#if defined(STRATA_HAVE_DFLASH2)
+                           , (df2_ctx_park && n_st == 0) ? &df2 : nullptr
+#endif
+            };
             for (auto& st : stages) src.stage_sessions.push_back(&st->ss);
             return park_source(src, held);
         };
@@ -14309,10 +14353,19 @@ int main(int argc, char** argv) {
             }
             const size_t n_st = stages.size();
             static const std::vector<ImgKey> no_imgs;
+#if defined(STRATA_HAVE_DFLASH2)
+            if (batch_df2 && (size_t) b < slot_df2.size()) {
+                df2.harvest_slot(*slot_df2[(size_t) b]);
+            }
+#endif
             ParkSource src{sl.ids, no_imgs, sl.checks, sl.cvec, *bslot_ss[0][(size_t) b], {},
                            (n_st > 0 && !mtp_first) || !batch_mtp || batch_df2 ? nullptr : &slot_mtp[(size_t) b]->kv_state(),
                            batch_mtp && !batch_df2 && !mtp_first && n_st > 0 ? &slot_mtp[(size_t) b]->kv_state() : nullptr, false,
-                           " from slot " + std::to_string(b)};
+                           " from slot " + std::to_string(b)
+#if defined(STRATA_HAVE_DFLASH2)
+                           , (df2_ctx_park && batch_df2 && n_st == 0 && (size_t) b < slot_df2.size()) ? slot_df2[(size_t) b].get() : nullptr
+#endif
+            };
             for (size_t k = 1; k < bslot_ss.size(); ++k) src.stage_sessions.push_back(bslot_ss[k][(size_t) b].get());
             try {
                 if (park_source(src, 0)) return;
@@ -14538,6 +14591,23 @@ int main(int argc, char** argv) {
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
+#if defined(STRATA_HAVE_DFLASH2)
+                        if (batch_df2 && sl.cached && (size_t) b < slot_df2.size()) {
+                            strata::core::Dflash2Drafter& d = *slot_df2[(size_t) b];
+                            const int fin_kp = j + 1;
+                            d.note_rows(tok + first[t], fin_kp, pos[first[t]]);
+                            if (d.has_deferred() && !d.catch_up(pos[first[t]], err)) {
+                                std::printf("ERR batch DFlash2 slot %d: %s\n", b, err.c_str());
+                                return false;
+                            }
+                            d.clear_deferred();
+                            if (!ver.gather_taps(d.landing(), d.device(), first[t], fin_kp, 0, d.stream(), err) ||
+                                !d.context(d.landing(), fin_kp, pos[first[t]], err)) {
+                                std::printf("ERR batch DFlash2 slot %d: %s\n", b, err.c_str());
+                                return false;
+                            }
+                        }
+#endif
                         break;
                     }
                     sl.x = y;
@@ -16427,6 +16497,14 @@ int main(int argc, char** argv) {
                 cvec_cached = donor->cvec;
                 resume = parked.tokens;
                 from_live = false;
+#if defined(STRATA_HAVE_DFLASH2)
+                if (df2_ctx_park && !donor->df2_state.empty()) {
+                    std::string de;
+                    if (!df2.restore_lineage(donor->df2_state, de))
+                        std::fprintf(stderr, "strata serve: conversation cache: borrowed DFlash2 lineage not restored (%s)\n",
+                                     de.c_str());
+                }
+#endif
                 conversations.count_borrow();
                 std::fprintf(stderr, "strata serve: conversation cache: borrowed %lld tokens from a parked "
                              "conversation, which stays parked, in %.1f ms; parked=%zu bytes=%zu borrowed=%zu\n",
@@ -16481,6 +16559,19 @@ int main(int argc, char** argv) {
                 cvec_cached = incoming->cvec;
                 resume = parked.tokens;
                 from_live = parked.live;
+#if defined(STRATA_HAVE_DFLASH2)
+                if (df2_ctx_park && !incoming->df2_state.empty()) {
+                    std::string de;
+                    const size_t df2_kb = incoming->df2_state.size() >> 10;
+                    if (!df2.restore_lineage(incoming->df2_state, de))
+                        std::fprintf(stderr, "strata serve: conversation cache: DFlash2 lineage NOT restored (%s); "
+                                             "the drafter starts cold\n", de.c_str());
+                    else
+                        std::fprintf(stderr, "strata serve: conversation cache: DFlash2 lineage restored "
+                                             "(%zu KiB, %lld tokens)\n", df2_kb, (long long) resume);
+                    incoming->df2_state.clear();
+                }
+#endif
                 if (std::getenv("STRATA_SNAPSHOT_FULL_CAPTURE") == nullptr) {
                     std::vector<std::vector<strata::core::ConversationKv>> stage_kv;   // every stage's, for its next park
                     for (auto& si : incoming->stage_images) stage_kv.push_back(std::move(si.kv));
@@ -19610,6 +19701,7 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, "strata batch: DFlash2 admission for slot %d failed: %s\n", admit_slot, err.c_str());
                             return 1;
                         }
+                        df2.copy_log_state_from(d);   // the main session's `live` holds `sl.p` tokens too: keep its lineage complete for a park
                         for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts && j < (int) sl.draft.size(); ++j) { sl.draft[(size_t) j] = dd[j]; sl.dprob[(size_t) j] = pp[j]; }
                         sl.draft_ready = true;
                     } else
