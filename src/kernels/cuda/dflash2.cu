@@ -1173,9 +1173,11 @@ __device__ void select_slot_walk(const float* __restrict__ hp, const float* __re
                 if (sc[j] > bv) { bv = sc[j]; bj = j; }
             float z = 0.0f;
             for (int j = 0; j < kDf2TopK; ++j) z += __expf(sc[j] - bv);
-            out_tok[i] = tok[i * kDf2TopK + bj];
+            const int32_t picked = tok[i * kDf2TopK + bj];
             out_prob[i] = 1.0f / z;
-            prev = out_tok[i];
+            prev = picked;
+            if (i + 1 == rows) __threadfence_system();
+            out_tok[i] = picked;
         }
         __syncthreads();
     }
