@@ -46,6 +46,7 @@ namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
 constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersionDf2 = 4;
 constexpr size_t kHeader = 64, kTrailer = 16;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
@@ -239,6 +240,13 @@ public:
         }
         return true;
     }
+    bool seek(uint64_t offset) {
+        LARGE_INTEGER at{};
+        at.QuadPart = (LONGLONG) offset;
+        if (SetFilePointerEx(h_, at, nullptr, FILE_BEGIN)) return true;
+        { const DWORD c_ = GetLastError(); kind_ = win_kind(c_); error_ = last_error(c_); }
+        return false;
+    }
     bool truncate(uint64_t n) {
         LARGE_INTEGER at{};
         at.QuadPart = (LONGLONG) n;
@@ -417,6 +425,17 @@ public:
     }
     bool truncate(uint64_t n) {
         if (::ftruncate(fd_, (off_t) n) == 0) return true;
+        kind_ = errno_kind(errno);
+        error_ = std::strerror(errno);
+        return false;
+    }
+    bool seek(uint64_t offset) {
+        if (direct_ && (offset % kAlign) != 0 && !leave_direct()) {
+            kind_ = errno_kind(errno);
+            error_ = std::strerror(errno);
+            return false;
+        }
+        if (::lseek(fd_, (off_t) offset, SEEK_SET) == (off_t) offset) return true;
         kind_ = errno_kind(errno);
         error_ = std::strerror(errno);
         return false;
@@ -602,6 +621,15 @@ public:
         }
         return true;
     }
+    bool skip(uint64_t n) {
+        const size_t buf_rem = have_ - at_;
+        if (n <= buf_rem) { at_ += (size_t) n; return true; }
+        n -= buf_rem;
+        at_ = have_ = 0;
+        if (!f_.seek(total_ + n)) return false;
+        total_ += n;
+        return true;
+    }
     std::optional<Ticker> progress;
     uint64_t expected = 0;
 private:
@@ -686,7 +714,8 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.u64(c.used);
 }
 
-void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr) {
+void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKvSource>* sources = nullptr,
+                 uint32_t version = kVersion) {
     for (int64_t g : s.geometry) o.i64(g);
     o.i64(s.layer_lo); o.i64(s.layer_hi); o.u64(s.cvec ? 1 : 0);
     put_checkpoint(o, s.live);
@@ -698,12 +727,16 @@ void put_payload(Out& o, const SavedConversation& s, const std::vector<SessionKv
             put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
             for (size_t part = 0; part < 5; ++part) o.source(k, part);
         }
-        return;
+    } else {
+        o.u64(s.kv.size());
+        for (const auto& k : s.kv) {
+            put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
+            o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
+        }
     }
-    o.u64(s.kv.size());
-    for (const auto& k : s.kv) {
-        put_kv_header(o, k.format, k.cells, k.heads, k.head_dim, k.page_size, k.pooled_rows, k.idx_dim);
-        o.buffer(k.k); o.buffer(k.v); o.buffer(k.k_scale); o.buffer(k.v_scale); o.buffer(k.pooled);
+    if (version >= kVersionDf2) {
+        o.u64(s.df2_state.size());
+        if (!s.df2_state.empty()) o.raw(s.df2_state.data(), s.df2_state.size());
     }
 }
 
@@ -762,7 +795,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
            in.vec(c.block_pos, m[4]) && in.u64(c.used);
 }
 
-bool get_payload(In& in, SavedConversation& s) {
+bool get_payload(In& in, SavedConversation& s, uint32_t version = kVersion) {
     for (auto& g : s.geometry) if (!in.i64(g)) return false;
     // checked before any state array is read: a file of another geometry allocates nothing
     if (in.limits.geometry && *in.limits.geometry != s.geometry)
@@ -792,6 +825,55 @@ bool get_payload(In& in, SavedConversation& s) {
         if (!in.buffer(k.k, 0) || !in.buffer(k.v, 1) || !in.buffer(k.k_scale, 2) || !in.buffer(k.v_scale, 3) ||
             !in.buffer(k.pooled, 4)) return false;
     }
+    if (version >= kVersionDf2) {
+        uint64_t df2_n = 0;
+        if (!in.count(df2_n, 1, in.limits.max_df2_bytes)) return false;
+        s.df2_state.resize((size_t) df2_n);
+        if (df2_n && !in.raw(s.df2_state.data(), (size_t) df2_n)) return false;
+    }
+    return true;
+}
+
+bool skip_bytes(In& in, uint64_t n, uint64_t limit = UINT64_MAX) {
+    if (n > in.left) return in.fail("payload ends early");
+    if (n > limit) return in.fail("element count " + std::to_string(n) + " exceeds this engine's limit " +
+                                  std::to_string(limit));
+    if (n && !in.f->skip(n)) { in.kind = in.f->kind(); return in.fail("read error: " + in.f->error()); }
+    in.left -= n;
+    return true;
+}
+
+bool get_meta_checkpoint(In& in, std::vector<int32_t>& ids, std::vector<ConversationImageKey>& imgs) {
+    if (!in.vec(ids, in.limits.max_tokens)) return false;
+    uint64_t n = 0;
+    if (!in.count(n, 16, in.limits.max_tokens)) return false;
+    imgs.resize((size_t) n);
+    for (auto& k : imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
+    const auto& m = in.limits.max_state_bytes;
+    for (size_t i = 0; i < 5; ++i) {
+        uint64_t sz = 0;
+        if (!in.u64(sz) || !skip_bytes(in, sz, m[i])) return false;
+    }
+    uint64_t used = 0;
+    return in.u64(used);
+}
+
+bool get_meta_payload(In& in, SessionFileMeta& m) {
+    for (auto& g : m.geometry) if (!in.i64(g)) return false;
+    if (in.limits.geometry && *in.limits.geometry != m.geometry)
+        return in.fail("saved with another model geometry than this runtime's");
+    uint64_t cvec = 0;
+    if (!in.i64(m.layer_lo) || !in.i64(m.layer_hi) || !in.u64(cvec)) return false;
+    if (in.limits.layer_range &&
+        (in.limits.layer_range->first != m.layer_lo || in.limits.layer_range->second != m.layer_hi))
+        return in.fail("saved with another layer range than this runtime's");
+    if (cvec > 1) return in.fail("invalid cvec flag");
+    m.cvec = cvec == 1;
+    if (!get_meta_checkpoint(in, m.ids, m.imgs)) return false;
+    uint64_t n = 0;
+    if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
+    m.checkpoints.resize((size_t) n);
+    for (auto& c : m.checkpoints) if (!get_meta_checkpoint(in, c.ids, c.imgs)) return false;
     return true;
 }
 
@@ -801,12 +883,12 @@ bool has_stage_parts(const SavedConversation& s) {
     return false;
 }
 
-// header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
+// header v1/v4, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
 // header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
-void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
+void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, uint32_t version = kVersion) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
-    const uint32_t version = kVersion, size = kHeader;
+    const uint32_t size = kHeader;
     std::memcpy(h + 8, &version, 4);
     std::memcpy(h + 12, &size, 4);
     std::memcpy(h + 16, &id.model, 8);
@@ -935,6 +1017,7 @@ std::vector<SessionModelFile> session_model_inputs(const SessionInputs& in) {
     if (!in.embedding.empty()) f.push_back({"embedding", in.embedding});
     if (!in.ple.empty()) f.push_back({"ple", in.ple});
     if (!in.mtp.empty()) f.push_back({"mtp", in.mtp});
+    if (!in.dflash2.empty()) f.push_back({"dflash2", in.dflash2});
     if (!in.pack.empty()) f.push_back({"pack native_experts.txt", in.pack + "/native_experts.txt", true});
     for (const auto& [role, path] : in.experts) f.push_back({role, path});
     return f;
@@ -1014,6 +1097,7 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
         n = sat_add(n, 7 * 8);
         for (uint64_t b : l.max_kv_bytes[(size_t) i]) n = sat_add(n, sat_add(8, b));
     }
+    if (l.max_df2_bytes != open) n = sat_add(n, sat_add(8, l.max_df2_bytes));
     return std::min(n, l.max_file_bytes);
 }
 
@@ -1031,8 +1115,9 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    const uint32_t version = !image.df2_state.empty() ? kVersionDf2 : kVersion;
     Out sizing;
-    put_payload(sizing, image, sources);
+    put_payload(sizing, image, sources, version);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
         sizing.n + kHeader + kTrailer > (uint64_t) std::numeric_limits<size_t>::max()) {
         error = "session file: the state is too large for this build";
@@ -1069,13 +1154,13 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
     uint8_t h[kHeader];
-    header_bytes(h, id, payload);
+    header_bytes(h, id, payload, version);
     bool ok = f.write(h, kHeader);
     SessionHasher hash(0);
     Out out;
     out.f = &f;
     out.hash = &hash;
-    if (ok) put_payload(out, image, sources);
+    if (ok) put_payload(out, image, sources, version);
     ok = ok && out.ok && out.n == payload;
     if (ok) {
         const uint64_t ph = hash.digest();
@@ -1204,7 +1289,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
-    if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
+    if (version != kVersion && version != kVersionDf2) { error = "session file: unsupported version " + std::to_string(version); return false; }
     if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
     if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
@@ -1223,7 +1308,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     }
     SavedConversation parsed;
     In in{&f, SessionHasher(0), payload, error, limits};
-    if (!get_payload(in, parsed)) { st.error = in.kind; return false; }
+    if (!get_payload(in, parsed, version)) { st.error = in.kind; return false; }
     if (in.left) { error = "session file: payload has " + std::to_string(in.left) + " unparsed bytes"; return false; }
     uint8_t t[kTrailer];
     if (!f.read(t, kTrailer)) { st.error = f.kind(); error = "session file: trailer read error: " + f.error(); return false; }
@@ -1233,6 +1318,54 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     if (std::memcmp(t + 8, kEnd, 8) != 0) { error = "session file: bad end marker"; return false; }
     image = std::move(parsed);
     bytes = (size_t) size;
+    st.error = SessionError::none;
+    return true;
+}
+
+bool read_meta_impl(const std::string& path, const SessionFileIdentity& id, SessionFileMeta& meta,
+                    uint64_t& file_bytes, std::string& error, const SessionReadLimits& limits, SessionStatus& st) {
+    error.clear();
+    st = {};
+    st.error = SessionError::invalid;
+    RawFile raw;
+    uint64_t size = 0;
+    if (!raw.open_session(path, size)) {
+        st.error = raw.refused() ? SessionError::invalid : raw.kind();
+        error = "session file: " + path + ": " + raw.error();
+        return false;
+    }
+    if (size < kHeader + kTrailer) { error = "session file: size " + std::to_string(size) + " is below the minimum"; return false; }
+    const uint64_t max_size = session_read_max_file_bytes(limits);
+    if (size > max_size || size > (uint64_t) std::numeric_limits<size_t>::max()) {
+        error = "session file: size " + std::to_string(size) + " exceeds this engine's limit" +
+                (max_size == UINT64_MAX ? std::string() : " of " + std::to_string(max_size));
+        return false;
+    }
+    FileSource f(raw);
+    if (!f.ok()) { st.error = SessionError::memory; error = "session file: " + f.error(); return false; }
+    uint8_t h[kHeader];
+    if (!f.read(h, kHeader)) { st.error = f.kind(); error = "session file: header read error: " + f.error(); return false; }
+    uint32_t version = 0, hsize = 0;
+    uint64_t model = 0, config = 0, payload = 0, r0 = 0, r1 = 0, hh = 0;
+    std::memcpy(&version, h + 8, 4); std::memcpy(&hsize, h + 12, 4);
+    std::memcpy(&model, h + 16, 8); std::memcpy(&config, h + 24, 8); std::memcpy(&payload, h + 32, 8);
+    std::memcpy(&r0, h + 40, 8); std::memcpy(&r1, h + 48, 8); std::memcpy(&hh, h + 56, 8);
+    if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
+    if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
+    if (version != kVersion && version != kVersionDf2) { error = "session file: unsupported version " + std::to_string(version); return false; }
+    if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
+    if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
+    if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
+    if (payload > size || size - kHeader - kTrailer != payload) {
+        error = "session file: size " + std::to_string(size) + " does not match the header (" +
+                std::to_string(kHeader + payload + kTrailer) + ")";
+        return false;
+    }
+    SessionFileMeta parsed;
+    In in{&f, SessionHasher(0), payload, error, limits};
+    if (!get_meta_payload(in, parsed)) { st.error = in.kind; return false; }
+    meta = std::move(parsed);
+    file_bytes = size;
     st.error = SessionError::none;
     return true;
 }
@@ -1251,6 +1384,81 @@ bool session_file_read(const std::string& path, const SessionFileIdentity& id, S
     }
     if (status) *status = st;
     return ok;
+}
+
+bool session_file_read_meta(const std::string& path, const SessionFileIdentity& id, SessionFileMeta& meta,
+                            uint64_t& file_bytes, std::string& error, const SessionReadLimits& limits,
+                            SessionStatus* status) {
+    SessionStatus st;
+    bool ok = false;
+    try {
+        ok = read_meta_impl(path, id, meta, file_bytes, error, limits, st);
+    } catch (const std::bad_alloc&) {
+        error = "session file: out of memory while reading metadata of " + path;
+        st.error = SessionError::memory;
+        ok = false;
+    }
+    if (status) *status = st;
+    return ok;
+}
+
+bool conversation_cache_index(const std::filesystem::path& dir, const std::string& prefix,
+                              const SessionFileIdentity& id, double max_age_days,
+                              uint64_t max_tokens, uint64_t max_checkpoints,
+                              std::vector<CachedConversationFile>& out, std::string& error) {
+    out.clear();
+    error.clear();
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec)) return true;
+    const auto now = std::filesystem::file_time_type::clock::now();
+    const bool prune_all = !(max_age_days > 0.0);
+    const auto max_age = prune_all ? std::chrono::nanoseconds(0)
+                                   : std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::duration<double, std::ratio<86400>>(max_age_days));
+    SessionReadLimits limits;
+    limits.max_tokens = max_tokens;
+    limits.max_checkpoints = max_checkpoints;
+    std::filesystem::directory_iterator it(dir, ec), end;
+    if (ec) {
+        error = "conversation cache: cannot list " + dir.string() + ": " + ec.message();
+        return false;
+    }
+    for (; it != end; it.increment(ec)) {
+        if (ec) break;
+        const auto& p = it->path();
+        const std::string name = p.filename().string();
+        if (name.compare(0, prefix.size(), prefix) != 0) continue;
+        // Leftover temporary files from an interrupted write (`<prefix>*.sess.tmp*`).
+        if (name.find(".sess.tmp") != std::string::npos) {
+            std::filesystem::remove(p, ec);
+            ec.clear();
+            continue;
+        }
+        if (name.size() <= prefix.size() + 5 || name.compare(name.size() - 5, 5, ".sess") != 0) continue;
+        const auto mtime = std::filesystem::last_write_time(p, ec);
+        if (ec) { ec.clear(); continue; }
+        const auto age = std::chrono::duration_cast<std::chrono::nanoseconds>(now - mtime);
+        if (prune_all || age > max_age) {
+            std::filesystem::remove(p, ec);
+            ec.clear();
+            continue;
+        }
+        SessionFileMeta meta;
+        uint64_t fbytes = 0;
+        std::string rerr;
+        if (!session_file_read_meta(p.string(), id, meta, fbytes, rerr, limits)) {
+            std::filesystem::remove(p, ec);
+            ec.clear();
+            continue;
+        }
+        const auto mtime_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(mtime.time_since_epoch()).count();
+        out.push_back(CachedConversationFile{p.string(), fbytes, (int64_t) mtime_ns, std::move(meta)});
+    }
+    std::sort(out.begin(), out.end(), [](const CachedConversationFile& a, const CachedConversationFile& b) {
+        if (a.mtime_ns != b.mtime_ns) return a.mtime_ns < b.mtime_ns;
+        return a.path < b.path;
+    });
+    return true;
 }
 
 } // namespace strata::core

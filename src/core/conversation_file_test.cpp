@@ -768,6 +768,76 @@ int main() {
         check(::stat(link.c_str(), &st) == 0 && (st.st_mode & 0777) == 0600, "the session file is mode 0600");
     }
 #endif
+    {
+        SessionInputs in;
+        in.native_shards = {"/a/s0", "/a/s1"};
+        in.native_dense = {"/a/d0"};
+        in.native_head = {"/a/h0"};
+        in.embedding = "/a/e";
+        in.ple = "/a/p";
+        in.mtp = "/a/m";
+        in.pack = "/a/pack";
+        in.experts = {{"expert 0", "/a/x0"}};
+        check(session_model_inputs(in).size() == 9, "ordered model inputs");
+        in.dflash2 = "/tmp/dflash2.gguf";
+        check(session_model_inputs(in).size() == 10 && session_model_inputs(in)[7].role == "dflash2",
+              "dflash2 included in ordered model inputs");
+    }
+
+    // session_file_read_meta and conversation_cache_index (version 1 + version 4 with df2_state)
+    {
+        const fs::path cache_dir = dir / "conv_cache";
+        fs::create_directories(cache_dir);
+        SavedConversation c1 = sample();
+        c1.live.ids = {10, 20, 30, 40};
+        SavedConversation c2 = sample();
+        c2.live.ids = {50, 60, 70};
+        c2.df2_state = bytes_of(4096, 77); // v4 file with DFlash2 lineage
+        const fs::path p1 = cache_dir / "conv-1.sess";
+        const fs::path p2 = cache_dir / "conv-2.sess";
+        const fs::path p_bad = cache_dir / "conv-bad.sess";
+        const fs::path p_tmp = cache_dir / "conv-3.sess.tmp.1234";
+        const fs::path p_other = cache_dir / "unrelated.bin";
+        size_t w1 = 0, w2 = 0;
+        check(session_file_write(p1.string(), c1, id, w1, error), "write c1 (v1)");
+        check(session_file_write(p2.string(), c2, id, w2, error), "write c2 (v4 with df2_state)");
+        {
+            SavedConversation back2;
+            size_t r2 = 0;
+            check(session_file_read(p2.string(), id, back2, r2, error) && same(c2, back2) &&
+                  back2.df2_state == c2.df2_state,
+                  "v4 session file round-trips df2_state");
+        }
+        spit(p_bad, {'b', 'a', 'd'});
+        spit(p_tmp, {'t', 'm', 'p'});
+        spit(p_other, {'k', 'e', 'e', 'p'});
+        const auto base_time = fs::last_write_time(p1);
+        fs::last_write_time(p1, base_time - std::chrono::seconds(10));
+        fs::last_write_time(p2, base_time);
+
+        SessionFileMeta meta1;
+        uint64_t fb1 = 0;
+        check(session_file_read_meta(p1.string(), id, meta1, fb1, error), "read_meta succeeds on c1");
+        check(fb1 == w1 && meta1.ids == c1.live.ids && meta1.geometry == c1.geometry &&
+              meta1.checkpoints.size() == c1.checkpoints.size() &&
+              meta1.checkpoints[0].ids == c1.checkpoints[0].ids &&
+              meta1.checkpoints[0].gdn.empty(),
+              "read_meta returns token/checkpoint metadata without reading state or K/V");
+
+        std::vector<CachedConversationFile> indexed;
+        check(conversation_cache_index(cache_dir, "conv-", id, 7.0, 10000, 100, indexed, error),
+              "conversation_cache_index succeeds");
+        check(indexed.size() == 2 && indexed[0].path == p1.string() && indexed[1].path == p2.string(),
+              "indexed files ordered oldest-mtime first");
+        check(!fs::exists(p_bad) && !fs::exists(p_tmp) && fs::exists(p_other),
+              "corrupt and temp files removed; unrelated files untouched");
+
+        // incompatible fingerprint prunes cached files
+        check(conversation_cache_index(cache_dir, "conv-", {id.model ^ 1, id.config}, 7.0, 10000, 100, indexed, error),
+              "conversation_cache_index with different model");
+        check(indexed.empty() && !fs::exists(p1) && !fs::exists(p2),
+              "incompatible session files pruned on startup");
+    }
 
     fs::remove_all(dir);
     std::printf("conversation_file_test: %d checks passed\n", checks);

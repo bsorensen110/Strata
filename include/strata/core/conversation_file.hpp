@@ -12,6 +12,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <optional>
 #include <string>
@@ -103,7 +104,7 @@ bool session_model_fingerprint(const std::vector<SessionModelFile>& files, uint6
 // native_experts.txt resolved it (ExpertSource::model_inputs).
 struct SessionInputs {
     std::vector<std::string> native_shards, native_dense, native_head;
-    std::string embedding, ple, pack, mtp;
+    std::string embedding, ple, pack, mtp, dflash2;
     std::vector<std::pair<std::string, std::string>> experts;
 };
 // The fingerprint's list: every role with its file, none merged (a path in two roles is two entries).
@@ -218,6 +219,8 @@ struct SessionReadLimits {
     // per K/V layer (the QSA layers, then the draft): the most bytes of each part (k, v, k_scale, v_scale, pooled).
     // A layer past the end of the list is bounded by the payload only.
     std::vector<std::array<uint64_t, 5>> max_kv_bytes;
+    // v4: the most bytes of the serialized DFlash2 drafter lineage (default 512 MiB).
+    uint64_t max_df2_bytes = 1ull << 29;
     // the RAM PREFLIGHT: asked once the header and identity match and before any payload allocation, with what the
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
@@ -234,6 +237,37 @@ uint64_t session_read_peak_bytes(uint64_t file_bytes);
 bool session_file_read(const std::string& path, const SessionFileIdentity& id, SavedConversation& image,
                        size_t& bytes, std::string& error, const SessionReadLimits& limits = {},
                        SessionStatus* status = nullptr);
+
+// What `ConversationCache` needs to index a session file on disk without reading its running state or K/V: the
+// live token / image lists, the checkpoints' token / image lists (and pins), the geometry, the layer range and
+// the steering flag.  `session_file_read_meta` checks the header (magic, version, model & config fingerprints,
+// header hash, payload_bytes vs file size) and reads only this prefix of the payload, seeking past the state
+// byte arrays and stopping before the K/V layers.
+struct SessionFileMeta {
+    std::array<int64_t, 18> geometry{};
+    int64_t layer_lo = 0, layer_hi = 0;
+    bool cvec = true;
+    std::vector<int32_t> ids;
+    std::vector<ConversationImageKey> imgs;
+    std::vector<ConversationCheckpoint> checkpoints;
+};
+bool session_file_read_meta(const std::string& path, const SessionFileIdentity& id, SessionFileMeta& meta,
+                            uint64_t& file_bytes, std::string& error, const SessionReadLimits& limits = {},
+                            SessionStatus* status = nullptr);
+
+struct CachedConversationFile {
+    std::string path;
+    uint64_t bytes = 0;
+    int64_t mtime_ns = 0;
+    SessionFileMeta meta;
+};
+// Scans `dir` for `<prefix>*.sess` files (and removes leftover `<prefix>*.sess.tmp.*` files), prunes files older than
+// `max_age_days` (`<= 0` removes every matching file) or incompatible / corrupt files, and returns the surviving files
+// ordered oldest-mtime first so the caller can replay them into `ConversationCache` in LRU order.
+bool conversation_cache_index(const std::filesystem::path& dir, const std::string& prefix,
+                              const SessionFileIdentity& id, double max_age_days,
+                              uint64_t max_tokens, uint64_t max_checkpoints,
+                              std::vector<CachedConversationFile>& out, std::string& error);
 
 // The folder the free-space preflight asks about for `path`, by the rules of Windows or of POSIX (exposed so both can
 // be tested anywhere).  Windows: backslashes and a trailing backslash, as GetDiskFreeSpaceExW requires for a UNC
