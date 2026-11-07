@@ -859,6 +859,61 @@ __global__ void kv_ring_batch_kernel(const float* __restrict__ kin, const float*
     if (tag != nullptr && h == 0 && d == 0) tag[slot] = ((int64_t) *epoch_ptr << 32) | (int64_t) pos[r];
 }
 
+template <typename RingT>
+__global__ void kv_ring_batch_precomp_kernel(const float* __restrict__ kin, const float* __restrict__ vin, size_t layer_stride,
+                                             const int32_t* __restrict__ pos_dev, const float* __restrict__ table,
+                                             Df2BatchKvRingPrecomp bkv, const int32_t* __restrict__ slot_info,
+                                             const int32_t* __restrict__ epoch_base, int n_items, int n_layers,
+                                             int slots, int heads, float eps, const double* __restrict__ rope_inv,
+                                             const int32_t* __restrict__ blk_pos, float* __restrict__ blk_table, int total_B) {
+    const int z = (int) blockIdx.z;
+    if (z >= n_items * n_layers) {
+        const int r = (int) (blockIdx.x * gridDim.y + blockIdx.y);
+        const int i = (int) threadIdx.x;
+        if (r < total_B && i < 64 && rope_inv != nullptr && blk_pos != nullptr && blk_table != nullptr) {
+            double ang = (double) blk_pos[r] * rope_inv[i];
+            const double two_pi = 6.283185307179586476925286766559;
+            ang -= two_pi * rint(ang / two_pi);
+            float s, c;
+            sincosf((float) ang, &s, &c);
+            float* row = blk_table + (size_t) r * 128;
+            row[i] = c;
+            row[64 + i] = s;
+        }
+        return;
+    }
+    const int r_local = (int) blockIdx.x, h = (int) blockIdx.y, d = (int) threadIdx.x;
+    const int l = z / n_items, idx = z % n_items;
+    const int c0 = slot_info[idx * 4 + 1];
+    const int m  = slot_info[idx * 4 + 2];
+    if (r_local >= m) return;
+    const int r = c0 + r_local;
+    RingT* kring = static_cast<RingT*>(bkv.kring[idx][l]);
+    RingT* vring = static_cast<RingT*>(bkv.vring[idx][l]);
+    const float* gk = bkv.gk[l];
+    int64_t* tag = bkv.tag[idx];
+    const int32_t* epoch_ptr = epoch_base + idx;
+    const float* kin_l = kin + (size_t) l * layer_stride;
+    const float* vin_l = vin + (size_t) l * layer_stride;
+    __shared__ float red[4];
+    __shared__ float y[HD];
+    const float x = kin_l[((size_t) r * heads + h) * HD + d];
+    float ss = x * x;
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+    if ((d & 31) == 0) red[d >> 5] = ss;
+    __syncthreads();
+    const float v = x * rsqrtf((red[0] + red[1] + red[2] + red[3]) / (float) HD + eps) * gk[d];
+    y[d] = v;
+    __syncthreads();
+    const int i = d & 63;
+    const float c = table[(r * 2 + 0) * 64 + i], sn = table[(r * 2 + 1) * 64 + i];
+    const int slot = (int) (pos_dev[r] % slots);
+    const size_t at = ((size_t) h * slots + slot) * HD + d;
+    store_ring_elem(kring, at, d < 64 ? v * c - y[d + 64] * sn : v * c + y[d - 64] * sn);
+    store_ring_elem(vring, at, vin_l[((size_t) r * heads + h) * HD + d]);
+    if (l == 0 && tag != nullptr && h == 0 && d == 0) tag[slot] = ((int64_t) *epoch_ptr << 32) | (int64_t) pos_dev[r];
+}
+
 // silu(gate) * up then the planar quantization: grid (ceil(I / 32 / 8), rows), 256 threads
 __global__ void swiglu_quant_kernel(const float* __restrict__ gate, const float* __restrict__ up, int I, int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int blk = blockIdx.x * 8 + (threadIdx.x >> 5), b = blockIdx.y, lane = threadIdx.x & 31;
@@ -1456,6 +1511,34 @@ void df2_kv_ring_batch_f16(const float* kin, const float* vin, const float* gk, 
     kv_ring_batch_kernel<uint16_t><<<dim3((unsigned) total_rows, (unsigned) heads), HD, 0, (cudaStream_t) stream>>>(
         kin, vin, gk, pos, table, bkv, slots, heads, eps, epoch_base);
     check("kv_ring_batch_f16");
+}
+
+void df2_kv_ring_batch_precomp(const float* kin, const float* vin, size_t layer_stride,
+                               const int32_t* pos_dev, const float* table,
+                               Df2BatchKvRingPrecomp bkv, const int32_t* slot_info,
+                               const int32_t* epoch_base, int n_items, int n_layers,
+                               int slots, int n_kv, float eps, void* stream,
+                               const double* rope_inv, const int32_t* blk_pos,
+                               float* blk_table, int total_B) {
+    if (n_items <= 0 || n_layers <= 0) return;
+    const unsigned extra = (rope_inv && blk_pos && blk_table && total_B > 0) ? 1u : 0u;
+    kv_ring_batch_precomp_kernel<float><<<dim3((unsigned) kDf2Rows, (unsigned) n_kv, (unsigned) (n_items * n_layers) + extra), HD, 0, (cudaStream_t) stream>>>(
+        kin, vin, layer_stride, pos_dev, table, bkv, slot_info, epoch_base, n_items, n_layers, slots, n_kv, eps, rope_inv, blk_pos, blk_table, total_B);
+    check("kv_ring_batch_precomp");
+}
+
+void df2_kv_ring_batch_precomp_f16(const float* kin, const float* vin, size_t layer_stride,
+                                   const int32_t* pos_dev, const float* table,
+                                   Df2BatchKvRingPrecomp bkv, const int32_t* slot_info,
+                                   const int32_t* epoch_base, int n_items, int n_layers,
+                                   int slots, int n_kv, float eps, void* stream,
+                                   const double* rope_inv, const int32_t* blk_pos,
+                                   float* blk_table, int total_B) {
+    if (n_items <= 0 || n_layers <= 0) return;
+    const unsigned extra = (rope_inv && blk_pos && blk_table && total_B > 0) ? 1u : 0u;
+    kv_ring_batch_precomp_kernel<uint16_t><<<dim3((unsigned) kDf2Rows, (unsigned) n_kv, (unsigned) (n_items * n_layers) + extra), HD, 0, (cudaStream_t) stream>>>(
+        kin, vin, layer_stride, pos_dev, table, bkv, slot_info, epoch_base, n_items, n_layers, slots, n_kv, eps, rope_inv, blk_pos, blk_table, total_B);
+    check("kv_ring_batch_precomp_f16");
 }
 
 void df2_attention_batch(const float* q, Df2BatchAttn ba, const float* kblk, const float* vblk,

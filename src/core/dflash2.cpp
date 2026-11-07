@@ -51,6 +51,8 @@ Dflash2Drafter::~Dflash2Drafter() {
     for (int i = 0; i <= kRows; ++i)
         for (int j = 0; j <= kRows; ++j)
             if (batch_body_exec_[i][j]) cudaGraphExecDestroy(batch_body_exec_[i][j]);
+    for (auto& e : batch_full_exec_)
+        if (e) cudaGraphExecDestroy(e);
     auto fr = [](void* p) { if (p) cudaFree(p); };
     if (h_logq_) cudaFreeHost(h_logq_);
     if (h_logd_) cudaFreeHost(h_logd_);
@@ -448,7 +450,7 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
 
 #endif  // STRATA_DF2_NO_BIND
 void Dflash2Drafter::gemm(std::initializer_list<const char*> names, std::initializer_list<float*> outs, int ncols, cudaStream_t cs, const uint8_t* xq, const float* xd) {
-    kernels::Df2Mat mats[3];
+    kernels::Df2Mat mats[16];
     int n = 0, n_in = 0;
     auto o = outs.begin();
     for (const char* name : names) {
@@ -888,6 +890,9 @@ void Dflash2Drafter::set_max_drafts(int n) {
     for (int i = 0; i <= kRows; ++i)
         for (int j = 0; j <= kRows; ++j)
             if (batch_body_exec_[i][j]) { cudaGraphExecDestroy(batch_body_exec_[i][j]); batch_body_exec_[i][j] = nullptr; }
+    for (auto& e : batch_full_exec_)
+        if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    clear_precomputed_context();
     graph_taps_ = nullptr;
     ndraft_ = n;
 }
@@ -1677,6 +1682,130 @@ bool Dflash2Drafter::record_batch_body(const BatchSlotItem* items, int n_items, 
     return true;
 }
 
+bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err) {
+    using namespace kernels;
+    try {
+        const int total_B = n_items * kRows;
+        Df2BatchKvRingPrecomp bkv{};
+        for (int idx = 0; idx < n_items; ++idx) {
+            for (int l = 0; l < L_; ++l) {
+                bkv.kring[idx][l] = items[idx].slot->kring_[l];
+                bkv.vring[idx][l] = items[idx].slot->vring_[l];
+            }
+            bkv.tag[idx] = items[idx].slot->tag_;
+        }
+        for (int l = 0; l < L_; ++l) {
+            bkv.gk[l] = f32("layers." + std::to_string(l) + ".self_attn.k_norm.weight");
+        }
+        const size_t l_stride = (size_t) (4 * kRows) * NKV_ * HD_;
+        if (!skip_part("ctx")) {
+            if (fp16_ring_)
+                df2_kv_ring_batch_precomp_f16(kc_, vc_, l_stride, d_meta_ + 192, rt_bctx_, bkv, d_meta_ + 144, d_meta_ + 132,
+                                              n_items, L_, kRing, NKV_, eps_, cs, rope_inv_, d_meta_ + 64, rt_bblk_, total_B);
+            else
+                df2_kv_ring_batch_precomp(kc_, vc_, l_stride, d_meta_ + 192, rt_bctx_, bkv, d_meta_ + 144, d_meta_ + 132,
+                                          n_items, L_, kRing, NKV_, eps_, cs, rope_inv_, d_meta_ + 64, rt_bblk_, total_B);
+        } else {
+            df2_rope_table_inv(d_meta_ + 64, total_B, rope_inv_, rt_bblk_, cs);
+        }
+        embed_(d_meta_ + 96, total_B, h_, cs);
+        df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, total_B, N_, eps_, xqp_, xdp_, cs);
+        for (int l = 0; l < L_; ++l) {
+            const std::string p = "layers." + std::to_string(l) + ".";
+            const float* base_a = f32(p + "attention_conv.base_kernel");
+            const float* base_m = f32(p + "mlp_conv.base_kernel");
+            const std::string akp = p + "attention_conv.kernel_projection.weight";
+            const std::string qp = p + "self_attn.q_proj.weight", kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
+            const std::string op = p + "self_attn.o_proj.weight";
+            const std::string mkp = p + "mlp_conv.kernel_projection.weight";
+            const std::string gp = p + "mlp.gate_proj.weight", up = p + "mlp.up_proj.weight";
+            if (!skip_part("tiny")) gemm({akp.c_str()}, {dyn_}, total_B, cs, xqp_, xdp_);
+            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_a, total_B, N_, group_, xqp_, xdp_, cs);
+            if (!skip_part("qkvo")) gemm({qp.c_str(), kp.c_str(), vp.c_str()}, {q_, k_, v_}, total_B, cs, xqp_, xdp_);
+            if (!skip_part("small")) df2_norm_rope_qk(q_, k_, f32(p + "self_attn.q_norm.weight"), f32(p + "self_attn.k_norm.weight"), rt_bblk_, qn_, kblk_, total_B, NH_, NKV_, eps_, cs);
+            Df2BatchAttn ba{};
+            for (int idx = 0; idx < n_items; ++idx) {
+                ba.kring[idx] = items[idx].slot->kring_[l];
+                ba.vring[idx] = items[idx].slot->vring_[l];
+                ba.tag[idx] = items[idx].slot->tag_;
+            }
+            if (!skip_part("attn")) {
+                if (fp16_ring_)
+                    df2_attention_batch_f16(qn_, ba, kblk_, v_, d_meta_ + 128, kRing, window_, part_, xqp_, xdp_, n_items, cs, d_meta_ + 132);
+                else
+                    df2_attention_batch(qn_, ba, kblk_, v_, d_meta_ + 128, kRing, window_, part_, xqp_, xdp_, n_items, cs, d_meta_ + 132);
+            }
+            if (!skip_part("qkvo")) gemm({op.c_str()}, {o_}, total_B, cs, xqp_, xdp_);
+            if (!skip_part("small")) df2_conv_rms_quant(o_, dyn_ + 320, 640, base_a + 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_, total_B, N_, group_, eps_, xqp_, xdp_, cs);
+            if (!skip_part("tiny")) gemm({mkp.c_str()}, {dyn_}, total_B, cs, xqp_, xdp_);
+            if (!skip_part("small")) df2_conv_quant(xn_, dyn_, 640, base_m, total_B, N_, group_, xqp_, xdp_, cs);
+            if (!skip_part("mlp")) gemm({gp.c_str(), up.c_str()}, {gate_, up_}, total_B, cs, xqp_, xdp_);
+            if (!skip_part("small")) df2_swiglu_quant(gate_, up_, total_B, I_, xqp_, xdp_, cs);
+            if (!skip_part("mlp")) gemm({(p + "mlp.down_proj.weight").c_str()}, {mlp_}, total_B, cs, xqp_, xdp_);
+            const std::string next_gamma = l + 1 < L_ ? "layers." + std::to_string(l + 1) + ".input_layernorm.weight" : std::string("norm.weight");
+            if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, total_B, N_, group_, eps_, xqp_, xdp_, cs);
+        }
+        if (skip_part("small")) df2_quant_rows(fn_, N_, total_B, xqp_, xdp_, cs);
+        gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, total_B, cs, xqp_, xdp_);
+        df2_pack_head_rows_batch(fn_, hsel_, fn_batch_, hsel_batch_, m_bmeta_, n_items, N_, rank_, cs);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    return true;
+}
+
+bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t cs, std::string& err) {
+    try {
+        using namespace kernels;
+        static const int head_il = [] {
+            const char* e = std::getenv("STRATA_DF2_HEAD_IL");
+            if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
+            return e && e[0] ? (e[0] != '0' ? 1 : 0) : -1;
+        }();
+        static const int head_chunk = [] {
+            const char* e = std::getenv("STRATA_DF2_HEAD_CHUNK");
+            if (e && e[0]) return std::max(1, std::min(14, std::atoi(e)));
+            return (int) (2 * kDrafts);
+        }();
+        for (int c0 = 0; c0 < total_rows; c0 += head_chunk) {
+            const int nc = std::min(head_chunk, total_rows - c0);
+            const bool use_il = !skip_part("head") && nc <= 8 && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)));
+            if (use_il && nc >= 2 && nc <= 4)
+                native_quantize_q8_1_il(fn_batch_ + (size_t) c0 * N_, xq_, xil_, N_, nc, cs);
+            else {
+                native_quantize_q8_1(fn_batch_ + (size_t) c0 * N_, xq_, N_, nc, cs);
+                if (use_il && nc > 4)
+                    native_q8_1_interleave(xq_, xil_, N_, nc, cs);
+            }
+            if (!skip_part("head")) {
+                if (use_il) {
+                    if (head_il == 1 && !native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)) {
+                        native_mmvq_il_tune(4);
+                        native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, nc, cs);
+                        native_mmvq_il_tune(0);
+                    } else {
+                        native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, nc, cs);
+                    }
+                } else {
+                    native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, nc, cs);
+                }
+            }
+            df2_topk(logits_, (int) n_dvocab_, dvocab_, nc, topscratch_,
+                     topval_ + (size_t) c0 * 16, toptok_ + (size_t) c0 * 16, cs);
+        }
+        df2_select_multi(hsel_batch_, topval_, toptok_,
+                         reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
+                         reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off),
+                         rank_, m_bmeta_, n_items, out_btok_, out_bprob_, cs,
+                         find("candidate_selector.predecessor_codebook").dtype == "q4_0");
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    return true;
+}
+
 bool Dflash2Drafter::capture_batch_body(const BatchSlotItem* items, int n_items, std::string& err) {
     if (n_items != 2) return false;
     const int n0 = items[0].n_new, n1 = items[1].n_new;
@@ -1708,6 +1837,35 @@ bool Dflash2Drafter::capture_batch_body(const BatchSlotItem* items, int n_items,
     return true;
 }
 
+bool Dflash2Drafter::capture_batch_full(const BatchSlotItem* items, int n_items, int total_rows, std::string& err) {
+    if (n_items != 2 || total_rows < 1 || total_rows > 2 * kDrafts) return false;
+    if (batch_slots_[0] != items[0].slot || batch_slots_[1] != items[1].slot) {
+        for (auto& e : batch_full_exec_)
+            if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+        batch_slots_[0] = items[0].slot;
+        batch_slots_[1] = items[1].slot;
+    }
+    if (batch_full_exec_[total_rows]) return true;
+    kernels::native_mmvq_il_tune(4);
+    kernels::native_mmvq_il_tune(0);
+    if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin batch full capture"; return false; }
+    kernels::copy_i32_from_mapped(d_meta_ + 64, m_meta_ + 64, 96, cs_);
+    const bool ok = record_batch_body_precomp(items, n_items, cs_, err) &&
+                    record_batch_head(n_items, total_rows, cs_, err);
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+    if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
+    if (ce != cudaSuccess || cudaGraphInstantiate(&batch_full_exec_[total_rows], graph, 0) != cudaSuccess) {
+        if (graph) cudaGraphDestroy(graph);
+        err = std::string("dflash2: capture_batch_full: ") + cudaGetErrorString(ce);
+        return false;
+    }
+    cudaGraphDestroy(graph);
+    cudaGraphUpload(batch_full_exec_[total_rows], cs_);
+    cudaStreamSynchronize(cs_);
+    return true;
+}
+
 bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_items, std::string& err) {
     if (!bound_ || blob_shared_) { err = "dflash2: draft_batch_slots requires bound parent drafter"; return false; }
     if (n_items == 0) return true;
@@ -1721,6 +1879,8 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
     }();
     const bool use_batch_body = batch_body_on && n_items >= 2 && rt_bctx_ != nullptr;
 
+    int precomp_offs[kBatchMaxSlots] = {};
+    bool can_use_precomp = use_batch_body && n_items == 2 && precomp_taps_ != nullptr && precomp_rows_ > 0;
     int total_rows = 0;
     for (int idx = 0; idx < n_items; ++idx) {
         const BatchSlotItem& it = items[idx];
@@ -1732,6 +1892,9 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
         if (it.k_want < 1 || it.k_want > it.slot->ndraft_) { err = "dflash2: batch k_want out of range"; return false; }
         Dflash2Drafter& sl = *it.slot;
         if (!sl.context_wait(err)) return false;
+        if (can_use_precomp && !has_precomputed_context(it.taps, it.n_new, it.pos0, &precomp_offs[idx])) {
+            can_use_precomp = false;
+        }
         if (!use_batch_body) {
             if (sl.graph_taps_ != nullptr && sl.graph_taps_ != it.taps) {
                 err = "dflash2: the taps buffer moved after capture";
@@ -1745,6 +1908,7 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
         }
         total_rows += it.k_want;
     }
+    clear_precomputed_context();
 
     int row_off = 0;
     int c0_meta = 0;
@@ -1753,13 +1917,20 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
         Dflash2Drafter& sl = *it.slot;
         const int64_t s = it.pos0 + it.n_new;
         if (use_batch_body) {
-            for (int i = 0; i < it.n_new; ++i) h_meta_[32 + c0_meta + i] = (int32_t) (it.pos0 + i);
+            const int c0_slot = can_use_precomp ? precomp_offs[idx] : c0_meta;
+            if (!can_use_precomp) {
+                for (int i = 0; i < it.n_new; ++i) h_meta_[32 + c0_meta + i] = (int32_t) (it.pos0 + i);
+            }
             c0_meta += it.n_new;
             for (int i = 0; i < 8; ++i) h_meta_[64 + idx * 8 + i] = (int32_t) (s + i);
             h_meta_[96 + idx * 8 + 0] = it.anchor;
             for (int i = 1; i < 8; ++i) h_meta_[96 + idx * 8 + i] = sl.mask_token_;
             h_meta_[128 + idx] = (int32_t) s;
             h_meta_[132 + idx] = sl.epoch_;
+            h_meta_[144 + idx * 4 + 0] = idx;
+            h_meta_[144 + idx * 4 + 1] = c0_slot;
+            h_meta_[144 + idx * 4 + 2] = it.n_new;
+            h_meta_[144 + idx * 4 + 3] = (int32_t) s;
         } else {
             for (int i = 0; i < 8; ++i) {
                 sl.h_meta_[i] = (int32_t) (it.pos0 + std::min(i, it.n_new - 1));
@@ -1781,19 +1952,37 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
     std::atomic_thread_fence(std::memory_order_seq_cst);
 
     if (timing_) cudaEventRecord(ev_a_, cs_);
+    bool head_recorded_in_graph = false;
     if (use_batch_body) {
         for (int idx = 0; idx < n_items; ++idx) {
             const BatchSlotItem& it = items[idx];
             Dflash2Drafter& sl = *it.slot;
             cudaEventRecord(sl.ev_join_, sl.cs_);
             cudaStreamWaitEvent(cs_, sl.ev_join_, 0);
+            if (can_use_precomp && sl.log_on_) {
+                const int c0 = precomp_offs[idx];
+                cudaMemcpyAsync(sl.h_logq_, xqc_ + (size_t) c0 * N_, (size_t) it.n_new * N_, cudaMemcpyDeviceToHost, cs_);
+                cudaMemcpyAsync(sl.h_logd_, xdc_ + (size_t) c0 * (N_ / 32), (size_t) it.n_new * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs_);
+            }
             sl.log_stage(it.pos0, it.n_new);
             sl.launch_t0_ = t0;
             sl.launch_n_ = it.n_new;
             sl.launch_pos0_ = it.pos0;
             sl.launched_ = true;
         }
-        if (!prof_ && n_items == 2) {
+        if (can_use_precomp) {
+            if (!prof_ && n_items == 2) {
+                if (!capture_batch_full(items, n_items, total_rows, err)) return false;
+                if (cudaGraphLaunch(batch_full_exec_[total_rows], cs_) != cudaSuccess) {
+                    err = std::string("dflash2 draft_batch_slots (batch_full): ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                head_recorded_in_graph = true;
+            } else {
+                kernels::copy_i32_from_mapped(d_meta_ + 64, m_meta_ + 64, 96, cs_);
+                if (!record_batch_body_precomp(items, n_items, cs_, err)) return false;
+            }
+        } else if (!prof_ && n_items == 2) {
             if (!capture_batch_body(items, n_items, err)) return false;
             if (cudaGraphLaunch(batch_body_exec_[items[0].n_new][items[1].n_new], cs_) != cudaSuccess) {
                 err = std::string("dflash2 draft_batch_slots (batch_body): ") + cudaGetErrorString(cudaGetLastError());
@@ -1833,53 +2022,7 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
         }
     }
 
-    try {
-        using namespace kernels;
-        static const int head_il = [] {
-            const char* e = std::getenv("STRATA_DF2_HEAD_IL");
-            if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
-            return e && e[0] ? (e[0] != '0' ? 1 : 0) : -1;
-        }();
-        static const int head_chunk = [] {
-            const char* e = std::getenv("STRATA_DF2_HEAD_CHUNK");
-            if (e && e[0]) return std::max(1, std::min(14, std::atoi(e)));
-            return (int) (2 * kDrafts);
-        }();
-        for (int c0 = 0; c0 < total_rows; c0 += head_chunk) {
-            const int nc = std::min(head_chunk, total_rows - c0);
-            const bool use_il = !skip_part("head") && nc <= 8 && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)));
-            if (use_il && nc >= 2 && nc <= 4)
-                native_quantize_q8_1_il(fn_batch_ + (size_t) c0 * N_, xq_, xil_, N_, nc, cs_);
-            else {
-                native_quantize_q8_1(fn_batch_ + (size_t) c0 * N_, xq_, N_, nc, cs_);
-                if (use_il && nc > 4)
-                    native_q8_1_interleave(xq_, xil_, N_, nc, cs_);
-            }
-            if (!skip_part("head")) {
-                if (use_il) {
-                    if (head_il == 1 && !native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)) {
-                        native_mmvq_il_tune(4);
-                        native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, nc, cs_);
-                        native_mmvq_il_tune(0);
-                    } else {
-                        native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, nc, cs_);
-                    }
-                } else {
-                    native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, nc, cs_);
-                }
-            }
-            df2_topk(logits_, (int) n_dvocab_, dvocab_, nc, topscratch_,
-                     topval_ + (size_t) c0 * 16, toptok_ + (size_t) c0 * 16, cs_);
-        }
-        df2_select_multi(hsel_batch_, topval_, toptok_,
-                         reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
-                         reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off),
-                         rank_, m_bmeta_, n_items, out_btok_, out_bprob_, cs_,
-                         find("candidate_selector.predecessor_codebook").dtype == "q4_0");
-    } catch (const std::exception& e) {
-        err = e.what();
-        return false;
-    }
+    if (!head_recorded_in_graph && !record_batch_head(n_items, total_rows, cs_, err)) return false;
     if (timing_) cudaEventRecord(ev_b_, cs_);
     (void) cudaStreamQuery(cs_);
     launch_t0_ = t0;

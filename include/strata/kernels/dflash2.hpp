@@ -128,6 +128,13 @@ struct Df2BatchKvRing {
     uint8_t row_slot[32];
 };
 
+struct Df2BatchKvRingPrecomp {
+    void* kring[4][8];
+    void* vring[4][8];
+    const float* gk[8];
+    int64_t* tag[4];
+};
+
 struct Df2BatchAttn {
     const void* kring[4];
     const void* vring[4];
@@ -140,6 +147,20 @@ void df2_kv_ring_batch(const float* kin, const float* vin, const float* gk, cons
 void df2_kv_ring_batch_f16(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table,
                            Df2BatchKvRing bkv, int slots, int total_rows, int heads, float eps, void* stream,
                            const int32_t* epoch_base);
+void df2_kv_ring_batch_precomp(const float* kin, const float* vin, size_t layer_stride,
+                               const int32_t* pos_dev, const float* table,
+                               Df2BatchKvRingPrecomp bkv, const int32_t* slot_info,
+                               const int32_t* epoch_base, int n_items, int n_layers,
+                               int slots, int n_kv, float eps, void* stream,
+                               const double* rope_inv = nullptr, const int32_t* blk_pos = nullptr,
+                               float* blk_table = nullptr, int total_B = 0);
+void df2_kv_ring_batch_precomp_f16(const float* kin, const float* vin, size_t layer_stride,
+                                   const int32_t* pos_dev, const float* table,
+                                   Df2BatchKvRingPrecomp bkv, const int32_t* slot_info,
+                                   const int32_t* epoch_base, int n_items, int n_layers,
+                                   int slots, int n_kv, float eps, void* stream,
+                                   const double* rope_inv = nullptr, const int32_t* blk_pos = nullptr,
+                                   float* blk_table = nullptr, int total_B = 0);
 void df2_attention_batch(const float* q, Df2BatchAttn ba, const float* kblk, const float* vblk,
                          const int32_t* anchor_pos_base, int ring_slots, int window, float* part,
                          void* xq, float* xd, int n_slots, void* stream, const int32_t* epoch_base);
