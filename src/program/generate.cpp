@@ -6867,11 +6867,12 @@ int main(int argc, char** argv) {
     // each conversation; set with the drafter below (STRATA_DF2_CTX=0 turns it off; never with a layer split).
     [[maybe_unused]] bool df2_park_ok = false;
     auto batch_max_t = [&]() -> int {
-        if (batch_df2 && df2_solo && split_devs.empty()) {
+        if ((batch_df2 || batch_df2_wanted) && df2_solo && split_devs.empty()) {
             static const int df2_read_max_t = [] {
                 const char* v = std::getenv("STRATA_BATCH_DF2_READ_MAX_T");
+                if (v == nullptr || v[0] == '\0') v = std::getenv("STRATA_BATCH_DF2_MAX_T");
                 return v != nullptr && v[0] != '\0' ? std::clamp(std::atoi(v), 8, (int) strata::kernels::kVerifyMaxT)
-                                                    : (int) strata::kernels::kVerifyMaxT;
+                                                    : (int) strata::kernels::kVerifyNarrowT;
             }();
             return std::max(o.spec, df2_read_max_t);
         }
@@ -11292,7 +11293,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: the penalty-history allocation failed\n");
             return 1;
         }
-        strata::core::Verifier ver;
+        auto ver_holder = std::make_unique<strata::core::Verifier>();
+        strata::core::Verifier& ver = *ver_holder;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
@@ -11316,7 +11318,8 @@ int main(int argc, char** argv) {
         // Layer split: `ver` runs layers [0, K1) and hands its residual to the next stage's verifier, and so on; the
         // last runs the head.  The hand-offs are mapped pinned memory, portable: a stage on another GPU reads it.
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
-        strata::core::Verifier ver_same;
+        auto ver_same_holder = std::make_unique<strata::core::Verifier>();
+        strata::core::Verifier& ver_same = *ver_same_holder;
         SplitDrive split_drive;
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
@@ -11343,7 +11346,8 @@ int main(int argc, char** argv) {
         // K+1 while stage 1 still reads window K's hand-off.  With more stages every stage but the last is a "front"
         // stage: window K+1 follows window K through them one card behind, and only the last stage waits for K's verdict
         const bool pipe = o.pipeline_windows > 0 && n_stages >= 2 && !split_same && (int) stages.size() == n_stages - 1;
-        strata::core::Verifier ver_b;
+        auto ver_b_holder = std::make_unique<strata::core::Verifier>();
+        strata::core::Verifier& ver_b = *ver_b_holder;
         SplitDrive split_drive_b;
         std::vector<cudaStream_t> pl_stream(pipe ? (size_t) n_stages : 0, nullptr);
         // stage st's verifier of one parity (0: the even windows, 1: the odd ones)
@@ -11532,7 +11536,7 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         ver.set_pcie_mode(eff_pcie_mode);
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
-        if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+        if (batch_mtp) ver.set_batch_graph_limit(batch_df2 ? 128 : 64);   // --batch-mtp / batch_df2: keep all 1- and 2-slot window shapes in LRU cache
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2) ver.set_taps(df2.tap_layers());
         if (batch_df2) ver.set_batch_taps(true);
@@ -14635,13 +14639,22 @@ int main(int argc, char** argv) {
             static size_t next_slot = 0;
             // Each MTP slot uses two rows; rotate slots when more than four are active.
             int A = 0;
-            // (--batch-mtp: two rows a slot, at most kVerifyNarrowT; the plain windows hold up to kVerifyMaxT)
-            const int win_cap = batch_mtp ? (int) strata::kernels::kVerifyNarrowT : (int) strata::kernels::kVerifyMaxT;
+            // (--batch-mtp: two rows a slot, at most kVerifyNarrowT; batch_df2 and plain windows hold up to ver.max_t() / kVerifyMaxT)
+            static const int df2_win_max_t = [] {
+                const char* v = std::getenv("STRATA_BATCH_DF2_MAX_T");
+                return v != nullptr && v[0] != '\0'
+                           ? std::clamp(std::atoi(v), (int) strata::kernels::kVerifyNarrowT, (int) strata::kernels::kVerifyMaxT)
+                           : (int) strata::kernels::kVerifyNarrowT;
+            }();
+            const int win_cap = batch_df2 ? std::min(ver.max_t(), df2_win_max_t)
+                              : batch_mtp ? (int) strata::kernels::kVerifyNarrowT
+                                          : (int) strata::kernels::kVerifyMaxT;
             int nrow[strata::kernels::kVerifyMaxT] = {};   // the rows slot a (the a-th active) holds: its token and its drafts
             // DFlash2 slots: the rows beyond one a slot are SPARE; they carry the slots' drafts, shared evenly in slot order (so the layout of a window
             // depends on which slots are active, not on the drafts: the captured batch graphs are reused).  More slots than rows: no drafts, the slots
             // take turns as in the plain windows.  A draft row a slot has no room for (its last tokens, the context's end) is not asked for.
             int df2_extra[64] = {};
+            bool df2_has_room[64] = {};
             if (batch_df2) {
                 int act_ids[64] = {}, nact = 0;
                 for (size_t b = 0; b < bs.size() && nact < (int) (sizeof act_ids / sizeof act_ids[0]); ++b)
@@ -14654,6 +14667,7 @@ int main(int argc, char** argv) {
                     want = std::min<int>(want, (int) std::max<int64_t>(0, q.max_new - q.produced - 1));
                     want = std::min<int>(want, (int) std::max<int64_t>(0, (int64_t) o.max_context - q.p - 2));
                     want = std::min(want, df2_cap);
+                    if (act_ids[k] < (int) (sizeof df2_has_room / sizeof df2_has_room[0])) df2_has_room[act_ids[k]] = (want > 0);
                     if (q.draft_ready && df2_conf > 0.0) {   // a draft row is worth its cost where the chain so far is likely: the product of the selector's probabilities
                         double chain = 1.0;
                         int keep_n = 0;
@@ -14713,7 +14727,11 @@ int main(int argc, char** argv) {
                     ++S;
                 }
             }
-            if (batch_mtp && A > 0) next_slot = ((size_t) active[A - 1] + 1) % bs.size();
+            if (batch_mtp && A > 0) {
+                int nact_all = 0;
+                for (const auto& q : bs) nact_all += q.active ? 1 : 0;
+                next_slot = (batch_df2 && A >= nact_all) ? 0 : ((size_t) active[A - 1] + 1) % bs.size();
+            }
             if (S == 0) return true;
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
@@ -14865,8 +14883,10 @@ int main(int argc, char** argv) {
                     strata::core::Dflash2Drafter& d = *slot_df2[(size_t) b];
                     const int kp = keep[b];
                     d.note_rows(tok + first[t], kp, pos[first[t]]);
-                    if (nrow[t] > 1 || !batch_df2_defer) {
-                        // this window carried drafts for the slot: its drafter takes the committed rows' taps and drafts again
+                    const bool slot_has_room = (b < (int) (sizeof df2_has_room / sizeof df2_has_room[0]) && df2_has_room[b]) &&
+                                               sl.produced < sl.max_new && sl.p + 2 <= o.max_context;
+                    if (nrow[t] > 1 || slot_has_room || !batch_df2_defer) {
+                        // this window carried drafts (or had spare window capacity trimmed only by confidence): its drafter takes the committed rows' taps and drafts again
                         if (d.has_deferred() && !d.catch_up(pos[first[t]], err)) {
                             std::printf("ERR batch DFlash2 slot %d: %s\n", b, err.c_str());
                             return false;
@@ -14931,6 +14951,7 @@ int main(int argc, char** argv) {
                     df2_bitems[idx] = {&d, d.landing(), le.kp, le.pos0, le.anchor, std::max(1, kw), df2_bdd[idx], df2_bpp[idx]};
                 }
                 if (!df2.draft_batch_slots_launch(df2_bitems, (int) df2_launched.size(), err)) {
+                    std::fprintf(stderr, "strata batch ERR DFlash2 launch: %s\n", err.c_str());
                     std::printf("ERR batch DFlash2: %s\n", err.c_str());
                     return false;
                 }
@@ -14938,6 +14959,7 @@ int main(int argc, char** argv) {
                 for (const Df2LaunchEntry& le : df2_launched) {
                     strata::core::Dflash2Drafter& d = *slot_df2[(size_t) le.b];
                     if (!d.draft_launch(d.landing(), le.kp, le.pos0, le.anchor, err)) {
+                        std::fprintf(stderr, "strata batch ERR DFlash2 slot %d: %s\n", le.b, err.c_str());
                         std::printf("ERR batch DFlash2 slot %d: %s\n", le.b, err.c_str());
                         return false;
                     }
@@ -20809,7 +20831,8 @@ int main(int argc, char** argv) {
             return 2;
         }
         mem_mark("the head and the prompt path");
-        strata::core::Verifier ver;
+        auto ver_holder = std::make_unique<strata::core::Verifier>();
+        strata::core::Verifier& ver = *ver_holder;
         strata::core::VerifyHits vh;
         vh.d_res = thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
