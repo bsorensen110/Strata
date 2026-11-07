@@ -30,7 +30,10 @@ SessionSaveReclaimed session_save_reclaim(std::vector<ConversationCheckpoint>& c
         room = available();
         if (done()) return out;
     }
-    while (true) {
+    // Disk-only mode holds only the conversation index in RAM; evicting an entry would delete its
+    // session file without returning host K/V.  (In two-tier L1+L2 mode, disk() is false and
+    // evict_oldest() spills L1 RAM entries to L2 disk and frees their host K/V.)
+    if (!cache.disk()) while (true) {
         const size_t before = cache.bytes();
         if (!cache.evict_oldest()) break; // pinned conversations stay parked
         ++out.parked;

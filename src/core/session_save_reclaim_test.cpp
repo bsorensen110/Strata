@@ -111,5 +111,17 @@ int main() {
         auto r = session_save_reclaim(chain, cache, live, floor, [] { return std::optional<uint64_t>(0); });
         check(!r.bytes && !r.checkpoints && !r.parked, "empty chain and disabled cache");
     }
+    // Disk-only mode: the cache holds only the index in RAM, so evicting entries would delete session files without
+    // returning host K/V.  Reclaim drops non-selected checkpoints directly and leaves every disk entry in place.
+    {
+        std::vector<ConversationCheckpoint> chain{checkpoint(100), checkpoint(300)};
+        ConversationCache cache(1u << 20, 10);
+        cache.enable_disk();
+        SavedConversation d; d.live.ids = {1, 2, 3};
+        check(cache.put_disk(std::move(d), "/nonexistent/conv-1.sess", 64000), "disk entry parked");
+        auto r = session_save_reclaim(chain, cache, live, floor, [] { return std::optional<uint64_t>(0); });
+        check(r.parked == 0 && cache.size() == 1 && cache.evictions() == 0, "disk entries are not evicted for RAM");
+        check(r.checkpoints == 1 && chain.size() == 1 && chain[0].ids.size() == 300, "checkpoints still reclaimed");
+    }
     std::printf("session_save_reclaim: %d checks passed\n", checks_run);
 }

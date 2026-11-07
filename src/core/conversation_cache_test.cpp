@@ -745,5 +745,147 @@ int main() {
         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
     }
+    {
+        // --conversation-cache-disk-mib: entries are slim metadata in RAM and session files on disk.
+        SavedConversation full = image({1, 2, 3, 4});
+        full.geometry = {18, 17, 16};
+        full.layer_lo = 2; full.layer_hi = 10; full.cvec = false;
+        ConversationCheckpoint cp1; cp1.ids = {1, 2}; cp1.imgs = {{1, 7}}; cp1.used = 9; cp1.pinned = true;
+        cp1.gdn.assign(512, 3); cp1.ple.assign(256, 4);
+        full.checkpoints.push_back(cp1);
+        full.df2_state.assign(1024, 9);
+        SavedConversation slim = conversation_meta_only(full);
+        check(slim.live.ids == full.live.ids && slim.geometry == full.geometry &&
+              slim.layer_lo == 2 && slim.layer_hi == 10 && !slim.cvec &&
+              slim.checkpoints.size() == 1 && slim.checkpoints[0].ids == cp1.ids &&
+              slim.checkpoints[0].imgs == cp1.imgs && slim.checkpoints[0].used == 9 && slim.checkpoints[0].pinned,
+              "conversation_meta_only keeps the prefix-matching metadata");
+        check(slim.live.gdn.empty() && slim.kv.empty() && slim.df2_state.empty() &&
+              slim.checkpoints[0].gdn.empty() && slim.checkpoints[0].ple.empty(),
+              "conversation_meta_only drops the running state, K/V, and df2_state");
+        check(ConversationCache::entry_bytes(full) == full.bytes(), "RAM entry_bytes is the in-memory footprint");
+        slim.disk_path = "/nonexistent/a.sess"; slim.disk_bytes = 123456;
+        check(ConversationCache::entry_bytes(slim) == 123456, "disk entry_bytes is the file size on disk");
+    }
+    {
+        // Disk mode: file-size accounting and file removal on eviction / supersede / clear, while remove_at (restore)
+        // leaves the file for the caller.
+        const auto dir = std::filesystem::temp_directory_path() / "strata_conv_cache_disk_test";
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir, ec);
+        auto touch = [&](const char* name) {
+            const auto p = (dir / name).string();
+            FILE* f = std::fopen(p.c_str(), "wb");
+            check(f != nullptr, "create dummy session file");
+            std::fwrite("sess", 1, 4, f);
+            std::fclose(f);
+            return p;
+        };
+        auto exists = [](const std::string& p) { return std::filesystem::exists(p); };
+        auto meta = [](std::initializer_list<int32_t> ids, std::initializer_list<int32_t> cp_ids = {}, bool pin = false) {
+            SavedConversation m;
+            m.live.ids = ids;
+            if (cp_ids.size() != 0) {
+                ConversationCheckpoint c; c.ids = cp_ids; c.pinned = pin;
+                m.checkpoints.push_back(std::move(c));
+            }
+            return m;
+        };
+
+        const std::string f1 = touch("conv-1.sess");
+        const std::string f2 = touch("conv-2.sess");
+        const std::string f3 = touch("conv-3.sess");
+        ConversationCache disk(1000, 4);
+        disk.enable_disk();
+        check(disk.disk() && disk.budget() == 1000, "disk mode enabled");
+        check(!disk.put_disk(meta({1, 2}), "", 100) && !disk.put_disk(meta({1, 2}), f1, 0),
+              "put_disk refuses an empty path or zero size");
+        check(!disk.put_disk(meta({1, 2}), f1, 1001) && exists(f1),
+              "a file larger than the whole budget is refused without unlinking it");
+        check(disk.put_disk(meta({1, 2, 3}), f1, 400) && disk.put_disk(meta({4, 5, 6}), f2, 400),
+              "two 400-byte files fit in a 1000-byte disk cache");
+        check(disk.bytes() == 800 && disk.size() == 2, "disk cache counts file_bytes");
+        check(disk.put_disk(meta({7, 8, 9}), f3, 400), "a third 400-byte file evicts the oldest");
+        check(!exists(f1) && exists(f2) && exists(f3) && disk.bytes() == 800 && disk.evictions() == 1,
+              "eviction unlinks the oldest file and debits its file_bytes");
+
+        const auto m = disk.best(std::vector<int32_t>{4, 5, 6, 7}, {}, true);
+        check(m.tokens == 3 && disk.at(m.index).disk_path == f2, "best() matches a disk entry and at() inspects it");
+        disk.remove_at(m.index);
+        check(exists(f2) && disk.bytes() == 400 && disk.size() == 1,
+              "remove_at debits the budget and leaves the file for the caller to restore and unlink");
+        std::filesystem::remove(f2, ec);
+
+        const std::string f4 = touch("conv-4.sess");
+        const std::string f5 = touch("conv-5.sess");
+        check(disk.put_disk(meta({10, 11, 12, 13}, {10, 11}), f4, 300), "park turn 1 on disk");
+        ConversationCheckpoint cp_t1; cp_t1.ids = {10, 11};
+        ConversationCheckpoint cp_t2; cp_t2.ids = {10, 11, 12, 13, 14};
+        SavedConversation t2 = meta({10, 11, 12, 13, 14, 15});
+        t2.checkpoints = {cp_t1, cp_t2};
+        check(disk.put_disk(std::move(t2), f5, 350), "park turn 2 on disk");
+        check(!exists(f4) && exists(f5) && disk.superseded() == 1 && disk.bytes() == 750,
+              "drop_superseded unlinks the superseded turn's file and debits its file_bytes");
+
+        check(disk.clear() == 2 && !exists(f3) && !exists(f5) && disk.bytes() == 0,
+              "clear() unlinks every remaining session file");
+        std::filesystem::remove_all(dir, ec);
+    }
+    {
+        // Two-tier L1 RAM + L2 Disk mode: L1 evictions spill in-place to L2 disk files via spill_fn,
+        // freeing L1 RAM while keeping the conversation searchable and borrowable in the cache.
+        const auto dir = std::filesystem::temp_directory_path() / "strata_conv_cache_l2_test";
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+        std::filesystem::create_directories(dir, ec);
+        int seq = 0;
+        const size_t one_ram = image({1, 2, 3, 4}).bytes();
+        ConversationCache two_tier(one_ram + 64, 4);
+        two_tier.set_l2_disk(1000, [&](const SavedConversation& img, std::string& path_out, size_t& bytes_out) {
+            const auto p = (dir / ("spill-" + std::to_string(++seq) + ".sess")).string();
+            FILE* f = std::fopen(p.c_str(), "wb");
+            if (!f) return false;
+            std::fwrite(img.live.ids.data(), sizeof(int32_t), img.live.ids.size(), f);
+            std::fclose(f);
+            path_out = p;
+            bytes_out = 300;
+            return true;
+        });
+        check(two_tier.has_l2_disk() && two_tier.l2_disk_budget() == 1000, "L2 disk configured on L1 RAM cache");
+        SavedConversation c1 = image({1, 2, 3, 4});
+        ConversationCheckpoint root; root.ids = {1, 2};
+        ConversationCheckpoint turn1; turn1.ids = {1, 2, 3};
+        c1.checkpoints = {root, turn1};
+        const size_t c1_ram = c1.bytes();
+        ConversationCache tiered(c1_ram + 16, 4);
+        tiered.set_l2_disk(1000, [&](const SavedConversation& img, std::string& path_out, size_t& bytes_out) {
+            const auto p = (dir / ("spill-" + std::to_string(++seq) + ".sess")).string();
+            FILE* f = std::fopen(p.c_str(), "wb");
+            if (!f) return false;
+            std::fwrite(img.live.ids.data(), sizeof(int32_t), img.live.ids.size(), f);
+            std::fclose(f);
+            path_out = p;
+            bytes_out = 300;
+            return true;
+        });
+        check(tiered.put(std::move(c1)), "park conversation 1 in L1 RAM");
+        check(tiered.bytes() == c1_ram && tiered.l2_disk_bytes() == 0 && tiered.size() == 1, "c1 is in L1 RAM");
+        SavedConversation c2 = image({5, 6, 7, 8});
+        const size_t c2_ram = c2.bytes();
+        check(tiered.put(std::move(c2)), "parking c2 spills c1 to L2 disk and fits c2 in L1 RAM");
+        check(tiered.size() == 2 && tiered.bytes() == c2_ram && tiered.l2_disk_bytes() == 300 && tiered.evictions() == 1,
+              "c1 spilled in-place to L2 disk (300 B) and c2 occupies L1 RAM");
+        check(!tiered.at(0).disk_path.empty() && std::filesystem::exists(tiered.at(0).disk_path) &&
+              tiered.at(0).kv.empty() && tiered.at(1).disk_path.empty(),
+              "entry 0 is now a slim disk entry and entry 1 is an L1 RAM entry");
+        const auto m_c1 = tiered.best(std::vector<int32_t>{1, 2, 3, 4, 5}, {}, true);
+        check(m_c1.tokens == 4 && m_c1.index == 0, "spilled L2 disk entry is still matched by best()");
+        const auto m_borrow = tiered.best(std::vector<int32_t>{1, 2, 99}, {}, true);
+        check(m_borrow.tokens == 2 && tiered.borrows(m_borrow), "spilled L2 disk entry still supports prefix borrowing");
+        check(tiered.clear() == 2 && tiered.bytes() == 0 && tiered.l2_disk_bytes() == 0,
+              "clear() frees both L1 RAM and L2 disk entries");
+        std::filesystem::remove_all(dir, ec);
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

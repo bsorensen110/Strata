@@ -9,7 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
+#include <functional>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -182,6 +185,13 @@ struct SavedConversation {
     bool cvec = true;
     // with a layer split, the later stages' own images, one per stage, in stage order
     std::vector<SavedConversation> stage_images;
+    // DFlash2 drafter ring-log lineage (serialized by Dflash2Drafter::save_lineage); empty when DFlash2 is off.
+    std::vector<uint8_t> df2_state;
+    // Disk-backed conversation cache (--conversation-cache-disk-mib): the session file holding this entry's running
+    // state and K/V on disk, and its size in bytes.  Runtime-only: session_file_write / session_file_read do not
+    // serialize these fields, and a RAM-cached entry leaves them empty / 0.
+    std::string disk_path;
+    size_t disk_bytes = 0;
     // STRATA_PARK_ASYNC: set while a background copy fills this image's K/V; its deleter waits for that copy, and as
     // one of the last members it runs before any buffer is freed (whichever copy of the image goes last)
     std::shared_ptr<void> pending;
@@ -196,13 +206,38 @@ struct SavedConversation {
 
     size_t bytes() const {
         size_t n = live.bytes() + checkpoints.capacity() * sizeof(ConversationCheckpoint) +
-                   kv.capacity() * sizeof(ConversationKv);
+                   kv.capacity() * sizeof(ConversationKv) + df2_state.capacity();
         for (const auto& s : stage_images) n += s.bytes();
         for (const auto& c : checkpoints) n += c.bytes();
         for (const auto& k : kv) n += k.bytes();
         return n;
     }
 };
+
+/// A slim copy of `s` for the disk-backed conversation cache: keeps only the tokens, image keys, checkpoint tokens /
+/// image keys / pins, geometry, layer range and steering flag that prefix matching (`ConversationCache::best` /
+/// `holds` / `drop_superseded` / `borrows`) reads, and drops all running-state byte arrays, K/V buffers, and df2_state.
+inline SavedConversation conversation_meta_only(const SavedConversation& s) {
+    SavedConversation m;
+    m.geometry = s.geometry;
+    m.layer_lo = s.layer_lo;
+    m.layer_hi = s.layer_hi;
+    m.cvec = s.cvec;
+    m.live.ids = s.live.ids;
+    m.live.imgs = s.live.imgs;
+    m.live.used = s.live.used;
+    m.live.pinned = s.live.pinned;
+    m.checkpoints.reserve(s.checkpoints.size());
+    for (const auto& c : s.checkpoints) {
+        ConversationCheckpoint mc;
+        mc.ids = c.ids;
+        mc.imgs = c.imgs;
+        mc.used = c.used;
+        mc.pinned = c.pinned;
+        m.checkpoints.push_back(std::move(mc));
+    }
+    return m;
+}
 
 /// `c` holds the state `ids` (with `images`) describes, or a continuation of it: its tokens start with `ids` and
 /// its pictures below ids.size() are exactly `images`.  What an idle batch slot holds is then parked already (or
@@ -249,6 +284,25 @@ public:
     ConversationCache(size_t budget, size_t slots, int64_t min_tokens = 0)
         : budget_(budget), slots_(slots), min_tokens_(min_tokens) {}
     bool enabled() const { return budget_ != 0 && slots_ != 0; }
+    size_t budget() const { return budget_; }
+    /// Disk-only mode (--conversation-cache-disk-mib with --conversation-cache-mib 0): entries are session files on
+    /// disk (`e.disk_path`, `e.disk_bytes`), `budget_` is the folder's byte cap, and eviction / supersede / clear
+    /// unlink the entry's file.
+    void enable_disk() { disk_ = true; }
+    bool disk() const { return disk_; }
+    /// Two-tier L1 RAM + L2 Disk mode (--conversation-cache-mib > 0 and --conversation-cache-disk-mib > 0):
+    /// L1 RAM entries (`e.disk_path.empty()`) count toward `bytes_` (under `budget_`), while L2 Disk entries
+    /// (`!e.disk_path.empty()`) count toward `l2_disk_bytes_` (under `l2_disk_budget_`).  When an L1 RAM entry is
+    /// evicted, `spill_` writes it to a `.sess` file and converts the entry in-place into an L2 Disk entry.
+    using SpillFn = std::function<bool(const SavedConversation& image, std::string& path_out, size_t& file_bytes_out)>;
+    void set_l2_disk(size_t disk_budget, SpillFn spill = {}) {
+        l2_disk_budget_ = disk_budget;
+        spill_ = std::move(spill);
+    }
+    bool has_l2_disk() const { return !disk_ && l2_disk_budget_ > 0; }
+    size_t l2_disk_budget() const { return l2_disk_budget_; }
+    size_t l2_disk_bytes() const { return l2_disk_bytes_; }
+    static size_t entry_bytes(const SavedConversation& e) { return e.disk_path.empty() ? e.bytes() : e.disk_bytes; }
     /// `--conversation-cache-min-tokens`: whether a conversation of this length is worth one of `slots`.  Every
     /// parked conversation costs a whole slot whatever its length, so a client that interleaves short side requests
     /// with one long conversation spends the cache on the side requests and evicts the long one (oldest first) -
@@ -335,9 +389,19 @@ public:
 
     SavedConversation take(size_t index) {
         SavedConversation out = std::move(entries_.at(index));
-        bytes_ -= out.bytes();
+        debit_entry(out);
         erase(index);
         return out;
+    }
+
+    const SavedConversation& at(size_t index) const { return entries_.at(index); }
+
+    /// Removes the entry at `index` and debits its budget without unlinking `disk_path` (the caller owns the file:
+    /// either it just restored from it and will unlink it after `conversation_snapshot_restore`, or the read failed on
+    /// transient host memory pressure and the file is left on disk for a later run).
+    void remove_at(size_t index) {
+        debit_entry(entries_.at(index));
+        erase(index);
     }
 
     // A checkpoint inside a parked conversation that a NEW conversation starts with - a sibling subagent sharing the
@@ -388,14 +452,18 @@ public:
             // shared prefix)?  If not, evict nothing
             size_t kept = 0, kept_bytes = 0;
             for (size_t i = 0; i < entries_.size(); ++i)
-                if (stays(i)) { ++kept; kept_bytes += entries_[i].bytes(); }
+                if (stays(i)) {
+                    ++kept;
+                    if (disk_ || entries_[i].disk_path.empty()) kept_bytes += entry_bytes(entries_[i]);
+                }
             if (kept >= slots_ || kept_bytes > budget_ - held - incoming) { guard_blocked_ = true; return false; }
         }
         if (bytes() > budget_ - held - incoming) reuse_ = {};
-        while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
-            // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
-            // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
-            if (!evict_oldest()) return false;
+        while (!entries_.empty() && bytes_ > budget_ - held - incoming) {
+            if (has_l2_disk() ? !evict_oldest_l1() : !evict_oldest_slot()) return false;
+        }
+        while (!entries_.empty() && entries_.size() >= slots_) {
+            if (!evict_oldest_slot()) return false;
         }
         return true;
     }
@@ -407,24 +475,19 @@ public:
     // to the kernel at once - the next admission check reads it back from /proc/meminfo.
     // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
     bool evict_oldest() {
-        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
-        for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            bytes_ -= entries_[i].bytes();
-            erase(i);
-            ++evictions_;
-            return true;
-        }
-        return false;
+        if (has_l2_disk()) return evict_oldest_l1();
+        return evict_oldest_slot();
     }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
     // may carry the poison.  Returns how many were parked.
     size_t clear() {
         const size_t n = entries_.size();
+        for (const auto& e : entries_) unlink_if_disk(e);
         entries_.clear();
         serials_.clear();
         bytes_ = 0;
+        l2_disk_bytes_ = 0;
         reuse_ = {};
         return n;
     }
@@ -455,7 +518,8 @@ public:
                 if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
             if (e.cvec == cvec && deepest && !deepest->ids.empty() && held(*deepest) &&
                 !(guarded_ != 0 && serials_[i] == guarded_)) {
-                bytes_ -= e.bytes();
+                debit_entry(e);
+                unlink_if_disk(e);
                 erase(i);
                 ++dropped;
                 continue;
@@ -515,7 +579,7 @@ public:
     }
 
     bool put(SavedConversation&& image, size_t held = 0) {
-        const size_t n = image.bytes();
+        const size_t n = entry_bytes(image);
         if (!enabled() || held > budget_ || n > budget_ - held) return false;   // make_room's refusal, first
         drop_superseded(image.live.ids, image.live.imgs, image.checkpoints, image.cvec);
         if (!make_room(n, held)) return false;
@@ -525,13 +589,108 @@ public:
         return true;
     }
 
+    /// Indexes a disk-backed entry (`meta` holds only the slim prefix-matching metadata; `path` is its `.sess` file
+    /// of `file_bytes` on disk).  Drops any superseded entries (unlinking their files) and evicts oldest unpinned
+    /// entries if needed to fit the disk budget and slot limit.
+    bool put_disk(SavedConversation&& meta, std::string path, size_t file_bytes) {
+        if (path.empty() || file_bytes == 0) return false;
+        meta.disk_path = std::move(path);
+        meta.disk_bytes = file_bytes;
+        if (disk_) return put(std::move(meta), 0);
+        if (!has_l2_disk() || slots_ == 0 || file_bytes > l2_disk_budget_) return false;
+        drop_superseded(meta.live.ids, meta.live.imgs, meta.checkpoints, meta.cvec);
+        auto stays = [&](size_t i) { return entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_); };
+        if (guarded_ != 0 && index_of(guarded_) != SIZE_MAX) {
+            size_t kept = 0, kept_l2 = 0;
+            for (size_t i = 0; i < entries_.size(); ++i)
+                if (stays(i)) {
+                    ++kept;
+                    if (!entries_[i].disk_path.empty()) kept_l2 += entries_[i].disk_bytes;
+                }
+            if (kept >= slots_ || kept_l2 > l2_disk_budget_ - file_bytes) { guard_blocked_ = true; return false; }
+        }
+        while (l2_disk_bytes_ > l2_disk_budget_ - file_bytes) {
+            if (!evict_oldest_l2_disk(SIZE_MAX)) return false;
+        }
+        while (entries_.size() >= slots_) {
+            if (!evict_oldest_slot()) return false;
+        }
+        entries_.push_back(std::move(meta));
+        serials_.push_back(next_serial_++);
+        l2_disk_bytes_ += file_bytes;
+        return true;
+    }
+
 private:
+    static void unlink_if_disk(const SavedConversation& e) {
+        if (!e.disk_path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(e.disk_path, ec);
+        }
+    }
+    void debit_entry(const SavedConversation& e) {
+        if (!disk_ && !e.disk_path.empty()) l2_disk_bytes_ -= std::min(l2_disk_bytes_, e.disk_bytes);
+        else bytes_ -= std::min(bytes_, entry_bytes(e));
+    }
+    bool evict_oldest_l1() {
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (!entries_[i].disk_path.empty()) continue;
+            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            bytes_ -= entries_[i].bytes();
+            ++evictions_;
+            std::string path;
+            size_t fb = 0;
+            if (has_l2_disk() && spill_ && spill_(entries_[i], path, fb) && fb > 0 && fb <= l2_disk_budget_) {
+                while (l2_disk_bytes_ + fb > l2_disk_budget_) {
+                    if (!evict_oldest_l2_disk(i)) break;
+                }
+                if (l2_disk_bytes_ + fb <= l2_disk_budget_) {
+                    entries_[i] = conversation_meta_only(entries_[i]);
+                    entries_[i].disk_path = std::move(path);
+                    entries_[i].disk_bytes = fb;
+                    l2_disk_bytes_ += fb;
+                    return true;
+                }
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+            }
+            erase(i);
+            return true;
+        }
+        return false;
+    }
+    bool evict_oldest_l2_disk(size_t skip_index) {
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (i == skip_index || entries_[i].disk_path.empty()) continue;
+            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            debit_entry(entries_[i]);
+            unlink_if_disk(entries_[i]);
+            erase(i);
+            ++evictions_;
+            return true;
+        }
+        return false;
+    }
+    bool evict_oldest_slot() {
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            debit_entry(entries_[i]);
+            unlink_if_disk(entries_[i]);
+            erase(i);
+            ++evictions_;
+            return true;
+        }
+        return false;
+    }
     void erase(size_t index) {
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         serials_.erase(serials_.begin() + (std::ptrdiff_t) index);
     }
     size_t budget_ = 0, slots_ = 0, bytes_ = 0, evictions_ = 0, superseded_ = 0, borrowed_ = 0;
+    size_t l2_disk_budget_ = 0, l2_disk_bytes_ = 0;
     int64_t min_tokens_ = 0;   // --conversation-cache-min-tokens: 0 parks every conversation, whatever its size
+    bool disk_ = false;        // --conversation-cache-disk-mib (disk-only): entries are session files on disk
+    SpillFn spill_;
     std::deque<SavedConversation> entries_; // least recently active first
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
     uint64_t next_serial_ = 1, guarded_ = 0;
