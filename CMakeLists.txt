@@ -1175,6 +1175,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(hip_expert_cache_staging PRIVATE strata_engine)
     add_test(NAME hip_expert_cache_staging COMMAND hip_expert_cache_staging)
     list(APPEND _strata_hip_tests hip_expert_cache_staging)
+    add_test(NAME runtime_options_test
+             COMMAND ${CMAKE_COMMAND} -DSTRATA_BIN=$<TARGET_FILE:strata>
+                     -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_options_test.cmake)
+    list(APPEND _strata_hip_tests runtime_options_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/hip/intrinsics.cpp")
       add_executable(hip_intrinsics tests/hip/intrinsics.cpp)
       target_link_libraries(hip_intrinsics PRIVATE strata_hip_runtime)
