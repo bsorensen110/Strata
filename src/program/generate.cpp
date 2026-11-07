@@ -14772,7 +14772,24 @@ int main(int argc, char** argv) {
                 ver.set_slot_history(rows[t], ps.ids.data() + from, (int64_t) ps.ids.size() - from);
             }
             const Clock::time_point w0 = Clock::now();
-            if (!ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err) || drive.d.failed) {
+#if defined(STRATA_HAVE_DFLASH2)
+            static const bool df2_tap_overlap = [] {
+                const char* e = std::getenv("STRATA_DF2_TAP_OVERLAP");
+                return !e || !e[0] || e[0] != '0';
+            }();
+            if (batch_df2 && df2_tap_overlap && stages.empty() && A >= 2) {
+                ver.set_taps_ready(
+                    [](void* u, const float* taps_dev, int n_rows, const int64_t* pos_in) {
+                        static_cast<strata::core::Dflash2Drafter*>(u)->precompute_batch_context(taps_dev, n_rows, pos_in);
+                    },
+                    &df2);
+            }
+#endif
+            const bool ver_ok = ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err);
+#if defined(STRATA_HAVE_DFLASH2)
+            ver.set_taps_ready(nullptr, nullptr);
+#endif
+            if (!ver_ok || drive.d.failed) {
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
             }
@@ -14822,6 +14839,8 @@ int main(int argc, char** argv) {
                 int kp = 0;
                 int64_t pos0 = 0;
                 int32_t anchor = 0;
+                const float* taps = nullptr;
+                int first_row = 0;
             };
             std::vector<Df2LaunchEntry> df2_launched;   // batch DFlash2: slots to draft this round
             for (int t = 0; t < A; ++t) {
@@ -14892,11 +14911,19 @@ int main(int argc, char** argv) {
                             return false;
                         }
                         d.clear_deferred();
-                        if (!ver.gather_taps(d.landing(), d.device(), first[t], kp, 0, d.stream(), err)) {
-                            std::printf("ERR batch DFlash2 slot %d: %s\n", b, err.c_str());
-                            return false;
+                        const size_t tap_stride = (size_t) d.tap_layers().size() * (size_t) g.n_embd;
+                        const float* slot_taps = nullptr;
+                        if (stages.empty() && A >= 2 &&
+                            df2.has_precomputed_context(ver.tap_dev() + (size_t) first[t] * tap_stride, kp, pos[first[t]])) {
+                            slot_taps = ver.tap_dev() + (size_t) first[t] * tap_stride;
+                        } else {
+                            if (!ver.gather_taps(d.landing(), d.device(), first[t], kp, 0, d.stream(), err)) {
+                                std::printf("ERR batch DFlash2 slot %d: %s\n", b, err.c_str());
+                                return false;
+                            }
+                            slot_taps = d.landing();
                         }
-                        df2_launched.push_back({b, kp, pos[first[t]], outb[first[t] + kp - 1]});
+                        df2_launched.push_back({b, kp, pos[first[t]], outb[first[t] + kp - 1], slot_taps, first[t]});
                     } else {
                         // no spare row for the slot: no draft, no drafter work; the rows' taps wait on the host until spare rows return
                         float* dst = d.defer_rows(pos[first[t]], kp, err);
@@ -14948,7 +14975,7 @@ int main(int argc, char** argv) {
                     int kw = std::min(d.max_drafts(), std::min(df2_cap, max_per_slot));
                     kw = std::min<int>(kw, (int) std::max<int64_t>(1, q.max_new - q.produced));
                     kw = std::min<int>(kw, (int) std::max<int64_t>(1, (int64_t) o.max_context - q.p - 1));
-                    df2_bitems[idx] = {&d, d.landing(), le.kp, le.pos0, le.anchor, std::max(1, kw), df2_bdd[idx], df2_bpp[idx]};
+                    df2_bitems[idx] = {&d, le.taps ? le.taps : d.landing(), le.kp, le.pos0, le.anchor, std::max(1, kw), df2_bdd[idx], df2_bpp[idx]};
                 }
                 if (!df2.draft_batch_slots_launch(df2_bitems, (int) df2_launched.size(), err)) {
                     std::fprintf(stderr, "strata batch ERR DFlash2 launch: %s\n", err.c_str());
@@ -14956,8 +14983,15 @@ int main(int argc, char** argv) {
                     return false;
                 }
             } else {
+                df2.clear_precomputed_context();
                 for (const Df2LaunchEntry& le : df2_launched) {
                     strata::core::Dflash2Drafter& d = *slot_df2[(size_t) le.b];
+                    if (le.taps != d.landing()) {
+                        if (!ver.gather_taps(d.landing(), d.device(), le.first_row, le.kp, 0, d.stream(), err)) {
+                            std::printf("ERR batch DFlash2 slot %d: %s\n", le.b, err.c_str());
+                            return false;
+                        }
+                    }
                     if (!d.draft_launch(d.landing(), le.kp, le.pos0, le.anchor, err)) {
                         std::fprintf(stderr, "strata batch ERR DFlash2 slot %d: %s\n", le.b, err.c_str());
                         std::printf("ERR batch DFlash2 slot %d: %s\n", le.b, err.c_str());

@@ -373,7 +373,12 @@ public:
     /// each window in a device buffer, tap_dev() = [max_t][n_taps][n_embd] floats, valid until the next window.  Single-stage
     /// verifiers only; STRATA_TAP_FILE (research dump) turns the same buffer on without this call.
     void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
-    const float* tap_dev() const { return tap_dev_; }
+    const float* tap_dev() const noexcept { return tap_dev_; }
+    using TapsReadyFn = void (*)(void* user, const float* tap_dev, int n_rows, const int64_t* pos);
+    void set_taps_ready(TapsReadyFn fn, void* user) noexcept {
+        taps_ready_cb_ = fn;
+        taps_ready_user_ = user;
+    }
     bool tapping() const { return tap_on_; }
     /// Batch windows tap too (default off: the graphs of --batch windows carry no tap kernels): the slot drafters of DFlash2 read rows of tap_dev().  Before init.
     void set_batch_taps(bool on) { tap_batch_ = on; }
@@ -754,6 +759,8 @@ private:
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
     uint32_t ple_rows_b_[strata::kernels::kVerifyLongT * strata::kernels::PLE_N_HEADS] = {};
     bool ple_pending_b_ = false;
+    TapsReadyFn taps_ready_cb_ = nullptr;
+    void* taps_ready_user_ = nullptr;
 };
 
 }  // namespace strata::core
