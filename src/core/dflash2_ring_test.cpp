@@ -12,6 +12,7 @@
 //   5 evicted    : a stash too small to keep A: the resume is cold (missing rows reported, *cold set)
 // Exit 0 when every assertion holds.
 #include "strata/core/dflash2.hpp"
+#include "strata/core/batch_df2_budget.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -424,6 +425,43 @@ int main(int argc, char** argv) {
             cudaFree(taps_both);
         }
         cudaFree(taps0); cudaFree(taps1); cudaFree(d_head); cudaFree(d_emb);
+    }
+    // 6. Cross-slot dprob-ranked spare-row budget (C-F2)
+    {
+        using strata::core::Df2SlotBudgetInput;
+        using strata::core::allocate_dprob_spare_rows;
+        using strata::core::batch_df2_head_max_per_slot;
+
+        // Case A: Slot 0 collapses after draft 0 (0.85 * 0.40 = 0.34 < 0.50); Slot 1 stays confident for 4 drafts.
+        // In an 8-row window (spare = 6), Slot 0 gets 1 extra row and Slot 1 claims all 4 of its confident rows (total 5 extra).
+        const float p0[7] = {0.85f, 0.40f, 0.90f, 0.90f, 0.0f, 0.0f, 0.0f};
+        const float p1[7] = {0.95f, 0.92f, 0.90f, 0.88f, 0.0f, 0.0f, 0.0f};
+        const Df2SlotBudgetInput in_a[2] = {{4, true, p0}, {4, true, p1}};
+        int out_a[2] = {};
+        allocate_dprob_spare_rows(in_a, 2, 6, 0.50, out_a);
+        check(out_a[0] == 1 && out_a[1] == 4, "dprob budget: confident slot claims spare rows released by low-confidence peer");
+
+        // Case B: Both slots have 4 confident drafts, but Slot 1 has strictly higher chain probabilities through draft 3
+        // than Slot 0 has at draft 2 (Slot 1 chains: 0.98, 0.9604, 0.9412, 0.9224 vs Slot 0 chains: 0.90, 0.81, 0.729, 0.6561).
+        // With spare = 6, Slot 1 gets 4 rows and Slot 0 gets 2 rows (4 + 2 = 6).
+        const float q0[7] = {0.90f, 0.90f, 0.90f, 0.90f, 0.0f, 0.0f, 0.0f};
+        const float q1[7] = {0.98f, 0.98f, 0.98f, 0.98f, 0.0f, 0.0f, 0.0f};
+        const Df2SlotBudgetInput in_b[2] = {{4, true, q0}, {4, true, q1}};
+        int out_b[2] = {};
+        allocate_dprob_spare_rows(in_b, 2, 6, 0.50, out_b);
+        check(out_b[0] == 2 && out_b[1] == 4, "dprob budget: greedy chain-prob ranking allocates 2+4 across asymmetric slots");
+
+        // Case C: Equal probabilities break ties in slot order (3 + 3 = 6).
+        const Df2SlotBudgetInput in_c[2] = {{4, true, q1}, {4, true, q1}};
+        int out_c[2] = {};
+        allocate_dprob_spare_rows(in_c, 2, 6, 0.50, out_c);
+        check(out_c[0] == 3 && out_c[1] == 3, "dprob budget: equal chain-prob ties break symmetrically (3+3)");
+
+        // Case D: Head max_per_slot keeps 2-slot 8-row window at 4 per slot (total_rows=8 <= 8 IL cap).
+        check(batch_df2_head_max_per_slot(6, 2, true, 0) == 4 &&
+              batch_df2_head_max_per_slot(6, 2, false, 0) == 3 &&
+              batch_df2_head_max_per_slot(14, 2, true, 0) == 7,
+              "batch_df2_head_max_per_slot: returns 4 for 2-slot 8-row dprob budget and 7 for 16-row");
     }
     std::printf(g_fail == 0 ? "dflash2_ring_test: ok\n" : "dflash2_ring_test: FAILED\n");
     return g_fail == 0 ? 0 : 1;

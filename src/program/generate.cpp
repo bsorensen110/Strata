@@ -24,6 +24,7 @@
 #include "strata/core/nv_defaults.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/batch_telemetry.hpp"
+#include "strata/core/batch_df2_budget.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/remote_expert_opt.hpp"
@@ -14655,26 +14656,35 @@ int main(int argc, char** argv) {
             // take turns as in the plain windows.  A draft row a slot has no room for (its last tokens, the context's end) is not asked for.
             int df2_extra[64] = {};
             bool df2_has_room[64] = {};
+            static const bool df2_dprob_budget = [] {
+                const char* e = std::getenv("STRATA_BATCH_DF2_DPROB_BUDGET");
+                return !e || e[0] != '0';
+            }();
+            static const int df2_budget_max_extra = [] {
+                const char* e = std::getenv("STRATA_BATCH_DF2_BUDGET_MAX_EXTRA");
+                return e && e[0] ? std::max(0, std::atoi(e)) : -1;
+            }();
+            static const int df2_head_max_per_slot_env = [] {
+                const char* e = std::getenv("STRATA_BATCH_DF2_HEAD_MAX_PER_SLOT");
+                return e && e[0] ? std::max(0, std::atoi(e)) : 0;
+            }();
             if (batch_df2) {
                 int act_ids[64] = {}, nact = 0;
                 for (size_t b = 0; b < bs.size() && nact < (int) (sizeof act_ids / sizeof act_ids[0]); ++b)
                     if (bs[b].active) act_ids[nact++] = (int) b;
                 const int spare = std::max(0, win_cap - nact);
+                int slot_room[64] = {};
                 for (int k = 0; k < nact && nact > 0; ++k) {
                     const BSlot& q = bs[(size_t) act_ids[k]];
-                    int want = spare / nact + (k < spare % nact ? 1 : 0);
-                    want = std::min(want, (int) strata::core::Dflash2Drafter::kDrafts);
-                    want = std::min<int>(want, (int) std::max<int64_t>(0, q.max_new - q.produced - 1));
-                    want = std::min<int>(want, (int) std::max<int64_t>(0, (int64_t) o.max_context - q.p - 2));
-                    want = std::min(want, df2_cap);
-                    if (act_ids[k] < (int) (sizeof df2_has_room / sizeof df2_has_room[0])) df2_has_room[act_ids[k]] = (want > 0);
-                    if (q.draft_ready && df2_conf > 0.0) {   // a draft row is worth its cost where the chain so far is likely: the product of the selector's probabilities
-                        double chain = 1.0;
-                        int keep_n = 0;
-                        while (keep_n < want && (chain *= (double) q.dprob[(size_t) keep_n]) >= df2_conf) ++keep_n;
-                        want = keep_n;
-                    }
-                    if (act_ids[k] < (int) (sizeof df2_extra / sizeof df2_extra[0])) df2_extra[act_ids[k]] = want;
+                    const int even_want = spare / nact + (k < spare % nact ? 1 : 0);
+                    int room = df2_dprob_budget ? spare : even_want;
+                    room = std::min(room, (int) strata::core::Dflash2Drafter::kDrafts);
+                    room = std::min<int>(room, (int) std::max<int64_t>(0, q.max_new - q.produced - 1));
+                    room = std::min<int>(room, (int) std::max<int64_t>(0, (int64_t) o.max_context - q.p - 2));
+                    room = std::min(room, df2_cap);
+                    slot_room[k] = room;
+                    if (act_ids[k] < (int) (sizeof df2_has_room / sizeof df2_has_room[0]))
+                        df2_has_room[act_ids[k]] = (std::min(room, even_want) > 0 || (df2_dprob_budget && room > 0));
                 }
 #if defined(STRATA_HAVE_DFLASH2)
                 // A slot that sat out earlier rounds (no spare rows: its drafter did no work, the committed rows' taps wait on the host) gets its ring brought
@@ -14682,7 +14692,8 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < nact; ++k) {
                     const int b = act_ids[k];
                     BSlot& q = bs[(size_t) b];
-                    if (b >= (int) (sizeof df2_extra / sizeof df2_extra[0]) || df2_extra[b] == 0 || q.draft_ready) continue;
+                    const int even_want = spare / nact + (k < spare % nact ? 1 : 0);
+                    if (b >= (int) (sizeof df2_extra / sizeof df2_extra[0]) || slot_room[k] == 0 || even_want == 0 || q.draft_ready) continue;
                     strata::core::Dflash2Drafter& d = *slot_df2[(size_t) b];
                     int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                     float pp[strata::core::Dflash2Drafter::kDrafts];
@@ -14694,7 +14705,7 @@ int main(int argc, char** argv) {
                         if (err.empty()) err = "the deferred rows do not end at the slot's position";
                         std::fprintf(stderr, "strata batch: DFlash2 slot %d: catch-up failed (%s): no drafts for it this round\n", b, err.c_str());
                         err.clear();
-                        df2_extra[b] = 0;
+                        slot_room[k] = 0;
                         continue;
                     }
                     d.clear_deferred();
@@ -14702,6 +14713,30 @@ int main(int argc, char** argv) {
                     q.draft_ready = true;
                 }
 #endif
+                if (df2_dprob_budget) {
+                    strata::core::Df2SlotBudgetInput binputs[64] = {};
+                    int extra_k[64] = {};
+                    for (int k = 0; k < nact; ++k) {
+                        const BSlot& q = bs[(size_t) act_ids[k]];
+                        binputs[k] = {slot_room[k], q.draft_ready, q.dprob.data()};
+                    }
+                    const int budget_spare = df2_budget_max_extra >= 0 ? std::min(spare, df2_budget_max_extra) : spare;
+                    strata::core::allocate_dprob_spare_rows(binputs, nact, budget_spare, df2_conf, extra_k);
+                    for (int k = 0; k < nact; ++k)
+                        if (act_ids[k] < (int) (sizeof df2_extra / sizeof df2_extra[0])) df2_extra[act_ids[k]] = extra_k[k];
+                } else {
+                    for (int k = 0; k < nact && nact > 0; ++k) {
+                        const BSlot& q = bs[(size_t) act_ids[k]];
+                        int want = q.draft_ready ? slot_room[k] : 0;
+                        if (q.draft_ready && df2_conf > 0.0) {   // a draft row is worth its cost where the chain so far is likely: the product of the selector's probabilities
+                            double chain = 1.0;
+                            int keep_n = 0;
+                            while (keep_n < want && (chain *= (double) q.dprob[(size_t) keep_n]) >= df2_conf) ++keep_n;
+                            want = keep_n;
+                        }
+                        if (act_ids[k] < (int) (sizeof df2_extra / sizeof df2_extra[0])) df2_extra[act_ids[k]] = want;
+                    }
+                }
             }
             for (size_t offset = 0; offset < bs.size(); ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
@@ -14967,7 +15002,8 @@ int main(int argc, char** argv) {
                 int nact_next = 0;
                 for (const auto& q : bs) nact_next += q.active ? 1 : 0;
                 const int spare_next = std::max(0, win_cap - std::max(1, nact_next));
-                const int max_per_slot = std::max(1, (spare_next + std::max(1, nact_next) - 1) / std::max(1, nact_next));
+                const int max_per_slot = strata::core::batch_df2_head_max_per_slot(
+                    spare_next, nact_next, df2_dprob_budget, df2_head_max_per_slot_env);
                 for (size_t idx = 0; idx < df2_launched.size(); ++idx) {
                     const Df2LaunchEntry& le = df2_launched[idx];
                     strata::core::Dflash2Drafter& d = *slot_df2[(size_t) le.b];

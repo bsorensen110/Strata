@@ -1,6 +1,7 @@
 // The batch window's row layout (include/strata/core/batch_rows.hpp): plain one-row slots, a slot's contiguous group of
 // proposed rows (--batch-mtp), and the hand-off capacity of a layer split's stages.  Header-only, CPU.
 #include "strata/core/batch_rows.hpp"
+#include "strata/core/batch_df2_budget.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -71,6 +72,36 @@ int main() {
         check(run(rows, pos, 0, 1, 8, 0, false) != nullptr, "an empty window");
         check(run(rows, pos, 3, 1, 8, -1, false) != nullptr, "a negative hand-off base");
         check(run(rows, pos, 3, 1, 8, 0, false) == nullptr, "three rows of one slot are a group");
+    }
+    // Cross-slot dprob-ranked spare-row budget (C-F2)
+    {
+        using strata::core::Df2SlotBudgetInput;
+        using strata::core::allocate_dprob_spare_rows;
+        using strata::core::batch_df2_head_max_per_slot;
+
+        const float p0[7] = {0.85f, 0.40f, 0.90f, 0.90f, 0.0f, 0.0f, 0.0f};
+        const float p1[7] = {0.95f, 0.92f, 0.90f, 0.88f, 0.0f, 0.0f, 0.0f};
+        const Df2SlotBudgetInput in_a[2] = {{4, true, p0}, {4, true, p1}};
+        int out_a[2] = {};
+        allocate_dprob_spare_rows(in_a, 2, 6, 0.50, out_a);
+        check(out_a[0] == 1 && out_a[1] == 4, "dprob budget: confident slot claims spare rows released by low-confidence peer");
+
+        const float q0[7] = {0.90f, 0.90f, 0.90f, 0.90f, 0.0f, 0.0f, 0.0f};
+        const float q1[7] = {0.98f, 0.98f, 0.98f, 0.98f, 0.0f, 0.0f, 0.0f};
+        const Df2SlotBudgetInput in_b[2] = {{4, true, q0}, {4, true, q1}};
+        int out_b[2] = {};
+        allocate_dprob_spare_rows(in_b, 2, 6, 0.50, out_b);
+        check(out_b[0] == 2 && out_b[1] == 4, "dprob budget: greedy chain-prob ranking allocates 2+4 across asymmetric slots");
+
+        const Df2SlotBudgetInput in_c[2] = {{4, true, q1}, {4, true, q1}};
+        int out_c[2] = {};
+        allocate_dprob_spare_rows(in_c, 2, 6, 0.50, out_c);
+        check(out_c[0] == 3 && out_c[1] == 3, "dprob budget: equal chain-prob ties break symmetrically (3+3)");
+
+        check(batch_df2_head_max_per_slot(6, 2, true, 0) == 4 &&
+              batch_df2_head_max_per_slot(6, 2, false, 0) == 3 &&
+              batch_df2_head_max_per_slot(14, 2, true, 0) == 7,
+              "batch_df2_head_max_per_slot: returns 4 for 2-slot 8-row dprob budget and 7 for 16-row");
     }
     if (failures != 0) return EXIT_FAILURE;
     std::printf("batch_rows_test: ok\n");
