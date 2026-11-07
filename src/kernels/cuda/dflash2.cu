@@ -384,14 +384,28 @@ __global__ void attn_merge_batch_kernel(const float* __restrict__ part, int8_t* 
 // 16 Q8 blocks) the group stores the 8 rows' 512 int8 one after the other (4 KB), so a warp that works on a group reads 4 KB contiguous per step
 // (lane = block * 2 + half: one 16-byte load per row).  The fp16 block scales follow all the int8 of the matrix, in the same tile order (8 rows x 16
 // blocks = 256 bytes a step).  Activations: x_q (int8 [col][n_in]) and x_d (float [col][n_in / 32]); a column's 512 bytes of a step are contiguous.
+constexpr int kDf2MaxSegs = 16;
 struct Df2Seg { const int8_t* q; const __half* d; float* y; int n_out; int row0; };
-struct Df2Segs { Df2Seg s[3]; int n; };
+struct Df2Segs { Df2Seg s[kDf2MaxSegs]; int n; };
 
 // The matrix a warp's rows belong to.  Constant indices only: a loop over segs.s[si] makes the by-value parameter struct live in local memory (STACK 104 in the spill guard).
 __device__ __forceinline__ Df2Seg df2_pick(const Df2Segs& segs, int row_g) {
     Df2Seg sg = segs.s[0];
-    if (segs.n > 1 && row_g >= segs.s[1].row0) sg = segs.s[1];
-    if (segs.n > 2 && row_g >= segs.s[2].row0) sg = segs.s[2];
+    if (segs.n > 1  && row_g >= segs.s[1].row0)  sg = segs.s[1];
+    if (segs.n > 2  && row_g >= segs.s[2].row0)  sg = segs.s[2];
+    if (segs.n > 3  && row_g >= segs.s[3].row0)  sg = segs.s[3];
+    if (segs.n > 4  && row_g >= segs.s[4].row0)  sg = segs.s[4];
+    if (segs.n > 5  && row_g >= segs.s[5].row0)  sg = segs.s[5];
+    if (segs.n > 6  && row_g >= segs.s[6].row0)  sg = segs.s[6];
+    if (segs.n > 7  && row_g >= segs.s[7].row0)  sg = segs.s[7];
+    if (segs.n > 8  && row_g >= segs.s[8].row0)  sg = segs.s[8];
+    if (segs.n > 9  && row_g >= segs.s[9].row0)  sg = segs.s[9];
+    if (segs.n > 10 && row_g >= segs.s[10].row0) sg = segs.s[10];
+    if (segs.n > 11 && row_g >= segs.s[11].row0) sg = segs.s[11];
+    if (segs.n > 12 && row_g >= segs.s[12].row0) sg = segs.s[12];
+    if (segs.n > 13 && row_g >= segs.s[13].row0) sg = segs.s[13];
+    if (segs.n > 14 && row_g >= segs.s[14].row0) sg = segs.s[14];
+    if (segs.n > 15 && row_g >= segs.s[15].row0) sg = segs.s[15];
     return sg;
 }
 
@@ -1241,11 +1255,11 @@ static int df2_q4_auto(int rows) {
 #define DF2_Q4_AUTO(rows) df2_q4_auto(rows)
 #endif
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream) {
-    if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1 || ncols > 32) throw std::invalid_argument("df2_gemm: unsupported shape");
+    if (n < 1 || n > kDf2MaxSegs || n_in % 512 != 0 || ncols < 1 || ncols > 32) throw std::invalid_argument("df2_gemm: unsupported shape");
     if (ncols > 16) {
         for (int c0 = 0; c0 < ncols; c0 += 16) {
             const int nc = std::min(16, ncols - c0);
-            Df2Mat sub[3];
+            Df2Mat sub[kDf2MaxSegs];
             for (int i = 0; i < n; ++i) {
                 sub[i] = Df2Mat{mats[i].w, mats[i].y + (size_t) c0 * mats[i].n_out, mats[i].n_out, mats[i].q4};
             }
