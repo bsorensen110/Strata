@@ -5217,17 +5217,29 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (!published) ++d.stale_x;
     }
     const auto c1 = std::chrono::steady_clock::now();
+    d.pool->clear_act_quant();
     if (any_cpu) {
         // Any token whose routed experts all run on a GPU (kind >= 0) or are tail-skipped (kind == -2) has no local CPU
         // expert job (kind == -1) and never reads act_multi[t] / nact_multi[t]; skip quantizing its row over PCIe.
+        int act_toks[strata::kernels::cpu::MAXT] = {};
+        int n_act_toks = 0;
         for (int64_t t = 0; t < n_tok; ++t) {
             if (std::none_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v == -1; })) continue;
-            if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
-                act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
-            else if (native)
-                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
-            else
-                act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+            if (t < strata::kernels::cpu::MAXT) act_toks[n_act_toks++] = (int) t;
+        }
+        if (n_act_toks >= 2 && d.pool->workers() > 1 && d.cold_mode == 0) {
+            d.pool->defer_act_quant(x_f, native ? d.nact_multi.data() : nullptr, d.act_multi.data(),
+                                    act_toks, n_act_toks, native);
+        } else {
+            for (int qi = 0; qi < n_act_toks; ++qi) {
+                const int t = act_toks[qi];
+                if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))
+                    act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                else if (native)
+                    native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+                else
+                    act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+            }
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
