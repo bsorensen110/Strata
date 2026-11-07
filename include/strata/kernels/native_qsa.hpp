@@ -32,4 +32,8 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* 
 void native_qsa_gate_apply(const float* attn, const float* q_full, float* output,
                            int n_head, int head_dim, void* stream);
 
+// Fused gate_apply + Q8_1 quantization directly into x_q8_1 (requires head_dim % 32 == 0).
+void native_qsa_gate_quantize_q8_1(const float* attn, const float* q_full, void* x_q8_1,
+                                   int n_head, int head_dim, void* stream);
+
 } // namespace strata::kernels

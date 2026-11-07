@@ -23,6 +23,9 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_qsa.hpp"
+#define STRATA_Q81_FASTMATH_DIV 1
+#include "strata/kernels/q8_1_finite.hpp"
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <atomic>
 #include <cmath>
@@ -100,6 +103,30 @@ __global__ void gate(const float* attn, const float* __restrict__ q_full, float*
     const float sigmoid = 1.0f / (1.0f + expf(-raw));
     output[i] = attn[i] * sigmoid;
 }
+struct QsaQ81Block { half2 ds; int8_t qs[32]; };
+__global__ void gate_quantize_q8_1_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
+                                          QsaQ81Block* __restrict__ xq, int n_head, int head_dim) {
+#pragma clang fp contract(off)
+    const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::size_t count = std::size_t(n_head) * head_dim;
+    float xi = 0.0f;
+    if (i < count) {
+        const std::size_t head = i / head_dim, channel = i % head_dim;
+        const float raw = q_full[head * 2 * head_dim + head_dim + channel];
+        const float sigmoid = 1.0f / (1.0f + expf(-raw));
+        xi = attn[i] * sigmoid;
+    }
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    if (i < count) {
+        const float d = q8_1_finite(q81_div(amax, 127.0f));
+        xq[i / 32].qs[i % 32] = q8_1_quant(xi, d, amax);
+        if (i % 32 == 0) xq[i / 32].ds = q8_1_ds(d, sum);
+    }
+}
 std::size_t elements(int cols, int rows) {
     if (cols <= 0 || rows <= 0 || std::uint64_t(cols) * rows > std::uint64_t(std::numeric_limits<int>::max()))
         throw std::invalid_argument("native QSA requires positive bounded dimensions");
@@ -162,6 +189,15 @@ void native_qsa_gate_apply(const float* attn, const float* q_full, float* output
     const auto count = elements(head_dim, n_head);
     buffers(attn, count * 4, q_full, count * 8, output, stream);
     gate<<<unsigned((count + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(attn, q_full, output, n_head, head_dim);
+    check_launch();
+}
+void native_qsa_gate_quantize_q8_1(const float* attn, const float* q_full, void* x_q8_1,
+                                   int n_head, int head_dim, void* stream) {
+    const auto count = elements(head_dim, n_head);
+    if (head_dim % 32 != 0 || !stream || !valid(attn, count * 4) || !valid(q_full, count * 8) || !x_q8_1)
+        throw std::invalid_argument("native_qsa_gate_quantize_q8_1 requires head_dim % 32 == 0 and valid buffers");
+    gate_quantize_q8_1_kernel<<<unsigned((count + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        attn, q_full, static_cast<QsaQ81Block*>(x_q8_1), n_head, head_dim);
     check_launch();
 }
 } // namespace strata::kernels
