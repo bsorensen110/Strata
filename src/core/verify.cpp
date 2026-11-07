@@ -1832,6 +1832,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         ++n_gdn_groups;
                     }
                 }
+                static const bool gdn_groups_qfuse = [] {
+                    const char* e = std::getenv("STRATA_GDN_GROUPS_QFUSE");
+                    return !e || e[0] != '0';
+                }();
+                const bool use_quant_il_wout = n >= 2 && n <= 4 && qil_on() && g_mmvq_il() &&
+                                               strata::kernels::native_mmvq_il_supported(wout->native_type, n, (int) N);
+                bool gdn_q_done = false;
                 if (batch_rec_ && gdn_groups_on && n_gdn_groups >= 1 && n_gdn_groups <= 8) {
                     strata::kernels::GdnGroups gg;
                     for (int t = tb; t < te;) {
@@ -1844,8 +1851,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         gg.keep[gg.n] = keep_rows ? one_ : nullptr;   // STRATA_BATCH_SELF_COMMIT: the window keeps its one-row groups itself
                         ++gg.n;
                     }
+                    gdn_q_done = gdn_groups_qfuse && !use_quant_il_wout;
                     strata::kernels::gdn_step_norm_groups(gg, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS,
-                                                          y_, (int) HK, (int) HV, keep_rows, cs);
+                                                          y_, (int) HK, (int) HV, keep_rows, cs, tb,
+                                                          gdn_q_done ? (void*) xq_ : nullptr);
                 } else
                 if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
                     for (int t = tb; t < te;) {
@@ -1858,13 +1867,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                             (const float*) wnm->data, EPS, y_ + (size_t) first * ZV,
                                             (int) HK, (int) HV, t - first, keep_rows ? one_ : nullptr, cs, 0);
                     }
-                } else
-                gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                    (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
+                } else {
+                    gdn_q_done = g_qfuse();
+                    gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
+                                        (int) HV, te, self_commit ? one_ : nullptr, cs, tb, gdn_q_done ? (void*) xq_ : nullptr);
+                }
                 stamp(l, 6, grp);
-                // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
-                // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
-                if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
+                // STRATA_QFUSE / STRATA_GDN_GROUPS_QFUSE: done above by gdn_step_norm_groups / gdn_step_norm_multi
+                if (!gdn_q_done) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
             } else {
