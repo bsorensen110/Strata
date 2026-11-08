@@ -5227,7 +5227,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (std::none_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v == -1; })) continue;
             if (t < strata::kernels::cpu::MAXT) act_toks[n_act_toks++] = (int) t;
         }
-        if (n_act_toks >= 2 && d.pool->workers() > 1 && d.cold_mode == 0) {
+        if (n_act_toks >= 2 && d.pool->workers() > 1) {
             d.pool->defer_act_quant(x_f, native ? d.nact_multi.data() : nullptr, d.act_multi.data(),
                                     act_toks, n_act_toks, native);
         } else {

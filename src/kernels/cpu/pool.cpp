@@ -1245,6 +1245,17 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     for (int t = 0; t < mjobs_[e].nt; ++t)
                         for (int r = r0; r < r1; ++r)
                             sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+                    if (sb.gu_rows_done.fetch_add(r1 - r0, std::memory_order_acq_rel) + (r1 - r0) == (int) nfmt->n_ff) {
+                        const int nt = mjobs_[e].nt;
+                        for (int t = 0; t < nt; ++t) {
+                            uint8_t expected = 0;
+                            if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                                if (q2_native_kernels(nfmt->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+                                else native_quant_h(*nfmt, sb.ff[t], sb.hq[t]);
+                                sb.q_state[t].store(2, std::memory_order_release);
+                            }
+                        }
+                    }
                 } else if (mode_ == 5) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
@@ -1252,6 +1263,17 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                         native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
                     else
                         native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    if (sb.gu_rows_done.fetch_add(r1 - r0, std::memory_order_acq_rel) + (r1 - r0) == (int) nfmt->n_ff) {
+                        const int nt = mjobs_[e].nt;
+                        for (int t = 0; t < nt; ++t) {
+                            uint8_t expected = 0;
+                            if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                                if (q2_native_kernels(nfmt->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+                                else native_quant_h(*nfmt, sb.ff[t], sb.hq[t]);
+                                sb.q_state[t].store(2, std::memory_order_release);
+                            }
+                        }
+                    }
                 } else if (q2_native_kernels(nfmt->d_type)) {
                     // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
                     const int nt = mjobs_[e].nt;
@@ -1306,6 +1328,16 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                     float* ff[MAXT];
                     for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
                     s2_expert_gu_rows_multi(mjobs_[e].blob, mjobs_[e].act, mjobs_[e].nt, ff, r0, r1);
+                    if (sb.gu_rows_done.fetch_add(r1 - r0, std::memory_order_acq_rel) + (r1 - r0) == FF) {
+                        const int nt = mjobs_[e].nt;
+                        for (int t = 0; t < nt; ++t) {
+                            uint8_t expected = 0;
+                            if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                                act_quant_q8_1(sb.ff[t], FF, sb.a2[t]);
+                                sb.q_state[t].store(2, std::memory_order_release);
+                            }
+                        }
+                    }
                 } else {
                     const int nt = mjobs_[e].nt;
                     for (int t = 0; t < nt; ++t) {
@@ -1335,6 +1367,28 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 ns.drained_ns.store(now_ns(), std::memory_order_relaxed);
         } else {
             done_.fetch_add(1, std::memory_order_release);
+        }
+    }
+    if ((mode_ == 5 || mode_ == 3) && mnb_ > 0) {
+        for (int e = 0; e < mnb_; ++e) {
+            SplitBufMulti& sb = split_multi_[(size_t) e];
+            const NativeFmt* const nfmt = (mode_ == 5 && mjobs_[e].fmt != nullptr) ? mjobs_[e].fmt : nfmt_;
+            const int target_rows = mode_ == 5 ? (int) nfmt->n_ff : FF;
+            if (sb.gu_rows_done.load(std::memory_order_acquire) < target_rows) continue;
+            const int nt = mjobs_[e].nt;
+            for (int t = 0; t < nt; ++t) {
+                if (sb.q_state[t].load(std::memory_order_relaxed) != 0) continue;
+                uint8_t expected = 0;
+                if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                    if (mode_ == 5) {
+                        if (q2_native_kernels(nfmt->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+                        else native_quant_h(*nfmt, sb.ff[t], sb.hq[t]);
+                    } else {
+                        act_quant_q8_1(sb.ff[t], FF, sb.a2[t]);
+                    }
+                    sb.q_state[t].store(2, std::memory_order_release);
+                }
+            }
         }
     }
 }
@@ -1405,9 +1459,11 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
     }
     const auto t0 = std::chrono::steady_clock::now();
     mjobs_ = jobs;
+    mnb_ = n;
     int total_pairs = 0;
     for (int e = 0; e < n; ++e) {
         total_pairs += jobs[e].nt;
+        split_multi_[(size_t) e].gu_rows_done.store(0, std::memory_order_relaxed);
         for (int t = 0; t < jobs[e].nt; ++t)
             split_multi_[(size_t) e].q_state[t].store(0, std::memory_order_relaxed);
     }
@@ -1443,11 +1499,13 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
         const int nb = (std::min)(kMaxSplitMulti, n - b0);
         mjobs_ = jobs + b0;
+        mnb_ = nb;
         nfmt_ = &f;
         narithmetic_ = arithmetic;
         int total_pairs = 0;
         for (int e = 0; e < nb; ++e) {
             total_pairs += mjobs_[e].nt;
+            split_multi_[(size_t) e].gu_rows_done.store(0, std::memory_order_relaxed);
             for (int t = 0; t < mjobs_[e].nt; ++t)
                 split_multi_[(size_t) e].q_state[t].store(0, std::memory_order_relaxed);
         }

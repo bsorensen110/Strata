@@ -251,12 +251,14 @@ public:
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
     /// Defer input activation quantization (`x_f` -> `nact` / `act`) to run in parallel across the pool's threads at
     /// the start of the next `mode 5` / `mode 3` gate/up phase instead of serially on the host thread before publish.
+    static constexpr int kMaxActQuantToks = 1024;
     void defer_act_quant(const float* x_f, uint8_t* nact, ActQ* act, const int* toks, int count, bool native) noexcept {
         act_xf_ = x_f;
         act_nact_ = nact;
         act_q_ = act;
-        for (int i = 0; i < count && i < MAXT; ++i) act_toks_[i] = toks[i];
-        act_count_ = count <= MAXT ? count : MAXT;
+        const int n = count <= kMaxActQuantToks ? count : kMaxActQuantToks;
+        for (int i = 0; i < n; ++i) act_toks_[i] = toks[i];
+        act_count_ = n;
         act_native_ = native;
         act_next_.store(0, std::memory_order_relaxed);
         act_done_.store(0, std::memory_order_relaxed);
@@ -372,6 +374,7 @@ private:
     std::vector<SplitBuf> split_;
     // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts
     ExpertJobMulti* mjobs_ = nullptr;
+    int mnb_ = 0;           // number of experts in the current multi phase
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
     struct SplitBufMulti {
@@ -379,11 +382,13 @@ private:
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
         std::atomic<uint8_t> q_state[MAXT];
+        std::atomic<int> gu_rows_done{0};
         SplitBufMulti() noexcept {
             for (int t = 0; t < MAXT; ++t) q_state[t].store(0, std::memory_order_relaxed);
         }
         SplitBufMulti(SplitBufMulti&& o) noexcept {
             for (int t = 0; t < MAXT; ++t) q_state[t].store(o.q_state[t].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            gu_rows_done.store(o.gu_rows_done.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
     };
     const NativeFmt* nfmt_ = nullptr;
@@ -392,7 +397,7 @@ private:
     const float* act_xf_ = nullptr;
     uint8_t* act_nact_ = nullptr;
     ActQ* act_q_ = nullptr;
-    int act_toks_[MAXT] = {};
+    int act_toks_[kMaxActQuantToks] = {};
     int act_count_ = 0;
     bool act_native_ = false;
     alignas(64) std::atomic<int> act_next_{0};
