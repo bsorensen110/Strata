@@ -9,11 +9,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 
 namespace strata::prefill {
 
 /// The value of STRATA_PREFILL_COPY_EVENT_EVERY: 1 (every entry) unless the text is a number above 1; at most 64.
 inline int copy_event_every_from(int parsed) { return parsed > 1 ? (parsed < 64 ? parsed : 64) : 1; }
+
+/// STRATA_PREFILL_COPY_WAIT_DEDUPE: unset or empty uses `default_on`; any non-zero number is on.
+inline bool copy_wait_dedupe_from(const char* v, bool default_on = false) {
+    if (v == nullptr || v[0] == '\0') return default_on;
+    return std::atoi(v) != 0;
+}
 
 /// Entry `idx` of `total` records its copied event right after its copy: always with every == 1; else every N-th entry
 /// and the last one.

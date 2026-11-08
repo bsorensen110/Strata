@@ -3837,10 +3837,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const char* v = std::getenv("STRATA_PREFILL_COPY_EVENT_EVERY");
             return strata::prefill::copy_event_every_from(v ? std::atoi(v) : 1);
         }();
-        static const bool copy_wait_dedupe = [] {
-            const char* v = std::getenv("STRATA_PREFILL_COPY_WAIT_DEDUPE");
-            return v != nullptr && std::atoi(v) != 0;
-        }();
         // STRATA_PREFILL_ROUTED_STREAM=1 (opt-in, routed_stream.hpp): the issuer keeps at most a few copies queued
         // ahead of the link (STRATA_PREFILL_ROUTED_STREAM_DEPTH, default 16), each layer's routing is published once
         // its router has run (host grouping below), and an entry not yet issued that no token of the chunk routes to
@@ -3850,6 +3846,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // unset, nothing here runs and the loop below is the walk.  Declared
         // before the issuer thread, so they outlive it on every return (IssuerJoin joins it first).
         static const bool rs_env = routed_stream::enabled_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM"), false);
+        static const bool copy_wait_dedupe = [] {
+#if defined(STRATA_USE_HIP)
+            const bool def_on = !rs_env;
+#else
+            const bool def_on = false;
+#endif
+            return strata::prefill::copy_wait_dedupe_from(std::getenv("STRATA_PREFILL_COPY_WAIT_DEDUPE"), def_on);
+        }();
         static const int rs_depth = routed_stream::depth_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM_DEPTH"));
         const bool rs_on = rs_env && routed_stream::eligible(
             stream_all, issuer_on, m.pp != nullptr, copy_event_every, copy_wait_dedupe);

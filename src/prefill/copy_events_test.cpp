@@ -16,6 +16,9 @@ int main() {
     check(copy_event_every_from(0) == 1 && copy_event_every_from(1) == 1 && copy_event_every_from(-5) == 1, "unset / 0 / 1 / negative: every entry");
     check(copy_event_every_from(2) == 2 && copy_event_every_from(16) == 16 && copy_event_every_from(64) == 64, "2..64 as given");
     check(copy_event_every_from(65) == 64 && copy_event_every_from(100000) == 64, "above 64 is 64");
+    check(!copy_wait_dedupe_from(nullptr, false) && !copy_wait_dedupe_from("", false), "dedupe unset/empty uses default_on=false");
+    check(copy_wait_dedupe_from(nullptr, true) && copy_wait_dedupe_from("", true), "dedupe unset/empty uses default_on=true");
+    check(!copy_wait_dedupe_from("0", true) && copy_wait_dedupe_from("1", false), "dedupe explicit 0/1 overrides default_on");
 
     // default: every entry records (the walk then waits on copied[slot], as before the switch)
     for (size_t total : {1u, 2u, 7u, 100u})
