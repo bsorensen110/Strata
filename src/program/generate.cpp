@@ -2004,12 +2004,23 @@ int adapt_lag() {
 bool adapt_overlap() {
     static const bool v = [] {
         const char* e = std::getenv("STRATA_ADAPT_OVERLAP");
-        // Opt-in on every backend (#2010).  Windows CUDA since 0.1.43: an RTX 5070 decoded Q2_0 2.6% slower with it
-        // (story decode, -2.1% code), IQ3_XXS no faster.  Linux CUDA was on by default from 0.1.43 (same tokens, +5.5..8.3%
-        // decode on an A4000, +4.4% on a P100) until an RTX 5090 Laptop (WSL2, Core Ultra 9 275HX, native IQ3_XXS pack,
-        // --expert-cache-per-layer) decoded 21% slower with it: 84.6 vs 106.6 tok/s medians of 5 generations of 256
-        // tokens from one build, the slowest of the fast run above the fastest of the slow one.
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+        return e == nullptr || e[0] == '\0' || e[0] != '0';
+#else
         return e && e[0] == '1';
+#endif
+    }();
+    return v;
+}
+
+bool adapt_overlap_resident() {
+    static const bool v = [] {
+        const char* e = std::getenv("STRATA_ADAPT_OVERLAP_RESIDENT");
+#if defined(STRATA_USE_HIP) && !defined(_WIN32)
+        return e == nullptr || e[0] == '\0' || e[0] != '0';
+#else
+        return e && e[0] == '1';
+#endif
     }();
     return v;
 }
@@ -13048,8 +13059,7 @@ int main(int argc, char** argv) {
                               : adapt_lag() != 1 || adapt_nowait() ? "not with STRATA_ADAPT_LAG / STRATA_ADAPT_NOWAIT"
                               // the resident RAM mode is exact too (soft_commit_exchanges) but not a win everywhere: RTX A4000 +7.0%
                               // (5/5 pairs), RTX 3060 on a 46 GB box -2.6% (0/5; the CPU experts and the copies share the RAM bandwidth)
-                              : src.complement_ready() && !(std::getenv("STRATA_ADAPT_OVERLAP_RESIDENT") &&
-                                                            std::getenv("STRATA_ADAPT_OVERLAP_RESIDENT")[0] == '1')
+                              : src.complement_ready() && !adapt_overlap_resident()
                                     ? "not in the resident RAM mode unless STRATA_ADAPT_OVERLAP_RESIDENT=1"
                               : drive.d.usage.empty() ? "the adaptive tier is off"
                               : nullptr;
@@ -13240,7 +13250,7 @@ int main(int argc, char** argv) {
         std::function<void()> adapt_fence;
         int64_t adapt_nswaps = 0;   // the blocking tier's swaps chosen, cumulative (the decode timing line's swaps/window)
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
-        auto adapt = [&]() -> bool {
+        auto adapt_impl = [&](const std::atomic<bool>* ver_done) -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
             if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             struct Swap { float gain; int32_t layer, in, out; };
@@ -13310,11 +13320,17 @@ int main(int argc, char** argv) {
             bool main_live = false;
             // STRATA_DMA_BATCH (F12): the main device's copies as one cudaMemcpyBatchAsync (mode 0: one each)
             const int dma_mode = multi_gpu ? 0 : strata::core::dma_batch_mode();
+            if (ver_done != nullptr && (!aov || dma_mode != 0)) {
+                while (!ver_done->load(std::memory_order_acquire)) std::this_thread::yield();
+            }
             std::vector<void*> cp_dst;
             std::vector<const void*> cp_src;
             std::vector<size_t> cp_bytes;
             for (size_t si = 0; si < swaps.size(); ++si) {
                 const Swap& s = swaps[si];
+                if (ver_done != nullptr && s.layer >= (int32_t) g.n_layers - 1) {
+                    while (!ver_done->load(std::memory_order_acquire)) std::this_thread::yield();
+                }
                 if (aov && (si == 0 || swaps[si - 1].layer != s.layer)) {
                     // test hook (STRATA_ADAPT_OVERLAP_SLOW_US=N): a slow link, to make the windows wait for the copies
                     static const int slow_us = [] { const char* e = std::getenv("STRATA_ADAPT_OVERLAP_SLOW_US"); return e ? std::atoi(e) : 0; }();
@@ -13402,6 +13418,7 @@ int main(int argc, char** argv) {
             for (float& v : drive.d.usage) v *= o.adapt_decay;
             return true;
         };
+        auto adapt = [&]() -> bool { return adapt_impl(nullptr); };
         // ---- --adapt-async 1: the asynchronous adaptive tier (opt-in; the resident RAM mode, see the checks where
         // the RAM copy is built).  adapt() runs a whole round - choose, copy the evicted slots back with a stream sync,
         // copy the new experts in from the RAM copy - on a thread the decode loop joins after the draft: ~24 ms every
@@ -14848,11 +14865,48 @@ int main(int argc, char** argv) {
                     &df2);
             }
 #endif
+            struct AdaptRun {
+                std::thread th;
+                std::atomic<bool> ver_done{true};
+                bool ok = true;
+                ~AdaptRun() {
+                    ver_done.store(true, std::memory_order_release);
+                    if (th.joinable()) th.join();
+                }   // an error return below still joins it
+            } adapt_run;
+            static const bool adapt_early = [] {
+                const char* v = std::getenv("STRATA_ADAPT_EARLY");
+                return v == nullptr || v[0] == '\0' || v[0] != '0';
+            }();
+            const bool want_adapt_early = adapt_early && !aflipped && !drive.d.usage.empty() && !ajob && !in_prompt_read &&
+                                          o.adapt_every > 0 && ((ba_window + 1) % o.adapt_every) == 0 && pending.empty() &&
+                                          stages.empty();
+            struct AdaptEarlyCtx {
+                AdaptRun* run = nullptr;
+                std::function<bool()> fn;
+            } adapt_early_ctx;
+            if (want_adapt_early) {
+                adapt_run.ver_done.store(false, std::memory_order_release);
+                adapt_early_ctx.run = &adapt_run;
+                adapt_early_ctx.fn = [&] {
+                    strata::platform::name_this_thread("strata-adapt");
+                    strata::aux_cpus::pin_current_thread();
+                    return adapt_impl(&adapt_run.ver_done);
+                };
+                ver.set_post_layers([](void* u) {
+                    auto* c = static_cast<AdaptEarlyCtx*>(u);
+                    if (!c->run->th.joinable())
+                        c->run->th = std::thread([c] { c->run->ok = c->fn(); });
+                }, &adapt_early_ctx);
+            }
             const bool ver_ok = ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err);
+            ver.set_post_layers(nullptr, nullptr);
+            adapt_run.ver_done.store(true, std::memory_order_release);
 #if defined(STRATA_HAVE_DFLASH2)
             ver.set_taps_ready(nullptr, nullptr);
 #endif
             if (!ver_ok || drive.d.failed) {
+                if (adapt_run.th.joinable()) adapt_run.th.join();
                 if (aflipped) apply_pending(true);
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
@@ -14865,13 +14919,14 @@ int main(int argc, char** argv) {
             // before this window ends, so no other path (a prompt chunk read between windows, a loan of cache slots, a KV
             // growth) ever meets swaps in flight.  Not between a prompt's chunks: a loan of cache slots marks its lent
             // experts missing, and they are put back when the loan ends.  (With --adapt-async the tier is ticked above.)
-            struct AdaptRun {
-                std::thread th;
-                bool ok = true;
-                ~AdaptRun() { if (th.joinable()) th.join(); }   // an error return below still joins it
-            } adapt_run;
-            if (!drive.d.usage.empty() && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 && pending.empty())
-                adapt_run.th = std::thread([&] { adapt_run.ok = adapt(); });
+            if (!drive.d.usage.empty() && !ajob && !in_prompt_read && (++ba_window % o.adapt_every) == 0 &&
+                !adapt_run.th.joinable() && pending.empty()) {
+                adapt_run.th = std::thread([&] {
+                    strata::platform::name_this_thread("strata-adapt");
+                    strata::aux_cpus::pin_current_thread();
+                    adapt_run.ok = adapt();
+                });
+            }
             // Accept the proposal only when the target picked it and there is room to emit both tokens.
             std::vector<int> keep(bs.size(), 0);
             for (int a = 0; a < A; ++a) {
@@ -15095,7 +15150,7 @@ int main(int argc, char** argv) {
                 const char* e = std::getenv("STRATA_DF2_DEFER_WAITCOMMIT");
                 return !e || e[0] != '0';
             }();
-            if (!defer_wait_commit || adapt_run.th.joinable() || !batch_on()) {
+            if (!defer_wait_commit || (adapt_run.th.joinable() && !aov) || !batch_on()) {
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
@@ -15197,7 +15252,7 @@ int main(int argc, char** argv) {
                 const char* e = std::getenv("STRATA_DF2_DEFER_WAITCOMMIT");
                 return !e || e[0] != '0';
             }();
-            if (!defer_wait_commit || adapt_run.th.joinable() || !batch_on()) {
+            if (!defer_wait_commit || (adapt_run.th.joinable() && !aov) || !batch_on()) {
                 if (!ver.wait_commit(err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
