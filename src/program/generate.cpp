@@ -17587,6 +17587,14 @@ int main(int argc, char** argv) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
                 }
+                static const int64_t lend_batch_chunk_env = [] {
+                    const char* v = std::getenv("STRATA_BATCH_PREFILL_CHUNK");
+                    return v != nullptr ? (int64_t) std::max(0, std::atoi(v)) : (int64_t) -1;
+                }();
+                int n_act_lend = 0;
+                if (o.batch > 0 && stages.empty() && exact <= 0 && !o.prefill_head_alias) {
+                    for (const auto& x : bs) n_act_lend += x.active ? 1 : 0;
+                }
                 bool any = false;
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
@@ -17610,6 +17618,18 @@ int main(int argc, char** argv) {
                         // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
                         // lent even then is halved until it can, instead of ending the engine.
                         int64_t need_p = part_slots(p, want_p);
+                        bool shrunk_for_active = false;
+                        if (n_act_lend > 0) {
+                            const int64_t eff_c = strata::program::batch_prefill_chunk(want_p, n_act_lend, lend_batch_chunk_env);
+                            if (eff_c < want_p) {
+                                const int64_t need_eff = part_slots(p, eff_c);
+                                if (need_eff > 0 && need_eff < need_p && need_eff + g_lend_keep <= p.cache->slots()) {
+                                    want_p = eff_c;
+                                    need_p = need_eff;
+                                    shrunk_for_active = true;
+                                }
+                            }
+                        }
                         while ((need_p <= 0 || need_p + g_lend_keep > p.cache->slots()) && want_p > 256) {
                             want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
                             need_p = part_slots(p, want_p);
@@ -17618,7 +17638,7 @@ int main(int argc, char** argv) {
                             e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
                             return false;
                         }
-                        if (want_p != want)
+                        if (want_p != want && !shrunk_for_active)
                             std::fprintf(stderr, "strata serve: prompt chunk %lld -> %lld tokens for this request: its "
                                          "buffers do not fit the slots that can be lent (#2090)\n", (long long) want,
                                          (long long) want_p);
@@ -17801,7 +17821,7 @@ int main(int argc, char** argv) {
                 static const int prefill_layer_yield = [&] {
                     const char* v = std::getenv("STRATA_BATCH_PREFILL_LAYER_YIELD");
                     if (v != nullptr && v[0] != '\0') return std::max(0, std::atoi(v));
-                    return batch_mtp ? 12 : 0;
+                    return (batch_mtp || batch_df2) ? 12 : 0;
                 }();
                 auto active_slot_count = [&]() -> int {
                     int n_act = 0;
