@@ -754,7 +754,7 @@ __global__ void __launch_bounds__(1024) conv_rms_quant_kernel(const float* __res
             float acc = 0.0f;
 #pragma unroll
             for (int o = 0; o < 2; ++o) {
-                if (b - o < 0) continue;
+                if ((b & 7) - o < 0) continue;
                 const float k = base[o * H + c] + dyn[(size_t) b * dyn_stride + o * groups + c / group];
                 acc = fmaf(k, x[(size_t) (b - o) * H + c], acc);
             }
@@ -1146,38 +1146,55 @@ __device__ void select_slot_walk(const float* __restrict__ hp, const float* __re
         if (Q4) vp[tid] = q4row_at(reinterpret_cast<const uint8_t*>(pred_cb) + (size_t) prev * (rank / 32 * 18), tid) * hp[(size_t) i * rank + tid];
         else vp[tid] = bf16f(pred_cb[(size_t) prev * rank + tid]) * hp[(size_t) i * rank + tid];
         __syncthreads();
+        float v_loc[8];
+#pragma unroll
+        for (int e = 0; e < 8; ++e) v_loc[e] = vp[lane * 8 + e];
         for (int j = w * 2; j < w * 2 + 2; ++j) {
             const int t = tok[i * kDf2TopK + j];
             float acc = 0.0f;
             if (Q4) {
                 const uint8_t* row = reinterpret_cast<const uint8_t*>(succ_cb) + (size_t) t * (rank / 32 * 18);
 #pragma unroll
-                for (int e = 0; e < 8; ++e) acc = fmaf(q4row_at(row, lane * 8 + e), vp[lane * 8 + e], acc);
+                for (int e = 0; e < 8; ++e) acc = fmaf(q4row_at(row, lane * 8 + e), v_loc[e], acc);
             } else {
                 const uint4 raw = *reinterpret_cast<const uint4*>(succ_cb + (size_t) t * rank + lane * 8);
                 const uint32_t u[4] = {raw.x, raw.y, raw.z, raw.w};
 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
-                    acc = fmaf(__uint_as_float(u[e] << 16), vp[lane * 8 + e * 2], acc);
-                    acc = fmaf(__uint_as_float(u[e] & 0xffff0000u), vp[lane * 8 + e * 2 + 1], acc);
+                    acc = fmaf(__uint_as_float(u[e] << 16), v_loc[e * 2], acc);
+                    acc = fmaf(__uint_as_float(u[e] & 0xffff0000u), v_loc[e * 2 + 1], acc);
                 }
             }
             for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
             if (lane == 0) sc[j] = unary[i * kDf2TopK + j] + acc;
         }
         __syncthreads();
-        if (tid == 0) {
-            int bj = 0;
-            float bv = sc[0];
-            for (int j = 1; j < kDf2TopK; ++j)
-                if (sc[j] > bv) { bv = sc[j]; bj = j; }
+        if (w == 0) {
+            const float sj = (lane < kDf2TopK) ? sc[lane] : -INFINITY;
+            float bv = sj;
+            int bj = lane;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) {
+                const float obv = __shfl_xor_sync(0xffffffffu, bv, o);
+                const int obj = __shfl_xor_sync(0xffffffffu, bj, o);
+                if (obv > bv || (obv == bv && obj < bj)) {
+                    bv = obv;
+                    bj = obj;
+                }
+            }
+            bv = __shfl_sync(0xffffffffu, bv, 0);
+            bj = __shfl_sync(0xffffffffu, bj, 0);
+            const float ej = (lane < kDf2TopK) ? __expf(sj - bv) : 0.0f;
             float z = 0.0f;
-            for (int j = 0; j < kDf2TopK; ++j) z += __expf(sc[j] - bv);
-            const int32_t picked = tok[i * kDf2TopK + bj];
-            out_prob[i] = 1.0f / z;
-            prev = picked;
-            if (i + 1 == rows) __threadfence_system();
-            out_tok[i] = picked;
+#pragma unroll
+            for (int j = 0; j < kDf2TopK; ++j) z += __shfl_sync(0xffffffffu, ej, j);
+            if (lane == 0) {
+                const int32_t picked = tok[i * kDf2TopK + bj];
+                out_prob[i] = 1.0f / z;
+                prev = picked;
+                if (i + 1 == rows) __threadfence_system();
+                out_tok[i] = picked;
+            }
         }
         __syncthreads();
     }
