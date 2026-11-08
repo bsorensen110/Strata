@@ -438,7 +438,8 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
 } // namespace
 
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
-                          int64_t upto, bool index, std::string& error, bool queued) {
+                          int64_t upto, bool index, std::string& error, bool queued,
+                          int64_t unchanged_tokens) {
     Layout lf{}, lt{};
     if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error) ||
         !layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;
@@ -448,17 +449,29 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
         error = "conversation snapshot: direct K/V copy between different layouts";
         return false;
     }
+    if (unchanged_tokens < 0 || unchanged_tokens > upto) {
+        error = "conversation snapshot: invalid unchanged prefix";
+        return false;
+    }
     // The same bytes conversation_kv_save + conversation_kv_restore move, without the host image: each part
     // straight from the source's authoritative pool into the target's (device or mapped host memory), through the
     // private non-blocking stream the other snapshot copies use (complete on return, before the residency refresh).
     // `queued`: the copies are only queued, and a streamed state's refresh waits for them on the device (an event).
+    const int64_t whole_cells = (unchanged_tokens / lf.page_size) * lf.page_size;
+    const int64_t idx_block = strata::kernels::qsa_real_shapes().idx_block;
     const auto src = pools(from);
     const auto dst = pools(to);
     const std::array<size_t,5> sizes = {lf.data, lf.value_data, lf.scales, lf.value_scales, lf.pooled};
     for (size_t i = 0; i < sizes.size(); ++i) {
         if (!sizes[i]) continue;
         if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
-        const cudaError_t e = conversation_detail::copy_nonblocking(dst[i], src[i], sizes[i], queued);
+        const size_t keep = i == 4 ? (index && idx_block > 0
+                                          ? std::min(sizes[i], size_t(unchanged_tokens / idx_block) * size_t(g.idx_key_dim) * 4)
+                                          : 0)
+                                   : (lf.cells ? (sizes[i] / size_t(lf.cells)) * size_t(whole_cells) : 0);
+        if (keep >= sizes[i]) continue;
+        const cudaError_t e = conversation_detail::copy_nonblocking(
+            static_cast<uint8_t*>(dst[i]) + keep, static_cast<const uint8_t*>(src[i]) + keep, sizes[i] - keep, queued);
         if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
     }
     if (queued && to.kv_mode != 0) {

@@ -374,6 +374,11 @@ int main() {
             cuda_check(cudaDeviceSynchronize());
             check(conversation_kv_save(restored,f.state,f.g,upto,index,err),"read back restored A");
             check(equal(a,restored),"A/B/A byte-exact K/V and indexer state");
+            check(!conversation_kv_copy(f.state,f.state,f.g,upto,index,err,false,-1) &&
+                  !conversation_kv_copy(f.state,f.state,f.g,upto,index,err,false,upto+1),
+                  "conversation_kv_copy rejects out-of-range unchanged_tokens");
+            check(conversation_kv_copy(f.state,f.state,f.g,upto,index,err,false,upto/2),
+                  "conversation_kv_copy accepts valid unchanged_tokens");
             uint64_t fingerprint = 0;
             check(conversation_kv_verify(a,f.state,f.g,upto,index,fingerprint,err),"verify restored authoritative and resident bytes without rewriting them");
             {

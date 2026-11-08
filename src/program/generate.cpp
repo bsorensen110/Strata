@@ -14654,8 +14654,24 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SLOT_COPY_DIRECT");
             return v == nullptr || v[0] == '\0' || v[0] != '0';
         }();
+        static const bool solo_handoff_fast = [] {
+            const char* v = std::getenv("STRATA_SOLO_HANDOFF_FAST");
+            return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+        }();
         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
             const int64_t upto = (int64_t) ids.size();
+            int64_t unchanged_kv = 0;
+            if (solo_handoff_fast && live_imgs.empty() && !bs[(size_t) b].img && !bs[(size_t) b].tainted &&
+                bs[(size_t) b].cvec == cvec_cached) {
+                if (!into_slot && live_ok && live.size() > 1 && ids.size() >= live.size() &&
+                    std::equal(live.begin(), live.end(), ids.begin())) {
+                    unchanged_kv = (int64_t) live.size() - 1;
+                } else if (into_slot && !bs[(size_t) b].active && bs[(size_t) b].cached &&
+                           bs[(size_t) b].ids.size() > 1 && ids.size() >= bs[(size_t) b].ids.size() &&
+                           std::equal(bs[(size_t) b].ids.begin(), bs[(size_t) b].ids.end(), ids.begin())) {
+                    unchanged_kv = (int64_t) bs[(size_t) b].ids.size() - 1;
+                }
+            }
             auto sync_all = [&]() {
                 bool ok = true;
                 for (size_t k = 0; k < bslot_ss.size(); ++k) {
@@ -14682,7 +14698,8 @@ int main(int argc, char** argv) {
                 if (!strata::core::conversation_checkpoint_copy(from, to, ids, g, e, queued)) return failed();
                 for (int64_t j = 0; j < from.qsa_alloc; ++j)
                     if (!strata::core::conversation_kv_copy(from.qsa_states[from.qsa_ord0 + j],
-                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
+                                                            to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued,
+                                                            unchanged_kv))
                         return failed();
             }
 #if defined(STRATA_HAVE_DFLASH2)
@@ -17141,8 +17158,22 @@ int main(int argc, char** argv) {
             const size_t park_held = o.conversation_cache_park_gain > 0
                                          ? conversations.parked_prefix_tokens(live, live_imgs, checks, cvec_cached)
                                          : 0;
-            const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
-                                    (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            bool in_batch_slot = false;
+            if (solo_handoff_fast && live_ok && !live.empty() && live_imgs.empty() &&
+                (checks.empty() || slot_source >= 0)) {
+                for (int b = 0; b < (int) bs.size(); ++b) {
+                    const BSlot& sl = bs[(size_t) b];
+                    if ((sl.active || sl.cached) && !sl.tainted && !sl.img && sl.cvec == cvec_cached &&
+                        sl.ids.size() >= live.size() && std::equal(live.begin(), live.end(), sl.ids.begin()) &&
+                        (b != slot_source || (size_t) slot_tokens >= live.size())) {
+                        in_batch_slot = true;
+                        break;
+                    }
+                }
+            }
+            const bool park_worth = !in_batch_slot &&
+                                    (o.conversation_cache_park_gain <= 0 || park_held == 0 ||
+                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain);
             // STRATA_PARK_ASYNC: the checkpoints this request drops after its park - all of them when another state
             // comes in (a parked conversation, a borrow, a batch slot) or the cvec changes, else the ones off this
             // prompt's path (off_path below) - move into the parked image
