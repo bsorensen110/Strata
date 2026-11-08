@@ -1,11 +1,11 @@
 # DFlash2 & Target Verifier Optimization Campaign (2026-11-07)
 
 - **Worktree**: `/home/soren/Strata-perf-dflash2-on-main-20261103`
-- **Branch**: `perf/dflash2-tap-overlap-16row` (`d1c3d7fb3`, 21 atomic commits on top of `fork-main` @ `d80835e40`)
+- **Branch**: `perf/dflash2-tap-overlap-16row` (`0d468cf6b`, 26 code commits + docs on top of `fork-main` @ `d80835e40`)
 - **Hardware**: AMD Radeon AI PRO R9700 (`gfx1201` / RDNA4, 32 GiB VRAM, ROCm nightly `10.2.0a20260914`)
 - **Model**: `qwen3.8-flash-next-unsloth-ud-iq4_xs-v31` + `qwen3.8-flash-next-dflash2.q4_0-selq4.pack` (`--batch 2`, `--spec 8`, `--draft-conf 0.5`, `--resident-experts --resident-budget-gib 34`)
 
-## 1. Atomic Commit Stack (`d80835e40..d1c3d7fb3`)
+## 1. Atomic Commit Stack (`d80835e40..0d468cf6b`)
 
 1. `b44d8bc61` `perf(dflash2): support 16-way grouped GEMM dispatch`
 2. `62b915718` `perf(dflash2): batch all-layer K/V projections with strided scratch`
@@ -28,6 +28,11 @@
 19. `84230cd2f` `perf(mmvq): extend fused native_quantize_q8_1_il to 2..8 columns`
 20. `ece65d1a4` `perf(verify): fuse interleaved Q8_1 store into native_qsa_gate_quantize_q8_1`
 21. `d1c3d7fb3` `perf(verify): fuse step+pos upload and batch GDN/QSA layer commits in capture_commit_batch`
+22. `3c075b37f` `perf(batch): enable mid-chunk prefill layer yield for batch_df2 and shrink lend() chunk when slots decode`
+23. `ac3b744cd` `perf(dflash2): widen prompt context and log rebuild from 8-row to 16-row GEMM passes and batch D2H log copies`
+24. `db4964732` `perf(batch): overlap DFlash2 context with verify in read_windows and yield to active batch slots`
+25. `d3711bb3f` `perf(batch): enable precomputed context and captured batch_full graph when 1 slot is active in step_batch`
+26. `0d468cf6b` `perf(batch): batch DFlash2 ring copy into direct_slot_copy sync and overlap BADM initial draft with checkpoint setup`
 
 ## 2. Microbenchmark & Parity Verification (`gfx1201`, `strata.service` stopped)
 
@@ -75,3 +80,29 @@
   - Because `conv_rms_quant_kernel` launches only `B = 8` blocks across the GPU (`64` WGPs on `gfx1201`), reducing threads per block from `1024` (`32` warps, `float v[3]`, 3 loop rounds) to `256` (`8` warps, `float v[4][3]`, 12 serial loop rounds) serialized global memory latency and increased per-thread VGPR usage. Restoring `1024` threads brought `conv_rms_quant` to **5.91 µs**.
 - **Fusing `x_il` stores into `FusedGrArgs` (`fused_gr_read_multi`) and `gdn_step_norm_multi_kernel` increased verify window time by ~1.5 ms**:
   - Adding `void* q8_il` to `FusedGrArgs` expanded `GrMulti` by 128 bytes across every `gr_down` kernel launch, and adding `bm/pm/dl/cp` to `gdn_step_norm_multi_kernel` (which holds `float s[32]` recurrence state in VGPRs across 512 threads) increased VGPR pressure inside the recurrence loop. By contrast, fusing `x_il` into `native_qsa_gate_quantize_q8_1` (`ece65d1a4`, a 16-VGPR elementwise kernel) cleanly eliminated the 256 KB `attn32_` round-trip and second kernel launch when `use_quant_il_wo` is active for `2..8` rows.
+
+## 5. Single-Card Concurrent Prefill + Decode A/B Results (`/home/soren/.hermes/cache/scratch/ab_concurrent_pf_dec_20261108/results.json`)
+
+- **`dflash2_ring_test` Context & Stash Rebuild (`ac3b744cd`)**:
+  - Test 1 (`rewind`, 578 rows rebuilt): **4.1 ms** (down from ~8.5 ms with 8-row passes; bitwise exact)
+  - Test 2 (`parked`, 2042 rows rebuilt): **13.0 ms** (down from ~26 ms with 8-row passes; bitwise exact)
+- **Paired End-to-End Concurrent Prefill + Decode Benchmark (`0_prod_control` @ `cfb22e5b4` vs `1_cand_concurrent` @ `0d468cf6b`)**:
+  - **Solo Refactor Parity (`2x192`, `temp=0`)**:
+    - Control: **74.1 tok/s** (`60.5` cold / `87.6` warm), hash `ece1433a582a4c38`
+    - Candidate: **74.5 tok/s** (`63.3` cold / `85.7` warm), hash `ece1433a582a4c38` (exact match)
+  - **Concurrent Decode (Slot 0: 256 tok) + Long Prefill & Decode (Slot 1: 4,712 prompt tok + 128 generated tok)**:
+    - Control (`0_prod_control`):
+      - Combined aggregate throughput: **46.5 tok/s** (`45.4` cold R1 / `47.7` warm R2; wall `8.46s` / `8.05s`)
+      - Slot 0 decode throughput during co-prefill: **32.6 tok/s** (`31.1` R1 / `34.1` R2)
+      - Slot 1 total latency: **7.90s** (`8.11s` R1 / `7.70s` R2); engine 4,712-token prompt read: `6,146 ms (766.7 tok/s)` R1 / `5,886 ms (800.6 tok/s)` R2
+      - Slot 1 `copy_to_slot` admission latency: `57.7 ms`
+      - Window telemetry (warm R2): `34.11 ms/window` (`emit 3.53 ms`, `adapt wait 1.45 ms`), VRAM hits `84.6%`, CPU `14.6%`, `48.2 rows/s`, file-tier reads `10,845` blobs
+    - Candidate (`1_cand_concurrent`):
+      - Combined aggregate throughput: **48.2 tok/s** (**+3.7% mean / +5.8% warm**, `46.0` cold R1 / **50.5 tok/s** warm R2; wall `8.35s` / **7.61s**, **−0.44s faster warm**)
+      - Slot 0 decode throughput during co-prefill: **33.5 tok/s** (`32.1` R1 / **34.9 tok/s** warm R2)
+      - Slot 1 total latency: **7.63s** (`8.00s` R1 / **7.25s** warm R2, **−0.45s faster warm**); engine 4,712-token prompt read: **`5,843 ms (806.4 tok/s)` R1 / `5,606 ms (840.5 tok/s)` R2 (−292 ms avg prompt read)**
+      - Slot 1 `copy_to_slot` admission latency: **`5.8 ms` (−90.0%)**
+      - Window telemetry (warm R2): **`32.21 ms/window`** (`emit 2.40 ms` [**−32.0%**], `adapt wait 0.45 ms` [**−69.0%**]), VRAM hits **`87.1%`**, CPU **`12.3%`**, **`52.2 rows/s` (+8.3%)**, file-tier reads **`6,849` blobs (−36.8% due to `lend()` chunk shrink)**
+  - **2-Slot Concurrent `2x256` Burst (`batch2`)**:
+    - Control (`0_prod_control`): mean **125.8 tok/s** aggregate (`125.7` R1 / `125.9` R2; per-slot **63.7 tok/s**; engine **136.4 / 136.3 rows/s**; `emit 3.81 / 3.67 ms`, `adapt wait 3.69 / 3.97 ms`)
+    - Candidate (`1_cand_concurrent`): mean **128.9 tok/s** aggregate (**+2.5% mean / +4.4% warm**, `126.5` R1 / **131.4 tok/s** warm R2; per-slot **65.3 tok/s** [`64.0` R1 / **66.6 tok/s** R2]; engine **148.3 / 154.1 rows/s [+13.1% warm engine rows/s]**; `emit 2.79 / 2.76 ms [−25.6%]`, `adapt wait 1.08 / 1.08 ms [−72.8%]`, acceptance **346/164 = 211.0%**)
