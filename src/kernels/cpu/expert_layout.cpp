@@ -633,7 +633,7 @@ void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* co
                  int r0, int r1) {
     // VNNI-512 without VBMI: expert.cpp's zmm row dot has a substitute for the VBMI-only 2-bit unpack there
     // (q2_rows_512_ok also leaves the STRATA_CPU_YMM=1 choice to the AVX-2 kernel, on this CPU on the rung below).
-    if (q2_rows_512_ok()) q2_0_gguf_rows_multi(w, row_bytes, nblocks, a, nt, out, r0, r1);
+    if (q2_rows_512_ok()) q2_0_gguf_rows_multi_v2(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else if (cpu_avx2_ok()) q2_0_gguf_rows_multi_avx2(w, row_bytes, nblocks, a, nt, out, r0, r1);
     else q2_0_gguf_rows_multi_avx1(w, row_bytes, nblocks, a, nt, out, r0, r1);   // issue #1699: the third rung
 }

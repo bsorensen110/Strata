@@ -374,10 +374,6 @@ void expert_oracle_q8_0(const uint8_t* blob, const ActQ& a1, float* out, ExpertS
         out[r] = row_dot_oracle(blob + O_D_CODES + size_t(r) * ROW_D,
                                blob + O_D_SCALES + size_t(r) * SC_D * 2, ws.a2, SC_D);
 }
-
-bool q2_rows_512_ok() {
-    return kZmm && cpu_vnni_ok();
-}
 }  // namespace
 
 // CpuFeatures::reason, cpu_features, cpu_require_expert_support and the oracle flag live in expert_layout.cpp: this
