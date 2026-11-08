@@ -1214,7 +1214,9 @@ __global__ void pack_head_rows_kernel(const float* __restrict__ fn_in, const flo
 
 __global__ void pack_head_rows_batch_kernel(const float* __restrict__ fn_in, const float* __restrict__ hsel_in,
                                             float* __restrict__ fn_out, float* __restrict__ hsel_out,
-                                            const int32_t* __restrict__ batch_meta, int N, int rank) {
+                                            const int32_t* __restrict__ batch_meta, int N, int rank,
+                                            const int8_t* __restrict__ xq_in, const float* __restrict__ xd_in,
+                                            int8_t* __restrict__ xq_out, float* __restrict__ xd_out) {
     const int i = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
     const int r = blockIdx.y, s = blockIdx.z;
     const int row_off = batch_meta[s * 4 + 0];
@@ -1222,10 +1224,15 @@ __global__ void pack_head_rows_batch_kernel(const float* __restrict__ fn_in, con
     if (r >= k_want) return;
     const size_t src_r = (size_t) s * kDf2Rows + 1 + r;
     const size_t dst_r = (size_t) (row_off + r);
-    if (i < N)
+    const int nb = N / 32;
+    if (i < N) {
         fn_out[dst_r * N + i] = fn_in[src_r * N + i];
-    else if (i < N + rank)
+        if (xq_in && xq_out) xq_out[dst_r * N + i] = xq_in[src_r * N + i];
+    } else if (hsel_in && hsel_out && i < N + rank) {
         hsel_out[dst_r * rank + (i - N)] = hsel_in[src_r * rank + (i - N)];
+    } else if (xd_in && xd_out && i >= N && i < N + nb) {
+        xd_out[dst_r * nb + (i - N)] = xd_in[src_r * nb + (i - N)];
+    }
 }
 
 __global__ void tap_rows_kernel(const float* __restrict__ R, float* __restrict__ out, int64_t out_stride, int64_t n, int hc) {
@@ -1543,10 +1550,14 @@ void df2_pack_head_rows(const float* fn_in, const float* hsel_in, float* fn_out,
 }
 
 void df2_pack_head_rows_batch(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out,
-                              const int32_t* batch_meta, int n_items, int N, int rank, void* stream) {
+                              const int32_t* batch_meta, int n_items, int N, int rank, void* stream,
+                              const void* xq_in, const float* xd_in,
+                              void* xq_out, float* xd_out) {
     if (n_items <= 0) return;
-    pack_head_rows_batch_kernel<<<dim3((unsigned) ((N + rank + 255) / 256), (unsigned) (kDf2Rows - 1), (unsigned) n_items), 256, 0, (cudaStream_t) stream>>>(
-        fn_in, hsel_in, fn_out, hsel_out, batch_meta, N, rank);
+    const int extra = (hsel_in && hsel_out) ? rank : ((xd_in && xd_out) ? (N / 32) : 0);
+    pack_head_rows_batch_kernel<<<dim3((unsigned) ((N + extra + 255) / 256), (unsigned) (kDf2Rows - 1), (unsigned) n_items), 256, 0, (cudaStream_t) stream>>>(
+        fn_in, hsel_in, fn_out, hsel_out, batch_meta, N, rank,
+        static_cast<const int8_t*>(xq_in), xd_in, static_cast<int8_t*>(xq_out), xd_out);
     check("pack_head_rows_batch");
 }
 

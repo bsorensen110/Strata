@@ -1709,7 +1709,7 @@ bool Dflash2Drafter::record_batch_body(const BatchSlotItem* items, int n_items, 
     return true;
 }
 
-bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err) {
+bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err, int total_rows) {
     using namespace kernels;
     try {
         const int total_B = n_items * kRows;
@@ -1773,8 +1773,15 @@ bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n
             if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, total_B, N_, group_, eps_, xqp_, xdp_, cs);
         }
         if (skip_part("small")) df2_quant_rows(fn_, N_, total_B, xqp_, xdp_, cs);
-        gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, total_B, cs, xqp_, xdp_);
-        df2_pack_head_rows_batch(fn_, hsel_, fn_batch_, hsel_batch_, m_bmeta_, n_items, N_, rank_, cs);
+        if (total_rows > 0 && total_rows <= total_B) {
+            uint8_t* xqp_pack = xqp_ + (size_t) total_B * N_;
+            float* xdp_pack = xdp_ + (size_t) total_B * (N_ / 32);
+            df2_pack_head_rows_batch(fn_, nullptr, fn_batch_, nullptr, m_bmeta_, n_items, N_, rank_, cs, xqp_, xdp_, xqp_pack, xdp_pack);
+            gemm({"candidate_selector.hidden_projection.weight"}, {hsel_batch_}, total_rows, cs, xqp_pack, xdp_pack);
+        } else {
+            gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, total_B, cs, xqp_, xdp_);
+            df2_pack_head_rows_batch(fn_, hsel_, fn_batch_, hsel_batch_, m_bmeta_, n_items, N_, rank_, cs);
+        }
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -1886,7 +1893,7 @@ bool Dflash2Drafter::capture_batch_full(const BatchSlotItem* items, int n_items,
     kernels::native_mmvq_il_tune(0);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin batch full capture"; return false; }
     kernels::copy_i32_from_mapped(d_meta_ + 64, m_meta_ + 64, 96, cs_);
-    const bool ok = record_batch_body_precomp(items, n_items, cs_, err) &&
+    const bool ok = record_batch_body_precomp(items, n_items, cs_, err, total_rows) &&
                     record_batch_head(n_items, total_rows, cs_, err);
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);

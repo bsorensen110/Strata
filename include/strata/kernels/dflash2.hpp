@@ -168,7 +168,9 @@ void df2_attention_batch_f16(const float* q, Df2BatchAttn ba, const float* kblk,
                              const int32_t* anchor_pos_base, int ring_slots, int window, float* part,
                              void* xq, float* xd, int n_slots, void* stream, const int32_t* epoch_base);
 void df2_pack_head_rows_batch(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out,
-                              const int32_t* batch_meta, int n_items, int N, int rank, void* stream);
+                              const int32_t* batch_meta, int n_items, int N, int rank, void* stream,
+                              const void* xq_in = nullptr, const float* xd_in = nullptr,
+                              void* xq_out = nullptr, float* xd_out = nullptr);
 
 /// The verify window's tap: out[r][d] = mean over the hc streams c of (R[r][c][d] + bo[r][d] * 2 * sigmoid(inject[r][c] / hc)) - the layer output with
 /// its pending FFN write (gr_write) applied, averaged over the streams.  R rows are `R_stride` floats apart, bo rows `bo_stride`, inject rows

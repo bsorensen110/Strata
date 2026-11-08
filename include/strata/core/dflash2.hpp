@@ -225,7 +225,7 @@ private:
     bool record_block_body(cudaStream_t cs, std::string& err, bool rope = true);
     bool record_block(cudaStream_t cs, std::string& err, bool rope = true);
     bool record_batch_body(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err);
-    bool record_batch_body_precomp(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err);
+    bool record_batch_body_precomp(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err, int total_rows = 0);
     bool record_batch_head(int n_items, int total_rows, cudaStream_t cs, std::string& err);
     bool capture(int n, const float* taps, std::string& err);
     bool capture_body(int n, const float* taps, std::string& err);
