@@ -1409,15 +1409,15 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
                                          rt_bctx_ + (size_t) precomp_off * 128, kring_[l], vring_[l],
                                          kRing, (int) n, NKV_, eps_, cs_, tag_, d_meta_ + 18);
             }
-            if (log_on_) {
-                cudaMemcpyAsync(h_logq_, xqc_ + (size_t) precomp_off * N_, (size_t) n * N_, cudaMemcpyDeviceToHost, cs_);
-                cudaMemcpyAsync(h_logd_, xdc_ + (size_t) precomp_off * (N_ / 32), (size_t) n * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs_);
-            }
         } catch (const std::exception& e) {
             err = e.what();
             return false;
         }
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+        if (log_on_ && precomp_off > 0) {
+            std::memmove(h_logq_, h_logq_ + (size_t) precomp_off * N_, (size_t) n * N_);
+            std::memmove(h_logd_, h_logd_ + (size_t) precomp_off * (N_ / 32), (size_t) n * (N_ / 32) * sizeof(float));
+        }
         log_flush();
         have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
         ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n);
@@ -1578,7 +1578,7 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
         }
         std::atomic_thread_fence(std::memory_order_acquire);
     }
-    if (!solopipe || timing_ || prof_ || log_on_ || ((volatile int32_t*) h_out_)[std::max(0, ndraft_ - 1)] < 0) {
+    if (!solopipe || timing_ || prof_ || ((volatile int32_t*) h_out_)[std::max(0, ndraft_ - 1)] < 0) {
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     }
     log_flush();
@@ -1652,6 +1652,11 @@ void Dflash2Drafter::precompute_batch_context(const float* taps, int n_rows, con
                 const std::string kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
                 gemm({kp.c_str(), vp.c_str()}, {kc_ + l * l_stride, vc_ + l * l_stride}, n_rows, cs_, xqc_, xdc_);
             }
+        }
+        if (log_on_ && h_logq_ != nullptr && h_logd_ != nullptr) {
+            cudaMemcpyAsync(h_logq_, xqc_, (size_t) n_rows * N_, cudaMemcpyDeviceToHost, cs_);
+            cudaMemcpyAsync(h_logd_, xdc_, (size_t) n_rows * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs_);
+            if (ev_join_ != nullptr) cudaEventRecord(ev_join_, cs_);
         }
         (void) cudaStreamQuery(cs_);
         precomp_taps_ = taps;
@@ -2131,6 +2136,7 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
                     return false;
                 }
                 head_recorded_in_graph = true;
+                (void) cudaStreamQuery(cs_);
             } else {
                 kernels::copy_i32_from_mapped(d_meta_ + 64, m_meta_ + 64, 96, cs_);
                 if (!record_batch_body_precomp(items, n_items, cs_, err)) return false;
@@ -2145,15 +2151,29 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
             kernels::copy_i32_from_mapped(d_meta_ + 32, m_meta_ + 32, 112, cs_);
             if (!record_batch_body(items, n_items, cs_, err)) return false;
         }
+        bool precomp_ev_synced = false;
         for (int idx = 0; idx < n_items; ++idx) {
             const BatchSlotItem& it = items[idx];
             Dflash2Drafter& sl = *it.slot;
             if (can_use_precomp && sl.log_on_) {
                 const int c0 = precomp_offs[idx];
-                cudaMemcpyAsync(sl.h_logq_, xqc_ + (size_t) c0 * N_, (size_t) it.n_new * N_, cudaMemcpyDeviceToHost, cs_);
-                cudaMemcpyAsync(sl.h_logd_, xdc_ + (size_t) c0 * (N_ / 32), (size_t) it.n_new * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs_);
+                if (log_on_ && h_logq_ != nullptr && h_logd_ != nullptr) {
+                    if (!precomp_ev_synced && ev_join_ != nullptr) {
+                        cudaEventSynchronize(ev_join_);
+                        precomp_ev_synced = true;
+                    }
+                    std::memcpy(sl.h_logq_, h_logq_ + (size_t) c0 * N_, (size_t) it.n_new * N_);
+                    std::memcpy(sl.h_logd_, h_logd_ + (size_t) c0 * (N_ / 32), (size_t) it.n_new * (N_ / 32) * 4);
+                    sl.log_stage(it.pos0, it.n_new);
+                    sl.log_flush();
+                } else {
+                    cudaMemcpyAsync(sl.h_logq_, xqc_ + (size_t) c0 * N_, (size_t) it.n_new * N_, cudaMemcpyDeviceToHost, cs_);
+                    cudaMemcpyAsync(sl.h_logd_, xdc_ + (size_t) c0 * (N_ / 32), (size_t) it.n_new * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs_);
+                    sl.log_stage(it.pos0, it.n_new);
+                }
+            } else {
+                sl.log_stage(it.pos0, it.n_new);
             }
-            sl.log_stage(it.pos0, it.n_new);
             sl.launch_t0_ = t0;
             sl.launch_n_ = it.n_new;
             sl.launch_pos0_ = it.pos0;
@@ -2207,8 +2227,6 @@ bool Dflash2Drafter::draft_batch_slots_finish(const BatchSlotItem* items, int n_
         const char* e = std::getenv("STRATA_DF2_SOLOPIPE");
         return !e || e[0] != '0';
     }();
-    bool any_log = false;
-    for (int idx = 0; idx < n_items; ++idx) any_log = any_log || items[idx].slot->log_on_;
     if (solopipe && !timing_ && !prof_) {
         uint32_t spins = 0;
         for (;;) {
@@ -2228,7 +2246,7 @@ bool Dflash2Drafter::draft_batch_slots_finish(const BatchSlotItem* items, int n_
         const int kw = items[idx].k_want;
         if (kw > 0 && ((volatile int32_t*) h_bout_)[idx * 8 + kw - 1] < 0) all_ready = false;
     }
-    if (!solopipe || timing_ || prof_ || any_log || !all_ready) {
+    if (!solopipe || timing_ || prof_ || !all_ready) {
         if (cudaStreamSynchronize(cs_) != cudaSuccess) {
             err = std::string("dflash2 draft_batch_slots: ") + cudaGetErrorString(cudaGetLastError());
             return false;
