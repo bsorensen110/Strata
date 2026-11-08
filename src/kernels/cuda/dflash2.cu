@@ -169,7 +169,7 @@ __device__ void attn_part_device(const float* __restrict__ q, const RingT* __res
     const int64_t ep = tag != nullptr ? ((int64_t) *epoch_ptr << 32) : 0;
     float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32) * 130;
     if (k_begin >= nkeys) {
-        for (int i = tid; i < 32 * 130; i += 128) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
+        if (tid < 32) pbase[tid * 130] = -INFINITY;
         return;
     }
     const float scale = rsqrtf((float) HD);
@@ -306,7 +306,9 @@ __device__ void attn_part_device(const float* __restrict__ q, const RingT* __res
     if (tid < 32) { pbase[tid * 130] = m_s[tid]; pbase[tid * 130 + 1] = l_s[tid]; }
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        float* o = pbase + (size_t) (qg_pv * 4 + i) * 130 + 2 + dg_pv * 8;
+        const int qi = qg_pv * 4 + i;
+        if (m_s[qi] == -INFINITY) continue;
+        float* o = pbase + (size_t) qi * 130 + 2 + dg_pv * 8;
         *reinterpret_cast<float2*>(o) = make_float2(O[i][0], O[i][1]);
         *reinterpret_cast<float2*>(o + 2) = make_float2(O[i][2], O[i][3]);
         *reinterpret_cast<float2*>(o + 4) = make_float2(O[i][4], O[i][5]);
@@ -344,13 +346,20 @@ __device__ __forceinline__ void quant_block(float v, int blk, int col, int K, in
 __global__ void attn_merge_kernel(const float* __restrict__ part, int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int a = blockIdx.x;                      // kvh * 32 + qi
     const int kvh = a >> 5, qi = a & 31, d = threadIdx.x;
+    float mc_arr[kDf2MaxChunks];
     float M = -INFINITY;
-    for (int c = 0; c < kDf2MaxChunks; ++c) M = fmaxf(M, part[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130]);
-    float L = 0.0f, o = 0.0f;
+#pragma unroll
     for (int c = 0; c < kDf2MaxChunks; ++c) {
+        mc_arr[c] = part[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130];
+        M = fmaxf(M, mc_arr[c]);
+    }
+    float L = 0.0f, o = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kDf2MaxChunks; ++c) {
+        const float mc = mc_arr[c];
+        if (mc == -INFINITY) continue;
         const float* p = part + (((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130;
-        const float mc = p[0];
-        const float w = (mc == -INFINITY) ? 0.0f : __expf(mc - M);
+        const float w = __expf(mc - M);
         L += p[1] * w;
         o = fmaf(p[2 + d], w, o);
     }
@@ -364,13 +373,20 @@ __global__ void attn_merge_batch_kernel(const float* __restrict__ part, int8_t* 
     const int kvh = a >> 5, qi = a & 31, d = threadIdx.x;
     const size_t part_stride = (size_t) kDf2MaxChunks * kDf2Kv * 32 * 130;
     const float* part_s = part + (size_t) s_idx * part_stride;
+    float mc_arr[kDf2MaxChunks];
     float M = -INFINITY;
-    for (int c = 0; c < kDf2MaxChunks; ++c) M = fmaxf(M, part_s[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130]);
-    float L = 0.0f, o = 0.0f;
+#pragma unroll
     for (int c = 0; c < kDf2MaxChunks; ++c) {
+        mc_arr[c] = part_s[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130];
+        M = fmaxf(M, mc_arr[c]);
+    }
+    float L = 0.0f, o = 0.0f;
+#pragma unroll
+    for (int c = 0; c < kDf2MaxChunks; ++c) {
+        const float mc = mc_arr[c];
+        if (mc == -INFINITY) continue;
         const float* p = part_s + (((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130;
-        const float mc = p[0];
-        const float w = (mc == -INFINITY) ? 0.0f : __expf(mc - M);
+        const float w = __expf(mc - M);
         L += p[1] * w;
         o = fmaf(p[2 + d], w, o);
     }
