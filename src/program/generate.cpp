@@ -17159,15 +17159,27 @@ int main(int argc, char** argv) {
                                          ? conversations.parked_prefix_tokens(live, live_imgs, checks, cvec_cached)
                                          : 0;
             bool in_batch_slot = false;
-            if (solo_handoff_fast && live_ok && !live.empty() && live_imgs.empty() &&
-                (checks.empty() || slot_source >= 0)) {
+            if (solo_handoff_fast && live_ok && !live.empty() && live_imgs.empty()) {
                 for (int b = 0; b < (int) bs.size(); ++b) {
                     const BSlot& sl = bs[(size_t) b];
                     if ((sl.active || sl.cached) && !sl.tainted && !sl.img && sl.cvec == cvec_cached &&
                         sl.ids.size() >= live.size() && std::equal(live.begin(), live.end(), sl.ids.begin()) &&
                         (b != slot_source || (size_t) slot_tokens >= live.size())) {
-                        in_batch_slot = true;
-                        break;
+                        bool checks_covered = (b == slot_source) || checks.empty();
+                        if (!checks_covered && sl.checks.size() >= checks.size()) {
+                            checks_covered = true;
+                            for (const ConvCheckpoint& ck : checks) {
+                                bool found = false;
+                                for (const ConvCheckpoint& sck : sl.checks) {
+                                    if (sck.ids.size() == ck.ids.size()) { found = true; break; }
+                                }
+                                if (!found) { checks_covered = false; break; }
+                            }
+                        }
+                        if (checks_covered) {
+                            in_batch_slot = true;
+                            break;
+                        }
                     }
                 }
             }
@@ -18082,9 +18094,13 @@ int main(int argc, char** argv) {
                                 max_b = std::max<uint64_t>(max_b, b);
                                 if (src.loan_slot_for(slot) < 0) ++need_new;
                             }
+                            static const bool lend_pinned = [] {
+                                const char* v = std::getenv("STRATA_LEND_PCIE_PINNED");
+                                return v != nullptr && std::atoi(v) != 0;
+                            }();
                             std::string lerr;
                             if ((need_new == 0 || src.reserve_loan_slots(src.loan_used_slots() + need_new, max_b,
-                                                                         src.complement_pinned(), lerr)) &&
+                                                                         lend_pinned && src.complement_pinned(), lerr)) &&
                                 src.loan_capacity() > 0) {
                                 bool copied_d2h = false;
                                 for (const auto& [i, slot] : p.lent) {

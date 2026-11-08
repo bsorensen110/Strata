@@ -3849,11 +3849,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // STRATA_PREFILL_COPY_WAIT_DEDUPE=1, whose copy records the routed walk does not write (routed_stream::eligible);
         // unset, nothing here runs and the loop below is the walk.  Declared
         // before the issuer thread, so they outlive it on every return (IssuerJoin joins it first).
-#if defined(STRATA_USE_HIP)
-        static const bool rs_env = routed_stream::enabled_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM"), true);
-#else
         static const bool rs_env = routed_stream::enabled_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM"), false);
-#endif
         static const int rs_depth = routed_stream::depth_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM_DEPTH"));
         const bool rs_on = rs_env && routed_stream::eligible(
             stream_all, issuer_on, m.pp != nullptr, copy_event_every, copy_wait_dedupe);

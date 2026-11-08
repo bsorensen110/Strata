@@ -4884,7 +4884,7 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (!loan_active_.empty() && index < loan_active_.size() && loan_active_[index] != nullptr) {
         static const bool pcie_pin_ok = [] {
             const char* v = std::getenv("STRATA_LEND_PCIE_PINNED");
-            return v == nullptr || std::atoi(v) != 0;
+            return v != nullptr && std::atoi(v) != 0;
         }();
         return loan_pinned_ && pcie_pin_ok;
     }
