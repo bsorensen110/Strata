@@ -30,8 +30,11 @@ namespace strata::prefill::routed_stream {
 constexpr int kDefaultDepth = 16;   // about 28 MB of 1.7 MB blobs, 2.4 ms of a PCIe 3.0 x16 link
 constexpr int kMaxDepth = 256;
 
-// STRATA_PREFILL_ROUTED_STREAM: unset, empty or 0 is off; any other number is on.
-inline bool enabled_from(const char* v) { return v != nullptr && v[0] != '\0' && std::atoi(v) != 0; }
+// STRATA_PREFILL_ROUTED_STREAM: unset, empty or 0 is off unless default_on is true; any other number is on.
+inline bool enabled_from(const char* v, bool default_on = false) {
+    if (v == nullptr || v[0] == '\0') return default_on;
+    return std::atoi(v) != 0;
+}
 
 // STRATA_PREFILL_ROUTED_STREAM_DEPTH: the copies kept queued ahead of the link (default 16, clamped to 1..256).
 inline int depth_from(const char* v) {

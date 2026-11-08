@@ -418,6 +418,12 @@ inline int ring_budget_slots() {
 }
 inline int ring_slots(size_t T) {
     const char* v = std::getenv("STRATA_PREFILL_RING");
+    static const int co_ring = [] {
+        const char* e = std::getenv("STRATA_BATCH_CO_RING");
+        return e != nullptr ? std::max(0, std::atoi(e)) : 96;
+    }();
+    if (!v && g_ring_override <= 0 && co_ring > 0 && g_share_blocked.load(std::memory_order_relaxed))
+        return (int64_t) T >= stream_all_min() ? std::max(16, std::min(co_ring, ring_cap())) : STAGE;
 #if defined(STRATA_USE_HIP)
     // S6: with the matrix-core attention (the gfx12 default since 148-amd; STRATA_HIP_WMMA=1 or auto elsewhere / forced, on a card that
     // has it) a 96-slot ring: measured with it, 9070 XT 4K prompts 718 -> 1,211 tok/s (16K 1,949 -> 2,032), R9700 4K 2,426 -> 2,483 (16K the same)
@@ -3843,7 +3849,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // STRATA_PREFILL_COPY_WAIT_DEDUPE=1, whose copy records the routed walk does not write (routed_stream::eligible);
         // unset, nothing here runs and the loop below is the walk.  Declared
         // before the issuer thread, so they outlive it on every return (IssuerJoin joins it first).
-        static const bool rs_env = routed_stream::enabled_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM"));
+#if defined(STRATA_USE_HIP)
+        static const bool rs_env = routed_stream::enabled_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM"), true);
+#else
+        static const bool rs_env = routed_stream::enabled_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM"), false);
+#endif
         static const int rs_depth = routed_stream::depth_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM_DEPTH"));
         const bool rs_on = rs_env && routed_stream::eligible(
             stream_all, issuer_on, m.pp != nullptr, copy_event_every, copy_wait_dedupe);
@@ -3864,7 +3874,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
         }
         std::atomic<size_t> a_issued{0}, a_consumed{0};
-        std::atomic<bool> a_stop{false};
+        std::atomic<bool> a_stop{false}, a_pause{false};
         double iss_ms = 0;
         int64_t iss_streamed = 0, iss_dma = 0;
         std::thread issuer;
@@ -3908,6 +3918,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         [&](int sl) { return cudaEventQuery(m.copied[sl]) != cudaErrorNotReady; },
                         [](const StreamEntry& en) { return en.job < 0; },
                         [&](size_t idx, int sl) {   // the copy of the loop below, unchanged
+                            while (a_pause.load(std::memory_order_acquire) && !a_stop.load(std::memory_order_acquire))
+                                std::this_thread::yield();
                             const StreamEntry& en = seq[idx];
                             const auto th = Clock::now();
                             const size_t bytes = (size_t) lay0.blob_bytes(en.l);
@@ -3940,7 +3952,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 // before the issuer waits: what it issued is covered, so no consumer waits on an entry with no event
                 auto cover = [&](size_t idx) { if (sparse_copied && idx > 0 && last_rec < (int64_t) idx - 1) record(idx - 1); };
                 for (size_t idx = 0; idx < seq.size(); ++idx) {
-                    while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring) {
+                    while (idx >= a_consumed.load(std::memory_order_acquire) + (size_t) m.ring ||
+                           a_pause.load(std::memory_order_acquire)) {
                         cover(idx);
                         if (a_stop.load(std::memory_order_acquire)) return;
                         std::this_thread::yield();
@@ -5827,6 +5840,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const int rel = gg_slots[gg_nslots - 1];
                                 cudaEventRecord(m.used[rel], m.cs);
                                 for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                                const size_t k_hi = std::max(consumed, gg_ents[gg_nslots - 1] + 1);
+                                for (size_t idx = gg_ents[0]; idx < k_hi; ++idx) m.used_of[idx % (size_t) m.ring] = rel;
                             }
                             gg_nslots = 0;
                             gg.first = gg.n;
@@ -6106,11 +6121,22 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t kend = seq_start[(size_t) l + 1];
                             auto release_to = [&](int32_t e_stop) {
                                 while (k < kend && seq[k].e < e_stop) {
-                                    if (gg_nslots > 0) flush(0);   // the open group's slots get their event first
-                                    const int sl = (int) (k % (size_t) m.ring);
-                                    cudaEventRecord(m.used[sl], m.cs);
-                                    m.used_of[sl] = sl;
-                                    consumed = ++k;
+                                    if (gg_nslots > 0 && k - gg_ents[0] + 1 < (size_t) MMQ_GROUP &&
+                                        k - gg_ents[0] + 1 < (size_t) m.ring) {
+                                        consumed = ++k;
+                                        continue;
+                                    }
+                                    if (gg_nslots > 0) {
+                                        flush(0);   // the open group's slots get their event first
+                                        give_back(consumed);
+                                    }
+                                    const size_t k0 = k;
+                                    const size_t span_cap = std::max<size_t>(1, std::min<size_t>(MMQ_GROUP, (size_t) m.ring / 2));
+                                    while (k < kend && seq[k].e < e_stop && k - k0 < span_cap) ++k;
+                                    const int rel = (int) ((k - 1) % (size_t) m.ring);
+                                    cudaEventRecord(m.used[rel], m.cs);
+                                    for (size_t idx = k0; idx < k; ++idx) m.used_of[idx % (size_t) m.ring] = rel;
+                                    consumed = k;
                                     give_back(consumed);
                                 }
                             };
@@ -6279,8 +6305,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 #endif
             }
             if (layer_yield_fn_ && layer_yield_every_ > 0 && (l - LB + 1) % layer_yield_every_ == 0 && l + 1 < LE) {
+                a_pause.store(true, std::memory_order_release);
                 cudaStreamSynchronize(m.cs);
-                if (!layer_yield_fn_()) {
+                const bool yield_ok = layer_yield_fn_();
+                a_pause.store(false, std::memory_order_release);
+                if (!yield_ok) {
+                    a_stop.store(true, std::memory_order_release);
                     if (issuer.joinable()) issuer.join();
                     err = "prefill: mid-chunk decode yield failed";
                     return false;

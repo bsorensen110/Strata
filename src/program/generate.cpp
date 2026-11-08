@@ -17976,6 +17976,7 @@ int main(int argc, char** argv) {
                 int n_act_lend = 0;
                 if (o.batch > 0 && stages.empty() && exact <= 0 && !o.prefill_head_alias) {
                     for (const auto& x : bs) n_act_lend += x.active ? 1 : 0;
+                    strata::prefill::Prefill::set_share_blocked(n_act_lend > 0);
                 }
                 bool any = false;
                 for (PfPart& p : pf_parts) {

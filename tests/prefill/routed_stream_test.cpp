@@ -286,6 +286,9 @@ int main() {
     expect(!rs::enabled_from(""), "empty: off");
     expect(!rs::enabled_from("0"), "0: off");
     expect(rs::enabled_from("1"), "1: on");
+    expect(rs::enabled_from(nullptr, true), "unset default_on: on");
+    expect(rs::enabled_from("", true), "empty default_on: on");
+    expect(!rs::enabled_from("0", true), "0 default_on: off");
     expect(rs::depth_from(nullptr) == rs::kDefaultDepth, "depth unset: default");
     expect(rs::depth_from("8") == 8, "depth 8");
     expect(rs::depth_from("0") == 1 && rs::depth_from("-4") == 1, "depth clamps to 1");
