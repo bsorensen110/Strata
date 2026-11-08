@@ -830,17 +830,21 @@ bool Dflash2Drafter::clone_bind(const Dflash2Drafter& parent, std::string& err) 
     return true;
 }
 
-bool Dflash2Drafter::copy_state_from(Dflash2Drafter& src, std::string& err) {
+bool Dflash2Drafter::copy_state_from(Dflash2Drafter& src, std::string& err, bool already_synced, bool sync_after) {
     if (src.device_ != device_ || src.L_ != L_ || src.NKV_ != NKV_ || src.fp16_ring_ != fp16_ring_) { err = "dflash2: the two drafters are not alike"; return false; }
     if (!src.context_wait(err) || !context_wait(err)) return false;
     const OnDevice on_device(device_);
-    if (cudaStreamSynchronize(src.cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) { err = "dflash2: sync before a state copy"; return false; }
+    if (!already_synced) {
+        if (cudaStreamSynchronize(src.cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) { err = "dflash2: sync before a state copy"; return false; }
+    }
     const size_t ring_bytes = (size_t) kRing * NKV_ * HD_ * ring_elem_bytes();
     for (int l = 0; l < L_; ++l)
         if (cudaMemcpyAsync(kring_[l], src.kring_[l], ring_bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
             cudaMemcpyAsync(vring_[l], src.vring_[l], ring_bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) { err = "dflash2: ring copy"; return false; }
     if (cudaMemcpyAsync(tag_, src.tag_, (size_t) kRing * 8, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) { err = "dflash2: tag copy"; return false; }
-    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: state copy: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    if (sync_after) {
+        if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: state copy: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    }
     copy_log_state_from(src);   // history, the log (shared copy-on-write), the tag shadow, the epoch, ring_hi_ and have_ctx_
     return true;
 }

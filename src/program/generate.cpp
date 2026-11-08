@@ -14430,6 +14430,9 @@ int main(int argc, char** argv) {
             // a copy that fails part-way leaves earlier residency refreshes queued on the legacy stream: drain them
             // before the caller reuses the sessions (its zeroing runs on non-blocking streams, not ordered against these)
             auto failed = [&]() { (void) sync_all(); return false; };
+#if defined(STRATA_HAVE_DFLASH2)
+            if (batch_df2 && (!df2.context_wait(e) || !slot_df2[(size_t) b]->context_wait(e))) return false;
+#endif
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             // STRATA_SLOT_COPY_BATCHSYNC: every copy is only queued, and the sync_all below is the one wait per device
             const bool queued = slot_copy_batchsync_env();
@@ -14445,6 +14448,13 @@ int main(int argc, char** argv) {
                                                             to.qsa_states[to.qsa_ord0 + j], g, upto, true, e, queued))
                         return failed();
             }
+#if defined(STRATA_HAVE_DFLASH2)
+            if (batch_df2) {
+                strata::core::Dflash2Drafter& df_from = into_slot ? df2 : *slot_df2[(size_t) b];
+                strata::core::Dflash2Drafter& df_to   = into_slot ? *slot_df2[(size_t) b] : df2;
+                if (!df_to.copy_state_from(df_from, e, true, !queued)) return failed();
+            }
+#endif
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
             return true;
         };
@@ -14480,7 +14490,7 @@ int main(int argc, char** argv) {
             if (batch_df2) {
                 // The solo drafter's ring holds the prompt (its taps came with the prompt read): the slot's drafter starts from an exact copy of it.
 #if defined(STRATA_HAVE_DFLASH2)
-                if (!slot_df2[(size_t) b]->copy_state_from(df2, e)) return false;
+                if (!slot_copy_direct && !slot_df2[(size_t) b]->copy_state_from(df2, e)) return false;
 #endif
             } else
             if (batch_mtp) {
@@ -14541,7 +14551,7 @@ int main(int argc, char** argv) {
             }
             if (batch_df2) {
 #if defined(STRATA_HAVE_DFLASH2)
-                if (!df2.copy_state_from(*slot_df2[(size_t) b], e)) return false;   // a returning solo request goes on from the slot's ring
+                if (!(slot_copy_direct && at == nullptr) && !df2.copy_state_from(*slot_df2[(size_t) b], e)) return false;   // a returning solo request goes on from the slot's ring
 #endif
             } else
             if (batch_mtp) {
@@ -20266,8 +20276,6 @@ int main(int argc, char** argv) {
                     if (batch_df2) {
                         // the slot's first drafts: the admission window's taps (1 row unmerged, up to max_t rows with STRATA_ADMIT_MERGE_FIRST) and the token it produced
                         strata::core::Dflash2Drafter& d = *slot_df2[(size_t) admit_slot];
-                        int32_t dd[strata::core::Dflash2Drafter::kDrafts];
-                        float pp[strata::core::Dflash2Drafter::kDrafts];
                         const int adm_rows = std::max(1, last_adm_rows);
                         const int kR = (int) strata::core::Dflash2Drafter::kRows;
                         const int tail_m = std::min(adm_rows, kR);
@@ -20281,13 +20289,10 @@ int main(int argc, char** argv) {
                             }
                         }
                         if (!ver.gather_taps(d.landing(), d.device(), head_n, tail_m, 0, d.stream(), err) ||
-                            !d.draft(d.landing(), tail_m, sl.p - tail_m, sl.x, dd, pp, err)) {
+                            !d.draft_launch(d.landing(), tail_m, sl.p - tail_m, sl.x, err)) {
                             std::fprintf(stderr, "strata batch: DFlash2 admission for slot %d failed: %s\n", admit_slot, err.c_str());
                             return 1;
                         }
-                        df2.copy_log_state_from(d);   // the main session's `live` holds `sl.p` tokens too: keep its lineage complete for a park
-                        for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts && j < (int) sl.draft.size(); ++j) { sl.draft[(size_t) j] = dd[j]; sl.dprob[(size_t) j] = pp[j]; }
-                        sl.draft_ready = true;
                     } else
 #endif
                     if (batch_mtp) {
@@ -20341,6 +20346,20 @@ int main(int argc, char** argv) {
                             sl.checks.push_back(*best);
                         }
                     }
+#if defined(STRATA_HAVE_DFLASH2)
+                    if (batch_df2) {
+                        strata::core::Dflash2Drafter& d = *slot_df2[(size_t) admit_slot];
+                        int32_t dd[strata::core::Dflash2Drafter::kDrafts];
+                        float pp[strata::core::Dflash2Drafter::kDrafts];
+                        if (!d.draft_finish(dd, pp, err)) {
+                            std::fprintf(stderr, "strata batch: DFlash2 admission finish for slot %d failed: %s\n", admit_slot, err.c_str());
+                            return 1;
+                        }
+                        df2.copy_log_state_from(d);   // the main session's `live` holds `sl.p` tokens too: keep its lineage complete for a park
+                        for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts && j < (int) sl.draft.size(); ++j) { sl.draft[(size_t) j] = dd[j]; sl.dprob[(size_t) j] = pp[j]; }
+                        sl.draft_ready = true;
+                    }
+#endif
                     const auto tc4 = Clock::now();
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
                                  (long long) live.size(), std::chrono::duration<double, std::milli>(tc4 - tc0).count());

@@ -81,7 +81,7 @@ public:
     bool clone_alloc(const Dflash2Drafter& parent, std::string& err);   ///< after the parent's load: streams and buffers (before the expert cache is sized)
     bool clone_bind(const Dflash2Drafter& parent, std::string& err);    ///< after the parent's bind: the shared head, embedding and the draft logits
     /// Copy another drafter's context (ring, tags, token history, epoch) exactly: a request that moves between the solo session and a batch slot.  Same card.
-    bool copy_state_from(Dflash2Drafter& src, std::string& err);
+    bool copy_state_from(Dflash2Drafter& src, std::string& err, bool already_synced = false, bool sync_after = true);
     /// A fixed device buffer [kRows][taps][n_embd] on this drafter's card: where a layer split's stages land their taps (Verifier::gather_taps) and the
     /// graphs are captured on it.  Allocated at load.
     float* landing() const { return landing_; }
