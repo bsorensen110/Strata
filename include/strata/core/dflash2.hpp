@@ -338,7 +338,8 @@ private:
     bool rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* missing, std::string& err);
     void stash_push(Lineage&& l);
     void invalidate_ring();                    ///< a new epoch: every slot is stale, the shadow forgets them
-    bool record_kv(int n, cudaStream_t cs, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err);
+    bool record_kv(int n, cudaStream_t cs, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err,
+                   const float* rt_override = nullptr, const int32_t* epoch_override = nullptr);
     int64_t ring_hi_ = 0;           ///< one past the highest position written in this epoch
     bool ctx_pending_ = false;      ///< context_async() queued rows nobody has waited for yet
     int32_t epoch_ = 0;             ///< stamped into the ring tags: a new epoch makes every older slot invalid
