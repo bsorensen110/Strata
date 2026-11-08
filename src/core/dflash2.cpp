@@ -684,11 +684,11 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
 #endif
         }();
         const bool use_il = !skip_part("head") && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)));
-        if (use_il && ndraft_ >= 2 && ndraft_ <= 4)
+        if (use_il && ndraft_ >= 2 && ndraft_ <= 8)
             native_quantize_q8_1_il(fn_ + N_, xq_, xil_, N_, ndraft_, cs);
         else {
             native_quantize_q8_1(fn_ + N_, xq_, N_, ndraft_, cs);   // rows 1..7, the head's format
-            if (use_il && ndraft_ > 4)
+            if (use_il && ndraft_ > 8)
                 native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
         }
         // df2_conv_rms_quant on the final layer has already quantized fn_ rows 1..7 into xqp_ + N_ and xdp_ + N_ / 32
@@ -1814,11 +1814,11 @@ bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t
         for (int c0 = 0; c0 < total_rows; c0 += head_chunk) {
             const int nc = std::min(head_chunk, total_rows - c0);
             const bool use_il = !skip_part("head") && nc <= 8 && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)));
-            if (use_il && nc >= 2 && nc <= 4)
+            if (use_il && nc >= 2 && nc <= 8)
                 native_quantize_q8_1_il(fn_batch_ + (size_t) c0 * N_, xq_, xil_, N_, nc, cs);
             else {
                 native_quantize_q8_1(fn_batch_ + (size_t) c0 * N_, xq_, N_, nc, cs);
-                if (use_il && nc > 4)
+                if (use_il && nc > 8)
                     native_q8_1_interleave(xq_, xil_, N_, nc, cs);
             }
             if (!skip_part("head")) {

@@ -91,7 +91,7 @@ int main() {
     bool all = true;
     const int shapes[] = {32, 2560, 4096, 8192, 10240};   // N, the GDN value width, NH*HD class widths
     for (int n_in : shapes)
-        for (int ncols = 2; ncols <= 4; ++ncols)
+        for (int ncols = 2; ncols <= 8; ++ncols)
             for (unsigned seed : {1u, 2u, 3u}) all = run_case(n_in, ncols, seed, s) && all;
     (void) cudaStreamDestroy(s);
     std::printf("%s\n", all ? "ALL PASS" : "FAILURES");
