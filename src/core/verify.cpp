@@ -1777,12 +1777,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
                                 df_side_[1]);
                 }
-                const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
+                bool batch_same_slot = true;
+                if (batch_rec_) {
+                    for (int t = tb + 1; t < te; ++t)
+                        if (brow_[t] != brow_[tb]) { batch_same_slot = false; break; }
+                }
+                const bool fuse_ab = fuse_convab_on() && !br && (!batch_rec_ || batch_same_slot) && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
                 strata::dispatch::notef("gdn layer: side_gates=%ld side_proj=%ld df_branch=%ld", (long) sidem, (long) side_proj, (long) br);
                 strata::dispatch::notef("gdn layer: conv+ab fused=%ld batch_rows=%ld", (long) fuse_ab, (long) batch_rec_);
                 if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
-                if (batch_rec_) {   // contiguous rows may be proposals for the same slot
+                if (batch_rec_ && !fuse_ab) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
                         const int first = t;
                         while (t < te && brow_[t] == brow_[first]) ++t;
@@ -1795,12 +1800,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 } else
                 // a one-token window keeps its token: it advances the conv history and the state itself (commit)
-                if (fuse_ab)   // 143-amdk: the conv and the a/b projections in one launch
-                    gdn_conv_ab_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, tb, self_commit,
+                if (fuse_ab) {   // 143-amdk: the conv and the a/b projections in one launch
+                    const float* conv_p = conv;
+                    if (batch_rec_) {
+                        SessionState& sx = slot_ss(tb);
+                        conv_p = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
+                                 (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    }
+                    gdn_conv_ab_multi(conv_p, batch_rec_ ? (qkv + (size_t) tb * C) : qkv, (const float*) wc->data,
+                                      batch_rec_ ? (hb + (size_t) tb * C) : hb, (int) C, (int) (2 * HK), EPS, n,
+                                      batch_rec_ ? 0 : tb, batch_rec_ ? keep_rows : self_commit,
                                       xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
                                       (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
                                       (int) HV, cs);
-                else
+                } else
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb,
                                   self_commit);
                 stamp(l, 3, grp);
@@ -4169,7 +4182,11 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
-    if (cudaGraphUpload(ex, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess)
+    static const bool warm_upload = [] {
+        const char* e = std::getenv("STRATA_BATCH_GRAPH_UPLOAD");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    if (warm_upload && (cudaGraphUpload(ex, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess))
         (void) cudaGetLastError();   // only a warm-up: the first launch uploads it (see capture)
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
