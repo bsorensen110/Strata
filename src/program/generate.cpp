@@ -14767,7 +14767,10 @@ int main(int argc, char** argv) {
                 for (const auto& q : bs) nact_all += q.active ? 1 : 0;
                 next_slot = (batch_df2 && A >= nact_all) ? 0 : ((size_t) active[A - 1] + 1) % bs.size();
             }
-            if (S == 0) return true;
+            if (S == 0) {
+                if (aflipped) apply_pending(true);
+                return true;
+            }
             const bool was_busy = strata::core::progress().busy.load();
             strata::core::progress().busy.store(true);
             drive.d.layers = 0;
@@ -14829,9 +14832,11 @@ int main(int argc, char** argv) {
             ver.set_taps_ready(nullptr, nullptr);
 #endif
             if (!ver_ok || drive.d.failed) {
+                if (aflipped) apply_pending(true);
                 std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                 return false;
             }
+            if (aflipped) apply_pending(true);
             const Clock::time_point w1 = Clock::now();
             // The adaptive VRAM tier, as the solo loop runs it: every --adapt-every windows, on a thread beside the commit and
             // the drafts.  Every stage's window has finished here (run_slot_rows synchronised each stage's stream), and
@@ -15064,6 +15069,39 @@ int main(int argc, char** argv) {
                     ss.ple.table->prefetch_rows(ple_r);
                 }
             }
+            static const bool defer_wait_commit = [] {
+                const char* e = std::getenv("STRATA_DF2_DEFER_WAITCOMMIT");
+                return !e || e[0] != '0';
+            }();
+            if (!defer_wait_commit || adapt_run.th.joinable() || !batch_on()) {
+                if (!ver.wait_commit(err)) {
+                    std::printf("ERR %s\n", err.c_str());
+                    return false;
+                }
+            }
+            double win_adapt_ms = 0.0;
+            if (adapt_run.th.joinable()) {
+                const Clock::time_point wa = Clock::now();
+                adapt_run.th.join();
+                if (!adapt_run.ok) {
+                    std::printf("ERR an adaptive refill failed\n");
+                    return false;
+                }
+                ++bt_adapt_rounds;
+                bt_adapt_swaps += (int64_t) pending.size();
+                if (aov && batch_on() && !in_prompt_read && !pending.empty() && !aflipped &&
+                    (!src.complement_ready() || src.soft_commit_exchanges())) {
+                    for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+                    res_upload();
+                    aflipped = true;
+                    ++aov_flips;
+                    agate.active.store(true, std::memory_order_release);
+                } else {
+                    apply_pending(true);   // the copies land and the tables follow (the next window plans from them)
+                }
+                win_adapt_ms = msd(wa, Clock::now());
+                bt_adapt_wait += win_adapt_ms;
+            }
             if (use_bhead) {
                 if (!df2.draft_batch_slots_finish(df2_bitems, (int) df2_launched.size(), err)) {
                     std::printf("ERR batch DFlash2: %s\n", err.c_str());
@@ -15118,7 +15156,7 @@ int main(int argc, char** argv) {
                 static int64_t cnt_win = 0, cnt_rows = 0, cnt_acc = 0;
                 sum_ver += msd(w0, w1);
                 sum_com += msd(w1, w2);
-                sum_df2 += msd(w_df2_0, Clock::now());
+                sum_df2 += std::max(0.0, msd(w_df2_0, Clock::now()) - win_adapt_ms);
                 cnt_win += 1;
                 for (int a = 0; a < A; ++a) {
                     cnt_rows += keep[active[a]];
@@ -15132,7 +15170,7 @@ int main(int argc, char** argv) {
                                  (double) cnt_acc / (double) cnt_win);
                 }
             }
-#endif
+#else
             static const bool defer_wait_commit = [] {
                 const char* e = std::getenv("STRATA_DF2_DEFER_WAITCOMMIT");
                 return !e || e[0] != '0';
@@ -15143,8 +15181,7 @@ int main(int argc, char** argv) {
                     return false;
                 }
             }
-            std::fflush(stdout);
-            bt_emit += msd(w2, Clock::now());
+            double win_adapt_ms = 0.0;
             if (adapt_run.th.joinable()) {
                 const Clock::time_point wa = Clock::now();
                 adapt_run.th.join();
@@ -15154,9 +15191,23 @@ int main(int argc, char** argv) {
                 }
                 ++bt_adapt_rounds;
                 bt_adapt_swaps += (int64_t) pending.size();
-                apply_pending(true);   // the copies land and the tables follow (the next window plans from them)
-                bt_adapt_wait += msd(wa, Clock::now());
+                if (aov && batch_on() && !in_prompt_read && !pending.empty() && !aflipped &&
+                    (!src.complement_ready() || src.soft_commit_exchanges())) {
+                    for (const auto& [i, slot] : pending) host_res[(size_t) i] = slot;
+                    res_upload();
+                    aflipped = true;
+                    ++aov_flips;
+                    agate.active.store(true, std::memory_order_release);
+                } else {
+                    apply_pending(true);   // the copies land and the tables follow (the next window plans from them)
+                }
+                win_adapt_ms = msd(wa, Clock::now());
+                bt_adapt_wait += win_adapt_ms;
             }
+#endif
+            std::fflush(stdout);
+            bt_emit += std::max(0.0, msd(w2, Clock::now()) - win_adapt_ms);
+            if (!batch_on() && aflipped) apply_pending(true);
             strata::core::progress().busy.store(was_busy);
             report_batch_window(S, A, !batch_on(), w0);
             pc.window(S, A);
@@ -15783,6 +15834,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+            if (aflipped) apply_pending(true);
             if (!adapt_tick(true)) {
                 std::printf("ERR an adaptive refill failed\n");
                 return 1;
