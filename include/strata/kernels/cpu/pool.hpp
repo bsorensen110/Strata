@@ -370,13 +370,22 @@ private:
     struct SplitBuf {
         alignas(64) float ff[FF];
         ActQ a2;
+        std::atomic<uint8_t> q_state{0};
+        std::atomic<int> gu_rows_done{0};
+        SplitBuf() noexcept = default;
+        SplitBuf(SplitBuf&& o) noexcept {
+            q_state.store(o.q_state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            gu_rows_done.store(o.gu_rows_done.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
     };
     std::vector<SplitBuf> split_;
-    // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts
+    // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts, 7/8 = single-phase gate/up + down
     ExpertJobMulti* mjobs_ = nullptr;
     int mnb_ = 0;           // number of experts in the current multi phase
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
+    int64_t mrows_down_ = 0;
+    int mtasks_down_ = 1;
     struct SplitBufMulti {
         alignas(64) float ff[MAXT][FF];
         ActQ a2[MAXT];
