@@ -681,10 +681,16 @@ __device__ __forceinline__ void fetch_blobs_copy(const unsigned long long* __res
                                                  uint4* __restrict__ dst, long long per,
                                                  const unsigned long long* __restrict__ dst2) {
     const long long total = (long long) *n * per;
+    long long kd = -1;
+    uint4* d = nullptr;
     for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < total;
          i += (long long) gridDim.x * blockDim.x) {
         const long long k = i / per, off = i - k * per;
-        dst[i] = ((const uint4*) src[k])[off];
+        if (k != kd) {   // the blob's target, read once per blob a thread visits
+            kd = k;
+            d = dst2 != nullptr && dst2[k] != 0 ? (uint4*) dst2[k] : dst + k * per;
+        }
+        d[off] = ((const uint4*) src[k])[off];
     }
 }
 
@@ -710,9 +716,10 @@ __global__ void res_patch_kernel(int32_t* __restrict__ table, const volatile int
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x) table[pairs[2 * k]] = pairs[2 * k + 1];
 }
 
-__global__ void rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes) {
+__global__ void rebase_ptrs_kernel(unsigned long long* ptr, const int32_t* n, unsigned long long base, long long bytes,
+                                   const unsigned long long* dst2) {
     const int k = threadIdx.x;
-    if (k < *n) ptr[k] = base + (unsigned long long) k * (unsigned long long) bytes;
+    if (k < *n) ptr[k] = dst2 != nullptr && dst2[k] != 0 ? dst2[k] : base + (unsigned long long) k * (unsigned long long) bytes;
 }
 
 __global__ void add_streams_broadcast_kernel(const float* __restrict__ h, const float* __restrict__ e,
@@ -828,9 +835,14 @@ void res_patch(int32_t* table, const int32_t* pairs, int n, void* stream) {
     check("res_patch");
 }
 
-void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
-    rebase_ptrs_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ptr, n, (unsigned long long) base, (long long) blob_bytes);
+void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream,
+                 const unsigned long long* dst2) {
+    rebase_ptrs_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(ptr, n, (unsigned long long) base, (long long) blob_bytes,
+                                                             dst2);
     check("rebase_ptrs");
+}
+void rebase_ptrs(unsigned long long* ptr, const int32_t* n, uint8_t* base, int64_t blob_bytes, void* stream) {
+    rebase_ptrs(ptr, n, base, blob_bytes, stream, nullptr);
 }
 
 void add_streams_broadcast(const float* h, const float* e, float* R, int64_t n_embd, int hc, int n_tok, void* stream) {

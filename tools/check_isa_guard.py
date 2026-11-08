@@ -41,6 +41,7 @@ WIDE_PUBLIC = {
     "act_quant_q8_1_avx2", "q8k_quant_avx2", "kq256_gu_rows", "kq256_rows", "bf16_rows_dot_multi",
     "q8k_quant_avx512", "kq512_gu_rows", "kq512_rows", "iq4nl512_down_rows", "q2_512_down_rows",
     "bf16_rows_dot_512", "bf16_rows_dot_multi_512",
+    "q50_512_down_rows", "iq512_fused_gu_rows",
     "tq_rows_avx512",                        # trellis rows (tq_cpu.cpp: behind cpu_avx512_ok())
 }
 WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq_avx2.cpp", "nvfp4_avx512.cpp", "tq_avx512.cpp")
