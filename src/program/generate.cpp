@@ -392,6 +392,9 @@ bool ckpt_pool_env() {
 size_t ckpt_pool_ready_env() {
     static const size_t n = [] {
         const char* v = std::getenv("STRATA_CKPT_POOL_READY");
+#if defined(STRATA_USE_HIP)
+        if (!v || !v[0]) return (size_t) 2;
+#endif
         const long k = v ? std::atol(v) : 0;
         return k >= 1 ? (size_t) std::min(16L, k) : (size_t) 0;
     }();
@@ -12439,8 +12442,8 @@ int main(int argc, char** argv) {
                         if (c.gdn.empty()) break;
                         storage.push_back(std::move(c));
                     }
-                std::vector<ConvCheckpoint> moved;   // STRATA_PARK_ASYNC: the ones this request drops (view: the rest)
-                if (park_drops && n_st == 0 && src.with_reuse) {   // (the main session's checkpoints only, not an idle slot's)
+                std::vector<ConvCheckpoint> moved;   // STRATA_PARK_ASYNC / STRATA_SLOT_CKPT_MOVE: the ones this request/slot drops
+                if (park_drops && n_st == 0) {
                     size_t w = 0;
                     for (size_t i = 0; i < checks.size(); ++i) {
                         if (park_drops(static_cast<const ConvCheckpoint&>(checks[i]))) { moved.push_back(std::move(checks[i])); continue; }
@@ -14627,6 +14630,14 @@ int main(int argc, char** argv) {
 #endif
             };
             for (size_t k = 1; k < bslot_ss.size(); ++k) src.stage_sessions.push_back(bslot_ss[k][(size_t) b].get());
+            struct SlotParkDrops {
+                std::function<bool(const ConvCheckpoint&)>& f;
+                std::function<bool(const ConvCheckpoint&)> prev;
+                SlotParkDrops(std::function<bool(const ConvCheckpoint&)>& fn, bool on) : f(fn), prev(std::move(fn)) {
+                    if (on) f = [](const ConvCheckpoint&) { return true; };
+                }
+                ~SlotParkDrops() { f = std::move(prev); }
+            } slot_park_drops(park_drops, slot_ckpt_move_env());
             try {
                 if (park_source(src, 0)) return;
                 // the snapshot failed (the copy's own memory, as in #3350): the slot is not touched, so go on without
@@ -16855,7 +16866,7 @@ int main(int argc, char** argv) {
                 std::function<bool(const ConvCheckpoint&)>& f;
                 ~ParkDrops() { f = nullptr; }
             } park_drops_reset{park_drops};
-            if (park_async_env()) {
+            if (park_async_env() || slot_ckpt_move_env()) {
                 const bool drops_all = incoming.has_value() || borrow || slot_source >= 0 || want_cvec != cvec_cached;
                 park_drops = [&, drops_all](const ConvCheckpoint& c) {
                     return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);

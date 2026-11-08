@@ -45,6 +45,13 @@ bool copy(void* dst, const void* src, size_t bytes, std::string& error, bool que
     return false;
 }
 
+bool sync_copy(std::string& error) {
+    const auto status = conversation_detail::sync_private_stream();
+    if (status == cudaSuccess) return true;
+    error = std::string("conversation snapshot running-state copy: ") + cudaGetErrorString(status);
+    return false;
+}
+
 // The session's carve (#216): `qsa_states` keeps global ordinals and holds the owned ones
 // [qsa_ord0, qsa_ord0 + qsa_alloc); `gdn_state` holds `gdn_alloc` rows. A whole-model session owns every layer.
 size_t owned_qsa(const SessionState& ss) { return (size_t) std::max<int64_t>(ss.qsa_alloc, 0); }
@@ -360,22 +367,25 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
             staged = true;
         }
     }
-    if (!staged && !copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error)) return false;
+    if (!staged && !copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error, /*queued=*/true)) return false;
     const auto s0 = std::chrono::steady_clock::now();
     const bool ok = [&] {
         // STRATA_CKPT_GATHER=1: the small vectors through one device gather and one copy (else one copy each)
         if (ckpt_gather_on()) {
             const int r = ckpt_gather_small(c, ss, z, layers, error);
-            if (r != 0) return r > 0;
+            if (r != 0) {
+                if (r < 0) return false;
+                return staged || sync_copy(error);
+            }
         }
-        if (!copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
+        if (!copy(c.ple.data(), ss.ple_hist, c.ple.size(), error, /*queued=*/true)) return false;
         for (size_t j = 0; j < layers; ++j) {
             const auto& st = owned(ss, j);
-            if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error) ||
-                !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error) ||
-                !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error)) return false;
+            if (!copy(c.tails.data() + j * z.tail, st.idx_tail, z.tail, error, /*queued=*/true) ||
+                !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error, /*queued=*/true) ||
+                !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error, /*queued=*/true)) return false;
         }
-        return true;
+        return sync_copy(error);
     }();
     if (atr) std::fprintf(stderr, "strata parktrace: save small copies %.2f ms\n",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count());
@@ -410,16 +420,16 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& c, SessionSta
     ConversationStateSizes z;
     if (!conversation_session_sizes(g, ss, z, error)) return false;
     if (!sync(error)) return false;   // the copies below no longer ride the legacy stream's implicit ordering
-    if (!copy(ss.gdn_state, hit != nullptr ? hit->p : (const void*) c.gdn.data(), c.gdn.size(), error) ||
-        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error)) return false;
+    if (!copy(ss.gdn_state, hit != nullptr ? hit->p : (const void*) c.gdn.data(), c.gdn.size(), error, /*queued=*/true) ||
+        !copy(ss.ple_hist, c.ple.data(), c.ple.size(), error, /*queued=*/true)) return false;
     for (size_t j = 0; j < owned_qsa(ss); ++j) {
         const auto& st = owned(ss, j);
-        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error) ||
-            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error) ||
-            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error)) return false;
+        if (!copy(st.idx_tail, c.tails.data() + j * z.tail, z.tail, error, /*queued=*/true) ||
+            !copy(st.idx_dead, c.dead.data() + j * z.dead, z.dead, error, /*queued=*/true) ||
+            !copy(st.idx_block_pos, c.block_pos.data() + j * z.block_pos, z.block_pos, error, /*queued=*/true)) return false;
         if (!c.ids.empty()) {
             const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
-            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error)) return false;
+            if (!copy(st.idx_pooled + row * g.idx_key_dim, c.dead.data() + j * z.dead, z.dead, error, /*queued=*/true)) return false;
         }
     }
     const size_t tokens = c.ids.size();

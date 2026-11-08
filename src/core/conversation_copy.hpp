@@ -152,6 +152,15 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bo
     return e;
 }
 
+inline cudaError_t sync_private_stream() {
+    cudaStream_t s = nullptr;
+    cudaError_t e = private_stream(s);
+    if (e != cudaSuccess) return e;
+    e = cudaStreamSynchronize(s);
+    core::progress_beat();
+    return e;
+}
+
 /// #2049 #2065 #1971: a host-to-host copy that tells the watchdog it is moving.  Parked state (the running
 /// checkpoints, the K/V segments) sits in ordinary pageable memory for the whole session; when the OS has written
 /// it to the pagefile, copying it back runs at the drive's page-in speed (measured in the reports: ~190 hard faults

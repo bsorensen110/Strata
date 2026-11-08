@@ -255,11 +255,11 @@ bool park_trace_on() {
     return on;
 }
 
-bool transfer(void* dst, const void* src, size_t n, std::string& error) {
+bool transfer(void* dst, const void* src, size_t n, std::string& error, bool queued = false) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
     // Default handles both device allocations and device-mapped host pool aliases.
-    const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n);
+    const cudaError_t e = conversation_detail::copy_nonblocking(dst, src, n, queued);
     if (e == cudaSuccess) return true;
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
@@ -312,6 +312,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     // STRATA_PARK_VRAM_MIB: this layer's parts go into the park's slot under a fresh tag (0: no slot this park)
     image.dev_tag = park_async().slot != nullptr ? vram_kv().next_tag++ : 0;
+    bool need_sync = false;
     for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
@@ -341,7 +342,8 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                 } else {
                     dst[i]->resize(sizes[i]);
                     if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                            return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                            need_sync = need_sync || n > 0;
+                            return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error, /*queued=*/true);
                         })) return false;
                 }
                 if (reused_bytes) *reused_bytes += keep;
@@ -362,7 +364,10 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const auto t2 = tick();
         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
-                if (!staged) return transfer(p, s, n, error);
+                if (!staged) {
+                    need_sync = need_sync || n > 0;
+                    return transfer(p, s, n, error, /*queued=*/true);
+                }
                 const cudaError_t e = conversation_detail::copy_nonblocking(a.stage + a.used, s, n, true);
                 if (e != cudaSuccess) { error = std::string("conversation snapshot stage copy: ") + cudaGetErrorString(e); return false; }
                 a.items.push_back({p, n, a.used});
@@ -377,6 +382,17 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         }
         if (!copied) return false;
         if (reused_bytes) *reused_bytes += keep;
+    }
+    if (need_sync) {
+        const auto t_sync = park_trace_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const cudaError_t se = conversation_detail::sync_private_stream();
+        if (park_trace_on()) {
+            kv_save_trace().copy += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sync).count();
+        }
+        if (se != cudaSuccess) {
+            error = std::string("conversation snapshot copy: ") + cudaGetErrorString(se);
+            return false;
+        }
     }
     return true;
 }
@@ -465,13 +481,17 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     if (slot != nullptr && !vram_kv_locate(*slot, image.dev_tag, sizes, off)) { slot = nullptr; conversation_park_join(); }
     if (slot != nullptr) {
         for (size_t i = 0; i < src.size(); ++i)
-            if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error)) return false;
+            if (!transfer(dst[i], static_cast<const uint8_t*>(slot->p) + off[i], sizes[i], error, /*queued=*/true)) return false;
+        const cudaError_t se = conversation_detail::sync_private_stream();
+        if (se != cudaSuccess) { error = std::string("conversation snapshot copy: ") + cudaGetErrorString(se); return false; }
         return refresh_residency(st, g, upto, error);
     }
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error, /*queued=*/true);
             })) return false;
+    const cudaError_t se = conversation_detail::sync_private_stream();
+    if (se != cudaSuccess) { error = std::string("conversation snapshot copy: ") + cudaGetErrorString(se); return false; }
     return refresh_residency(st, g, upto, error);
 }
 
