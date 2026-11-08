@@ -24,6 +24,7 @@
 #include "strata/core/nv_defaults.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/batch_telemetry.hpp"
+#include "strata/core/batch_admit_merge.hpp"
 #include "strata/core/batch_df2_budget.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/program/adaptive_range.hpp"
@@ -18802,9 +18803,11 @@ int main(int argc, char** argv) {
                 if (piece <= 0) return run(a0, b0);
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + piece);
+                    const double il_before = il_ms;
                     const auto tq = Clock::now();
                     if (!run_conc(q, r)) return false;
                     const double piece_ms = std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    const double mid_chunk_dec_ms = std::max(0.0, il_ms - il_before);
                     if (pr_on && r < b0) pr_prev_piece_ms = piece_ms;
                     const int64_t piece_tokens = r - q;
                     q = r;
@@ -18848,7 +18851,18 @@ int main(int argc, char** argv) {
                     const int n_act = active_slot_count();
                     const double eff_share = strata::program::batch_decode_share(decode_share, n_act);
                     if (eff_share <= 0.0 || n_act <= 0) continue;
-                    const double budget = eff_share * std::chrono::duration<double, std::milli>(Clock::now() - tq).count();
+                    static const bool net_decode_share = [] {
+                        const char* env = std::getenv("STRATA_BATCH_DECODE_SHARE_NET");
+                        if (env && env[0]) return env[0] != '0';
+#if defined(STRATA_USE_HIP)
+                        return true;
+#else
+                        return false;
+#endif
+                    }();
+                    const double budget = strata::core::inter_chunk_decode_budget_ms(
+                        eff_share, piece_ms, mid_chunk_dec_ms, net_decode_share);
+                    if (budget <= 0.0) continue;
                     const auto td = Clock::now();
                     in_prompt_read = true;
                     do {
@@ -19012,16 +19026,27 @@ int main(int argc, char** argv) {
                 if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
-                if (host_res.empty() || !pending.empty() ||
-                    std::any_of(host_res.begin(), host_res.end(), [](int32_t r) { return r < 0; }))
-                    return -1;
-                int mt = strata::kernels::kVerifyMaxT;
+                bool all_ar = !host_res.empty() && pending.empty() &&
+                              std::none_of(host_res.begin(), host_res.end(), [](int32_t r) { return r < 0; });
+                int mt = (!use_mtp && !pipe) ? ver.max_t() : strata::kernels::kVerifyMaxT;
                 for (int k = 0; k < n_pipe; ++k) {
-                    if (!stage_verifier(k).ar_live()) return -1;
+                    if (!stage_verifier(k).ar_live()) all_ar = false;
                     mt = std::min(mt, stage_verifier(k).max_t());
                 }
-                if (mt < 2) return -1;
-                return std::max(a0, n - mt);
+                static const bool merge_rem_on = [] {
+                    const char* env = std::getenv("STRATA_ADMIT_MERGE_REM");
+                    if (env && env[0]) return env[0] != '0';
+#if defined(STRATA_USE_HIP)
+                    return true;
+#else
+                    return false;
+#endif
+                }();
+                const bool single_stage_hybrid = merge_rem_on && n_pipe == 1 && o.pcie_frac <= 0.0f;
+                const int64_t win_w = (batch_df2 && !use_mtp && n_pipe == 1)
+                                          ? std::max<int64_t>(S, ver.max_t())
+                                          : std::min<int64_t>(S, mt);
+                return strata::core::admit_merge_from(a0, to, n, mt, all_ar, single_stage_hybrid, win_w);
             };
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
@@ -19922,8 +19947,18 @@ int main(int argc, char** argv) {
             auto draft_df2 = [&](int a_) -> bool {
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
-                const float* tp = df2_win_taps(a_ + 1, err);
-                if (tp == nullptr || !df2.draft(tp, a_ + 1, p, outv[(size_t) a_], dd, pp, err)) return false;
+                const int adm_rows = a_ + 1;
+                const float* tp = df2_win_taps(adm_rows, err);
+                if (tp == nullptr) return false;
+                const int kR = (int) strata::core::Dflash2Drafter::kRows;
+                const int tail_m = std::min(adm_rows, kR);
+                const int head_n = adm_rows - tail_m;
+                const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
+                for (int r0 = 0; r0 < head_n; r0 += kR) {
+                    const int chunk = std::min(kR, head_n - r0);
+                    if (!df2.context(tp + (size_t) r0 * tap_stride, chunk, p + r0, err)) return false;
+                }
+                if (!df2.draft(tp + (size_t) head_n * tap_stride, tail_m, p + head_n, outv[(size_t) a_], dd, pp, err)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 if (ss.ple.ready() && ss.ple.table != nullptr) {   // the PLE rows of the next window's tokens, read ahead (as the MTP's draft does)
                     int n_pf = 0;
