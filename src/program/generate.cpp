@@ -19958,7 +19958,12 @@ int main(int argc, char** argv) {
                     const int chunk = std::min(kR, head_n - r0);
                     if (!df2.context(tp + (size_t) r0 * tap_stride, chunk, p + r0, err)) return false;
                 }
-                if (!df2.draft(tp + (size_t) head_n * tap_stride, tail_m, p + head_n, outv[(size_t) a_], dd, pp, err)) return false;
+                if (head_n > 0) {
+                    (void) cudaMemcpyAsync(const_cast<float*>(tp), tp + (size_t) head_n * tap_stride,
+                                           (size_t) tail_m * tap_stride * sizeof(float),
+                                           cudaMemcpyDeviceToDevice, df2.stream());
+                }
+                if (!df2.draft(tp, tail_m, p + head_n, outv[(size_t) a_], dd, pp, err)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 if (ss.ple.ready() && ss.ple.table != nullptr) {   // the PLE rows of the next window's tokens, read ahead (as the MTP's draft does)
                     int n_pf = 0;
@@ -20279,6 +20284,32 @@ int main(int argc, char** argv) {
                     ? invariant_win_pool_fn
                     : win_pool_fn;
                 exit_if_gpu_fatal("");   // (the test hook counts windows here)
+#if defined(STRATA_HAVE_DFLASH2)
+                static const bool df2_adm_tap_overlap = [] {
+                    const char* e = std::getenv("STRATA_DF2_TAP_OVERLAP");
+                    if (e && e[0]) return e[0] != '0';
+#if defined(STRATA_USE_HIP)
+                    return true;
+#else
+                    return false;
+#endif
+                }();
+                struct ScopedDecodeTapsReady {
+                    strata::core::Verifier& v;
+                    ScopedDecodeTapsReady(strata::core::Verifier& v_, strata::core::Dflash2Drafter* d, bool on) : v(v_) {
+                        if (on && d != nullptr) {
+                            v.set_taps_ready([](void* u, const float* taps_dev, int n_rows, const int64_t* pos_in) noexcept {
+                                static_cast<strata::core::Dflash2Drafter*>(u)->precompute_batch_context(taps_dev, n_rows, pos_in);
+                            }, d);
+                        }
+                    }
+                    ~ScopedDecodeTapsReady() { v.set_taps_ready(nullptr, nullptr); }
+                } scoped_dec_taps(ver, &df2,
+                                  df2_adm_tap_overlap && !use_mtp && use_df2 && req_df2 && n_stages <= 1 &&
+                                      ((admit_slot >= 0 && batch_df2 && admit_max_new > 1) ||
+                                       (merged && T > (int) strata::core::Dflash2Drafter::kRows) ||
+                                       (T >= max_new - produced_n)));
+#endif
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
@@ -20415,6 +20446,10 @@ int main(int argc, char** argv) {
                 if (df2_end_update && use_df2 && req_df2 && !will_admit_df2 && (eos || produced_n >= max_new)) {
                     const float* tp_end = df2_win_taps(a + 1, err);   // (on a layer split: every stage's taps gathered onto the drafter's card)
                     if (tp_end == nullptr || !df2.context(tp_end, a + 1, p, err)) { if (adapt_thr.joinable()) adapt_thr.join(); std::printf("ERR %s\n", err.c_str()); return 1; }
+                } else if (will_admit_df2 && use_df2 && req_df2 && (a + 1) > (int) strata::core::Dflash2Drafter::kRows) {
+                    const int head_n = (a + 1) - (int) strata::core::Dflash2Drafter::kRows;
+                    const float* tp_end = df2_win_taps(a + 1, err);
+                    if (tp_end == nullptr || !df2.context(tp_end, head_n, p, err)) { if (adapt_thr.joinable()) adapt_thr.join(); std::printf("ERR %s\n", err.c_str()); return 1; }
                 }
 #endif
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
@@ -20775,6 +20810,8 @@ int main(int argc, char** argv) {
                         if (req_pen_from >= 0 && !pen_prompt) sl.reply0 = std::min<int64_t>(sl.reply0, req_pen_from);   // a continued request (prompt + what it generated): the reply began earlier
                     }
 #if defined(STRATA_HAVE_DFLASH2)
+                    bool adm_batch_launched = false;
+                    strata::core::Dflash2Drafter::BatchSlotItem adm_it{};
                     if (batch_df2) {
                         // the slot's first drafts: the admission window's taps (1 row unmerged, up to max_t rows with STRATA_ADMIT_MERGE_FIRST) and the token it produced
                         strata::core::Dflash2Drafter& d = *slot_df2[(size_t) admit_slot];
@@ -20782,16 +20819,34 @@ int main(int argc, char** argv) {
                         const int kR = (int) strata::core::Dflash2Drafter::kRows;
                         const int tail_m = std::min(adm_rows, kR);
                         const int head_n = adm_rows - tail_m;
-                        for (int r0 = 0; r0 < head_n; r0 += kR) {
-                            const int chunk = std::min(kR, head_n - r0);
-                            if (!ver.gather_taps(d.landing(), d.device(), r0, chunk, 0, d.stream(), err) ||
-                                !d.context(d.landing(), chunk, sl.p - adm_rows + r0, err)) {
-                                std::fprintf(stderr, "strata batch: DFlash2 admission context for slot %d failed: %s\n", admit_slot, err.c_str());
-                                return 1;
+                        const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
+                        if (d.have_ctx() < sl.p - tail_m) {
+                            for (int r0 = 0; r0 < head_n; r0 += kR) {
+                                const int chunk = std::min(kR, head_n - r0);
+                                if (!ver.gather_taps(d.landing(), d.device(), r0, chunk, 0, d.stream(), err) ||
+                                    !d.context(d.landing(), chunk, sl.p - adm_rows + r0, err)) {
+                                    std::fprintf(stderr, "strata batch: DFlash2 admission context for slot %d failed: %s\n", admit_slot, err.c_str());
+                                    return 1;
+                                }
                             }
                         }
-                        if (!ver.gather_taps(d.landing(), d.device(), head_n, tail_m, 0, d.stream(), err) ||
-                            !d.draft_launch(d.landing(), tail_m, sl.p - tail_m, sl.x, err)) {
+                        if (n_stages <= 1 && ver.tap_dev() != nullptr &&
+                            df2.has_precomputed_context(ver.tap_dev() + (size_t) head_n * tap_stride, tail_m, sl.p - tail_m)) {
+                            adm_it.slot = &d;
+                            adm_it.taps = ver.tap_dev() + (size_t) head_n * tap_stride;
+                            adm_it.n_new = tail_m;
+                            adm_it.pos0 = sl.p - tail_m;
+                            adm_it.anchor = sl.x;
+                            adm_it.k_want = d.max_drafts();
+                            adm_it.drafts = sl.draft.data();
+                            adm_it.probs = sl.dprob.data();
+                            if (!df2.draft_batch_slots_launch(&adm_it, 1, err)) {
+                                std::fprintf(stderr, "strata batch: DFlash2 admission for slot %d failed: %s\n", admit_slot, err.c_str());
+                                return 1;
+                            }
+                            adm_batch_launched = true;
+                        } else if (!ver.gather_taps(d.landing(), d.device(), head_n, tail_m, 0, d.stream(), err) ||
+                                   !d.draft_launch(d.landing(), tail_m, sl.p - tail_m, sl.x, err)) {
                             std::fprintf(stderr, "strata batch: DFlash2 admission for slot %d failed: %s\n", admit_slot, err.c_str());
                             return 1;
                         }
@@ -20851,15 +20906,25 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_DFLASH2)
                     if (batch_df2) {
                         strata::core::Dflash2Drafter& d = *slot_df2[(size_t) admit_slot];
-                        int32_t dd[strata::core::Dflash2Drafter::kDrafts];
-                        float pp[strata::core::Dflash2Drafter::kDrafts];
-                        if (!d.draft_finish(dd, pp, err)) {
-                            std::fprintf(stderr, "strata batch: DFlash2 admission finish for slot %d failed: %s\n", admit_slot, err.c_str());
-                            return 1;
+                        if (adm_batch_launched) {
+                            if (!df2.draft_batch_slots_finish(&adm_it, 1, err)) {
+                                std::fprintf(stderr, "strata batch: DFlash2 admission finish for slot %d failed: %s\n", admit_slot, err.c_str());
+                                return 1;
+                            }
+                            df2.copy_log_state_from(d);
+                            sl.n_drafts = d.max_drafts();
+                            sl.draft_ready = true;
+                        } else {
+                            int32_t dd[strata::core::Dflash2Drafter::kDrafts];
+                            float pp[strata::core::Dflash2Drafter::kDrafts];
+                            if (!d.draft_finish(dd, pp, err)) {
+                                std::fprintf(stderr, "strata batch: DFlash2 admission finish for slot %d failed: %s\n", admit_slot, err.c_str());
+                                return 1;
+                            }
+                            df2.copy_log_state_from(d);   // the main session's `live` holds `sl.p` tokens too: keep its lineage complete for a park
+                            for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts && j < (int) sl.draft.size(); ++j) { sl.draft[(size_t) j] = dd[j]; sl.dprob[(size_t) j] = pp[j]; }
+                            sl.draft_ready = true;
                         }
-                        df2.copy_log_state_from(d);   // the main session's `live` holds `sl.p` tokens too: keep its lineage complete for a park
-                        for (int j = 0; j < strata::core::Dflash2Drafter::kDrafts && j < (int) sl.draft.size(); ++j) { sl.draft[(size_t) j] = dd[j]; sl.dprob[(size_t) j] = pp[j]; }
-                        sl.draft_ready = true;
                     }
 #endif
                     const auto tc4 = Clock::now();

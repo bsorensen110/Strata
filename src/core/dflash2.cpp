@@ -1388,7 +1388,7 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
     int precomp_off = 0;
     if (!blob_shared_ && rt_bctx_ != nullptr && !prof_ && !skip_part("ctx") && n >= 1 && n <= 4 * kRows &&
         has_precomputed_context(taps, (int) n, pos0, &precomp_off)) {
-        clear_precomputed_context();
+        if (precomp_off + (int) n >= precomp_rows_) clear_precomputed_context();
         try {
             log_stage(pos0, (int) n);
             h_meta_[18] = epoch_;

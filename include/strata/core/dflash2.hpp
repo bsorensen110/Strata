@@ -206,6 +206,7 @@ public:
     int mask_token() const { return mask_token_; }   ///< the token whose embedding fills the block's 7 mask rows (the split engine stages the block's embeddings itself)
     const std::vector<int>& tap_layers() const { return taps_; }
     cudaStream_t stream() const { return cs_; }
+    int64_t have_ctx() const noexcept { return have_ctx_; }
     /// Diagnostics (STRATA_DF2_DUMP): the final normalized block rows of the last draft(), host copy.
     bool debug_rows(std::vector<float>& rows, std::string& err);
     /// Tests: the whole ring as it is now (layer-major: per layer K then V, each [8 heads][kRing slots][128]) and its slot tags (epoch << 32 | position, -1 none).

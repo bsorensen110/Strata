@@ -391,6 +391,49 @@ int main(int argc, char** argv) {
             check(p_tok_ok, "precompute_batch_context + batch_full_exec_ 16-row draft tokens/probs match single-slot draft()");
             check(p_ring_ok, "precompute_batch_context + batch_full_exec_ 16-row K/V rings match single-slot draft() bitwise");
             {
+                int64_t pos_contig16[16] = {};
+                for (int r = 0; r < 16; ++r) pos_contig16[r] = 256 + r;
+                cudaMemcpy(taps0, taps_both, (size_t) 8 * kTap * 4, cudaMemcpyDeviceToDevice);
+                ref0.begin_request(nullptr, 0, 0, nullptr);
+                feed(ref0, dev, 1, 0, 256, err);
+                if (!ref0.context(taps0, 8, 256, err)) {
+                    std::printf("ref0 merged 16-row context: %s\n", err.c_str());
+                    return 2;
+                }
+                cudaMemcpy(taps0, taps_both + (size_t) 8 * kTap, (size_t) 8 * kTap * 4, cudaMemcpyDeviceToDevice);
+                if (!ref0.draft(taps0, 8, 264, 44, r_tok1, r_prob1, err)) {
+                    std::printf("ref0 merged 16-row admission: %s\n", err.c_str());
+                    return 2;
+                }
+                cudaMemcpy(taps0, taps_both, (size_t) 8 * kTap * 4, cudaMemcpyDeviceToDevice);
+                d.begin_request(nullptr, 0, 0, nullptr);
+                feed(d, dev, 1, 0, 256, err);
+                d.precompute_batch_context(taps_both, 16, pos_contig16);
+                if (!d.context(taps_both, 8, 256, err)) {
+                    std::printf("d prefix context(8): %s\n", err.c_str());
+                    return 2;
+                }
+                const bool kept_tail_precomp = d.has_precomputed_context(taps_both + (size_t) 8 * kTap, 8, 264);
+                check(kept_tail_precomp, "context(head_n) retains precomputed tail_m rows for merged BGEN admission");
+                if (!p0.copy_state_from(d, err)) {
+                    std::printf("p0 copy_state_from(d): %s\n", err.c_str());
+                    return 2;
+                }
+                Dflash2Drafter::BatchSlotItem adm_it{&p0, taps_both + (size_t) 8 * kTap, 8, 264, 44, 7, b_tok1, b_prob1};
+                if (!d.draft_batch_slots_launch(&adm_it, 1, err) ||
+                    !d.draft_batch_slots_finish(&adm_it, 1, err)) {
+                    std::printf("adm draft_batch_slots(1): %s\n", err.c_str());
+                    return 2;
+                }
+                bool adm_ok = kept_tail_precomp;
+                for (int i = 0; i < 7; ++i) {
+                    if (r_tok1[i] != b_tok1[i] || std::fabs(r_prob1[i] - b_prob1[i]) > 1e-5f) adm_ok = false;
+                }
+                ref0.debug_ring(r_ring0, r_tag0, err);
+                if (count_bad(p0, r_ring0, 0, 272, &wt0) != 0) adm_ok = false;
+                check(adm_ok, "merged 16-row BGEN admission (context(8) + copy_state_from + draft_batch_slots(8)) matches single-slot reference bitwise");
+            }
+            {
                 cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev2 = nullptr;
                 cudaEventCreate(&ev0); cudaEventCreate(&ev1); cudaEventCreate(&ev2);
                 const int reps = 50;
