@@ -379,6 +379,11 @@ public:
         taps_ready_cb_ = fn;
         taps_ready_user_ = user;
     }
+    using PostLayersFn = void (*)(void* user);
+    void set_post_layers(PostLayersFn fn, void* user) noexcept {
+        post_layers_cb_ = fn;
+        post_layers_user_ = user;
+    }
     bool tapping() const { return tap_on_; }
     /// Batch windows tap too (default off: the graphs of --batch windows carry no tap kernels): the slot drafters of DFlash2 read rows of tap_dev().  Before init.
     void set_batch_taps(bool on) { tap_batch_ = on; }
@@ -479,9 +484,10 @@ private:
     std::vector<strata::kernels::SamplerParams> slot_sp_;
     std::vector<float*> slot_bias_dev_;                  ///< per slot: its logit bias on the device (null = none)
     std::vector<std::vector<int32_t>> slot_tail_;        ///< per slot: its reply tail for the penalty window (set_slot_history)
+    std::vector<int32_t> slot_hrows_;                    ///< persistent host staging for batch penalty rows across async sample_rows
     int32_t* slot_hist_d_ = nullptr;                     ///< the penalty-history rows of the current batch window (device)
     size_t slot_hist_cap_ = 0;
-    bool sample_rows(int S, std::string& err);
+    bool sample_rows(int S, std::string& err, bool sync = true);
     int slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, const int32_t*& hist, int& hlen, std::vector<int32_t>& hrows, std::string& err);   ///< the sampled slots' rows of the last batch window
     int32_t* h_commitb_ = nullptr; int32_t* m_commitb_ = nullptr;   // per slot [1, 0, pos, -1 ..], stride 2 + max_t
     int32_t* commitb_ = nullptr;
@@ -761,6 +767,8 @@ private:
     bool ple_pending_b_ = false;
     TapsReadyFn taps_ready_cb_ = nullptr;
     void* taps_ready_user_ = nullptr;
+    PostLayersFn post_layers_cb_ = nullptr;
+    void* post_layers_user_ = nullptr;
 };
 
 }  // namespace strata::core

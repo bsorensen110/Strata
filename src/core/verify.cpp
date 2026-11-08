@@ -3704,6 +3704,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return false;
     }
 #endif
+    if (post_layers_cb_ != nullptr) post_layers_cb_(post_layers_user_);
     trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
@@ -4948,6 +4949,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             strata_store_fence();
             *flag = 1;
         }
+        if (le_ >= g.n_layers && !sample_rows(S, err, false)) return false;
+        if (post_layers_cb_ != nullptr) post_layers_cb_(post_layers_user_);
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
         if (copy_used_) {
@@ -4957,7 +4960,6 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
-        if (!sample_rows(S, err)) return false;
         for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
         note_nonfinite(S, last_pos_b_);
         progress_at("decode");
@@ -5029,6 +5031,8 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    if (le_ >= g.n_layers && !sample_rows(S, err, false)) return false;
+    if (post_layers_cb_ != nullptr) post_layers_cb_(post_layers_user_);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
     if (copy_used_) {
@@ -5038,7 +5042,6 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
-    if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     note_nonfinite(S, last_pos_b_);
     progress_at("decode");
@@ -5165,10 +5168,11 @@ int Verifier::slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, co
         strata::kernels::slot_penalty_rows(last_rows_, last_tokens_, S, tails_ptr, n_tails_ptr, hlen, hrows.data());
         const OnDevice on_hist(device_);
         if (slot_hist_cap_ < need) {
+            const size_t alloc_cap = std::max(need, (size_t) std::max(1, max_t_) * (size_t) kSlotHistMax);
             if (slot_hist_d_ != nullptr) cudaFree(slot_hist_d_);
             slot_hist_d_ = nullptr;
-            if (cudaMalloc((void**) &slot_hist_d_, need * sizeof(int32_t)) != cudaSuccess) { err = "verify batch: the penalty-history allocation failed"; return -1; }
-            slot_hist_cap_ = need;
+            if (cudaMalloc((void**) &slot_hist_d_, alloc_cap * sizeof(int32_t)) != cudaSuccess) { err = "verify batch: the penalty-history allocation failed"; return -1; }
+            slot_hist_cap_ = alloc_cap;
         }
 #if defined(STRATA_GPU_METAL)
         if (cudaMemcpy(slot_hist_d_, hrows.data(), need * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
@@ -5182,19 +5186,20 @@ int Verifier::slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, co
     return 1;
 }
 
-bool Verifier::sample_rows(int S, std::string& err) {
+bool Verifier::sample_rows(int S, std::string& err, bool sync) {
 #if defined(STRATA_GPU_METAL)
     (void) S;
+    (void) sync;
     err = "verify batch: sample_rows is the CUDA / HIP path";
     return false;
 #else
     bool any = false;
-    std::vector<int32_t> hrows;
+    slot_hrows_.clear();
     for (int t = 0; t < S;) {
         strata::kernels::SamplerParams sp;
         const int32_t* hist = nullptr;
         int hlen = 0;
-        const int r = slot_row_draw(S, t, sp, hist, hlen, hrows, err);
+        const int r = slot_row_draw(S, t, sp, hist, hlen, slot_hrows_, err);
         if (r < 0) return false;
         int end = t + 1;
         while (end < S && last_rows_[end] == last_rows_[t] &&
@@ -5208,7 +5213,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
         }
         t = end;
     }
-    if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
+    if (sync && any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
     return true;
 #endif
 }
