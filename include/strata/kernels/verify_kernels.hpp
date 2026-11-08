@@ -84,6 +84,10 @@ void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream);
 /// kernel costs ~2.4 us on a gfx1201 graph whatever it does.  n <= 128 * k for any k (a strided loop).
 void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* dst, const int32_t* src, int64_t n,
                                void* stream);
+/// Copy `T * 4` step words from `m_step` (mapped host memory) to `step` and broadcast each token's `step[t*4 + 0]`
+/// position to `pos` (`[T][NH]`), `pos + MT * NH` (`[T][NKV]`), and `pos + MT * (NH + NKV)` (`[T][IQ]`) in one launch.
+void copy_step_pos_from_mapped(int32_t* step, int32_t* pos, const int32_t* m_step, int T, int MT, int NH, int NKV,
+                               int IQ, void* stream);
 
 /// Layer split, overlapped hand-off (STRATA_SPLIT_OVERLAP): dst (mapped) = [a (na) | b (nb) | c (nc)] with volatile
 /// stores, then the LAST block to finish raises *flag = 1 (mapped) after a system fence, so the next stage's GPU can

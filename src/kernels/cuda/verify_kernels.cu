@@ -1736,6 +1736,37 @@ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* ds
     check("wait_copy_i32_from_mapped");
 }
 
+namespace {
+__global__ void copy_step_pos_from_mapped_kernel(int32_t* __restrict__ step, int32_t* __restrict__ pos,
+                                                 const volatile int32_t* __restrict__ m_step,
+                                                 int T, int MT, int NH, int NKV, int IQ) {
+    const int tid = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    const int stride = (int) gridDim.x * (int) blockDim.x;
+    const int n_step = T * 4;
+    for (int i = tid; i < n_step; i += stride) step[i] = m_step[i];
+    int32_t* pk = pos + (size_t) MT * NH;
+    int32_t* pi = pk + (size_t) MT * NKV;
+    const int total_h = NH + NKV + IQ;
+    const int total = T * total_h;
+    for (int i = tid; i < total; i += stride) {
+        const int t = i / total_h;
+        const int rem = i - t * total_h;
+        const int32_t p = m_step[t * 4];
+        if (rem < NH) pos[(size_t) t * NH + rem] = p;
+        else if (rem < NH + NKV) pk[(size_t) t * NKV + (rem - NH)] = p;
+        else pi[(size_t) t * IQ + (rem - NH - NKV)] = p;
+    }
+}
+}  // namespace
+
+void copy_step_pos_from_mapped(int32_t* step, int32_t* pos, const int32_t* m_step, int T, int MT, int NH, int NKV,
+                               int IQ, void* stream) {
+    if (T <= 0) return;
+    copy_step_pos_from_mapped_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(
+        step, pos, (const volatile int32_t*) m_step, T, MT, NH, NKV, IQ);
+    check("copy_step_pos_from_mapped");
+}
+
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");

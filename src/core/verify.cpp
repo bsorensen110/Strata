@@ -1503,8 +1503,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         in_s = df_side_[1];
         inputs_pending = true;
     }
-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, in_s);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), in_s);
+    copy_step_pos_from_mapped(step_, pos_, m_step_, T, (int) MT, (int) NH, (int) NKV, (int) IQ, in_s);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
@@ -3196,15 +3195,9 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
-    int32_t* const pk = h_pos_ + (size_t) max_t_ * g.n_head;
-    int32_t* const pi = pk + (size_t) max_t_ * g.n_head_kv;
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
-        const int32_t pos_t = (int32_t) (pos0 + t);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
     }
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
@@ -4183,9 +4176,96 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                 copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+#if defined(STRATA_GPU_METAL)
+        static const bool commit_batch = false;
+#else
+        static const bool commit_batch = [] { const char* e = std::getenv("STRATA_COMMIT_BATCH"); return !e || e[0] != '0'; }();
+#endif
+        bool gdn_batched = false;
+        if (commit_batch) {
+            int64_t n_gdn = 0;
+            bool norms_ok = true;
+            for (int64_t l = lb_; l < le_ && norms_ok; ++l)
+                if (!is_qsa_layer(g, l)) {
+                    ++n_gdn;
+                    norms_ok = need(LayerView(*wt_, l), "ssm_norm.weight", err) != nullptr;
+                }
+            if (!norms_ok) ok = false;
+            else if (n_gdn > 0) {
+                gdn_batched = true;
+                for (int t = 0; t < S && gdn_batched;) {
+                    const int first = t;
+                    while (t < S && rows[t] == rows[first]) ++t;
+                    SessionState& sx = *slots_[(size_t) rows[first]];
+                    const int32_t* keep = commitb_ + (size_t) rows[first] * CB;
+                    gdn_batched = gdn_commit_layers(
+                        sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
+                        (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size,
+                        qkv_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, MT * C,
+                        h_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, MT * C,
+                        gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
+                        beta_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV, MT * HV,
+                        (int) C, (int) g.ssm_k_heads, (int) HV, t - first, (int) n_gdn, keep, cs_);
+                }
+            }
+        }
+        bool qsa_batched = false;
+        if (commit_batch && ok && !g_no_batch_kv) {
+            bool all_fits = true;
+            for (int t = 0; t < S && all_fits;) {
+                const int first = t;
+                while (t < S && rows[t] == rows[first]) ++t;
+                SessionState& sx = *slots_[(size_t) rows[first]];
+                int nq = 0;
+                int64_t mc = -1;
+                for (int64_t l = lb_, qi = qsa_index; l < le_ && all_fits; ++l) {
+                    if (!is_qsa_layer(g, l)) continue;
+                    const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+                    if (!wikn) { ok = false; all_fits = false; break; }
+                    const QsaState& st = sx.qsa_states[qi];
+                    if (nq >= QsaIndexerLayers::kMax || (mc >= 0 && st.max_cells != mc)) { all_fits = false; break; }
+                    mc = st.max_cells;
+                    ++nq;
+                    ++qi;
+                }
+            }
+            if (ok && all_fits) {
+                for (int t = 0; t < S;) {
+                    const int first = t;
+                    while (t < S && rows[t] == rows[first]) ++t;
+                    SessionState& sx = *slots_[(size_t) rows[first]];
+                    const int32_t* keep = commitb_ + (size_t) rows[first] * CB;
+                    QsaIndexerLayers il;
+                    int nq = 0;
+                    int64_t mc = -1;
+                    for (int64_t l = lb_, qi = qsa_index; l < le_; ++l) {
+                        if (!is_qsa_layer(g, l)) continue;
+                        const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+                        const QsaState& st = sx.qsa_states[qi];
+                        mc = st.max_cells;
+                        il.gamma[nq] = (const float*) wikn->data;
+                        il.tail_src[nq] = tail_snap_b_ + ((size_t) rows[first] * nQ + qi) * TS;
+                        il.tail[nq] = st.idx_tail; il.dead[nq] = st.idx_dead; il.pooled[nq] = st.idx_pooled;
+                        il.block_pos[nq] = st.idx_block_pos;
+                        ++nq;
+                        ++qi;
+                    }
+                    if (nq > 0) {
+                        native_qsa_indexer_append_steps_layers(
+                            idx_raw_L_ + (size_t) (qsa_index * MT + first) * ID, MT * ID, keep + 2, 1,
+                            t - first, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
+                    }
+                }
+                qsa_batched = true;
+            }
+        }
         for (int64_t l = lb_; l < le_ && ok; ++l) {
             const LayerView v(*wt_, l);
-            if (!is_qsa_layer(g, l)) {
+            if (is_qsa_layer(g, l) && qsa_batched) {
+                ++qsa_index;
+            } else if (!is_qsa_layer(g, l) && gdn_batched) {
+                ++gdn_index;
+            } else if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
                 // STRATA_BATCH_GDN_GROUPS=1 (default on HIP): one-row groups (no --batch-mtp proposals) commit their recurrence
@@ -4752,11 +4832,6 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     for (int t = 0; t < S; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
-        int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
-        int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
     }
     ple_pending_b_ = false;
     if (ss_->ple.ready() && ple_stage()) {
