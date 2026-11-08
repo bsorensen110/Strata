@@ -226,4 +226,39 @@
       - Control (`0_prod_control`): mean **126.6 tok/s** aggregate (`125.2` R1 / `128.0` R2; per-slot **64.3 tok/s**; engine **135.2 / 148.0 rows/s**)
       - Candidate (`1_cand_coprefill` @ `345c2b505`): mean **135.2 tok/s** aggregate (**+6.8% vs control**, `134.9` R1 / `135.6` R2; per-slot **68.5 tok/s**; slot admission copies **`11.3 + 12.8 ms` R1, `9.8 + 14.0 ms` R2 [−70.0% R2 admission latency]**; engine **154.6 / 155.2 rows/s [+14.3% R1 / +4.9% R2]**; **`CPU experts 9.92 / 6.83 ms/window [−14.4% R1 / −10.2% R2 vs control]`**, **`emit 2.56 / 2.50 ms/window [−33.2% vs control]`**, **`adapt wait 0.92 / 1.03 ms/window [−74.9% vs control]`**)
 
+- **Fourth-Wave Co-Prefill & BGEN Admission Optimizations (`28c907aa1..7e7781b8c`)**:
+  - **Root Cause #1 — Prefill Copy-Stream Event-Wait Deduplication (`STRATA_PREFILL_COPY_WAIT_DEDUPE=1`, default on under HIP when `STRATA_PREFILL_ROUTED_STREAM` is off; commit `28c907aa1`)**:
+    - In `Prefill::run_impl` (`src/prefill/prefill.cpp:3940-4018`), `m.used[rel]` is recorded once per `GatherGroup` of 8 ring slots (`kGatherGroup = 8`) on `m.compute` after `moe_experts_gather` finishes reading those 8 slots.
+    - Previously, `STRATA_PREFILL_COPY_WAIT_DEDUPE` defaulted to `false`, causing the issuer thread to call `hipStreamWaitEvent(m.copy, m.used[rel], 0)` for all 8 slots in every group (`14,720` calls per chunk, `44,160` calls across 3 chunks for a `4,712`-token prompt), even though waiting on the first slot of the 8-slot group (`(rel & (kGatherGroup - 1)) == 0`) or tracking `used_waited[rel]` already orders `m.copy` after the group's `m.used` event.
+    - Added `strata::prefill::copy_wait_dedupe_from` in `include/strata/prefill/copy_events.hpp` (tested in `src/prefill/copy_events_test.cpp`) and enabled `STRATA_PREFILL_COPY_WAIT_DEDUPE` by default on HIP when `STRATA_PREFILL_ROUTED_STREAM` is not enabled, eliminating 7 out of 8 `hipStreamWaitEvent` driver calls (`~38,640` calls saved per `4,712`-token prompt).
+  - **Root Cause #2 — Hybrid MoE Partial `read_windows` Tail Merging into `BGEN` Admission & Net Mid-Chunk Decode Share (`STRATA_ADMIT_MERGE_REM=1`, `STRATA_BATCH_DECODE_SHARE_NET=1`, default on under HIP; commit `ef698b2c0`)**:
+    - Previously, `merge_from` in `src/program/generate.cpp` gated `STRATA_ADMIT_MERGE_FIRST` and `STRATA_ADMIT_MERGE_DF2` on `all_ar` (`ar_live()` and 100% of experts resident in VRAM), making `STRATA_ADMIT_MERGE_FIRST` and `STRATA_ADMIT_MERGE_DF2` completely inert on R9700 hybrid MoE (`9,856 / 24,576` experts in VRAM).
+    - Added `strata::core::admit_merge_from` and `strata::core::inter_chunk_decode_budget_ms` in `include/strata/core/batch_admit_merge.hpp` (tested in `tests/core/batch_admit_merge_test.cpp`):
+      1. When `single_stage_hybrid` (`!pipe && stage_verifier(0).live()` with `STRATA_ADMIT_MERGE_REM=1`) has a non-empty `read_windows` tail (`rem = (to - a0) % win_w > 0`) that fits with the final prompt token (`rem + 1 <= max_t`), `merge_from` returns `to - rem`, merging `[to - rem, n)` and `ids[n - 1]` into a single `(rem + 1)`-row `read_windows` verify pass (`1` verify pass instead of `2`, saving an entire 48-layer target verify pass on every `BGEN` admission with `rem < 16`).
+      2. Subtracted the mid-chunk decode time (`mid_chunk_dec_ms`) already yielded inside `Prefill::run_impl` (`layer_yield_fn_`) from the inter-chunk `decode_share` budget (`inter_chunk_decode_budget_ms`) so `read_part` does not double-count `decode_share` after each prefill chunk.
+  - **Root Cause #3 — Overlapped `precompute_batch_context` + `draft_batch_slots_launch` on `BGEN` Admission (`7e7781b8c`)**:
+    - Extended `scoped_dec_taps` (`set_taps_ready`) in `src/program/generate.cpp` to fire during single-token `BGEN` admission (`admit_slot >= 0 && batch_df2 && admit_max_new > 1`) as well as `merged && T > kRows`, overlapping DFlash2 `fc + hidden_norm + k_proj/v_proj` context projection on `df2.cs_` with target Layers 37–47 during the final prompt `ver.run` pass.
+    - Updated `Dflash2Drafter::context` (`src/core/dflash2.cpp`) to retain the trailing `precomp_n_ - n_new` rows in `precomp_pos_[]` / `precomp_slot_[]` (with `precomp_taps_` advanced to `taps + n_new * tap_stride`) when `context(head_n)` consumes a prefix of a `16`-row `precompute_batch_context` pass (`adm_rows = 9..16`), rather than calling `clear_precompute()`.
+    - Updated `copy_to_slot` `BGEN` admission (`src/program/generate.cpp:20813-20925`) to skip redundant `d.context(head_n)` when `df2.context(head_n)` already copied those KV ring entries via `d.copy_state_from(df2)` (`d.have_ctx() >= sl.p - tail_m`), and to launch `df2.draft_batch_slots_launch(&adm_it, 1, err)` (reusing precomputed context K/V and `batch_full_1_exec_[slot][total_rows]` CUDA Graph capture) before the host checkpoint move/copy and finish with `df2.draft_batch_slots_finish` afterward.
+  - **Paired A/B Results (`0_prod_control` @ `cfb22e5b4` vs `1_cand_wave4` @ `7e7781b8c`)**:
+    - **Unit & Parity Tests**: `copy_events_test`, `batch_admit_merge_test`, `file_expert_source_test`, `routed_stream_test`, `conversation_snapshot_test`, `verify_batch_parity`, and `dflash2_ring_test` (`context(head_n)` tail retention + 16-row merged BGEN admission bitwise match) all PASS.
+    - **Solo Greedy Refactor (`316` prompt + `192` decode, bit-identical hash `ece1433a582a4c38`)**:
+      - Control (`0_prod_control`): **73.8 tok/s** mean (`59.1` cold / `88.6` warm; engine decode `82.0 / 136.4 tok/s`, prompt `904 / 757 ms`)
+      - Candidate (`1_cand_wave4` @ `7e7781b8c`): **79.8 tok/s** mean (**+8.0% vs control**, `66.3` cold / **93.2 tok/s** warm; engine decode **`92.9 / 144.2 tok/s`**, prompt **`826 / 727 ms`**)
+    - **Concurrent `4,712`-Token Prefill + Continuous Decode (`pf_dec`)**:
+      - Control (`0_prod_control`):
+        - Combined aggregate throughput: **46.7 tok/s** (`45.6` R1 / `47.8` R2; wall `8.42s` / `8.04s`)
+        - Slot 0 continuous decode during co-prefill: **33.0 tok/s** (`32.2` R1 / `33.9` R2; wall `7.96s` / `7.56s`)
+        - Slot 1 total latency (`4,712` prompt + `128` decode): **7.88s** (`8.07s` R1 / `7.68s` R2; prompt read `6,102 ms [772.2 tok/s]` R1 / `5,928 ms [794.9 tok/s]` R2)
+      - Candidate (`1_cand_wave4` @ `7e7781b8c`):
+        - Combined aggregate throughput: **50.7 tok/s** (**+8.6% mean vs control, +2.0% vs Wave 3**, `49.1` R1 / **52.3 tok/s** R2; wall `7.81s` / **`7.35s` [−0.69s warm]**)
+        - Slot 0 continuous decode during co-prefill: **36.6 tok/s** (**+11.0% vs control**, `35.5` R1 / **37.8 tok/s** R2; wall `7.22s` / **`6.77s` [−0.79s faster]**)
+        - Slot 1 total latency (`4,712` prompt + `128` decode): **7.23s** (**−8.2% / −649 ms vs control, −2.2% vs Wave 3**, `7.46s` R1 / **`7.00s`** R2; prompt read **`5,659 ms (832.7 tok/s)` R1 / `5,340 ms (882.3 tok/s)` R2 [−588 ms / +11.0% warm prefill tok/s vs control]**)
+        - `BGEN` admission copy + draft latency (`slot 1 takes 4712 tokens`): **`14.2 ms` R1 / `10.7 ms` R2** (down from `29.1 ms` in Wave 3, **−63%**)
+        - Warm co-prefill window telemetry (`78 windows`): **`31.99 ms/window`** (`run 28.90 + commit 0.01 + emit 2.78 + adapt wait 0.31; VRAM 86.9% [+2.3 pp vs control], CPU 12.4% [−2.3 pp vs control]; 53.2 rows/s [+8.8% vs control]; 0 blob reads from the file`)
+    - **2-Slot Concurrent `2x256` Burst (`batch2`)**:
+      - Control (`0_prod_control`): mean **127.3 tok/s** aggregate (`126.6` R1 / `127.9` R2; per-slot **64.4 tok/s**; slot admission copies `42.3 + 40.4 ms` R2)
+      - Candidate (`1_cand_wave4` @ `7e7781b8c`): mean **131.9 tok/s** aggregate (**+3.6% mean / 136.4 tok/s R1**, per-slot **67.7 tok/s [+5.1% vs control, 68.9 tok/s R1]**; `40`-token prompt read **`183 / 190 ms`** vs `237 / 213 ms` control [**−17%** from `STRATA_ADMIT_MERGE_REM=1`]; slot admission copies **`10.7 + 18.1 ms` R1, `9.3 + 10.5 ms` R2 [−76.1% R2 admission latency vs control]**)
+
+
 
