@@ -17910,6 +17910,8 @@ int main(int argc, char** argv) {
                 for (const auto& [i, slot] : p.lent)
                     srcp->release(i / g.n_expert, i % g.n_expert);
 #endif
+                if (srcp == &src)
+                    for (const auto& [i, slot] : p.lent) src.deactivate_loan(i);
                 p.lent.clear();
                 p.lent_chunk = 0;
                 return true;
@@ -17936,6 +17938,7 @@ int main(int argc, char** argv) {
                     for (PfPart& p : pf_parts)
                         if (!p.lent.empty() && !refill_one(p, e)) return false;
                 }
+                if (srcp == &src) src.clear_active_loans();
                 if (n_parts > 0) res_upload();
                 if (trace && n_parts > 0) {
                     std::fprintf(stderr, "strata trace: refilled %lld slots on %lld stage(s) in %.1f ms\n",
@@ -18027,19 +18030,66 @@ int main(int argc, char** argv) {
                                          (long long) need_p, (long long) (p.cache->slots() - p.first));
                         first = (int32_t) (p.cache->slots() - need_p);
                     }
-                    if (want_p != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
-                        p.first_now = first;
-                    }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
                             const size_t i = (size_t) (l * g.n_expert + ex);
-                            if (host_res[i] >= first) {
-                                p.lent.emplace_back((int32_t) i, host_res[i]);
-                                host_res[i] = strata::core::kNotResident;
-                                any = true;
+                            if (host_res[i] >= first) p.lent.emplace_back((int32_t) i, host_res[i]);
+                        }
+                    if (srcp == &src && !p.lent.empty()) {
+                        static const bool lend_backup = [] {
+                            const char* v = std::getenv("STRATA_LEND_RAM_BACKUP");
+                            return v == nullptr || std::atoi(v) != 0;
+                        }();
+                        if (lend_backup && src.complement_ready()) {
+                            int64_t need_new = 0;
+                            uint64_t max_b = 0;
+                            for (const auto& [i, slot] : p.lent) {
+                                const int64_t l = i / g.n_expert, ex = i % g.n_expert;
+                                if (src.has_resident(l, ex)) continue;
+                                const uint64_t b = (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                                max_b = std::max<uint64_t>(max_b, b);
+                                if (src.loan_slot_for(slot) < 0) ++need_new;
+                            }
+                            std::string lerr;
+                            if ((need_new == 0 || src.reserve_loan_slots(src.loan_used_slots() + need_new, max_b,
+                                                                         src.complement_pinned(), lerr)) &&
+                                src.loan_capacity() > 0) {
+                                bool copied_d2h = false;
+                                for (const auto& [i, slot] : p.lent) {
+                                    const int64_t l = i / g.n_expert, ex = i % g.n_expert;
+                                    if (src.has_resident(l, ex)) continue;
+                                    const int32_t lid = src.ensure_loan_slot(slot);
+                                    if (lid < 0) continue;
+                                    if (src.loan_tag(lid) != i) {
+                                        const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                                        if (cudaMemcpyAsync(src.loan_buffer(lid), p.cache->device_slot(slot), nb,
+                                                            cudaMemcpyDeviceToHost, (cudaStream_t) 0) == cudaSuccess) {
+                                            src.set_loan_tag(lid, i);
+                                            copied_d2h = true;
+                                        } else {
+                                            (void) cudaGetLastError();
+                                            continue;
+                                        }
+                                    }
+                                    if (src.loan_tag(lid) == i) src.activate_loan(i, lid);
+                                }
+                                if (copied_d2h) (void) cudaStreamSynchronize((cudaStream_t) 0);
                             }
                         }
+                    }
+                    if (want_p != p.sp->chunk() || first != p.first_now) {
+                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) {
+                            if (srcp == &src)
+                                for (const auto& [i, slot] : p.lent) src.deactivate_loan(i);
+                            p.lent.clear();
+                            return false;
+                        }
+                        p.first_now = first;
+                    }
+                    for (const auto& [i, slot] : p.lent) {
+                        host_res[(size_t) i] = strata::core::kNotResident;
+                        any = true;
+                    }
                     p.lent_chunk = want_p;
                 }
                 for (const PfPart& p : pf_parts)

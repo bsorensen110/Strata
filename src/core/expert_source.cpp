@@ -1616,6 +1616,20 @@ void FileExpertSource::close() {
     xstage_pinned_ = false;
     xstage_cap_ = 0;
     xstage_blob_ = 0;
+    if (loan_host_ != nullptr) {
+        if (loan_pinned_) (void) cudaFreeHost(loan_host_);
+        else std::free(loan_host_);
+    }
+    loan_host_ = nullptr;
+    loan_dev_ = nullptr;
+    loan_pinned_ = false;
+    loan_cap_ = 0;
+    loan_used_ = 0;
+    loan_blob_ = 0;
+    loan_slot_of_.clear();
+    loan_tag_.clear();
+    loan_active_.clear();
+    loan_active_list_.clear();
     override_.clear();
     staged_.clear();
     exchange_storage_.clear();
@@ -2204,7 +2218,7 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
     // 149-cold mode 3: the GGUF in place, mapped and buffered: an expert the page cache holds whole is computed from
     // the mapping (its three tensors' rows), not assembled into a stage buffer first.  Decided here, before the lock.
     zc_keys_.clear();
-    if (complement_ready_) {
+    if (complement_ready_ || !loan_active_list_.empty()) {
         bool all_resident = true;
         for (int64_t i = 0; i < n; ++i) {
             const int64_t e = experts[i];
@@ -2225,7 +2239,7 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
             const int64_t e = experts[i];
             if (e < 0 || e >= n_expert_) continue;
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
-            if (complement_ready_ && resident_blob(index) != nullptr) continue;   // in the RAM copy: no residency query
+            if ((complement_ready_ || !loan_active_list_.empty()) && resident_blob(index) != nullptr) continue;   // in the RAM copy: no residency query
             if (!override_.empty() && override_[index] != nullptr) continue;
             uint64_t total = 0;
             const uint64_t c = cached_bytes(layer, e, total, true);
@@ -3415,7 +3429,7 @@ bool FileExpertSource::transient(int64_t layer, int64_t expert) const {
     // (its own read-ahead hints), so this answers as it did without io prefetch
     if ((role_ptr_.empty() && direct_.empty()) || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-    if (complement_ready_ && resident_blob(index) != nullptr)
+    if ((complement_ready_ || !loan_active_list_.empty()) && resident_blob(index) != nullptr)
         return false;
     return override_.empty() || override_[index] == nullptr;
 }
@@ -3456,7 +3470,7 @@ bool FileExpertSource::copy_blob(int64_t layer, int64_t expert, uint8_t* dst) {
         return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint64_t bytes = layer_blob_bytes_[(size_t) layer];
-    if (complement_ready_) {
+    if (complement_ready_ || !loan_active_list_.empty()) {
         const uint8_t* held =
             resident_blob(index);
         if (held == nullptr && !override_.empty()) held = override_[index];
@@ -4310,14 +4324,102 @@ bool FileExpertSource::pin_cache_complement(
 }
 
 const uint8_t* FileExpertSource::resident_blob(size_t index) const {
+    if (!loan_active_.empty() && index < loan_active_.size() && loan_active_[index] != nullptr)
+        return loan_active_[index];
+    if (!complement_ready_ || complement_host_ == nullptr || index >= complement_offsets_.size()) return nullptr;
     if (exchange_storage_.active()) return exchange_storage_.resident(index).host;
     return detail::cache_complement_blob_or_fallback(index, complement_offsets_, complement_host_, nullptr);
 }
 
 bool FileExpertSource::has_resident(int64_t layer, int64_t expert) const {
-    if (!complement_ready_ || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
+    if ((!complement_ready_ && loan_active_list_.empty()) || layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_)
+        return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     return resident_blob(index) != nullptr;
+}
+
+bool FileExpertSource::reserve_loan_slots(int64_t n_slots, uint64_t slot_blob_bytes, bool pin, std::string& err) {
+    err.clear();
+    if (n_slots <= 0) return true;
+    uint64_t blob = slot_blob_bytes;
+    for (const uint64_t b : layer_blob_bytes_) blob = std::max(blob, b);
+    if (blob == 0) { err = "FileExpertSource: no expert geometry for loan backup"; return false; }
+    if (loan_host_ != nullptr && n_slots <= loan_cap_ && loan_blob_ >= blob) {
+        if (loan_active_.size() < (size_t) blobs_) loan_active_.resize((size_t) blobs_, nullptr);
+        return true;
+    }
+    if (!loan_active_list_.empty()) {
+        err = "FileExpertSource: cannot resize loan backup while loans are active";
+        return false;
+    }
+    const uint64_t total_u64 = (uint64_t) n_slots * blob;
+    detail::HostMemory hm{};
+    const bool have_hm = detail::host_available_memory(hm) && hm.available > 0;
+    if (have_hm && hm.available < total_u64 + (2ull << 30)) {
+        err = "FileExpertSource: insufficient available host RAM for loan backup";
+        return false;
+    }
+    const size_t total = (size_t) total_u64;
+    void* p = nullptr;
+    bool pinned = false;
+    const void* dev = nullptr;
+    if (pin && (!have_hm || hm.available >= total_u64 + (4ull << 30)) &&
+        cudaHostAlloc(&p, total, cudaHostAllocMapped) == cudaSuccess && p != nullptr) {
+        pinned = true;
+        void* d = nullptr;
+        if (cudaHostGetDevicePointer(&d, p, 0) == cudaSuccess) dev = d;
+        else (void) cudaGetLastError();
+    } else {
+        if (pin) (void) cudaGetLastError();
+        p = std::malloc(total);
+        if (p == nullptr) { err = "FileExpertSource: cannot allocate loan backup"; return false; }
+    }
+    if (loan_host_ != nullptr) {
+        if (loan_used_ > 0 && loan_blob_ == blob) {
+            std::memcpy(p, loan_host_, (size_t) loan_used_ * (size_t) blob);
+        } else {
+            loan_used_ = 0;
+            std::fill(loan_slot_of_.begin(), loan_slot_of_.end(), -1);
+            loan_tag_.clear();
+        }
+        if (loan_pinned_) (void) cudaFreeHost(loan_host_);
+        else std::free(loan_host_);
+    }
+    loan_host_ = (uint8_t*) p;
+    loan_dev_ = (const uint8_t*) dev;
+    loan_pinned_ = pinned;
+    loan_cap_ = n_slots;
+    loan_blob_ = blob;
+    loan_tag_.resize((size_t) n_slots, -1);
+    if (loan_active_.size() < (size_t) blobs_) loan_active_.resize((size_t) blobs_, nullptr);
+    return true;
+}
+
+int32_t FileExpertSource::ensure_loan_slot(int64_t cache_slot) {
+    if (cache_slot < 0 || loan_host_ == nullptr) return -1;
+    if ((size_t) cache_slot >= loan_slot_of_.size()) loan_slot_of_.resize((size_t) cache_slot + 1, -1);
+    int32_t id = loan_slot_of_[(size_t) cache_slot];
+    if (id >= 0 && (int64_t) id < loan_cap_) return id;
+    if (loan_used_ >= loan_cap_) return -1;
+    id = (int32_t) loan_used_++;
+    loan_slot_of_[(size_t) cache_slot] = id;
+    if ((size_t) id >= loan_tag_.size()) loan_tag_.resize((size_t) id + 1, -1);
+    loan_tag_[(size_t) id] = -1;
+    return id;
+}
+
+void FileExpertSource::activate_loan(int32_t expert_idx, int32_t loan_id) {
+    uint8_t* buf = loan_buffer(loan_id);
+    if (buf == nullptr || expert_idx < 0 || (int64_t) expert_idx >= blobs_) return;
+    if (loan_active_.size() < (size_t) blobs_) loan_active_.resize((size_t) blobs_, nullptr);
+    if (loan_active_[(size_t) expert_idx] == nullptr) loan_active_list_.push_back(expert_idx);
+    loan_active_[(size_t) expert_idx] = buf;
+}
+
+void FileExpertSource::clear_active_loans() {
+    for (int32_t idx : loan_active_list_)
+        if (idx >= 0 && (size_t) idx < loan_active_.size()) loan_active_[(size_t) idx] = nullptr;
+    loan_active_list_.clear();
 }
 
 bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bounce) {
@@ -4695,16 +4797,15 @@ int64_t FileExpertSource::commit_flip() {
 }
 
 const uint8_t* FileExpertSource::resident_blob(int64_t layer, int64_t expert) const {
-    if (!complement_ready_ || complement_host_ == nullptr || layer < 0 || expert < 0 || layer >= n_layers_ ||
+    if ((!complement_ready_ && loan_active_list_.empty()) || layer < 0 || expert < 0 || layer >= n_layers_ ||
         expert >= n_expert_) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-    if (index >= complement_offsets_.size()) return nullptr;
     return resident_blob(index);   // through the rotation's ownership table when STRATA_EXCHANGE_ROTATE is on
 }
 
 const uint8_t* FileExpertSource::blob_stable(int64_t layer, int64_t expert) {
     if (io_pf_ && role_ptr_.empty() && direct_.empty()) {
-        if (complement_ready_ && layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_) {
+        if ((complement_ready_ || !loan_active_list_.empty()) && layer >= 0 && expert >= 0 && layer < n_layers_ && expert < n_expert_) {
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
             if (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr)) return blob(layer, expert);
         }
@@ -4723,7 +4824,9 @@ int FileExpertSource::blob_parts(int64_t layer, int64_t expert, BlobPart* out) {
         layer >= n_layers_ || expert >= n_expert_)
         return 0;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
-    if (complement_ready_ && (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr))) return 0;
+    if ((complement_ready_ || !loan_active_list_.empty()) &&
+        (resident_blob(index) != nullptr || (!override_.empty() && override_[index] != nullptr)))
+        return 0;
     Span sp[3];
     const int ns = spans(layer, expert, sp);
     for (int i = 0; i < ns; ++i) out[i] = {sp[i].p, sp[i].n, sp[i].at};
@@ -4739,7 +4842,7 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
     const uint8_t* result = nullptr;
     bool from_files = true;
-    if (complement_ready_) {
+    if (complement_ready_ || !loan_active_list_.empty()) {
         result = resident_blob(index);
         if (result != nullptr) {
             ram_reads_.fetch_add(1, std::memory_order_relaxed);
@@ -4768,16 +4871,24 @@ const uint8_t* FileExpertSource::blob(int64_t layer, int64_t expert) {
 #endif
             }
         }
-        if (complement_ready_ && result != nullptr) file_reads_.fetch_add(1, std::memory_order_relaxed);
+        if ((complement_ready_ || !loan_active_list_.empty()) && result != nullptr)
+            file_reads_.fetch_add(1, std::memory_order_relaxed);
     }
     if (result != nullptr) reads_.fetch_add(1, std::memory_order_relaxed);
     return result;
 }
 
 bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
-    if (!complement_ready_ || !complement_pinned_ || complement_host_ == nullptr || layer < 0 || expert < 0 ||
-        layer >= n_layers_ || expert >= n_expert_) return false;
+    if (layer < 0 || expert < 0 || layer >= n_layers_ || expert >= n_expert_) return false;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (!loan_active_.empty() && index < loan_active_.size() && loan_active_[index] != nullptr) {
+        static const bool pcie_pin_ok = [] {
+            const char* v = std::getenv("STRATA_LEND_PCIE_PINNED");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        return loan_pinned_ && pcie_pin_ok;
+    }
+    if (!complement_ready_ || !complement_pinned_ || complement_host_ == nullptr) return false;
     if (exchange_storage_.active()) return exchange_storage_.resident(index).host != nullptr;
     // soft_commit_exchanges: a staged `out` is judged by the place it will take (`in`'s), as after the commit
     const size_t at_index = !soft_in_.empty() && soft_in_[index] != SIZE_MAX ? soft_in_[index] : index;
@@ -4788,8 +4899,11 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
 }
 
 const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {
-    if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
+    if (!pinned(layer, expert)) return nullptr;
     const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) expert;
+    if (!loan_active_.empty() && index < loan_active_.size() && loan_active_[index] != nullptr)
+        return loan_dev_ != nullptr ? loan_dev_ + (size_t) (loan_active_[index] - loan_host_) : nullptr;
+    if (complement_device_ == nullptr) return nullptr;
     if (exchange_storage_.active()) return exchange_storage_.resident(index).device;
     if (!soft_in_.empty() && soft_in_[index] != SIZE_MAX)   // soft_commit_exchanges: out is read from its exchange buffer
         return override_.empty() || override_[index] == nullptr || xstage_dev_ == nullptr

@@ -1036,6 +1036,52 @@ void test_replace_resident(bool pin) {
     std::cout << "replace_resident: pinned=" << pin << " exact_bytes=PASS\n";
 }
 
+void test_loan_backup() {
+    using namespace strata::core;
+    using namespace strata::kernels::cpu;
+    constexpr int64_t layers = 1;
+    constexpr int64_t experts = 4;
+    const uint64_t total = (uint64_t) layers * (uint64_t) experts * BLOB;
+    TempDirectory dir;
+    std::string err;
+    require(expert_layout_load(dir.path.string(), layers, experts, err), err);
+    create_pack(dir.path, total, {{0, 'A'}, {(uint64_t) BLOB, 'B'}, {2 * (uint64_t) BLOB, 'C'}, {3 * (uint64_t) BLOB, 'D'}});
+
+    FileExpertSource src;
+    require(src.open(dir.path.string(), layers, experts, err), err);
+    require(!src.has_resident(0, 1) && !src.has_resident_blob(0, 1) && src.resident_blob(0, 1) == nullptr,
+            "unbacked GPU slot unexpectedly resident");
+
+    // Reserve 2 loan slots (pageable in CPU test) for unbacked GPU cache slots 1 and 2.
+    require(src.reserve_loan_slots(2, BLOB, false, err), "reserve_loan_slots failed: " + err);
+    const int32_t lid1 = src.ensure_loan_slot(1);
+    const int32_t lid2 = src.ensure_loan_slot(2);
+    require(lid1 == 0 && lid2 == 1 && src.ensure_loan_slot(1) == 0, "loan slot mapping not stable");
+    require(src.loan_tag(lid1) == -1 && src.loan_buffer(lid1) != nullptr, "initial loan slot state wrong");
+
+    // Simulate D2H backup of expert 1 (from cache slot 1) into loan slot lid1 and activate the loan.
+    std::memset(src.loan_buffer(lid1), 'B', (size_t) BLOB);
+    src.set_loan_tag(lid1, 1);
+    src.activate_loan(1, lid1);
+
+    const int64_t file_reads_before = src.file_reads();
+    require(src.has_resident(0, 1) && src.has_resident_blob(0, 1), "active loan not reported as resident");
+    require(src.resident_blob(0, 1) == src.loan_buffer(lid1), "resident_blob did not return active loan buffer");
+    require(src.blob(0, 1) == src.loan_buffer(lid1) && src.blob_stable(0, 1) == src.loan_buffer(lid1),
+            "blob/blob_stable did not serve from active loan buffer");
+    require(src.file_reads() == file_reads_before, "active loan triggered a file read");
+
+    // Deactivating or clearing active loans restores normal non-resident status while preserving cached tag and bytes.
+    src.deactivate_loan(1);
+    require(!src.has_resident(0, 1) && src.resident_blob(0, 1) == nullptr, "deactivate_loan left loan active");
+    src.activate_loan(1, lid1);
+    require(src.has_resident(0, 1) && src.resident_blob(0, 1) == src.loan_buffer(lid1), "re-activate_loan failed");
+    src.clear_active_loans();
+    require(!src.has_resident(0, 1) && src.resident_blob(0, 1) == nullptr, "clear_active_loans left loan active");
+    require(src.loan_tag(lid1) == 1 && src.loan_buffer(lid1)[0] == 'B', "clear_active_loans lost cached loan tag/bytes");
+    src.close();
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1053,6 +1099,7 @@ int main(int argc, char** argv) {
         test_canonical_layout();
         test_unbuffered_reads();
         test_io_prefetch();
+        test_loan_backup();
 #if defined(STRATA_NATIVE_EXPERTS)
         test_native_variable_layout();
 #endif

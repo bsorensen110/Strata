@@ -823,7 +823,7 @@ public:
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
     bool has_resident_blob(int64_t layer, int64_t expert) const override {
-        return complement_ready_ && has_resident(layer, expert);
+        return (complement_ready_ || !loan_active_list_.empty()) && has_resident(layer, expert);
     }
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     /// `bounce`: how many of the last buffers are only staged through and never hold an exchange (STRATA_EXCHANGE_ROTATE
@@ -832,6 +832,33 @@ public:
     int64_t exchange_capacity() const { return xstage_cap_; }
     /// The exchange buffers are page-locked (cudaHostAlloc): copies to and from them are asynchronous.
     bool exchange_pinned() const { return xstage_pinned_; }
+    /// Host backup for GPU-cache slots lent to the prompt path whose experts did not fit `--resident-budget-gib`.
+    /// Backed from VRAM before `relayout` overwrites the lent slots; tagged by expert index so subsequent prompt
+    /// reads reuse unchanged slots with 0 bytes copied.
+    bool reserve_loan_slots(int64_t n_slots, uint64_t slot_blob_bytes, bool pin, std::string& err);
+    int32_t ensure_loan_slot(int64_t cache_slot);
+    int32_t loan_slot_for(int64_t cache_slot) const {
+        return cache_slot >= 0 && (size_t) cache_slot < loan_slot_of_.size() ? loan_slot_of_[(size_t) cache_slot] : -1;
+    }
+    uint8_t* loan_buffer(int32_t loan_id) const {
+        return loan_host_ != nullptr && loan_id >= 0 && (int64_t) loan_id < loan_cap_
+                   ? loan_host_ + (size_t) loan_id * (size_t) loan_blob_
+                   : nullptr;
+    }
+    int32_t loan_tag(int32_t loan_id) const {
+        return loan_id >= 0 && (size_t) loan_id < loan_tag_.size() ? loan_tag_[(size_t) loan_id] : -1;
+    }
+    void set_loan_tag(int32_t loan_id, int32_t expert_idx) {
+        if (loan_id >= 0 && (size_t) loan_id < loan_tag_.size()) loan_tag_[(size_t) loan_id] = expert_idx;
+    }
+    void activate_loan(int32_t expert_idx, int32_t loan_id);
+    void deactivate_loan(int32_t expert_idx) {
+        if (expert_idx >= 0 && (size_t) expert_idx < loan_active_.size()) loan_active_[(size_t) expert_idx] = nullptr;
+    }
+    void clear_active_loans();
+    bool loan_pinned() const { return loan_pinned_; }
+    int64_t loan_capacity() const { return loan_cap_; }
+    int64_t loan_used_slots() const { return loan_used_; }
     /// Buffer `q`.  `layer` >= 0: the buffer an exchange of that layer's experts stages into (STRATA_EXCHANGE_ROTATE with
     /// several block sizes keeps one per size); without it, one that holds any layer's block.
     uint8_t* exchange_buffer(int64_t q, int64_t layer = -1) const;
@@ -1270,6 +1297,16 @@ private:
     int64_t xstage_cap_ = 0;
     uint64_t xstage_blob_ = 0;
     int64_t exchanges_ = 0;
+    uint8_t* loan_host_ = nullptr;            ///< host backup for unbacked lent GPU-cache slots
+    const uint8_t* loan_dev_ = nullptr;
+    bool loan_pinned_ = false;
+    int64_t loan_cap_ = 0;
+    int64_t loan_used_ = 0;
+    uint64_t loan_blob_ = 0;
+    std::vector<int32_t> loan_slot_of_;       ///< per GPU cache slot: loan_id in loan_host_ (-1: none)
+    std::vector<int32_t> loan_tag_;           ///< per loan_id: expert_idx currently held (-1: none)
+    std::vector<const uint8_t*> loan_active_; ///< per expert_idx: non-null while lent out to the prompt path
+    std::vector<int32_t> loan_active_list_;   ///< active expert_idx list for O(lent) clear_active_loans()
     std::atomic<int64_t> file_reads_{0};
     std::atomic<int64_t> reads_{0};   ///< (a counter only; two threads can read blobs at once)
 #if defined(_WIN32)
