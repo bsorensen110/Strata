@@ -8,11 +8,45 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace strata::prefill::share_rules {
 
-// ---- the limit (BW-MEASURE E25, owner decision 10-31) ----
+constexpr bool batch_cpu_share_blocked(bool share_enabled, bool concurrent_reader) {
+    return share_enabled && concurrent_reader;
+}
+
+/// Whether active single-card batch slots need the co-prefill ring policy, regardless of CPU-pool ownership.
+constexpr bool batch_co_prefill_active(bool single_card_batch, bool active_slots) {
+    return single_card_batch && active_slots;
+}
+
+/// Whether serial batch prefill shares the CPU pool (STRATA_PREFILL_CPU_SHARE_BATCH).
+/// Defaults ON for single-card gfx12 when batch is enabled by the engine/user (`single_card_gfx12 && batch_enabled`).
+inline bool batch_cpu_share_enabled_from(const char* v, bool single_card_gfx12, bool batch_enabled) {
+    if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0;
+    return single_card_gfx12 && batch_enabled;
+}
+
+/// Whether the loan backup uses page-locked PCIe memory (STRATA_LEND_PCIE_PINNED).
+/// Defaults ON for single-card gfx12 when batch is enabled by the engine/user (`single_card_gfx12 && batch_enabled`).
+inline bool batch_lend_pinned_from(const char* v, bool single_card_gfx12, bool batch_enabled) {
+    if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0;
+    return single_card_gfx12 && batch_enabled;
+}
+
+struct BatchPrefillPolicy {
+    bool block_cpu_share = false;
+    bool co_prefill_ring = false;
+};
+
+constexpr BatchPrefillPolicy batch_prefill_policy(bool batch_enabled, bool concurrent_reader,
+                                                  bool share_enabled, bool active_slots) {
+    return {batch_cpu_share_blocked(share_enabled, concurrent_reader),
+            batch_co_prefill_active(batch_enabled, active_slots)};
+}
+
 // The DEFAULT share applies to staged chunks up to this many tokens.  0.1.41 armed it below 1,024 tokens (RTX 3060, P100, RTX 5070: -20..-35% at 512 and
 // 1,000 tokens).  A chunk of 1-3K tokens routes to nearly every expert of every layer, so with half the experts resident one pass over the rest at the link's
 // speed is its floor (RTX PRO 5000 with a 28 GB/s link and 12,437 of 24,576 experts resident: 0.97-1.04 s for any 1K-4K prompt) and the CPU share takes
@@ -25,8 +59,13 @@ constexpr int64_t default_share_limit(bool raise = true) { return raise ? kShare
 /// AMD-Q: a gfx12 card whose fused IQ2_S / IQ4_XS gate/up kernels are on (fused::gfx12_iq2s_default): chunks below this are staged and take the CPU share, a chunk
 /// from it up streams every expert and runs the fused kernels.  R9700 (p620, IQ3_S, 54% resident), prompt speed against the share-only default (limit 3,072):
 /// limit 1,536: 1.3K 1.00, 1.5K 1.00, 1.8K +7.1%, 2K +10.0%, 2.6K +16.2%, 3K +11.1% (two pairs each); limit 2,048: 1.8K +1.4%, 2K +9.7%; limit 3,072 (fused only above): no gain at 1.5K-2.6K.
+/// When batch slots are used on single-card gfx12 (`batch_active`), co-prefill chunks are capped at 2,048 tokens, so raising the staged CPU-share ceiling to 2,560
+/// keeps 2,048-token co-prefill pieces on the staged MMQ + CPU share path (`STAGE_GRP = 32` slots) instead of streaming all non-resident experts with the CPU pool idle.
 constexpr int64_t kShareLimitGfx12Fused = 1536;
-constexpr int64_t gfx12_share_limit(bool fused_iq2s) { return fused_iq2s ? kShareLimitGfx12Fused : kShareLimitNew; }
+constexpr int64_t kShareLimitGfx12Batch = 2560;
+constexpr int64_t gfx12_share_limit(bool fused_iq2s, bool batch_active = false) {
+    return batch_active ? kShareLimitGfx12Batch : (fused_iq2s ? kShareLimitGfx12Fused : kShareLimitNew);
+}
 
 /// resident_slots: the expert cache's live slots; total_pairs: layers x routed experts per layer (<= 0: unknown, arm).
 constexpr bool default_share_has_work(int64_t resident_slots, int64_t total_pairs) {

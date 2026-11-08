@@ -282,19 +282,19 @@ public:
     /// its tokens, fewest first, up to a share of the experts it would stream (`auto`: measured, where both sides end
     /// together). The CPU reads them from RAM (the arena, the page-locked copy, or the mapped experts.bin's pages)
     /// while the rest come over PCIe; their rows go to Dm's tail, as a peer's do. Not bit-identical to the GPU's rows
-    /// (the CPU's own activation format). Unset (default) or null: every expert on the GPU. Only for a pool no other
-    /// thread runs meanwhile (no batch slots); on a layer split every stage may have it - one stage at a time takes it
-    /// for a chunk. Set before `init`.
+    /// (the CPU's own activation format). The pool must be available to the prompt reader during each share interval; serial
+    /// layer-yield batch mode may alternate prompt and decode uses on the scheduler thread. A concurrent reader thread
+    /// shares the pool with decode and must keep this path blocked while both run.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
     /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
-    /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
-    /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
-    static void arm_cpu_share(bool applies, bool by_default = false);
-    /// STRATA_PREFILL_CPU_SHARE_BATCH=1 (batch slots beside the pool): set before each read - true while a slot decodes
-    /// (its windows use the pool), so no chunk of that read takes the share; false lets the read's chunks take it.
+    /// `by_default`: this path is one the share was measured on; unset variable keeps the pool share off unless explicitly armed.
+    static void arm_cpu_share(bool applies, bool by_default = false, bool batch_slots = false);
+    /// Prevent CPU prefill share only during a truly concurrent reader/decode interval.
     static void set_share_blocked(bool blocked);
+    /// Preserve a co-prefill ring cap independently of CPU pool exclusion.
+    static void set_co_prefill_active(bool active);
 
     /// Mid-chunk decode yield hook (single GPU, batch slots active): called every `layer_yield_every_` layers
     /// inside a prompt chunk so active decode slots can run a verify/draft window without waiting for all 48 layers.

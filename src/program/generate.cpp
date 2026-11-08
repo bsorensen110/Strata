@@ -10706,8 +10706,9 @@ int main(int argc, char** argv) {
             if (const char* w = std::getenv("STRATA_RAM_ADAPT_PER_LAYER")) ram_adapt2.per_layer = std::max(1, std::atoi(w));
             if (const char* w = std::getenv("STRATA_RAM_ADAPT_SKIP_TOP")) ram_adapt2.skip_top = std::max(0, std::atoi(w));
         }
-        // the pool is idle while a prompt is read unless batch slots decode between its parts; with
-        // STRATA_PREFILL_CPU_SHARE the staged-chunk limit before the chunk below sizes the loans (bytes_needed reads it)
+        // the pool is idle while a prompt is read unless batch slots decode between its layers; with
+        // STRATA_PREFILL_CPU_SHARE_BATCH the single-threaded scheduler may lend that pool in the layer gaps. Concurrent
+        // reader-thread mode must keep the pool for decode and disables the prompt-side share.
         // #1607: Windows, the commit limit (RAM + page file) is what ends the engine silently; compare what this run plans
         // to allocate on the host from here (the conversation cache, checkpoints) with the commit that is left
 #if defined(_WIN32)
@@ -10725,13 +10726,25 @@ int main(int argc, char** argv) {
             }
         }
 #endif
-        // STRATA_PREFILL_CPU_SHARE_BATCH=1 (opt-in): the prompt path gets the pool beside batch slots too; a read takes the
-        // share only while no slot decodes (set_share_blocked before each read), since the slots' windows use the pool
-        static const bool share_batch = [] { const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH"); return v != nullptr && v[0] == '1'; }();
-        const bool share_pool = (o.batch <= 0 || share_batch) && !o.no_pool;
-        if (share_batch && o.batch > 0 && !o.no_pool)
+        // STRATA_PREFILL_CPU_SHARE_BATCH: enable the prompt's CPU pool for serial co-prefill windows too (default ON on single-card gfx12 when batch is used).
+        // The concurrent-reader mode owns the pool on the decode thread, so it deliberately excludes the prompt share.
+        const bool single_card_gfx12 = [&] {
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+            if (!stages.empty() || multi_gpu) return false;
+            cudaDeviceProp prop0{};
+            if (cudaGetDeviceProperties(&prop0, 0) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+            return strata::core::gfx12_prefill_share_default(prop0.gcnArchName);
+#else
+            return false;
+#endif
+        }();
+        const bool share_batch_enabled = strata::prefill::share_rules::batch_cpu_share_enabled_from(
+            std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH"), single_card_gfx12, o.batch > 0);
+        static const bool concurrent_read_enabled = [] { const char* v = std::getenv("STRATA_BATCH_CONCURRENT_READ"); return v != nullptr && std::atoi(v) != 0; }();
+        const bool share_pool = (o.batch <= 0 || (share_batch_enabled && !concurrent_read_enabled)) && !o.no_pool;
+        if (share_batch_enabled && o.batch > 0 && !concurrent_read_enabled && !o.no_pool)
             std::fprintf(stderr, "strata serve: STRATA_PREFILL_CPU_SHARE_BATCH=1: the prompt path may use the CPU pool beside the "
-                                 "%lld batch slots, for a read with no slot decoding\n", (long long) o.batch);
+                                 "%lld batch slots across serial prefill/decode intervals\n", (long long) o.batch);
         bool share_has_work = strata::prefill::share_rules::default_share_has_work(
             (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
         if (!share_has_work)
@@ -10739,7 +10752,7 @@ int main(int argc, char** argv) {
                                  "nothing to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
                          (long long) xcache.slots(), (long long) (g.n_layers * g.n_expert));
         if (share_pool && stages.empty() && !multi_gpu && share_has_work && !share_default_ok()) share_has_work = false;   // H11
-        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu && share_has_work);
+        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu && share_has_work, o.batch > 0);
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -11415,6 +11428,49 @@ int main(int argc, char** argv) {
             }
         }
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
+        if (srcp == &src && src.complement_ready() && src.complement_pinned() && !pf_parts.empty() && !host_res.empty()) {
+            const char* vb = std::getenv("STRATA_LEND_RAM_BACKUP");
+            const bool lb_on = vb == nullptr || std::atoi(vb) != 0;
+            const bool lp_on = strata::prefill::share_rules::batch_lend_pinned_from(
+                std::getenv("STRATA_LEND_PCIE_PINNED"), single_card_gfx12, o.batch > 0);
+            if (lb_on && lp_on) {
+                for (const PfPart& p : pf_parts) {
+                    if (p.first < 0) continue;
+                    const strata::core::OnDevice on(p.dev);
+                    const int64_t warm_c = std::min<int64_t>(o.prefill_chunk > 0 ? o.prefill_chunk : 2048, 2048);
+                    const int64_t warm_slots = part_slots(p, warm_c);
+                    if (warm_slots <= 0 || warm_slots + g_lend_keep > p.cache->slots()) continue;
+                    const int32_t warm_first = (int32_t) (p.cache->slots() - warm_slots);
+                    uint64_t max_b = 0;
+                    for (int64_t l = p.lb; l < p.le; ++l)
+                        max_b = std::max<uint64_t>(max_b, (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(l));
+                    std::string lerr;
+                    if (src.reserve_loan_slots(src.loan_used_slots() + warm_slots, max_b, true, lerr) &&
+                        src.loan_capacity() > 0) {
+                        bool copied_d2h = false;
+                        for (int64_t l = p.lb; l < p.le; ++l)
+                            for (int64_t ex = 0; ex < g.n_expert; ++ex) {
+                                const size_t idx = (size_t) (l * g.n_expert + ex);
+                                const int32_t sl = host_res[idx];
+                                if (sl < warm_first) continue;
+                                const int32_t lid = src.ensure_loan_slot(sl);
+                                if (lid < 0 || src.has_resident(l, ex)) continue;
+                                if (src.loan_tag(lid) != (int32_t) idx) {
+                                    const size_t nb = (size_t) strata::kernels::cpu::expert_layout().blob_bytes(l);
+                                    if (cudaMemcpyAsync(src.loan_buffer(lid), p.cache->device_slot(sl), nb,
+                                                        cudaMemcpyDeviceToHost, (cudaStream_t) 0) == cudaSuccess) {
+                                        src.set_loan_tag(lid, (int32_t) idx);
+                                        copied_d2h = true;
+                                    } else {
+                                        (void) cudaGetLastError();
+                                    }
+                                }
+                            }
+                        if (copied_d2h) (void) cudaStreamSynchronize((cudaStream_t) 0);
+                    }
+                }
+            }
+        }
         // the penalty-history buffer: one row per verify-window row (`penalty_rows`), each the last
         // `penalty_last_n` tokens that row's pick follows, -1 padded in front.  Allocated once at the cap for
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
@@ -18020,7 +18076,7 @@ int main(int argc, char** argv) {
                 int n_act_lend = 0;
                 if (o.batch > 0 && stages.empty() && exact <= 0 && !o.prefill_head_alias) {
                     for (const auto& x : bs) n_act_lend += x.active ? 1 : 0;
-                    strata::prefill::Prefill::set_share_blocked(n_act_lend > 0);
+                    strata::prefill::Prefill::set_co_prefill_active(n_act_lend > 0);
                 }
                 bool any = false;
                 for (PfPart& p : pf_parts) {
@@ -18095,10 +18151,8 @@ int main(int argc, char** argv) {
                                 max_b = std::max<uint64_t>(max_b, b);
                                 if (src.loan_slot_for(slot) < 0) ++need_new;
                             }
-                            static const bool lend_pinned = [] {
-                                const char* v = std::getenv("STRATA_LEND_PCIE_PINNED");
-                                return v != nullptr && std::atoi(v) != 0;
-                            }();
+                            const bool lend_pinned = strata::prefill::share_rules::batch_lend_pinned_from(
+                                std::getenv("STRATA_LEND_PCIE_PINNED"), single_card_gfx12, o.batch > 0);
                             std::string lerr;
                             if ((need_new == 0 || src.reserve_loan_slots(src.loan_used_slots() + need_new, max_b,
                                                                          lend_pinned && src.complement_pinned(), lerr)) &&
@@ -18166,16 +18220,23 @@ int main(int argc, char** argv) {
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             int64_t req_chunk = 0, req_chunk_len = 0;   // the DONE line's chunk=: the longest batched segment's first chunk
 
-            // STRATA_PREFILL_CPU_SHARE_BATCH: the read takes the CPU share only with no slot decoding (their windows use the pool)
+            bool conc_read = false;   // run_conc / pr_conc sets this while a reader thread shares the pool with decode
+            // STRATA_PREFILL_CPU_SHARE_BATCH: only opt the CPU pool into serial batch prefill. The concurrent-reader path
+            // shares that pool with decode and must keep the prompt-side share disabled for the whole reader interval.
             auto share_gate = [&]() {
                 int busy = 0;
                 for (const auto& x : bs) busy += x.active ? 1 : 0;
-                strata::prefill::Prefill::set_share_blocked(busy > 0);
                 static int said = 0;
-                static const bool on = [] { const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH"); return v != nullptr && v[0] == '1'; }();
-                if (on && said < 4) {
+                const strata::prefill::share_rules::BatchPrefillPolicy policy =
+                    strata::prefill::share_rules::batch_prefill_policy(
+                        o.batch > 0 && stages.empty(), conc_read, share_batch_enabled, busy > 0);
+                strata::prefill::Prefill::set_share_blocked(policy.block_cpu_share);
+                strata::prefill::Prefill::set_co_prefill_active(policy.co_prefill_ring);
+                static const bool cpu_diag = [] { const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH_DIAG"); return v != nullptr && v[0] == '1'; }();
+                if (cpu_diag && share_batch_enabled && said < 4) {
                     ++said;
-                    std::fprintf(stderr, "strata batch: CPU share for this read: %s (%d slot(s) decoding)\n", busy > 0 ? "off" : "on", busy);
+                    std::fprintf(stderr, "strata batch: CPU share for this read: %s (%d slot(s) decoding)\n",
+                                 policy.block_cpu_share ? "off (concurrent reader owns the pool)" : "on between serial windows/layers", busy);
                 }
             };
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
@@ -18299,7 +18360,6 @@ int main(int argc, char** argv) {
                     for (const auto& x : bs) n_act += x.active ? 1 : 0;
                     return n_act;
                 };
-                bool conc_read = false;   // run_conc: the slots decode beside the read, so the share stays off for all of it
                 auto run = [&](int64_t q, int64_t r) -> bool {
                     if (planned) {
                         sp.force_chunk(plan.chunk, plan_single, plan.chunked);
@@ -18641,6 +18701,7 @@ int main(int argc, char** argv) {
                         bool read_ok = true;
                         std::string read_err;
                         in_prompt_read = true;
+                        conc_read = true;
                         sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
                         share_gate();   // on this thread, before the reader starts
                         std::thread reader([&] {
@@ -18663,12 +18724,14 @@ int main(int argc, char** argv) {
                             std::thread& t;
                             std::function<bool()>& hook;
                             bool& reading;
+                            bool& conc;
                             ~ReadEnd() {
                                 if (t.joinable()) t.join();
                                 hook = nullptr;
                                 reading = false;
+                                conc = false;
                             }
-                        } read_end{reader, sp.stop_at_chunk, in_prompt_read};
+                        } read_end{reader, sp.stop_at_chunk, in_prompt_read, conc_read};
                         bool pump_ok = true;
                         size_t seen = 0;   // in_lines' length after the last look: a line that comes wakes the wait
                         while (!done.load(std::memory_order_acquire)) {
@@ -18698,6 +18761,7 @@ int main(int argc, char** argv) {
                         reader.join();   // (a failed window leaves the read to finish: it is not stopped mid-run)
                         sp.stop_at_chunk = nullptr;
                         in_prompt_read = false;
+                        conc_read = false;
                         if (!pump_ok || !pipe_drain()) {
                             batch_fatal = true;
                             e = "a pipelined batch window failed";
@@ -19052,16 +19116,21 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
-                if (win && !refill(err)) {
-                    std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
-                    return 1;
-                }
                 // a read going on in a planned segment gets the loan it was read with (what is left would size
                 // another, and the loan decides which experts are read in place: bits)
                 const int64_t plan_lend = resume_plan.chunk > 0 && at == resume_plan_at && to == resume_plan_end
                                               ? resume_plan.lend : 0;
-                if (!win && !lend(to - at, err, plan_lend)) {
-                    std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
+                if (!win) {
+                    // Admission can already have active slots; set independent CPU-share and co-ring policies before
+                    // the lender sizes ring-backed buffers.
+                    share_gate();
+                    if (!lend(to - at, err, plan_lend)) {
+                        std::printf("ERR lending the prompt path its slots failed: %s\n", err.c_str());
+                        return 1;
+                    }
+                }
+                if (win && !refill(err)) {
+                    std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
                 if (win) merge_at = merge_from(at, to);   // (after the refill: the loans are back)

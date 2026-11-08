@@ -20,6 +20,46 @@ int main() {
     check(copy_wait_dedupe_from(nullptr, true) && copy_wait_dedupe_from("", true), "dedupe unset/empty uses default_on=true");
     check(!copy_wait_dedupe_from("0", true) && copy_wait_dedupe_from("1", false), "dedupe explicit 0/1 overrides default_on");
 
+    check(!fused_release_batch_from(nullptr, false) && !fused_release_batch_from("", false), "fused batch release defaults off");
+    check(fused_release_batch_from("1", false) && !fused_release_batch_from("0", true), "fused batch release env overrides default");
+
+    check(!stage_lookahead_from(nullptr, false) && !stage_lookahead_from("", false), "stage lookahead defaults off");
+    check(stage_lookahead_from("1", false) && !stage_lookahead_from("0", true), "stage lookahead env overrides default");
+    check(staged_pending_cap(false, false, 8, 32, 16) == 8 && staged_pending_cap(true, false, 8, 32, 16) == 8,
+          "stage lookahead off keeps STAGE=8 pending cap");
+    check(staged_pending_cap(false, true, 8, 32, 16) == 8,
+          "non-grouped staged walk keeps STAGE=8 pending cap");
+    check(staged_pending_cap(true, true, 8, 32, 16) == 16,
+          "grouped staged walk with lookahead on keeps STAGE_GRP - MMQ_GROUP = 16 transfers ahead");
+    check(staged_pending_cap(true, true, 8, 16, 16) == 8,
+          "grouped staged walk falls back to STAGE when stage_grp <= mmq_group");
+
+    check(copy_release_event_slot(0, 32, 96) == 31, "fused batch releases at its last ring slot");
+    check(copy_release_event_slot(32, 64, 96) == 63, "next fused batch gets its own release slot");
+    check(copy_release_event_slot(96, 128, 96) == 31, "fused release slot wraps with the ring");
+    check(copy_release_event_slot(8, 8, 96) == -1 && copy_release_event_slot(0, 1, 0) == -1,
+          "empty or zero-ring fused batch has no release event");
+    {
+        // Simulate a 96-slot co-prefill ring released in 32-slot fused batches [0,32), [32,64), [64,96):
+        // on the second revolution [96, 192), only the first slot of each batch waits; the other 31 dedupe.
+        constexpr int ring = 96;
+        constexpr int group = 16;
+        int used_of[ring] = {};
+        for (size_t b0 = 0; b0 < (size_t) ring; b0 += 32) {
+            const int rel = copy_release_event_slot(b0, b0 + 32, ring);
+            for (size_t k = b0; k < b0 + 32; ++k) used_of[k % (size_t) ring] = rel;
+        }
+        int prev_rel = used_of[ring - 1];   // entry 95's wait at the end of the first revolution
+        int waits = 0, dedup = 0;
+        for (size_t idx = (size_t) ring; idx < (size_t) (2 * ring); ++idx) {
+            const int rel = used_of[idx % (size_t) ring];
+            if (copy_wait_dedupe_ok(idx, ring, group, rel, prev_rel)) ++dedup;
+            else ++waits;
+            prev_rel = rel;
+        }
+        check(waits == 3 && dedup == 93, "fused batch release deduplicates 93 of 96 waits on second ring revolution");
+    }
+
     // default: every entry records (the walk then waits on copied[slot], as before the switch)
     for (size_t total : {1u, 2u, 7u, 100u})
         for (size_t i = 0; i < total; ++i) check(copy_event_due(i, total, 1), "every == 1 records every entry");

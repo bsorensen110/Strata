@@ -322,8 +322,12 @@ inline int64_t cpu_share_max() {
 // On a layer split every stage may have the pool (set_cpu_pool), and the stages read different chunks at the same time:
 // one stage at a time takes it for a chunk, the other reads its chunk with the GPU alone.
 std::atomic<bool> g_cpu_pool_busy{false};
-// STRATA_PREFILL_CPU_SHARE_BATCH: a slot is decoding beside this read (Prefill::set_share_blocked): the pool is its windows'
+// STRATA_PREFILL_CPU_SHARE_BATCH: batch windows may use the CPU pool between prompt layers/chunks on the same
+// scheduling thread. Concurrent reader-thread mode still blocks the share while decode runs in parallel.
 std::atomic<bool> g_share_blocked{false};
+// Separate from g_share_blocked: batch slots can require the smaller co-prefill ring even when their main-thread
+// decode windows and the prompt's CPU-share work are serialized.
+std::atomic<bool> g_co_prefill_active{false};
 double g_pinned_share = 1.0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
 // 8192-token chunks: 96 slots 1153 tok/s, 384 1294 (the next layer's experts arrive during its attention half) -
@@ -422,7 +426,7 @@ inline int ring_slots(size_t T) {
         const char* e = std::getenv("STRATA_BATCH_CO_RING");
         return e != nullptr ? std::max(0, std::atoi(e)) : 96;
     }();
-    if (!v && g_ring_override <= 0 && co_ring > 0 && g_share_blocked.load(std::memory_order_relaxed))
+    if (!v && g_ring_override <= 0 && co_ring > 0 && g_co_prefill_active.load(std::memory_order_relaxed))
         return (int64_t) T >= stream_all_min() ? std::max(16, std::min(co_ring, ring_cap())) : STAGE;
 #if defined(STRATA_USE_HIP)
     // S6: with the matrix-core attention (the gfx12 default since 148-amd; STRATA_HIP_WMMA=1 or auto elsewhere / forced, on a card that
@@ -2969,10 +2973,26 @@ int64_t Prefill::ring_max_slots() {
     return g_pinned_share >= 0.9 ? (int64_t) ring_budget_slots() : (int64_t) std::min(96, ring_cap());
 }
 
+inline bool single_card_gfx12_default() {
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    static const bool ok = [] {
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess || n != 1) { (void) cudaGetLastError(); return false; }
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        return strata::core::gfx12_prefill_share_default(p.gcnArchName);
+    }();
+    return ok;
+#else
+    return false;
+#endif
+}
+
 int64_t Prefill::ring_slots_for(int64_t chunk) { return ring_slots((size_t) chunk); }
 void Prefill::set_cpu_pool(kernels::cpu::ExpertPool* pool) { cpu_pool_ = pool; }
-void Prefill::arm_cpu_share(bool applies, bool by_default) {
+void Prefill::arm_cpu_share(bool applies, bool by_default, bool batch_slots) {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    (void) batch_slots;
     if (applies && by_default && cpu_share_explicit() == -2.0 && !g_share_default) {
         g_share_default = true;
         std::fprintf(stderr, "prefill: the CPU share is ON by default for prompt chunks up to %lld tokens (the idle CPU "
@@ -2988,7 +3008,7 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
         if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
             strata::core::gfx12_prefill_share_default(prop.gcnArchName)) {
             g_share_default = true;
-            g_share_limit_arch = strata::prefill::share_rules::gfx12_share_limit(fused::gfx12_iq2s_default());
+            g_share_limit_arch = strata::prefill::share_rules::gfx12_share_limit(fused::gfx12_iq2s_default(), batch_slots);
             std::fprintf(stderr, "prefill: the CPU share is ON by default for prompt chunks up to %lld tokens on this gfx12 card (the idle CPU "
                                  "takes some of the experts the GPU would stream; answers can differ slightly: first-token KL ~0.02 at 1K tokens, "
                                  "prompts of 500-1,000 tokens +18..+31%%, 2K and up unchanged). STRATA_PREFILL_CPU_SHARE=0 or STRATA_GFX12_DEFAULTS=0 turns it off, "
@@ -2997,11 +3017,13 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
     }
 #else
     (void) by_default;
+    (void) batch_slots;
 #endif
     if (applies && cpu_share_on()) g_stream_min_share = cpu_share_max();
 }
 
 void Prefill::set_share_blocked(bool blocked) { g_share_blocked.store(blocked, std::memory_order_release); }
+void Prefill::set_co_prefill_active(bool active) { g_co_prefill_active.store(active, std::memory_order_release); }
 bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
 size_t Prefill::slot_guard_bytes() { return mmq::direct_slot_guard(); }
 
@@ -4886,11 +4908,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             } else {
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             }
-                            for (size_t kk = k0; kk < k; ++kk) {
-                                cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
-                                m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
-                            }
+                            static const bool release_batch = [] {
+                                const char* e = std::getenv("STRATA_PREFILL_FUSED_BATCH_RELEASE");
+                                return strata::prefill::fused_release_batch_from(e, single_card_gfx12_default());
+                            }();
+                            // One tail event can release the batch after all its earlier reads on the compute stream.
                             if (k > k0) {
+                                const int batch_rel = release_batch
+                                                          ? strata::prefill::copy_release_event_slot(k0, k, m.ring)
+                                                          : -1;
+                                if (batch_rel >= 0) {
+                                    cudaEventRecord(m.used[batch_rel], m.cs);
+                                    for (size_t kk = k0; kk < k; ++kk) m.used_of[kk % (size_t) m.ring] = batch_rel;
+                                } else {
+                                    for (size_t kk = k0; kk < k; ++kk) {
+                                        const int rel = (int) (kk % (size_t) m.ring);
+                                        cudaEventRecord(m.used[rel], m.cs);
+                                        m.used_of[rel] = rel;
+                                    }
+                                }
                                 consumed = k;
                                 give_back(consumed);
                             }
@@ -6091,11 +6127,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             size_t staged = 0;
                             size_t pending = 0;
                             const bool stream_ahead = stream_ahead_enabled();
+                            static const bool stage_lookahead_full =
+                                strata::prefill::stage_lookahead_from(std::getenv("STRATA_PREFILL_STAGE_LOOKAHEAD"),
+                                                                      single_card_gfx12_default());
                             const size_t lookahead = group_resident ? (size_t) (STAGE_GRP - MMQ_GROUP - 1) : STAGE - 1;
+                            const size_t pending_cap = strata::prefill::staged_pending_cap(
+                                group_resident, stage_lookahead_full, (size_t) STAGE, (size_t) STAGE_GRP, (size_t) MMQ_GROUP);
                             for (size_t j = 0; j < order.size(); ++j) {
-                                // Resident experts occupy no staging slot. Keep STAGE actual transfers ahead,
+                                // Resident experts occupy no staging slot. Keep pending_cap actual transfers ahead,
                                 // rather than STAGE positions in the mixed resident/streamed order.
-                                while (staged < order.size() && (stream_ahead ? pending < STAGE : staged <= j + lookahead)) {
+                                while (staged < order.size() && (stream_ahead ? pending < pending_cap : staged <= j + lookahead)) {
                                     if (!stage_one(staged)) return false;
                                     if (stage_of[staged] >= 0) ++pending;
                                     ++staged;
