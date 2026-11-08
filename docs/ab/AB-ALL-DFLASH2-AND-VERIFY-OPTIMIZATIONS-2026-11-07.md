@@ -151,3 +151,43 @@
   - **2-Slot Concurrent `2x256` Burst (`batch2`)**:
     - Control (`0_prod_control`): mean **126.6 tok/s** aggregate (`127.4` R1 / `125.8` R2; per-slot **63.8 tok/s**; slot admission copies `41.7 ms`, `44.4 ms`, `38.2 ms`; engine **147.5 / 135.1 rows/s**; warm R2 `CPU pool 8.15 ms/window`, `emit 3.75 ms/window`, `adapt wait 3.98 ms/window`)
     - Candidate (`1_cand_concurrent` @ `0247ac749`): mean **132.5 tok/s** aggregate (**+4.7% vs control, +2.8% vs pre-CPU candidate `0d468cf6b`**, **134.0 tok/s** R1 / **131.0 tok/s** R2; per-slot **68.2 tok/s [+6.8% vs control]**; slot admission copies **`17.6 ms`, `10.0 ms`, `14.4 ms`, `14.0 ms` [−67% vs control]**; engine **152.3 / 154.5 rows/s [+14.4% warm engine rows/s]**; warm R2 **`CPU pool 6.91 ms/window [−15.2% vs control, −11.1% vs pre-CPU 7.77 ms]`**, **`emit 2.82 ms/window [−24.8% vs control]`**, **`adapt wait 1.25 ms/window [−68.6% vs control]`**, acceptance **347/163 = 212.9%**)
+
+## 7. Second-Wave CPU Concurrent Optimizations: Barrier-Free `ExpertPool` Pass, Fast-Path Dispatch, Async `sample_rows`, and Early Adaptive Tier Launch (`e18b5c8f5..bc746b98a`)
+
+- **Mechanisms**:
+  1. **Single Barrier-Free `ExpertPool` Pass (`STRATA_POOL_SINGLE_PHASE=1`, `e18b5c8f5`)**:
+     - Fuses the `gate/up` (`parts_a_`) and `down` (`parts_b_`) phases into a single `run_phase(9..11, n * parts_a_ + n * parts_b_)` work-stealing pass across `run_split_multi_native`, `run_split_multi`, and `run_split` when `numa_n_ == 0`.
+     - Uses per-expert `q_state` (`0 = pending`, `1 = quantizing`, `2 = ready`) so workers reaching a `down` task (`t >= n * parts_a_`) for an expert whose `gate/up + H-quantization` is already complete execute `down` immediately without a global thread-pool barrier; if `q_state != 2`, the worker helps quantize `H` (or spins briefly on `q_state == 2`), eliminating 48 extra pool wake/wait barriers per verify window.
+  2. **Direct Deduplicated CPU Expert Job Construction & Scan Elision (`STRATA_DISPATCH_FAST_JOBS=1`, `0ba00b12a`)**:
+     - Builds `jobs` (`ExpertJobMulti`) directly from the deduplicated `(expert -> token chain)` linked list (`cpu_i0[]`, `head[]`, `next_node[]`, `node_tok[]`, `node_w[]`) during `expert_pool_dispatch_multi`, avoiding the $O(n_{\text{tok}} \times K)$ `job_of[512]` rescan.
+     - Tracks `cpu_tok_mask` (`uint64_t` bitmap for `n_tok <= 64`) during the routing classification loop and skips both the `claim_todo` loop and `job_of` construction when all cold experts are resident in RAM (`need_claim_todo == 0`).
+  3. **Async `sample_rows` Before Final `Verifier::run_slot_rows` Stream Sync & `post_layers_cb_` Hook (`STRATA_VERIFY_SAMPLE_ASYNC=1`, `cd3a3ded7`)**:
+     - Enqueues `sample_rows(..., /*sync=*/false)` on `cs_` immediately after `forward_head` and before the final `cudaStreamSynchronize(cs_)` in `Verifier::run_slot_rows`, using persistent host staging (`slot_hrows_`) and `cudaMemcpyAsync` into `slot_hist_d_` so CPU penalty-staging and `sample_tokens` kernel launch overlap with GPU Layer 47 + `output_norm` + 248,320-row LM-head execution (~3.8 ms).
+     - Adds `Verifier::set_post_layers(PostLayersFn, void*)` invoked right after Layer 47's CPU experts finish (`*flag = 48`) and before the final `cudaStreamSynchronize(cs_)`.
+  4. **Early Adaptive Tier Worker Launch During Final GPU Layer/LM-Head Execution (`STRATA_ADAPT_EARLY=1`, `bc746b98a`)**:
+     - Defaulted `STRATA_ADAPT_OVERLAP=1` and `STRATA_ADAPT_OVERLAP_RESIDENT=1` on HIP (`#if defined(STRATA_USE_HIP) && !defined(_WIN32)`).
+     - Uses `ver.set_post_layers(...)` in `step_batch` to launch the pinned `strata-adapt` worker thread (`adapt_impl(&adapt_run.ver_done)`) as soon as Layer 47's CPU expert pool finishes (`*flag = 48`), overlapping candidate/victim sorting across all 48 layers, `resident_stage_swaps` D2H copies, and Layers `0..46` H2D slot updates with the remaining ~3.8 ms of GPU execution (`Layer 47 MoE + output_norm + LM head + sample_rows`). Only Layer 47 slot H2D writes wait on `ver_done`.
+     - Keeps `ver.wait_commit(err)` deferred across `adapt_run.th.join()` when `aov` (`STRATA_ADAPT_OVERLAP=1`) is active.
+- **Verification & Paired End-to-End A/B Results (`0_prod_control` @ `cfb22e5b4` vs `1_cand_concurrent` @ `bc746b98a`)**:
+  - **CTest, `pool_stress`, and `dflash2_ring_test`**:
+    - `10/10` CTest parity & pool tests PASS (`mmvq_il_parity`, `quantize_il_parity`, `mmvf_rows_parity`, `shared_expert_parity`, `gr_parity`, `sampler_parity`, `verify_batch_parity`, `pool_tasks_test`, `expert_multi_test`, `pool_plan_test`)
+    - `pool_stress`: `39,637` batches across 15 workers + host over 20 s (`649` after sleep), `0` jobs missed (`pool_stress OK`)
+    - `dflash2_ring_test`: all 7 tests PASS (`578`-row rewind rebuild in `4.1 ms`, `2042`-row parked rebuild in `13.2 ms`, `precomp (16 rows): 225.91 us | batch_full_exec_: 43.91 us`, bitwise K/V ring and token/prob parity)
+  - **Solo Refactor Parity (`2x192`, `temp=0`)**:
+    - Control (`0_prod_control`): **73.8 tok/s** wall (`61.3` cold / `86.3` warm; engine decode `86.7` / `137.1 tok/s`, prompt `913` / `823 ms`), hash `ece1433a582a4c38`
+    - Candidate (`1_cand_concurrent` @ `bc746b98a`): **77.9 tok/s** wall (**+5.5% vs control**, `64.7` cold / **91.0 tok/s** warm; engine decode `92.3` / **142.4 tok/s**, prompt **`885` / `759 ms`**), hash `ece1433a582a4c38` (exact bitwise match)
+  - **Concurrent Decode (Slot 0: 256 tok) + Long Prefill & Decode (Slot 1: 4,712 prompt tok + 128 generated tok)**:
+    - Control (`0_prod_control`):
+      - Combined aggregate throughput: **46.2 tok/s** (`44.6` R1 / `47.9` R2; wall `8.61s` / `8.02s`)
+      - Slot 0 decode throughput during co-prefill: **33.7 tok/s** (`32.4` R1 / `35.0` R2; wall `7.89s` / `7.31s`)
+      - Slot 1 total latency: **7.97s** (`8.26s` R1 / `7.67s` R2); engine 4,712-token prompt read: `6,328 ms (744.7 tok/s)` R1 / `6,065 ms (776.9 tok/s)` R2; file-tier reads `12,459` blobs
+      - Co-prefill window telemetry (`80 windows`): `34.16 ms/window = run 29.67 (CUDA0 wait 15.47 + CPU experts 13.00) + commit 0.01 + emit 3.56 + adapt wait 0.92`, `46.4 rows/s`
+    - Candidate (`1_cand_concurrent` @ `bc746b98a`):
+      - Combined aggregate throughput: **49.4 tok/s** (**+6.9% vs control**, `48.2` R1 / **50.6 tok/s** R2; wall `7.96s` / **`7.59s` [−0.54s avg faster]**)
+      - Slot 0 decode throughput during co-prefill: **37.3 tok/s** (**+10.7% vs control**, `36.2` R1 / **38.5 tok/s** R2; wall `7.07s` / **`6.65s` [−0.74s avg faster]**)
+      - Slot 1 total latency: **7.43s** (**−6.8% vs control**, `7.61s` R1 / **`7.24s`** R2); engine 4,712-token prompt read: **`5,936 ms (793.7 tok/s)` R1 / `5,704 ms (826.1 tok/s)` R2 [−377 ms avg prompt read]**; file-tier reads **`7,380` blobs (−40.8%)**
+      - Co-prefill window telemetry (`75 windows`): **`31.07 ms/window` (−9.0% vs control)** = `run 28.66 (CUDA0 wait 16.47 + CPU experts 10.71 [−17.6% vs control]) + commit 0.01 + emit 2.21 [−37.9% vs control] + adapt wait 0.19 [−79.3% vs control]`, **`49.1 rows/s` (+5.8%)**
+  - **2-Slot Concurrent `2x256` Burst (`batch2`)**:
+    - Control (`0_prod_control`): mean **127.3 tok/s** aggregate (`126.0` R1 / `128.7` R2; per-slot **64.4 tok/s**; slot admission copies `48.7 + 3.3 ms` R1, `37.8 + 42.0 ms` R2; engine **135.5 / 150.7 rows/s**; `CPU experts 11.32 / 7.48 ms/window`, `emit 3.93 / 3.83 ms/window`, `adapt wait 3.85 / 3.61 ms/window`)
+    - Candidate (`1_cand_concurrent` @ `bc746b98a`): mean **135.8 tok/s** aggregate (**+6.7% / +8.5 tok/s vs control, +2.5% vs first CPU wave `0247ac749`**, **135.7 tok/s** R1 / **135.9 tok/s** R2; per-slot **68.8 tok/s [+6.7% vs control]**; slot admission copies **`20.9 + 14.1 ms` R1, `12.4 + 12.9 ms` R2 [−68.3% R2 admission latency]**; engine **145.5 / 155.6 rows/s [+7.4% R1 / +3.3% R2]**; **`CPU experts 10.55 / 6.85 ms/window [−8.4% warm vs control, −16.0% vs 8.15 ms pre-CPU]`**, **`emit 2.64 / 2.57 ms/window [−32.9% vs control]`**, **`adapt wait 1.03 / 1.09 ms/window [−71.6% vs control]`**, acceptance **350/160 = 218.8% R1, 345/165 = 209.1% R2**)
+
