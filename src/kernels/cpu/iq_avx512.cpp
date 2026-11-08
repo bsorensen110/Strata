@@ -39,9 +39,22 @@ inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); retur
 // lookups on a Ryzen 5 7600 (Zen 4 gathers are microcoded), so opt-in: STRATA_IQ_GATHER=1
 // 0.2.5: DEFAULT on where gathers are fast (Intel server and HEDT cores with AVX-512: cpu_gather_fast), off on Zen 4 (microcoded);
 // STRATA_IQ_GATHER=1 / 0 force it either way.  The same words are loaded, so the results are bit for bit the scalar decode's.
+// Fork measurement: on AMD Zen 5 sequential 256-bit half loads beat the gathers by 8-41% across the I-quant formats, so
+// the default is off on any AMD CPU (cpu_gather_fast() admits Zen 5).
+inline bool is_amd_cpu() noexcept {
+#if defined(_MSC_VER)
+    int r[4];
+    __cpuid(r, 0);
+    return (unsigned) r[1] == 0x68747541u;   // "Auth" ("AuthenticAMD")
+#else
+    unsigned a, b, c, d;
+    __cpuid(0, a, b, c, d);
+    return b == 0x68747541u;
+#endif
+}
 const bool gather = [] {
     const char* v = std::getenv("STRATA_IQ_GATHER");
-    return v != nullptr && v[0] != '\0' ? std::atoi(v) != 0 : cpu_gather_fast();
+    return v != nullptr && v[0] != '\0' ? std::atoi(v) != 0 : cpu_gather_fast() && !is_amd_cpu();
 }();
 // the grid lookups by one 64-bit gather of eight entries (IQ2_XXS / IQ2_XS / IQ2_S): `idx` = eight 32-bit indices
 inline __m512i gather64(__m256i idx, const void* grid) { return _mm512_i32gather_epi64(idx, grid, 8); }
