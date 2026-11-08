@@ -105,7 +105,9 @@ __global__ void gate(const float* attn, const float* __restrict__ q_full, float*
 }
 struct QsaQ81Block { half2 ds; int8_t qs[32]; };
 __global__ void gate_quantize_q8_1_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
-                                          QsaQ81Block* __restrict__ xq, int n_head, int head_dim) {
+                                          QsaQ81Block* __restrict__ xq, int n_head, int head_dim,
+                                          int* __restrict__ bm, int* __restrict__ pm, float* __restrict__ dl,
+                                          int n_in, int cp) {
 #pragma clang fp contract(off)
     const std::size_t i = std::size_t(blockIdx.x) * blockDim.x + threadIdx.x;
     const std::size_t count = std::size_t(n_head) * head_dim;
@@ -123,8 +125,22 @@ __global__ void gate_quantize_q8_1_kernel(const float* __restrict__ attn, const 
     for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
     if (i < count) {
         const float d = q8_1_finite(q81_div(amax, 127.0f));
-        xq[i / 32].qs[i % 32] = q8_1_quant(xi, d, amax);
-        if (i % 32 == 0) xq[i / 32].ds = q8_1_ds(d, sum);
+        const int8_t q = q8_1_quant(xi, d, amax);
+        xq[i / 32].qs[i % 32] = q;
+        const auto ds = q8_1_ds(d, sum);
+        if (i % 32 == 0) xq[i / 32].ds = ds;
+        if (bm != nullptr) {
+            const int lane = int(threadIdx.x) & 31;
+            unsigned v = unsigned(uint8_t(q)) << (8 * (lane & 3));
+            v |= __shfl_xor_sync(0xffffffffu, v, 1);
+            v |= __shfl_xor_sync(0xffffffffu, v, 2);
+            const int nb = n_in / 32, c = int(i / std::size_t(n_in)), b = int((i - std::size_t(c) * n_in) / 32), pp = lane >> 2;
+            if ((lane & 3) == 0) {
+                bm[(std::size_t(b) * 8 + pp) * cp + c] = int(v);
+                pm[(std::size_t(pp) * nb + b) * cp + c] = int(v);
+            }
+            if (lane == 0) dl[std::size_t(b) * cp + c] = __low2float(ds);
+        }
     }
 }
 std::size_t elements(int cols, int rows) {
@@ -192,12 +208,23 @@ void native_qsa_gate_apply(const float* attn, const float* q_full, float* output
     check_launch();
 }
 void native_qsa_gate_quantize_q8_1(const float* attn, const float* q_full, void* x_q8_1,
-                                   int n_head, int head_dim, void* stream) {
+                                   int n_head, int head_dim, void* stream, void* x_il, int ncols) {
     const auto count = elements(head_dim, n_head);
     if (head_dim % 32 != 0 || !stream || !valid(attn, count * 4) || !valid(q_full, count * 8) || !x_q8_1)
         throw std::invalid_argument("native_qsa_gate_quantize_q8_1 requires head_dim % 32 == 0 and valid buffers");
+    int *bm = nullptr, *pm = nullptr;
+    float* dl = nullptr;
+    int n_in = 0, cp = 0;
+    if (x_il != nullptr && ncols >= 2 && ncols <= 8 && (n_head % ncols) == 0) {
+        n_in = (n_head / ncols) * head_dim;
+        cp = ncols <= 2 ? 2 : (ncols <= 4 ? 4 : 8);
+        const std::size_t words = std::size_t(n_in / 32) * 8 * std::size_t(cp);
+        bm = static_cast<int*>(x_il);
+        pm = bm + words;
+        dl = reinterpret_cast<float*>(bm + 2 * words);
+    }
     gate_quantize_q8_1_kernel<<<unsigned((count + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
-        attn, q_full, static_cast<QsaQ81Block*>(x_q8_1), n_head, head_dim);
+        attn, q_full, static_cast<QsaQ81Block*>(x_q8_1), n_head, head_dim, bm, pm, dl, n_in, cp);
     check_launch();
 }
 } // namespace strata::kernels

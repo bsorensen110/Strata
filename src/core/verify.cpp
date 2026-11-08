@@ -1836,7 +1836,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const char* e = std::getenv("STRATA_GDN_GROUPS_QFUSE");
                     return !e || e[0] != '0';
                 }();
-                const bool use_quant_il_wout = n >= 2 && n <= 4 && qil_on() && g_mmvq_il() &&
+                const bool use_quant_il_wout = n >= 2 && n <= 8 && qil_on() && g_mmvq_il() &&
                                                strata::kernels::native_mmvq_il_supported(wout->native_type, n, (int) N);
                 bool gdn_q_done = false;
                 if (batch_rec_ && gdn_groups_on && n_gdn_groups >= 1 && n_gdn_groups <= 8) {
@@ -2269,13 +2269,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const char* e = std::getenv("STRATA_QSA_GATE_QFUSE");
                     return !e || e[0] != '0';
                 }();
-                const bool use_quant_il_wo = n >= 2 && n <= 4 && qil_on() && g_mmvq_il() &&
+                const bool use_quant_il_wo = n >= 2 && n <= 8 && qil_on() && g_mmvq_il() &&
                                              strata::kernels::native_mmvq_il_supported(wo->native_type, n, (int) N);
-                const bool fuse_gate_q8 = qb && qsa_gate_qfuse && (HD % 32) == 0 && !use_quant_il_wo;
+                const bool fuse_gate_q8 = qb && qsa_gate_qfuse && (HD % 32) == 0;
                 if (fuse_gate_q8) {
                     native_qsa_gate_quantize_q8_1(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, xq_,
-                                                  (int) (n * NH), (int) HD, cs);
-                    il_ready = false;
+                                                  (int) (n * NH), (int) HD, cs,
+                                                  use_quant_il_wo ? (void*) xil_ : nullptr, use_quant_il_wo ? n : 0);
+                    il_ready = use_quant_il_wo;
                 } else if (qb) {
                     native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
                                           (int) (n * NH), (int) HD, cs);
