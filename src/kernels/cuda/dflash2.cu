@@ -505,7 +505,7 @@ void launch_gemm8_ncols(int rows, cudaStream_t st, const Df2Segs& segs, const in
 // the arithmetic of gemm8_kernel (lane l's partial sums run over the same steps in the same order, the same shuffle tree), so the result is bitwise the same;
 // what changes is the number of warps in flight: the small matrices (fc 2560 rows = 320 groups, the 640-row convolution kernels) fill only a third of the
 // card with one warp per group, and a warp that waits for its 4 KB step per row stalls the group.
-template <int WARPS, int R, int UNR, int MAX_COLS = 8>
+template <int WARPS, int R, int UNR, int MAX_COLS = 8, bool EXACT = false>
 __global__ void __launch_bounds__(WARPS * 32) gemm_rows_kernel(Df2Segs segs, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n_in, int ncols) {
     constexpr int SUBS = 8 / R;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -533,10 +533,10 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_rows_kernel(Df2Segs segs, con
         }
         float xs[MAX_COLS];
 #pragma unroll
-        for (int c = 0; c < MAX_COLS; ++c) xs[c] = (c < ncols) ? xd[(size_t) c * nb + st * 16 + (lane >> 1)] : 0.0f;
+        for (int c = 0; c < MAX_COLS; ++c) xs[c] = (EXACT || c < ncols) ? xd[(size_t) c * nb + st * 16 + (lane >> 1)] : 0.0f;
 #pragma unroll
         for (int c = 0; c < MAX_COLS; ++c) {
-            if (c >= ncols) break;
+            if (!EXACT && c >= ncols) break;
             const int4 x = xv[(size_t) c * (n_in / 16) + st * 32];
 #pragma unroll
             for (int r = 0; r < R; ++r) {
@@ -558,8 +558,25 @@ __global__ void __launch_bounds__(WARPS * 32) gemm_rows_kernel(Df2Segs segs, con
             v += __shfl_xor_sync(0xffffffffu, v, 4);
             v += __shfl_xor_sync(0xffffffffu, v, 2);
             v += __shfl_xor_sync(0xffffffffu, v, 1);
-            if (lane == 0 && c < ncols) sg.y[(size_t) c * sg.n_out + row0 + sub * R + r] = v;
+            if (lane == 0 && (EXACT || c < ncols)) sg.y[(size_t) c * sg.n_out + row0 + sub * R + r] = v;
         }
+}
+
+template <int W, int R, int U>
+static void launch_gemm_rows_ncols(int rows, cudaStream_t st, const Df2Segs& segs, const int8_t* xqp, const float* xd, int n_in, int ncols) {
+    const unsigned grid = (rows / 8) * (8 / R) / W, blk = W * 32;
+    switch (ncols) {
+        case 1:  gemm_rows_kernel<W, R, U, 1,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 1); break;
+        case 2:  gemm_rows_kernel<W, R, U, 2,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 2); break;
+        case 3:  gemm_rows_kernel<W, R, U, 3,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 3); break;
+        case 4:  gemm_rows_kernel<W, R, U, 4,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 4); break;
+        case 5:  gemm_rows_kernel<W, R, U, 5,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 5); break;
+        case 6:  gemm_rows_kernel<W, R, U, 6,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 6); break;
+        case 7:  gemm_rows_kernel<W, R, U, 7,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 7); break;
+        case 8:  gemm_rows_kernel<W, R, U, 8,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 8); break;
+        case 16: gemm_rows_kernel<W, R, U, 16, true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 16); break;
+        default: gemm_rows_kernel<W, R, U, 16, false><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
+    }
 }
 
 // ---- Q4_0 variant of the same GEMM (opt-in drafter pack, dtype "q4_0"; a weight is 4 bits, the activations stay int8)
@@ -633,7 +650,7 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_kernel(Df2Segs segs, const i
 // The Q4_0 GEMM with R rows a warp (R = 4, 2, 1) instead of 8, as gemm_rows_kernel is to gemm8_kernel: a group of 8 rows is shared by 8 / R warps, each reading only its
 // rows' nibbles and scales; every output keeps the arithmetic of gemm4_kernel (same steps in the same order per lane, the same xsum and shuffle tree), so the result is bitwise
 // the same.  The activations' per-column sum is recomputed by each of the group's warps (4 dp4a a column and step).
-template <int WARPS, int R, int UNR, int MAX_COLS = 8>
+template <int WARPS, int R, int UNR, int MAX_COLS = 8, bool EXACT = false>
 __global__ void __launch_bounds__(WARPS * 32) gemm4_rows_kernel(Df2Segs segs, const int8_t* __restrict__ xq, const float* __restrict__ xd, int n_in, int ncols) {
     constexpr int SUBS = 8 / R;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -662,10 +679,10 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_rows_kernel(Df2Segs segs, co
         }
         float xs[MAX_COLS];
 #pragma unroll
-        for (int c = 0; c < MAX_COLS; ++c) xs[c] = (c < ncols) ? xd[(size_t) c * nb + st * 16 + (lane >> 1)] : 0.0f;
+        for (int c = 0; c < MAX_COLS; ++c) xs[c] = (EXACT || c < ncols) ? xd[(size_t) c * nb + st * 16 + (lane >> 1)] : 0.0f;
 #pragma unroll
         for (int c = 0; c < MAX_COLS; ++c) {
-            if (c >= ncols) break;
+            if (!EXACT && c >= ncols) break;
             const int4 x = xv[(size_t) c * (n_in / 16) + st * 32];
             int xsum = STRATA_DP4A(0x01010101, x.x, 0);
             xsum = STRATA_DP4A(0x01010101, x.y, xsum);
@@ -691,8 +708,25 @@ __global__ void __launch_bounds__(WARPS * 32) gemm4_rows_kernel(Df2Segs segs, co
             v += __shfl_xor_sync(0xffffffffu, v, 4);
             v += __shfl_xor_sync(0xffffffffu, v, 2);
             v += __shfl_xor_sync(0xffffffffu, v, 1);
-            if (lane == 0 && c < ncols) sg.y[(size_t) c * sg.n_out + row0 + sub * R + r] = v;
+            if (lane == 0 && (EXACT || c < ncols)) sg.y[(size_t) c * sg.n_out + row0 + sub * R + r] = v;
         }
+}
+
+template <int W, int R, int U>
+static void launch_gemm4_rows_ncols(int rows, cudaStream_t st, const Df2Segs& segs, const int8_t* xqp, const float* xd, int n_in, int ncols) {
+    const unsigned grid = (rows / 8) * (8 / R) / W, blk = W * 32;
+    switch (ncols) {
+        case 1:  gemm4_rows_kernel<W, R, U, 1,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 1); break;
+        case 2:  gemm4_rows_kernel<W, R, U, 2,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 2); break;
+        case 3:  gemm4_rows_kernel<W, R, U, 3,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 3); break;
+        case 4:  gemm4_rows_kernel<W, R, U, 4,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 4); break;
+        case 5:  gemm4_rows_kernel<W, R, U, 5,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 5); break;
+        case 6:  gemm4_rows_kernel<W, R, U, 6,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 6); break;
+        case 7:  gemm4_rows_kernel<W, R, U, 7,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 7); break;
+        case 8:  gemm4_rows_kernel<W, R, U, 8,  true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 8); break;
+        case 16: gemm4_rows_kernel<W, R, U, 16, true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 16); break;
+        default: gemm4_rows_kernel<W, R, U, 16, false><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
+    }
 }
 
 // quantize one 32-block of one row to the planar activation layout (a warp: lane = element)
@@ -1437,7 +1471,7 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
             DF2_ROWS4_CASE(14, 8, 1, 2)
             DF2_ROWS4_CASE(15, 4, 2, 4)
             DF2_ROWS4_CASE(16, 4, 1, 4)
-            DF2_ROWS4_CASE(17, 2, 2, 2)
+            case 17: launch_gemm4_rows_ncols<2, 2, 2>(rows, st, segs, xqp, xd, n_in, ncols); break;
             DF2_ROWS4_CASE(18, 8, 1, 4)
             DF2_ROWS4_CASE(19, 4, 4, 4)
             DF2_ROWS4_CASE(20, 4, 1, 8)
@@ -1446,12 +1480,12 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
             DF2_ROWS4_CASE(23, 2, 1, 4)
             DF2_ROWS4_CASE(24, 1, 2, 2)
             DF2_ROWS4_CASE(25, 1, 4, 2)
-            DF2_ROWS4_CASE(26, 2, 2, 1)
+            case 26: launch_gemm4_rows_ncols<2, 2, 1>(rows, st, segs, xqp, xd, n_in, ncols); break;
             DF2_ROWS4_CASE(27, 2, 4, 2)
             DF2_ROWS4_CASE(28, 1, 1, 2)
             DF2_ROWS4_CASE(29, 1, 2, 4)
             DF2_ROWS4_CASE(30, 2, 2, 4)
-            DF2_ROWS4_CASE(31, 1, 1, 1)
+            case 31: launch_gemm4_rows_ncols<1, 1, 1>(rows, st, segs, xqp, xd, n_in, ncols); break;
             DF2_ROWS4_CASE(32, 1, 1, 4)
             DF2_ROWS4_CASE(33, 1, 1, 8)
             DF2_ROWS4_CASE(34, 2, 1, 2)
@@ -1484,17 +1518,17 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
                                             : (rows % 32 == 0 ? 1 : 2);
 #define DF2_ROWS_CASE(V, W, R, U) case V: if (ncols <= 8) gemm_rows_kernel<W, R, U, 8><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); else gemm_rows_kernel<W, R, U, 16><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
     switch (variant) {
-        DF2_ROWS_CASE(10, 4, 4, 2)
+        case 10: launch_gemm_rows_ncols<4, 4, 2>(rows, st, segs, xqp, xd, n_in, ncols); break;
         DF2_ROWS_CASE(11, 4, 2, 2)
         DF2_ROWS_CASE(12, 4, 1, 2)
-        DF2_ROWS_CASE(13, 8, 2, 2)
+        case 13: launch_gemm_rows_ncols<8, 2, 2>(rows, st, segs, xqp, xd, n_in, ncols); break;
         DF2_ROWS_CASE(14, 8, 1, 2)
         DF2_ROWS_CASE(15, 4, 2, 4)
         DF2_ROWS_CASE(16, 4, 1, 4)
         DF2_ROWS_CASE(17, 2, 2, 2)
         DF2_ROWS_CASE(18, 8, 1, 4)
         DF2_ROWS_CASE(19, 4, 4, 4)
-        DF2_ROWS_CASE(20, 4, 1, 8)
+        case 20: launch_gemm_rows_ncols<4, 1, 8>(rows, st, segs, xqp, xd, n_in, ncols); break;
         DF2_ROWS_CASE(21, 8, 1, 8)
         DF2_ROWS_CASE(22, 8, 2, 4)
         DF2_ROWS_CASE(23, 2, 1, 4)
