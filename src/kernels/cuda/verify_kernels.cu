@@ -343,6 +343,8 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         beta += (size_t) f * h_v;
         z += (size_t) f * S * h_v;
         y += (size_t) f * S * h_v;
+        if constexpr (Q) xq += (size_t) (f - t_out_begin) * (S * h_v / 32);
+        t_out_begin = 0;
         T = grp.ntok[gi];
         n_keep = grp.keep[gi];
     }
@@ -421,7 +423,7 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
             const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
             const float scale = rsqrtf(ss / (float) S + eps);
             const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
-            y[(size_t) t * value_dim + head * S + col] = yv;
+            if (!(Q && grp.n > 0)) y[(size_t) t * value_dim + head * S + col] = yv;
             if constexpr (Q) gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
         }
     }
@@ -1303,7 +1305,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
-                          void* stream) {
+                          void* stream, int t_out_begin, void* xq_out) {
     if (groups.n < 1 || groups.n > 8 || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k) {
         std::fprintf(stderr, "gdn_step_norm_groups: invalid arguments\n");
         std::exit(1);
@@ -1314,11 +1316,15 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
             std::exit(1);
         }
     const dim3 g1((unsigned) h_v, (unsigned) groups.n), b1(S, RG);
+    GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);
     // the kernel gdn_step_norm_multi picks for these calls: a window's rows (all outputs, no keep) or a commit of
     // one-row groups (keep, t_out_begin 0)
     if (commit)
         gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
             nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+    else if (xq != nullptr)
+        gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+            nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, t_out_begin, xq, groups);
     else
         gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
             nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
@@ -1740,6 +1746,37 @@ void wait_copy_i32_from_mapped(const uint32_t* flag, uint32_t value, int32_t* ds
                                void* stream) {
     wait_copy_i32_kernel<<<1, 128, 0, (cudaStream_t) stream>>>(flag, value, dst, src, (int) n);
     check("wait_copy_i32_from_mapped");
+}
+
+namespace {
+__global__ void copy_step_pos_from_mapped_kernel(int32_t* __restrict__ step, int32_t* __restrict__ pos,
+                                                 const volatile int32_t* __restrict__ m_step,
+                                                 int T, int MT, int NH, int NKV, int IQ) {
+    const int tid = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    const int stride = (int) gridDim.x * (int) blockDim.x;
+    const int n_step = T * 4;
+    for (int i = tid; i < n_step; i += stride) step[i] = m_step[i];
+    int32_t* pk = pos + (size_t) MT * NH;
+    int32_t* pi = pk + (size_t) MT * NKV;
+    const int total_h = NH + NKV + IQ;
+    const int total = T * total_h;
+    for (int i = tid; i < total; i += stride) {
+        const int t = i / total_h;
+        const int rem = i - t * total_h;
+        const int32_t p = m_step[t * 4];
+        if (rem < NH) pos[(size_t) t * NH + rem] = p;
+        else if (rem < NH + NKV) pk[(size_t) t * NKV + (rem - NH)] = p;
+        else pi[(size_t) t * IQ + (rem - NH - NKV)] = p;
+    }
+}
+}  // namespace
+
+void copy_step_pos_from_mapped(int32_t* step, int32_t* pos, const int32_t* m_step, int T, int MT, int NH, int NKV,
+                               int IQ, void* stream) {
+    if (T <= 0) return;
+    copy_step_pos_from_mapped_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(
+        step, pos, (const volatile int32_t*) m_step, T, MT, NH, NKV, IQ);
+    check("copy_step_pos_from_mapped");
 }
 
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {

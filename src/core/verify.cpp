@@ -1456,7 +1456,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
     // S26 STRATA_LFUSE=1: where the shared expert's gate / scale fusions apply (the paths they replace are the ones taken)
     auto lfuse_on = [&](int n) {
-        return g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= 8 &&
+        return g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= kVerifyMaxT &&
                shared_expert_native_bf16_enabled();
     };
     bool sg_gated_[2] = {false, false};   // per group: the combine applies the shared gate
@@ -1506,8 +1506,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         in_s = df_side_[1];
         inputs_pending = true;
     }
-    copy_i32_from_mapped(step_, m_step_, (int64_t) T * kStepCount, in_s);
-    copy_i32_from_mapped(pos_, m_pos_, (int64_t) MT * (NH + NKV + IQ), in_s);
+    copy_step_pos_from_mapped(step_, pos_, m_step_, T, (int) MT, (int) NH, (int) NKV, (int) IQ, in_s);
     // per-ROW positions of the K rows [t][NKV] and the indexer query rows [t][IQ] (for batched RoPE)
     const int32_t* pos_k = pos_ + MT * NH;
     const int32_t* pos_i = pos_ + MT * (NH + NKV);
@@ -1706,7 +1705,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // bytes): Turing default (+0.5..+1 % decode, two launches fewer per GDN layer and per QSA layer); STRATA_QIL=0 / 1
         // forces it off / on
         auto quant_in = [&](const float* x, int n_in) {
-            if (qil_on() && n >= 2 && n <= 4 && g_mmvq_il()) {   // (c): the plain blocks and their interleaved copy, one launch
+            if (qil_on() && n >= 2 && n <= 8 && g_mmvq_il()) {   // (c): the plain blocks and their interleaved copy, one launch
                 strata::kernels::native_quantize_q8_1_il(x, xq_, xil_, n_in, n, cs);
                 il_ready = true;
                 return;
@@ -1835,6 +1834,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         ++n_gdn_groups;
                     }
                 }
+                static const bool gdn_groups_qfuse = [] {
+                    const char* e = std::getenv("STRATA_GDN_GROUPS_QFUSE");
+                    return !e || e[0] != '0';
+                }();
+                const bool use_quant_il_wout = n >= 2 && n <= 8 && qil_on() && g_mmvq_il() &&
+                                               strata::kernels::native_mmvq_il_supported(wout->native_type, n, (int) N);
+                bool gdn_q_done = false;
                 if (batch_rec_ && gdn_groups_on && n_gdn_groups >= 1 && n_gdn_groups <= 8) {
                     strata::kernels::GdnGroups gg;
                     for (int t = tb; t < te;) {
@@ -1847,8 +1853,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         gg.keep[gg.n] = keep_rows ? one_ : nullptr;   // STRATA_BATCH_SELF_COMMIT: the window keeps its one-row groups itself
                         ++gg.n;
                     }
+                    gdn_q_done = gdn_groups_qfuse && !use_quant_il_wout;
                     strata::kernels::gdn_step_norm_groups(gg, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS,
-                                                          y_, (int) HK, (int) HV, keep_rows, cs);
+                                                          y_, (int) HK, (int) HV, keep_rows, cs, tb,
+                                                          gdn_q_done ? (void*) xq_ : nullptr);
                 } else
                 if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
                     for (int t = tb; t < te;) {
@@ -1861,13 +1869,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                             (const float*) wnm->data, EPS, y_ + (size_t) first * ZV,
                                             (int) HK, (int) HV, t - first, keep_rows ? one_ : nullptr, cs, 0);
                     }
-                } else
-                gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                    (int) HV, te, self_commit ? one_ : nullptr, cs, tb, g_qfuse() ? (void*) xq_ : nullptr);
+                } else {
+                    gdn_q_done = g_qfuse();
+                    gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
+                                        (int) HV, te, self_commit ? one_ : nullptr, cs, tb, gdn_q_done ? (void*) xq_ : nullptr);
+                }
                 stamp(l, 6, grp);
-                // STRATA_QFUSE: done above by gdn_step_norm_multi - but a batch's per-slot recurrence passes it no q8_1
-                // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
-                if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
+                // STRATA_QFUSE / STRATA_GDN_GROUPS_QFUSE: done above by gdn_step_norm_groups / gdn_step_norm_multi
+                if (!gdn_q_done) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
             } else {
@@ -2258,9 +2267,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 13, grp);
                 if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
-                if (qb) native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
-                                              (int) (n * NH), (int) HD, cs);
-                else
+                static const bool qsa_gate_qfuse = [] {
+                    const char* e = std::getenv("STRATA_QSA_GATE_QFUSE");
+                    return !e || e[0] != '0';
+                }();
+                const bool use_quant_il_wo = n >= 2 && n <= 8 && qil_on() && g_mmvq_il() &&
+                                             strata::kernels::native_mmvq_il_supported(wo->native_type, n, (int) N);
+                const bool fuse_gate_q8 = qb && qsa_gate_qfuse && (HD % 32) == 0;
+                if (fuse_gate_q8) {
+                    native_qsa_gate_quantize_q8_1(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, xq_,
+                                                  (int) (n * NH), (int) HD, cs,
+                                                  use_quant_il_wo ? (void*) xil_ : nullptr, use_quant_il_wo ? n : 0);
+                    il_ready = use_quant_il_wo;
+                } else if (qb) {
+                    native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
+                                          (int) (n * NH), (int) HD, cs);
+                } else
                 for (int t = tb; t < te; ++t) {
                     if (native_qsa_enabled())
                         native_qsa_gate_apply(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, attn32_ + t * NH * HD,
@@ -2269,7 +2291,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         qsa_gate_apply_f32(attn_ + t * NH * HD, qfull_ + t * NH * 2 * HD, s, attn32_ + t * NH * HD, cs);
                 }
                 stamp(l, 14, grp);
-                quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
+                if (!fuse_gate_q8) quant_in(attn32_ + tb * NH * HD, (int) (NH * HD));
                 mm(wo, bo_ + tb * N, (int) (NH * HD), (int) N);
             }
         } catch (const std::exception& e) {
@@ -2297,8 +2319,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
         // S26 STRATA_LFUSE=1: the shared expert's gate row rides in the router GEMV launch, its sigmoid + row scale
-        // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
-        const bool sg_aux_ok = dec_batch && n > 1 && n <= 8 && shared_expert_native_bf16_enabled() && g_lfuse_gate() &&
+        // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-16 rows)
+        const bool sg_aux_ok = dec_batch && n > 1 && n <= kVerifyMaxT && shared_expert_native_bf16_enabled() && g_lfuse_gate() &&
                                (!sh_fork || sh_fork_late);
         const WeightRef* w_sgi = sg_aux_ok ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_aux = false;
@@ -2401,7 +2423,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             try {
                 const bool can_hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && dec_batch && n > 1 &&
-                                                 native_moe_combine_enabled() && n <= 8 &&
+                                                 native_moe_combine_enabled() && n <= kVerifyMaxT &&
                                                  native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
                 const bool sg_ready = sg_aux && (lfuse_on(n) || (g_lfuse() && can_hits_in_combine));
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
@@ -2541,7 +2563,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             } else {
                 // 143-amdk: the add of the GPU's hit rows is done by the combine that follows (one launch fewer)
                 hits_in_combine = fuse_hits_on() && !prof_on_ && !remote_opt_ && dec_batch && n > 1 &&
-                                  native_moe_combine_enabled() && n <= 8 &&
+                                  native_moe_combine_enabled() && n <= kVerifyMaxT &&
                                   native_moe_combine_hits_supported(parts_ + (size_t) tb * K * N, shared_ + tb * N, bo_ + tb * N, N, K, n);
                 const bool fuse_rows = fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr;   // 143-amdk
                 if (!fuse_rows) {
@@ -2725,13 +2747,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (head_ != nullptr && head_->loaded()) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
-                if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
-                if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_)) {
-                    if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
+                const bool use_head_il = g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_);
+                if (!q8_head && use_head_il && qil_on() && HT >= 2 && HT <= 8) {
+                    strata::kernels::native_quantize_q8_1_il(head_mixed_ + (size_t) h0 * N, xq_, xil_, (int) N, HT, cs);
                     strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, hl, (int) N,
                                                     (int) n_vocab_, (int) HT, cs);
-                } else
-                native_mmvq(head_->type(), head_->weights(), xq_, hl, (int) N, (int) n_vocab_, HT, cs);
+                } else {
+                    if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
+                    if (use_head_il) {
+                        if (HT >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
+                        strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, hl, (int) N,
+                                                        (int) n_vocab_, (int) HT, cs);
+                    } else
+                        native_mmvq(head_->type(), head_->weights(), xq_, hl, (int) N, (int) n_vocab_, HT, cs);
+                }
             } catch (const std::exception& e) {
                 err = std::string("verify head: ") + e.what();
                 return false;
@@ -3170,15 +3199,9 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
-    int32_t* const pk = h_pos_ + (size_t) max_t_ * g.n_head;
-    int32_t* const pi = pk + (size_t) max_t_ * g.n_head_kv;
     for (int t = 0; t < T; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos0 + t, s);
-        const int32_t pos_t = (int32_t) (pos0 + t);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = pos_t;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = pos_t;
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = pos_t;
     }
     *(volatile uint32_t*) h_seq_ = 0;
     *(volatile uint32_t*) h_flag_ = 0;
@@ -3602,6 +3625,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cur_layer_ = want - 1;
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
+        if (grp == 0 && taps_ready_cb_ != nullptr && !tap_layers_.empty() && l == (int64_t) tap_layers_.back() + 1) {
+            int64_t pos_buf[kVerifyLongT];
+            for (int r = 0; r < T; ++r) pos_buf[r] = pos0 + r;
+            taps_ready_cb_(taps_ready_user_, tap_dev_, T, pos_buf);
+        }
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (pool != nullptr)
@@ -3686,6 +3714,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return false;
     }
 #endif
+    if (post_layers_cb_ != nullptr) post_layers_cb_(post_layers_user_);
     trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
@@ -4172,9 +4201,96 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                 copy_i32_from_mapped(commitb_ + (size_t) rows[t] * CB, m_commitb_ + (size_t) rows[t] * CB, CB, cs_);
         int64_t qsa_index = 0, gdn_index = 0;
         for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa_index : gdn_index) += 1;
+#if defined(STRATA_GPU_METAL)
+        static const bool commit_batch = false;
+#else
+        static const bool commit_batch = [] { const char* e = std::getenv("STRATA_COMMIT_BATCH"); return !e || e[0] != '0'; }();
+#endif
+        bool gdn_batched = false;
+        if (commit_batch) {
+            int64_t n_gdn = 0;
+            bool norms_ok = true;
+            for (int64_t l = lb_; l < le_ && norms_ok; ++l)
+                if (!is_qsa_layer(g, l)) {
+                    ++n_gdn;
+                    norms_ok = need(LayerView(*wt_, l), "ssm_norm.weight", err) != nullptr;
+                }
+            if (!norms_ok) ok = false;
+            else if (n_gdn > 0) {
+                gdn_batched = true;
+                for (int t = 0; t < S && gdn_batched;) {
+                    const int first = t;
+                    while (t < S && rows[t] == rows[first]) ++t;
+                    SessionState& sx = *slots_[(size_t) rows[first]];
+                    const int32_t* keep = commitb_ + (size_t) rows[first] * CB;
+                    gdn_batched = gdn_commit_layers(
+                        sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
+                        (int64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size,
+                        qkv_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, MT * C,
+                        h_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, MT * C,
+                        gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
+                        beta_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV, MT * HV,
+                        (int) C, (int) g.ssm_k_heads, (int) HV, t - first, (int) n_gdn, keep, cs_);
+                }
+            }
+        }
+        bool qsa_batched = false;
+        if (commit_batch && ok && !g_no_batch_kv) {
+            bool all_fits = true;
+            for (int t = 0; t < S && all_fits;) {
+                const int first = t;
+                while (t < S && rows[t] == rows[first]) ++t;
+                SessionState& sx = *slots_[(size_t) rows[first]];
+                int nq = 0;
+                int64_t mc = -1;
+                for (int64_t l = lb_, qi = qsa_index; l < le_ && all_fits; ++l) {
+                    if (!is_qsa_layer(g, l)) continue;
+                    const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+                    if (!wikn) { ok = false; all_fits = false; break; }
+                    const QsaState& st = sx.qsa_states[qi];
+                    if (nq >= QsaIndexerLayers::kMax || (mc >= 0 && st.max_cells != mc)) { all_fits = false; break; }
+                    mc = st.max_cells;
+                    ++nq;
+                    ++qi;
+                }
+            }
+            if (ok && all_fits) {
+                for (int t = 0; t < S;) {
+                    const int first = t;
+                    while (t < S && rows[t] == rows[first]) ++t;
+                    SessionState& sx = *slots_[(size_t) rows[first]];
+                    const int32_t* keep = commitb_ + (size_t) rows[first] * CB;
+                    QsaIndexerLayers il;
+                    int nq = 0;
+                    int64_t mc = -1;
+                    for (int64_t l = lb_, qi = qsa_index; l < le_; ++l) {
+                        if (!is_qsa_layer(g, l)) continue;
+                        const WeightRef* wikn = need(LayerView(*wt_, l), "indexer.k_norm.weight", err);
+                        const QsaState& st = sx.qsa_states[qi];
+                        mc = st.max_cells;
+                        il.gamma[nq] = (const float*) wikn->data;
+                        il.tail_src[nq] = tail_snap_b_ + ((size_t) rows[first] * nQ + qi) * TS;
+                        il.tail[nq] = st.idx_tail; il.dead[nq] = st.idx_dead; il.pooled[nq] = st.idx_pooled;
+                        il.block_pos[nq] = st.idx_block_pos;
+                        ++nq;
+                        ++qi;
+                    }
+                    if (nq > 0) {
+                        native_qsa_indexer_append_steps_layers(
+                            idx_raw_L_ + (size_t) (qsa_index * MT + first) * ID, MT * ID, keep + 2, 1,
+                            t - first, 0, EPS, il, nq, s, mc, rope_scaling(), cs_);
+                    }
+                }
+                qsa_batched = true;
+            }
+        }
         for (int64_t l = lb_; l < le_ && ok; ++l) {
             const LayerView v(*wt_, l);
-            if (!is_qsa_layer(g, l)) {
+            if (is_qsa_layer(g, l) && qsa_batched) {
+                ++qsa_index;
+            } else if (!is_qsa_layer(g, l) && gdn_batched) {
+                ++gdn_index;
+            } else if (!is_qsa_layer(g, l)) {
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
                 // STRATA_BATCH_GDN_GROUPS=1 (default on HIP): one-row groups (no --batch-mtp proposals) commit their recurrence
@@ -4741,11 +4857,6 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     for (int t = 0; t < S; ++t) {
         h_tok_[t] = tokens[t];
         qsa_step_fill(h_step_ + t * kStepCount, pos[t], s);
-        for (int64_t h = 0; h < g.n_head; ++h) h_pos_[t * g.n_head + h] = (int32_t) pos[t];
-        int32_t* pk = h_pos_ + (size_t) max_t_ * g.n_head;
-        int32_t* pi = pk + (size_t) max_t_ * g.n_head_kv;
-        for (int64_t h = 0; h < g.n_head_kv; ++h) pk[t * g.n_head_kv + h] = (int32_t) pos[t];
-        for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
     }
     ple_pending_b_ = false;
     if (ss_->ple.ready() && ple_stage()) {
@@ -4832,17 +4943,11 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     const ModelGeometry& g = *g_;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, 0, tokens, pos, err)) return false;
+    if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
+        !adapt_gate_wait((int32_t) g.n_layers, err)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, 0)], cs_);
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
     (void) cudaStreamQuery(cs_);
-    if (ple_pending_b_) {
-        const Clock::time_point tp = Clock::now();
-        ple_pending_b_ = false;
-        if (!ss_->ple.table->gather_batch(ple_rows_b_, (size_t) S, h_ple_, err)) return false;
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        strata_store_fence();
-        ms_host += ms_since(tp);
-    }
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int64_t steps = le_ - lb_;
@@ -4855,18 +4960,30 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     // resident at init takes the doorbell graph while a prompt loan/shrink/swap is in flight (ar_off_), and that
     // graph waits on host doorbells the skipped service never raises (GPU at 100%, host in the sync below).
     if (ar_on()) {
+        if (ple_pending_b_) {
+            const Clock::time_point tp = Clock::now();
+            ple_pending_b_ = false;
+            if (!ss_->ple.table->gather_batch(ple_rows_b_, (size_t) S, h_ple_, err)) return false;
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            strata_store_fence();
+            ms_host += ms_since(tp);
+        }
         if (ss_->ple.ready() && ple_stage()) {
             std::atomic_thread_fence(std::memory_order_seq_cst);
             strata_store_fence();
             *flag = 1;
         }
+        if (le_ >= g.n_layers && !sample_rows(S, err, false)) return false;
+        if (post_layers_cb_ != nullptr) post_layers_cb_(post_layers_user_);
         const cudaError_t se = cudaStreamSynchronize(cs_);
         if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-        cudaStreamSynchronize(copy_);
+        if (copy_used_) {
+            cudaStreamSynchronize(copy_);
+            copy_used_ = false;
+        }
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
-        if (!sample_rows(S, err)) return false;
         for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
         note_nonfinite(S, last_pos_b_);
         progress_at("decode");
@@ -4900,8 +5017,15 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         }
         strata_load_fence();   // as above, for the batch loop's wait
         const Clock::time_point b = Clock::now();
+        if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && l >= 0 &&
+            (size_t) l < adapt_gate_->has.size() && adapt_gate_->has[(size_t) l] != 0 &&
+            !adapt_gate_wait((int32_t) l, err)) return false;
         cur_layer_ = want - 1;
         set_plan_slot(0);
+        if (taps_ready_cb_ != nullptr && !tap_layers_.empty() && l == (int64_t) tap_layers_.back() + 1) {
+            // Let the verifier expose the finalized taps directly to the drafter on the same device.
+            taps_ready_cb_(taps_ready_user_, tap_dev_, S, pos);
+        }
         progress_at("verify batch: the CPU experts of layer", l);
         // The recorded graph consumes the helper mask and weighted sum just as
         // the solo graph does. Reset both and supply this layer's routing weights.
@@ -4909,6 +5033,12 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
         if (remote_opt_) remote_opt_->end();
         progress_tick();
+        if (k == 0 && ple_pending_b_) {
+            const Clock::time_point tp = Clock::now();
+            ple_pending_b_ = false;
+            if (!ss_->ple.table->gather_batch(ple_rows_b_, (size_t) S, h_ple_, err)) return false;
+            ms_host += ms_since(tp);
+        }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         strata_store_fence();
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
@@ -4925,13 +5055,17 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
+    if (le_ >= g.n_layers && !sample_rows(S, err, false)) return false;
+    if (post_layers_cb_ != nullptr) post_layers_cb_(post_layers_user_);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-    cudaStreamSynchronize(copy_);
+    if (copy_used_) {
+        cudaStreamSynchronize(copy_);
+        copy_used_ = false;
+    }
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
-    if (!sample_rows(S, err)) return false;
     for (int t = 0; t < S; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     note_nonfinite(S, last_pos_b_);
     progress_at("decode");
@@ -5035,50 +5169,75 @@ int Verifier::slot_row_draw(int S, int t, strata::kernels::SamplerParams& sp, co
     if ((sp.greedy || sp.temperature <= 0.0f) && !pen && !bias) return 0;   // a plain greedy slot keeps the window's argmax token untouched
     sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
     if (!pen) { sp.penalty_last_n = 0; return 1; }
-    std::vector<const int32_t*> tails(slots_.size(), nullptr);
-    std::vector<int64_t> n_tails(slots_.size(), 0);
-    for (size_t b = 0; b < slots_.size() && b < slot_tail_.size(); ++b) { tails[b] = slot_tail_[b].data(); n_tails[b] = (int64_t) slot_tail_[b].size(); }
     hlen = std::min(sp.penalty_last_n, kSlotHistMax);
     const size_t need = (size_t) S * (size_t) hlen;
-    hrows.assign(need, -1);
-    strata::kernels::slot_penalty_rows(last_rows_, last_tokens_, S, tails.data(), n_tails.data(), hlen, hrows.data());
-    const OnDevice on_hist(device_);
-    if (slot_hist_cap_ < need) {
-        if (slot_hist_d_ != nullptr) cudaFree(slot_hist_d_);
-        slot_hist_d_ = nullptr;
-        if (cudaMalloc((void**) &slot_hist_d_, need * sizeof(int32_t)) != cudaSuccess) { err = "verify batch: the penalty-history allocation failed"; return -1; }
-        slot_hist_cap_ = need;
-    }
+    if (hrows.size() != need) {
+        const int32_t* tails_stack[strata::kernels::kVerifyMaxT] = {};
+        int64_t n_tails_stack[strata::kernels::kVerifyMaxT] = {};
+        std::vector<const int32_t*> tails_vec;
+        std::vector<int64_t> n_tails_vec;
+        const int32_t** tails_ptr = tails_stack;
+        int64_t* n_tails_ptr = n_tails_stack;
+        if (slots_.size() > strata::kernels::kVerifyMaxT) {
+            tails_vec.assign(slots_.size(), nullptr);
+            n_tails_vec.assign(slots_.size(), 0);
+            tails_ptr = tails_vec.data();
+            n_tails_ptr = n_tails_vec.data();
+        }
+        for (size_t b = 0; b < slots_.size() && b < slot_tail_.size(); ++b) {
+            tails_ptr[b] = slot_tail_[b].data();
+            n_tails_ptr[b] = (int64_t) slot_tail_[b].size();
+        }
+        hrows.assign(need, -1);
+        strata::kernels::slot_penalty_rows(last_rows_, last_tokens_, S, tails_ptr, n_tails_ptr, hlen, hrows.data());
+        const OnDevice on_hist(device_);
+        if (slot_hist_cap_ < need) {
+            const size_t alloc_cap = std::max(need, (size_t) std::max(1, max_t_) * (size_t) kSlotHistMax);
+            if (slot_hist_d_ != nullptr) cudaFree(slot_hist_d_);
+            slot_hist_d_ = nullptr;
+            if (cudaMalloc((void**) &slot_hist_d_, alloc_cap * sizeof(int32_t)) != cudaSuccess) { err = "verify batch: the penalty-history allocation failed"; return -1; }
+            slot_hist_cap_ = alloc_cap;
+        }
 #if defined(STRATA_GPU_METAL)
-    if (cudaMemcpy(slot_hist_d_ + (size_t) t * (size_t) hlen, hrows.data() + (size_t) t * (size_t) hlen, (size_t) hlen * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
+        if (cudaMemcpy(slot_hist_d_, hrows.data(), need * sizeof(int32_t), cudaMemcpyHostToDevice) != cudaSuccess)
 #else
-    if (cudaMemcpyAsync(slot_hist_d_ + (size_t) t * (size_t) hlen, hrows.data() + (size_t) t * (size_t) hlen, (size_t) hlen * sizeof(int32_t),
-                        cudaMemcpyHostToDevice, cs_) != cudaSuccess)
+        if (cudaMemcpyAsync(slot_hist_d_, hrows.data(), need * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, cs_) != cudaSuccess)
 #endif
-    { err = "verify batch: the penalty-history copy failed"; return -1; }
+        { err = "verify batch: the penalty-history copy failed"; return -1; }
+    }
     hist = slot_hist_d_ + (size_t) t * (size_t) hlen;
     return 1;
 }
 
-bool Verifier::sample_rows(int S, std::string& err) {
+bool Verifier::sample_rows(int S, std::string& err, bool sync) {
 #if defined(STRATA_GPU_METAL)
     (void) S;
+    (void) sync;
     err = "verify batch: sample_rows is the CUDA / HIP path";
     return false;
 #else
     bool any = false;
-    std::vector<int32_t> hrows;
-    for (int t = 0; t < S; ++t) {
+    slot_hrows_.clear();
+    for (int t = 0; t < S;) {
         strata::kernels::SamplerParams sp;
         const int32_t* hist = nullptr;
         int hlen = 0;
-        const int r = slot_row_draw(S, t, sp, hist, hlen, hrows, err);
+        const int r = slot_row_draw(S, t, sp, hist, hlen, slot_hrows_, err);
         if (r < 0) return false;
-        if (r == 0) continue;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, hist, hlen, sp, m_out_ + t, cs_);
-        any = true;
+        int end = t + 1;
+        while (end < S && last_rows_[end] == last_rows_[t] &&
+               last_pos_b_[end] == last_pos_b_[t] + (int64_t) (end - t)) {
+            ++end;
+        }
+        if (r > 0) {
+            strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, end - t, (int) n_vocab_,
+                                           hist, hlen, sp, m_out_ + t, cs_);
+            any = true;
+        }
+        t = end;
     }
-    if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
+    if (sync && any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
     return true;
 #endif
 }

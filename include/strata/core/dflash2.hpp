@@ -81,7 +81,7 @@ public:
     bool clone_alloc(const Dflash2Drafter& parent, std::string& err);   ///< after the parent's load: streams and buffers (before the expert cache is sized)
     bool clone_bind(const Dflash2Drafter& parent, std::string& err);    ///< after the parent's bind: the shared head, embedding and the draft logits
     /// Copy another drafter's context (ring, tags, token history, epoch) exactly: a request that moves between the solo session and a batch slot.  Same card.
-    bool copy_state_from(Dflash2Drafter& src, std::string& err);
+    bool copy_state_from(Dflash2Drafter& src, std::string& err, bool already_synced = false, bool sync_after = true);
     /// A fixed device buffer [kRows][taps][n_embd] on this drafter's card: where a layer split's stages land their taps (Verifier::gather_taps) and the
     /// graphs are captured on it.  Allocated at load.
     float* landing() const { return landing_; }
@@ -180,6 +180,12 @@ public:
     bool draft_batch_slots_launch(const BatchSlotItem* items, int n_items, std::string& err);
     bool draft_batch_slots_finish(const BatchSlotItem* items, int n_items, std::string& err);
 
+    /// Precomputes the context projections (rope table, tap quantize, fc.weight, hidden_norm, and all layers' K/V
+    /// projections) on cs_ for `n_rows` verify rows while the target model finishes layers 46..47.
+    void precompute_batch_context(const float* taps_dev, int n_rows, const int64_t* pos) noexcept;
+    bool has_precomputed_context(const float* taps, int n_rows, int64_t pos0, int* out_off = nullptr) const noexcept;
+    void clear_precomputed_context() noexcept { precomp_taps_ = nullptr; precomp_rows_ = 0; }
+
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
 
@@ -219,9 +225,12 @@ private:
     bool record_block_body(cudaStream_t cs, std::string& err, bool rope = true);
     bool record_block(cudaStream_t cs, std::string& err, bool rope = true);
     bool record_batch_body(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err);
+    bool record_batch_body_precomp(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err, int total_rows = 0);
+    bool record_batch_head(int n_items, int total_rows, cudaStream_t cs, std::string& err);
     bool capture(int n, const float* taps, std::string& err);
     bool capture_body(int n, const float* taps, std::string& err);
     bool capture_batch_body(const BatchSlotItem* items, int n_items, std::string& err);
+    bool capture_batch_full(const BatchSlotItem* items, int n_items, int total_rows, std::string& err);
     bool alloc(std::string& err);
     struct Prof;
     Prof* prof_ = nullptr;
@@ -290,8 +299,14 @@ private:
     cudaGraphExec_t exec_[kRows + 1] = {};
     cudaGraphExec_t body_exec_[kRows + 1] = {};
     cudaGraphExec_t batch_body_exec_[kRows + 1][kRows + 1] = {};
+    cudaGraphExec_t batch_full_exec_[2 * kDrafts + 1] = {};
+    cudaGraphExec_t batch_full_1_exec_[2][kDrafts + 1] = {};
     Dflash2Drafter* batch_slots_[2] = {};
+    Dflash2Drafter* batch_full_1_slots_[2] = {};
     const float* batch_taps_[2] = {};
+    const float* precomp_taps_ = nullptr;
+    int precomp_rows_ = 0;
+    int32_t precomp_pos_[4 * kRows] = {};
     const float* graph_taps_ = nullptr;
     int ndraft_ = kDrafts;          ///< drafts a window can use (set_max_drafts)
     int64_t have_ctx_ = 0;
@@ -325,7 +340,8 @@ private:
     bool rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* missing, std::string& err);
     void stash_push(Lineage&& l);
     void invalidate_ring();                    ///< a new epoch: every slot is stale, the shadow forgets them
-    bool record_kv(int n, cudaStream_t cs, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err);
+    bool record_kv(int n, cudaStream_t cs, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err,
+                   const float* rt_override = nullptr, const int32_t* epoch_override = nullptr);
     int64_t ring_hi_ = 0;           ///< one past the highest position written in this epoch
     bool ctx_pending_ = false;      ///< context_async() queued rows nobody has waited for yet
     int32_t epoch_ = 0;             ///< stamped into the ring tags: a new epoch makes every older slot invalid

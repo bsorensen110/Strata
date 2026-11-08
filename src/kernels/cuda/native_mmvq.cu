@@ -3752,7 +3752,7 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
                       int n_in, int n_out, int ncols, void* stream) {
     using F = SmallTraits<Q80Block, 8>;
     // only where both calls would run native_mmvq_multi_kernel<F, ncols, WARPS, 1> (exact layout, not packed)
-    if (ggml_type != 8 || !g_multi_exact || ncols < 2 || ncols > 8 || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
+    if (ggml_type != 8 || !g_multi_exact || ncols < 1 || ncols > STRATA_VERIFY_MAX_T || n_out <= 0 || n_in <= 0 || n_in % 32 != 0 ||
         n_in / F::DIV < F::BPI || !w1 || !w2 || !x_q8_1 || !y1 || !y2 || !stream)
         return false;
     const auto& reg = q8_packed_registry();
@@ -3762,13 +3762,27 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const auto s = static_cast<cudaStream_t>(stream);
     switch (ncols) {
+        case 1: q8_0_pair_launch<1>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 2: q8_0_pair_launch<2>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 3: q8_0_pair_launch<3>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 4: q8_0_pair_launch<4>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 5: q8_0_pair_launch<5>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 6: q8_0_pair_launch<6>(a, b, x, y1, y2, n_in, n_out, s); break;
         case 7: q8_0_pair_launch<7>(a, b, x, y1, y2, n_in, n_out, s); break;
-        default: q8_0_pair_launch<8>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 8: q8_0_pair_launch<8>(a, b, x, y1, y2, n_in, n_out, s); break;
+#if STRATA_VERIFY_MAX_T > 8
+        case 9: q8_0_pair_launch<9>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 10: q8_0_pair_launch<10>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 11: q8_0_pair_launch<11>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 12: q8_0_pair_launch<12>(a, b, x, y1, y2, n_in, n_out, s); break;
+#if STRATA_VERIFY_MAX_T > 12
+        case 13: q8_0_pair_launch<13>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 14: q8_0_pair_launch<14>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 15: q8_0_pair_launch<15>(a, b, x, y1, y2, n_in, n_out, s); break;
+        case 16: q8_0_pair_launch<16>(a, b, x, y1, y2, n_in, n_out, s); break;
+#endif
+#endif
+        default: return false;
     }
     launch_check();
     return true;
@@ -3779,7 +3793,8 @@ void q8_0_pair_swiglu_launch(const Q80Block* w1, const Q80Block* w2, const Q81Bl
                              int n_in, int n_out, cudaStream_t s) {
     using F = SmallTraits<Q80Block, 8>;
     const dim3 threads(WARP, WARPS);
-    native_mmvq_multi_kernel<F, NCOLS, WARPS, 2, false, true, false, true><<<unsigned(n_out), threads, 0, s>>>(
+    const dim3 grid = NCOLS == 1 ? dim3(grid_pad((unsigned(n_out) + 1) / 2, WARP * WARPS, 1)) : dim3(unsigned(n_out));
+    native_mmvq_multi_kernel<F, NCOLS, WARPS, 2, false, true, false, true><<<grid, threads, 0, s>>>(
         w1, x, y_swiglu, n_in, n_out, w2, nullptr);
 }
 
@@ -3790,7 +3805,7 @@ bool native_mmvq_pair_swiglu(int ggml_type, const void* w_gate, const void* w_up
         const char* v = std::getenv("STRATA_MMVQ_PAIR_SWIGLU");
         return v == nullptr || v[0] != '0';
     }();
-    if (!enabled || s26_tsum_on() || ggml_type != 8 || !g_multi_exact || b6_rows_mode() > 0 || ncols < 2 || ncols > 9 ||
+    if (!enabled || s26_tsum_on() || ggml_type != 8 || !g_multi_exact || b6_rows_mode() > 0 || ncols < 1 || ncols > STRATA_VERIFY_MAX_T ||
         n_out <= 0 || n_in <= 0 || n_in % 32 != 0 || n_in / F::DIV < F::BPI || !w_gate || !w_up || !x_q8_1 || !y_swiglu || !stream)
         return false;
     const auto& reg = q8_packed_registry();
@@ -3800,6 +3815,7 @@ bool native_mmvq_pair_swiglu(int ggml_type, const void* w_gate, const void* w_up
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const auto s = static_cast<cudaStream_t>(stream);
     switch (ncols) {
+        case 1: q8_0_pair_swiglu_launch<1>(a, b, x, y_swiglu, n_in, n_out, s); break;
         case 2: q8_0_pair_swiglu_launch<2>(a, b, x, y_swiglu, n_in, n_out, s); break;
         case 3: q8_0_pair_swiglu_launch<3>(a, b, x, y_swiglu, n_in, n_out, s); break;
         case 4: q8_0_pair_swiglu_launch<4>(a, b, x, y_swiglu, n_in, n_out, s); break;
@@ -3807,7 +3823,19 @@ bool native_mmvq_pair_swiglu(int ggml_type, const void* w_gate, const void* w_up
         case 6: q8_0_pair_swiglu_launch<6>(a, b, x, y_swiglu, n_in, n_out, s); break;
         case 7: q8_0_pair_swiglu_launch<7>(a, b, x, y_swiglu, n_in, n_out, s); break;
         case 8: q8_0_pair_swiglu_launch<8>(a, b, x, y_swiglu, n_in, n_out, s); break;
-        default: q8_0_pair_swiglu_launch<9>(a, b, x, y_swiglu, n_in, n_out, s); break;
+#if STRATA_VERIFY_MAX_T > 8
+        case 9: q8_0_pair_swiglu_launch<9>(a, b, x, y_swiglu, n_in, n_out, s); break;
+        case 10: q8_0_pair_swiglu_launch<10>(a, b, x, y_swiglu, n_in, n_out, s); break;
+        case 11: q8_0_pair_swiglu_launch<11>(a, b, x, y_swiglu, n_in, n_out, s); break;
+        case 12: q8_0_pair_swiglu_launch<12>(a, b, x, y_swiglu, n_in, n_out, s); break;
+#if STRATA_VERIFY_MAX_T > 12
+        case 13: q8_0_pair_swiglu_launch<13>(a, b, x, y_swiglu, n_in, n_out, s); break;
+        case 14: q8_0_pair_swiglu_launch<14>(a, b, x, y_swiglu, n_in, n_out, s); break;
+        case 15: q8_0_pair_swiglu_launch<15>(a, b, x, y_swiglu, n_in, n_out, s); break;
+        case 16: q8_0_pair_swiglu_launch<16>(a, b, x, y_swiglu, n_in, n_out, s); break;
+#endif
+#endif
+        default: return false;
     }
     launch_check();
     return true;
@@ -3910,7 +3938,7 @@ std::size_t native_q8_1_il_bytes(int n_in, int ncols) {
 
 void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in, int ncols, void* stream) {
     validate_shape(n_in, ncols);
-    if (ncols < 2 || ncols > 4) throw std::invalid_argument("native_quantize_q8_1_il requires 2 <= ncols <= 4");
+    if (ncols < 2 || ncols > 8) throw std::invalid_argument("native_quantize_q8_1_il requires 2 <= ncols <= 8");
     validate_pointer(x);
     validate_pointer(x_q8_1);
     validate_pointer(x_il);

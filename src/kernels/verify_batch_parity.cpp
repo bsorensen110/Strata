@@ -12,10 +12,13 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/native_gr_postops.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
+#include "strata/kernels/native_qsa.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/ple.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -156,6 +159,66 @@ void ple(cudaStream_t s) {
     }
 }
 
+// ---- 3. fused QSA gate + Q8_1 quantize (native_qsa_gate_quantize_q8_1 vs native_qsa_gate_apply + native_quantize_q8_1)
+void qsa_gate_q8(cudaStream_t s) {
+    const int NH = 16, HD = 256;
+    std::mt19937 rng(17);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    for (int n : {1, 4, 8, 16}) {
+        const size_t elems = (size_t) n * NH * HD;
+        const size_t q8_bytes = (elems / 32) * 36;
+        std::vector<float> attn(elems), qfull(elems * 2);
+        for (auto& x : attn) x = nd(rng);
+        for (auto& x : qfull) x = 2.f * nd(rng);
+        float* d_attn = upload(attn);
+        float* d_qfull = upload(qfull);
+        float* d_out = dalloc<float>(elems);
+        uint8_t* xq0 = dalloc<uint8_t>(q8_bytes);
+        uint8_t* xq1 = dalloc<uint8_t>(q8_bytes);
+        k::native_qsa_gate_apply(d_attn, d_qfull, d_out, n * NH, HD, s);
+        k::native_quantize_q8_1(d_out, xq0, NH * HD, n, s);
+        k::native_qsa_gate_quantize_q8_1(d_attn, d_qfull, xq1, n * NH, HD, s);
+        ck(cudaStreamSynchronize(s), "qsa_gate_q8");
+        char what[128];
+        std::snprintf(what, sizeof what, "native_qsa_gate_quantize_q8_1, %d tokens", n);
+        report(what, read(xq0, q8_bytes) == read(xq1, q8_bytes));
+        cudaFree(d_attn); cudaFree(d_qfull); cudaFree(d_out); cudaFree(xq0); cudaFree(xq1);
+    }
+}
+
+// ---- 4. fused GDN multi-group step + norm + Q8_1 quantize (gdn_step_norm_groups with xq_out vs separate native_quantize_q8_1)
+void gdn_groups_q8(cudaStream_t s) {
+    const int HK = 16, HV = 32, S = 128, ZV = HV * S, C = (2 * HK + HV) * S;
+    std::mt19937 rng(23);
+    std::normal_distribution<float> nd(0.f, 0.5f);
+    for (int n : {8, 16}) {
+        const int n0 = n / 2, n1 = n - n0;
+        const size_t st_floats = (size_t) HV * S * S;
+        const size_t q8_bytes = ((size_t) n * ZV / 32) * 36;
+        std::vector<float> st0(st_floats), st1(st_floats), h((size_t) n * C), gate((size_t) n * HV), beta((size_t) n * HV),
+            z((size_t) n * ZV), gam(S);
+        for (auto* v : {&st0, &st1, &h, &gate, &beta, &z})
+            for (auto& x : *v) x = nd(rng);
+        for (auto& x : gam) x = 1.f + 0.1f * nd(rng);
+        float *s0a = upload(st0), *s1a = upload(st1), *s0b = upload(st0), *s1b = upload(st1);
+        float *dh = upload(h), *dg = upload(gate), *db = upload(beta), *dz = upload(z), *dgam = upload(gam);
+        float *ya = dalloc<float>((size_t) n * ZV), *yb = dalloc<float>((size_t) n * ZV);
+        uint8_t *xqa = dalloc<uint8_t>(q8_bytes), *xqb = dalloc<uint8_t>(q8_bytes);
+        k::GdnGroups gga{}, ggb{};
+        gga.n = 2; gga.state[0] = s0a; gga.first[0] = 0; gga.ntok[0] = n0; gga.state[1] = s1a; gga.first[1] = n0; gga.ntok[1] = n1;
+        ggb.n = 2; ggb.state[0] = s0b; ggb.first[0] = 0; ggb.ntok[0] = n0; ggb.state[1] = s1b; ggb.first[1] = n0; ggb.ntok[1] = n1;
+        k::gdn_step_norm_groups(gga, dh, C, dg, db, dz, dgam, 1e-6f, ya, HK, HV, false, s, 0, nullptr);
+        k::native_quantize_q8_1(ya, xqa, ZV, n, s);
+        k::gdn_step_norm_groups(ggb, dh, C, dg, db, dz, dgam, 1e-6f, yb, HK, HV, false, s, 0, xqb);
+        ck(cudaStreamSynchronize(s), "gdn_groups_q8");
+        char what[128];
+        std::snprintf(what, sizeof what, "gdn_step_norm_groups fused q8_1, %d tokens (2 groups)", n);
+        report(what, read(xqa, q8_bytes) == read(xqb, q8_bytes));
+        for (float* p : {s0a, s1a, s0b, s1b, dh, dg, db, dz, dgam, ya, yb}) cudaFree(p);
+        cudaFree(xqa); cudaFree(xqb);
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -168,6 +231,8 @@ int main() {
     ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
     gr_post(s);
     ple(s);
+    qsa_gate_q8(s);
+    gdn_groups_q8(s);
     std::printf("verify_batch_parity: %s\n", g_fail ? "FAIL" : "PASS");
     return g_fail ? 1 : 0;
 }

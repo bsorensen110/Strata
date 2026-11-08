@@ -2204,6 +2204,19 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
     // 149-cold mode 3: the GGUF in place, mapped and buffered: an expert the page cache holds whole is computed from
     // the mapping (its three tensors' rows), not assembled into a stage buffer first.  Decided here, before the lock.
     zc_keys_.clear();
+    if (complement_ready_) {
+        bool all_resident = true;
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t e = experts[i];
+            if (e < 0 || e >= n_expert_) continue;
+            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+            if (resident_blob(index) == nullptr && (override_.empty() || override_[index] == nullptr)) {
+                all_resident = false;
+                break;
+            }
+        }
+        if (all_resident) return;
+    }
     std::vector<char> zc_ok;
     if (zc && !role_ptr_.empty() && !unmapped_ && direct_.empty() && strata::kernels::cpu::expert_layout().native &&
         strata::kernels::cpu::expert_layout().fmt[(size_t) layer].tail_off == 0) {
@@ -3108,7 +3121,7 @@ bool RouterLookahead::start(std::vector<std::vector<uint16_t>> routers, int64_t 
     n_expert_ = n_expert;
     k_ = k < 1 ? 1 : k > (int) n_expert ? (int) n_expert : k;
     src_ = src;
-    x_.assign((size_t) (8 * n_embd), 0.f);
+    x_.assign((size_t) (16 * n_embd), 0.f);
     thread_ = std::thread([this] {
         strata::platform::name_this_thread("strata-lookahead");
         strata::aux_cpus::pin_current_thread();
@@ -3122,7 +3135,19 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
-        n_tok_ = std::min<int64_t>(n_tok, 8);
+        if (!stats_on_ && fs_ == nullptr && src_ != nullptr && host_res != nullptr) {
+            const int depth = !src_->read_ahead_open() ? 1 : depth_;
+            bool any_cold = false;
+            for (int dj = 0; dj < depth && layer + 1 + dj < (int64_t) routers_.size() && !any_cold; ++dj) {
+                const int64_t tl = layer + 1 + dj;
+                const int32_t* hr = host_res + (size_t) (tl * n_expert_);
+                for (int64_t e = 0; e < n_expert_; ++e) {
+                    if (hr[e] < 0 && !src_->has_resident_blob(tl, e)) { any_cold = true; break; }
+                }
+            }
+            if (!any_cold) return;
+        }
+        n_tok_ = std::min<int64_t>(n_tok, 16);
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
         layer_ = layer + 1;
         has_res_ = host_res != nullptr;
@@ -3232,7 +3257,7 @@ void RouterLookahead::stats_score(int64_t layer, const int32_t* ids, int64_t n, 
 }
 
 void RouterLookahead::run() {
-    std::vector<float> logits((size_t) (8 * n_expert_));
+    std::vector<float> logits((size_t) (16 * n_expert_));
     std::vector<int32_t> order((size_t) n_expert_);
     std::vector<int64_t> want;
     std::vector<float> wconf;   // 149-prefetch: per wanted expert, its best rank's confidence (warm_scored)
@@ -3258,6 +3283,14 @@ void RouterLookahead::run() {
         const int depth = src_ != nullptr && !src_->read_ahead_open() ? 1 : depth_;   // 149: the gate closed
         for (int dj = 0; dj < depth && layer0 + dj < (int64_t) routers_.size(); ++dj) {
         layer = layer0 + dj;
+        if (dj > 0 && !stats_on_ && fs == nullptr && src_ != nullptr && host_res != nullptr) {
+            bool any_cold = false;
+            const int32_t* hr = host_res + (size_t) (layer * n_expert_);
+            for (int64_t e = 0; e < n_expert_; ++e) {
+                if (hr[e] < 0 && !src_->has_resident_blob(layer, e)) { any_cold = true; break; }
+            }
+            if (!any_cold) continue;
+        }
         want.clear();
         wconf.clear();
         const bool scored = src_->wants_scores();
@@ -4951,13 +4984,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
-    if (d.lookahead != nullptr) {
-        if (d.lookahead->stats_on()) {
-            if (d.layers == 0) d.lookahead->stats_window_start();
-            d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
-        }
-        d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1
-    }
     if (k < 1 || n_tok * k > kMaxWindowEntries) {
         d.failed = true;
         d.fail = "a verify window routes more entries than the expert pool's window tables hold";
@@ -4994,12 +5020,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     for (int64_t i = 0; i < n; ++i) lid[i] = ids[i];
     ids = lid;
     int32_t kind[kMaxWindowEntries];       // per entry: -1 CPU, 0 VRAM, 1 PCIe
+    int16_t next_same[kMaxWindowEntries];
+    int16_t cpu_i0[kMaxWindowEntries];
+    int n_cpu_exp = 0;
+    uint64_t cpu_tok_mask = 0;
+    bool plan_fast_ok = false;
     int64_t planned_vram_entries = -1, planned_gpu_entries = -1;
     if (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap) {
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
-        int16_t next_same[kMaxWindowEntries], tail_same[kMaxWindowEntries], cnt_same[kMaxWindowEntries];
+        int16_t tail_same[kMaxWindowEntries], cnt_same[kMaxWindowEntries];
         int minr_i0[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
+        bool bad_id = false, any_tail_skip = false;
         // a helper GPU (RemoteExperts) holding the expert computes it in its own VRAM once begin() claims the row: like
         // the peer tier's, such an expert is no miss of this plan and never part of the PCIe share, which would read it
         // over the primary's link instead (2x RX 6900 XT, IQ3_S, --remote-expert-opt with the probed share 0.39: ~4
@@ -5013,13 +5045,23 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
 #endif
             return false;
         };
+        int16_t seen_i0[512];
+        const bool fast_seen = d.n_expert > 0 && d.n_expert <= 512;
+        if (fast_seen) std::memset(seen_i0, 0xff, (size_t) d.n_expert * sizeof(int16_t));
         for (int64_t i = 0; i < n; ++i) {
             first_of[i] = i;
             next_same[i] = -1;
             const int32_t ei = lid[i];
-            for (int q = 0; q < nd; ++q) {
-                const int64_t j = distinct[q];
-                if (lid[j] == ei) { first_of[i] = j; break; }
+            if (ei < 0 || ei >= d.n_expert || ids[i] < 0 || ids[i] >= d.n_expert) bad_id = true;
+            if (fast_seen && ei >= 0 && ei < d.n_expert) {
+                const int16_t prev = seen_i0[ei];
+                if (prev >= 0) first_of[i] = prev;
+                else seen_i0[ei] = (int16_t) i;
+            } else {
+                for (int q = 0; q < nd; ++q) {
+                    const int64_t j = distinct[q];
+                    if (lid[j] == ei) { first_of[i] = j; break; }
+                }
             }
             const int rk = (int) (i % k);
             if (first_of[i] == i) {
@@ -5051,6 +5093,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (e < 0 || e >= d.n_expert || minr_i0[i0] < tail_rank) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
                 skip_d[q] = true;
+                any_tail_skip = true;
                 --nmiss;
                 ++d.tail_experts;
             }
@@ -5142,7 +5185,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++miss_rank;
                 }
             }
-            for (int16_t i = (int16_t) i0; i >= 0; i = next_same[i]) kind[i] = kd;
+            for (int16_t i = (int16_t) i0; i >= 0; i = next_same[i]) {
+                kind[i] = kd;
+                if (kd == -1 && n_tok <= 64) cpu_tok_mask |= (1ull << (i / k));
+            }
+            if (kd == -1 && e >= 0 && e < d.n_expert) cpu_i0[n_cpu_exp++] = (int16_t) i0;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             if (bucket_plan) {
                 // Split multi-token VRAM groups into chunks of at most 4 entries (ED_NC / GRP_NC / LDS_NT) so each
@@ -5256,6 +5303,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (P.publish) P.publish(P.ctx);
         pt("fetch", fetches);
         if (P.fetch) P.fetch(P.ctx, dma_src, P.pcie_mode != 0 ? 0 : fetches, (size_t) bb);   // the copy engine, beside the CPU's work
+        plan_fast_ok = !bad_id && !any_tail_skip && d.peer == nullptr && d.remote_count == 0;
     } else {
         for (int64_t i = 0; i < n; ++i) {
             const int32_t e = ids[i];
@@ -5263,6 +5311,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                        d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) ? 0
                     : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2 : -1;
         }
+    }
+    if (d.lookahead != nullptr) {
+        if (d.lookahead->stats_on()) {
+            if (d.layers == 0) d.lookahead->stats_window_start();
+            d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
+        }
+        d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1 after publishing GPU plan
     }
     if (!d.usage.empty())
         for (int64_t i = 0; i < n; ++i)
@@ -5305,8 +5360,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     bool any_cpu = false;
-    for (int64_t i = 0; i < n; ++i)
-        if (kind[i] == -1) { any_cpu = true; break; }   // -2: skipped (STRATA_ROUTE_TAIL_SKIP), no work
+    if (plan_fast_ok) {
+        any_cpu = n_cpu_exp > 0;
+    } else {
+        for (int64_t i = 0; i < n; ++i)
+            if (kind[i] == -1) { any_cpu = true; break; }   // -2: skipped (STRATA_ROUTE_TAIL_SKIP), no work
+    }
     if (d.dres_check != nullptr && any_cpu) {   // STRATA_ADAPT_CHECKRES
         bool published = false;
         for (int64_t i = 0; i < n && !published; ++i)
@@ -5315,17 +5374,37 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (!published) ++d.stale_x;
     }
     const auto c1 = std::chrono::steady_clock::now();
+    d.pool->clear_act_quant();
     if (any_cpu) {
         // Any token whose routed experts all run on a GPU (kind >= 0) or are tail-skipped (kind == -2) has no local CPU
         // expert job (kind == -1) and never reads act_multi[t] / nact_multi[t]; skip quantizing its row over PCIe.
-        for (int64_t t = 0; t < n_tok; ++t) {
-            if (std::none_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v == -1; })) continue;
-            if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))   // a native Q2_0 pack: the Q2_0 kernels' activations
-                act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
-            else if (native)
-                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
-            else
-                act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+        int act_toks[strata::kernels::cpu::MAXT] = {};
+        int n_act_toks = 0;
+        if (plan_fast_ok && n_tok <= 64 && n_tok <= strata::kernels::cpu::MAXT) {
+            uint64_t m = cpu_tok_mask;
+            while (m != 0) {
+                act_toks[n_act_toks++] = __builtin_ctzll(m);
+                m &= m - 1;
+            }
+        } else {
+            for (int64_t t = 0; t < n_tok; ++t) {
+                if (std::none_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v == -1; })) continue;
+                if (t < strata::kernels::cpu::MAXT) act_toks[n_act_toks++] = (int) t;
+            }
+        }
+        if (n_act_toks >= 2 && d.pool->workers() > 1) {
+            d.pool->defer_act_quant(x_f, native ? d.nact_multi.data() : nullptr, d.act_multi.data(),
+                                    act_toks, n_act_toks, native);
+        } else {
+            for (int qi = 0; qi < n_act_toks; ++qi) {
+                const int t = act_toks[qi];
+                if (native && strata::kernels::cpu::q2_native_kernels(lay.fmt[(size_t) d.layers].gu_type))
+                    act_quant_any(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+                else if (native)
+                    native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * H, d.nact_multi.data() + (size_t) t * kNativeActBytes);
+                else
+                    act_quant_q8_1(x_f + (size_t) t * H, H, d.act_multi[(size_t) t]);
+            }
         }
     }
     const auto c2 = std::chrono::steady_clock::now();
@@ -5340,21 +5419,41 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     int64_t npend = 0;
     double cold_r_ms = 0;
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
-        for (int64_t i = 0; i < n_tok * k; ++i)
-            if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
-                std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
-                miss.push_back(ids[i]);
-        if (d.cold_mode == 0) {
-            d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+        bool all_cpu_resident = plan_fast_ok;
+        if (plan_fast_ok) {
+            for (int c = 0; c < n_cpu_exp; ++c) {
+                const int32_t ei = ids[cpu_i0[c]];
+                miss.push_back(ei);
+                if (all_cpu_resident && !d.src->has_resident_blob(d.layers, ei))
+                    all_cpu_resident = false;
+            }
         } else {
-            mstate.assign(miss.size(), 0);
-            const auto r0 = std::chrono::steady_clock::now();
-            npend = d.src->prefetch_begin(d.layers, miss.data(), (int64_t) miss.size(), mstate.data());
-            if (npend > 0 && d.cold_mode == 2) {   // measure: every read first, as mode 0 does
-                d.src->prefetch_end();
-                for (uint8_t& s : mstate) if (s == 1) s = 2;
-                cold_r_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count();
-                d.ms_cold_wait += cold_r_ms;
+            int8_t miss_seen[512];
+            const bool fast_miss = d.n_expert > 0 && d.n_expert <= 512;
+            if (fast_miss) std::memset(miss_seen, 0, (size_t) d.n_expert);
+            for (int64_t i = 0; i < n_tok * k; ++i) {
+                const int32_t ei = ids[i];
+                if (kind[i] != -1 || ei < 0 || ei >= d.n_expert) continue;
+                if (fast_miss) {
+                    if (!miss_seen[ei]) { miss_seen[ei] = 1; miss.push_back(ei); }
+                } else if (std::find(miss.begin(), miss.end(), (int64_t) ei) == miss.end()) {
+                    miss.push_back(ei);
+                }
+            }
+        }
+        if (!all_cpu_resident) {
+            if (d.cold_mode == 0) {
+                d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
+            } else {
+                mstate.assign(miss.size(), 0);
+                const auto r0 = std::chrono::steady_clock::now();
+                npend = d.src->prefetch_begin(d.layers, miss.data(), (int64_t) miss.size(), mstate.data());
+                if (npend > 0 && d.cold_mode == 2) {   // measure: every read first, as mode 0 does
+                    d.src->prefetch_end();
+                    for (uint8_t& s : mstate) if (s == 1) s = 2;
+                    cold_r_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count();
+                    d.ms_cold_wait += cold_r_ms;
+                }
             }
         }
     }
@@ -5370,7 +5469,58 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     bool first_pass = true;
     uint8_t want = 0;
     double run_ms_extra = 0, cr_ms = 0;
-    for (;;) {
+    const bool used_fast_jobs = plan_fast_ok && gpu_zeroes_hits && npend == 0;
+    if (used_fast_jobs) {
+        d.cache_hits += planned_vram_entries;
+        d.offload_entries += planned_gpu_entries - planned_vram_entries;
+        for (int c = 0; c < n_cpu_exp; ++c) {
+            const int16_t i0 = cpu_i0[c];
+            const int64_t e = ids[i0];
+            const uint8_t* zp[3] = {nullptr, nullptr, nullptr};
+            const bool zc = d.cold_mode >= 3 && native && d.src->zc_roles(d.layers, e, zp);
+            const uint8_t* b = zc ? zp[0] : d.src->blob(d.layers, e);
+            if (b == nullptr) {
+                d.failed = true;
+                d.fail = "the expert source could not produce a blob";
+                d.fail_layer = d.layers;
+                d.fail_expert = e;
+                ++d.missing;
+                return;
+            }
+            int jo = njobs++;
+            ExpertJobMulti* jb = &d.jobs_multi[(size_t) jo];
+            jb->blob = b;
+            jb->nt = 0;
+            jb->fmt = nullptr;
+            if (zc) {
+                if (d.zc_fmt.size() < d.jobs_multi.size()) d.zc_fmt.resize(d.jobs_multi.size());
+                strata::kernels::cpu::NativeFmt& f = d.zc_fmt[(size_t) jo];
+                f = lay.fmt[(size_t) d.layers];
+                f.up_off = (size_t) ((uintptr_t) zp[1] - (uintptr_t) zp[0]);
+                f.down_off = (size_t) ((uintptr_t) zp[2] - (uintptr_t) zp[0]);
+                jb->fmt = &f;
+                ++d.cold_zc;
+            }
+            for (int16_t i = i0; i >= 0; i = next_same[i]) {
+                const int64_t t = i / k;
+                float* row = out + (size_t) i * H;
+                ++d.cache_refused;
+                if (jb->nt == MAXT) {
+                    const int prev = jo;
+                    jo = njobs++;
+                    jb = &d.jobs_multi[(size_t) jo];
+                    jb->blob = d.jobs_multi[(size_t) prev].blob;
+                    jb->fmt = d.jobs_multi[(size_t) prev].fmt;
+                    jb->nt = 0;
+                }
+                jb->act[jb->nt] = &d.act_multi[(size_t) t];
+                jb->nact[jb->nt] = native ? d.nact_multi.data() + (size_t) t * kNativeActBytes : nullptr;
+                jb->out[jb->nt] = row;
+                ++jb->nt;
+                ++d.multi_entries;
+            }
+        }
+    } else for (;;) {
     for (int64_t t = 0; t < n_tok; ++t)
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
@@ -5526,7 +5676,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.ms_actq += ms(c1, c2);
     d.ms_jobs += ms(c2, c3);
     d.ms_run += ms(c3, c4);
-    if (njobs > 0 && npend == 0) {
+    if (njobs > 0 && npend == 0 && !used_fast_jobs) {
         for (int64_t i = 0; i < n_tok * k; ++i) {
             const int64_t e = ids[i];
             if (e >= 0 && e < d.n_expert) d.job_of[(size_t) e] = -1;

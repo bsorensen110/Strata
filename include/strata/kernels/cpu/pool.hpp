@@ -249,6 +249,21 @@ public:
     /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
+    /// Defer input activation quantization (`x_f` -> `nact` / `act`) to run in parallel across the pool's threads at
+    /// the start of the next `mode 5` / `mode 3` gate/up phase instead of serially on the host thread before publish.
+    static constexpr int kMaxActQuantToks = 1024;
+    void defer_act_quant(const float* x_f, uint8_t* nact, ActQ* act, const int* toks, int count, bool native) noexcept {
+        act_xf_ = x_f;
+        act_nact_ = nact;
+        act_q_ = act;
+        const int n = count <= kMaxActQuantToks ? count : kMaxActQuantToks;
+        for (int i = 0; i < n; ++i) act_toks_[i] = toks[i];
+        act_count_ = n;
+        act_native_ = native;
+        act_next_.store(0, std::memory_order_relaxed);
+        act_done_.store(0, std::memory_order_relaxed);
+    }
+    void clear_act_quant() noexcept { act_count_ = 0; }
     static constexpr int kMaxSplitMulti = 96;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
@@ -355,20 +370,47 @@ private:
     struct SplitBuf {
         alignas(64) float ff[FF];
         ActQ a2;
+        std::atomic<uint8_t> q_state{0};
+        std::atomic<int> gu_rows_done{0};
+        SplitBuf() noexcept = default;
+        SplitBuf(SplitBuf&& o) noexcept {
+            q_state.store(o.q_state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            gu_rows_done.store(o.gu_rows_done.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
     };
     std::vector<SplitBuf> split_;
-    // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts
+    // run_split_multi state: mode 3 = gate/up row parts, 4 = down row parts, 7/8 = single-phase gate/up + down
     ExpertJobMulti* mjobs_ = nullptr;
+    int mnb_ = 0;           // number of experts in the current multi phase
     int64_t mrows_ = 0;     // rows of the current multi phase across all its experts (n * FF, then n * H)
     int mtasks_ = 1;        // equal row ranges the phase is cut into
+    int64_t mrows_down_ = 0;
+    int mtasks_down_ = 1;
     struct SplitBufMulti {
         alignas(64) float ff[MAXT][FF];
         ActQ a2[MAXT];
         alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
+        std::atomic<uint8_t> q_state[MAXT];
+        std::atomic<int> gu_rows_done{0};
+        SplitBufMulti() noexcept {
+            for (int t = 0; t < MAXT; ++t) q_state[t].store(0, std::memory_order_relaxed);
+        }
+        SplitBufMulti(SplitBufMulti&& o) noexcept {
+            for (int t = 0; t < MAXT; ++t) q_state[t].store(o.q_state[t].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            gu_rows_done.store(o.gu_rows_done.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
     };
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
     std::vector<SplitBufMulti> split_multi_;
+    const float* act_xf_ = nullptr;
+    uint8_t* act_nact_ = nullptr;
+    ActQ* act_q_ = nullptr;
+    int act_toks_[kMaxActQuantToks] = {};
+    int act_count_ = 0;
+    bool act_native_ = false;
+    alignas(64) std::atomic<int> act_next_{0};
+    alignas(64) std::atomic<uint32_t> act_done_{0};
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
     // part the resident complement places on node k in step B), and each node's threads claim and count on their own

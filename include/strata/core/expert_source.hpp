@@ -297,6 +297,8 @@ public:
     virtual bool wants_scores() const { return false; }
     /// Whether `warm` does anything (the predictor is not run otherwise).
     virtual bool warms() const { return false; }
+    /// Whether `(layer, expert)` is already held in the page-locked/resident RAM complement copy (no file read needed).
+    virtual bool has_resident_blob(int64_t layer, int64_t expert) const { (void) layer; (void) expert; return false; }
 protected:
     /// What model_inputs() returns; set by a source's open().
     void record_inputs(const std::string& pack_experts, const std::string& gguf,
@@ -820,6 +822,9 @@ public:
     // differ in block size keeps spares per size).
     /// Whether the compact copy holds `(layer, expert)`.
     bool has_resident(int64_t layer, int64_t expert) const;
+    bool has_resident_blob(int64_t layer, int64_t expert) const override {
+        return complement_ready_ && has_resident(layer, expert);
+    }
     /// Host room for `n` evicted blobs (page-locked when possible).  Idempotent for the same or a smaller `n`.
     /// `bounce`: how many of the last buffers are only staged through and never hold an exchange (STRATA_EXCHANGE_ROTATE
     /// keeps those in the largest block size alone).

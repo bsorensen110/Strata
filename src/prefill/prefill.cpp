@@ -5213,12 +5213,26 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (on_cpu[(size_t) e])
                                         for (int32_t r = 0; r < m.cnt[(size_t) e]; ++r)
                                             need[(size_t) src_h[(size_t) m.off[(size_t) e] + (size_t) r]] = 1;
-                                for (int64_t t = 0; t < T; ++t)
-                                    if (need[(size_t) t] && q2)
-                                        strata::kernels::cpu::act_quant_any(m.cpu_x + (size_t) t * N, (int) N, m.cpu_actq[(size_t) t]);
-                                    else if (need[(size_t) t])
-                                        strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N,
-                                                                               m.cpu_nact.data() + (size_t) t * AB);
+                                int act_toks[strata::kernels::cpu::ExpertPool::kMaxActQuantToks];
+                                int n_act_toks = 0;
+                                for (int64_t t = 0; t < T; ++t) {
+                                    if (!need[(size_t) t]) continue;
+                                    if (n_act_toks < strata::kernels::cpu::ExpertPool::kMaxActQuantToks)
+                                        act_toks[n_act_toks++] = (int) t;
+                                }
+                                if (n_act_toks >= 2 && cpu_pool_->workers() > 1 &&
+                                    n_act_toks <= strata::kernels::cpu::ExpertPool::kMaxActQuantToks) {
+                                    cpu_pool_->defer_act_quant(m.cpu_x, q2 ? nullptr : m.cpu_nact.data(),
+                                                               q2 ? m.cpu_actq.data() : nullptr,
+                                                               act_toks, n_act_toks, true);
+                                } else {
+                                    for (int64_t t = 0; t < T; ++t)
+                                        if (need[(size_t) t] && q2)
+                                            strata::kernels::cpu::act_quant_any(m.cpu_x + (size_t) t * N, (int) N, m.cpu_actq[(size_t) t]);
+                                        else if (need[(size_t) t])
+                                            strata::kernels::cpu::native_quant_act(cf, m.cpu_x + (size_t) t * N,
+                                                                                   m.cpu_nact.data() + (size_t) t * AB);
+                                }
                                 m.cpu_jobs.clear();
                                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                                     if (!on_cpu[(size_t) e]) continue;

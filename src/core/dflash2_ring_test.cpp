@@ -12,6 +12,7 @@
 //   5 evicted    : a stash too small to keep A: the resume is cold (missing rows reported, *cold set)
 // Exit 0 when every assertion holds.
 #include "strata/core/dflash2.hpp"
+#include "strata/core/batch_df2_budget.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
@@ -320,7 +321,147 @@ int main(int argc, char** argv) {
             ring_ok = false;
         check(tok_ok, "batch_body 2-slot draft tokens and probs match single-slot draft()");
         check(ring_ok, "batch_body 2-slot K/V rings match single-slot draft() bitwise");
+        {   // ---- 7 precompute_batch_context + batch_full_exec_ parity
+            std::printf("7 precompute_batch_context + batch_full_exec_ (2 slots, n_new=(8, 8))\n");
+            Dflash2Drafter p0, p1;
+            if (!p0.clone_alloc(d, err) || !p1.clone_alloc(d, err) ||
+                !p0.clone_bind(d, err) || !p1.clone_bind(d, err) ||
+                !feed(p0, dev, 1, 0, 256, err) || !feed(p1, dev, 2, 0, 192, err)) {
+                std::printf("precomp setup: %s\n", err.c_str());
+                return 2;
+            }
+            const int n0 = 8, n1 = 8;
+            std::vector<float> h_both((size_t) (n0 + n1) * kTap);
+            int64_t pos_both[16] = {};
+            for (int r = 0; r < n0; ++r) {
+                pos_both[r] = 256 + r;
+                for (int i = 0; i < kTap; ++i) h_both[(size_t) r * kTap + i] = tap_value(1, 256 + r, i);
+            }
+            for (int r = 0; r < n1; ++r) {
+                pos_both[n0 + r] = 192 + r;
+                for (int i = 0; i < kTap; ++i) h_both[(size_t) (n0 + r) * kTap + i] = tap_value(2, 192 + r, i);
+            }
+            float* taps_both = nullptr;
+            cudaMalloc((void**) &taps_both, h_both.size() * 4);
+            cudaMemcpy(taps_both, h_both.data(), h_both.size() * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(taps0, h_both.data(), (size_t) n0 * kTap * 4, cudaMemcpyHostToDevice);
+            cudaMemcpy(taps1, h_both.data() + (size_t) n0 * kTap, (size_t) n1 * kTap * 4, cudaMemcpyHostToDevice);
+            int32_t r_tok0[8] = {}, r_tok1[8] = {}, b_tok0[8] = {}, b_tok1[8] = {};
+            float r_prob0[8] = {}, r_prob1[8] = {}, b_prob0[8] = {}, b_prob1[8] = {};
+            ref0.begin_request(nullptr, 0, 0, nullptr);
+            ref1.begin_request(nullptr, 0, 0, nullptr);
+            feed(ref0, dev, 1, 0, 256, err);
+            feed(ref1, dev, 2, 0, 192, err);
+            if (!ref0.draft(taps0, n0, 256, 33, r_tok0, r_prob0, err) ||
+                !ref1.draft(taps1, n1, 192, 44, r_tok1, r_prob1, err)) {
+                std::printf("ref draft (precomp): %s\n", err.c_str());
+                return 2;
+            }
+            d.precompute_batch_context(taps_both, n0 + n1, pos_both);
+            Dflash2Drafter::BatchSlotItem pitems[2] = {
+                {&p0, taps_both, n0, 256, 33, 7, b_tok0, b_prob0},
+                {&p1, taps_both + (size_t) n0 * kTap, n1, 192, 44, 7, b_tok1, b_prob1},
+            };
+            bool p_tok_ok = true, p_ring_ok = true;
+            for (int rep = 0; rep < 2; ++rep) {
+                if (rep == 1) {
+                    feed(p0, dev, 1, 0, 256, err);
+                    feed(p1, dev, 2, 0, 192, err);
+                    d.precompute_batch_context(taps_both, n0 + n1, pos_both);
+                }
+                if (!d.draft_batch_slots_launch(pitems, 2, err) ||
+                    !d.draft_batch_slots_finish(pitems, 2, err)) {
+                    std::printf("precomp batch draft: %s\n", err.c_str());
+                    return 2;
+                }
+                for (int i = 0; i < 7; ++i) {
+                    if (r_tok0[i] != b_tok0[i] || r_tok1[i] != b_tok1[i] ||
+                        std::fabs(r_prob0[i] - b_prob0[i]) > 1e-5f ||
+                        std::fabs(r_prob1[i] - b_prob1[i]) > 1e-5f) {
+                        std::printf("    rep %d i=%d: p0 ref=(%d,%.6f) bat=(%d,%.6f) | p1 ref=(%d,%.6f) bat=(%d,%.6f)\n",
+                                    rep, i, r_tok0[i], r_prob0[i], b_tok0[i], b_prob0[i], r_tok1[i], r_prob1[i], b_tok1[i], b_prob1[i]);
+                        p_tok_ok = false;
+                    }
+                }
+            }
+            ref0.debug_ring(r_ring0, r_tag0, err);
+            ref1.debug_ring(r_ring1, r_tag1, err);
+            if (count_bad(p0, r_ring0, 0, 256 + n0, &wt0) != 0 || count_bad(p1, r_ring1, 0, 192 + n1, &wt1) != 0)
+                p_ring_ok = false;
+            check(p_tok_ok, "precompute_batch_context + batch_full_exec_ 16-row draft tokens/probs match single-slot draft()");
+            check(p_ring_ok, "precompute_batch_context + batch_full_exec_ 16-row K/V rings match single-slot draft() bitwise");
+            {
+                cudaEvent_t ev0 = nullptr, ev1 = nullptr, ev2 = nullptr;
+                cudaEventCreate(&ev0); cudaEventCreate(&ev1); cudaEventCreate(&ev2);
+                const int reps = 50;
+                float ms_pre = 0.0f, ms_full = 0.0f, ms_npre = 0.0f;
+                for (int r = 0; r < reps; ++r) {
+                    cudaEventRecord(ev0, d.stream());
+                    d.precompute_batch_context(taps_both, n0 + n1, pos_both);
+                    cudaEventRecord(ev1, d.stream());
+                    d.draft_batch_slots_launch(pitems, 2, err);
+                    cudaEventRecord(ev2, d.stream());
+                    d.draft_batch_slots_finish(pitems, 2, err);
+                    float a = 0.0f, b = 0.0f;
+                    cudaEventElapsedTime(&a, ev0, ev1);
+                    cudaEventElapsedTime(&b, ev1, ev2);
+                    ms_pre += a;
+                    ms_full += b;
+                }
+                for (int r = 0; r < reps; ++r) {
+                    d.clear_precomputed_context();
+                    cudaEventRecord(ev0, d.stream());
+                    d.draft_batch_slots_launch(pitems, 2, err);
+                    cudaEventRecord(ev1, d.stream());
+                    d.draft_batch_slots_finish(pitems, 2, err);
+                    float a = 0.0f;
+                    cudaEventElapsedTime(&a, ev0, ev1);
+                    ms_npre += a;
+                }
+                std::printf("  precomp (16 rows): %.2f us | batch_full_exec_: %.2f us (sum %.2f us) | batch_body_exec_+head: %.2f us\n",
+                            ms_pre * 1000.0f / reps, ms_full * 1000.0f / reps, (ms_pre + ms_full) * 1000.0f / reps, ms_npre * 1000.0f / reps);
+                cudaEventDestroy(ev0); cudaEventDestroy(ev1); cudaEventDestroy(ev2);
+            }
+            cudaFree(taps_both);
+        }
         cudaFree(taps0); cudaFree(taps1); cudaFree(d_head); cudaFree(d_emb);
+    }
+    // 6. Cross-slot dprob-ranked spare-row budget (C-F2)
+    {
+        using strata::core::Df2SlotBudgetInput;
+        using strata::core::allocate_dprob_spare_rows;
+        using strata::core::batch_df2_head_max_per_slot;
+
+        // Case A: Slot 0 collapses after draft 0 (0.85 * 0.40 = 0.34 < 0.50); Slot 1 stays confident for 4 drafts.
+        // In an 8-row window (spare = 6), Slot 0 gets 1 extra row and Slot 1 claims all 4 of its confident rows (total 5 extra).
+        const float p0[7] = {0.85f, 0.40f, 0.90f, 0.90f, 0.0f, 0.0f, 0.0f};
+        const float p1[7] = {0.95f, 0.92f, 0.90f, 0.88f, 0.0f, 0.0f, 0.0f};
+        const Df2SlotBudgetInput in_a[2] = {{4, true, p0}, {4, true, p1}};
+        int out_a[2] = {};
+        allocate_dprob_spare_rows(in_a, 2, 6, 0.50, out_a);
+        check(out_a[0] == 1 && out_a[1] == 4, "dprob budget: confident slot claims spare rows released by low-confidence peer");
+
+        // Case B: Both slots have 4 confident drafts, but Slot 1 has strictly higher chain probabilities through draft 3
+        // than Slot 0 has at draft 2 (Slot 1 chains: 0.98, 0.9604, 0.9412, 0.9224 vs Slot 0 chains: 0.90, 0.81, 0.729, 0.6561).
+        // With spare = 6, Slot 1 gets 4 rows and Slot 0 gets 2 rows (4 + 2 = 6).
+        const float q0[7] = {0.90f, 0.90f, 0.90f, 0.90f, 0.0f, 0.0f, 0.0f};
+        const float q1[7] = {0.98f, 0.98f, 0.98f, 0.98f, 0.0f, 0.0f, 0.0f};
+        const Df2SlotBudgetInput in_b[2] = {{4, true, q0}, {4, true, q1}};
+        int out_b[2] = {};
+        allocate_dprob_spare_rows(in_b, 2, 6, 0.50, out_b);
+        check(out_b[0] == 2 && out_b[1] == 4, "dprob budget: greedy chain-prob ranking allocates 2+4 across asymmetric slots");
+
+        // Case C: Equal probabilities break ties in slot order (3 + 3 = 6).
+        const Df2SlotBudgetInput in_c[2] = {{4, true, q1}, {4, true, q1}};
+        int out_c[2] = {};
+        allocate_dprob_spare_rows(in_c, 2, 6, 0.50, out_c);
+        check(out_c[0] == 3 && out_c[1] == 3, "dprob budget: equal chain-prob ties break symmetrically (3+3)");
+
+        // Case D: Head max_per_slot keeps 2-slot 8-row window at 4 per slot (total_rows=8 <= 8 IL cap).
+        check(batch_df2_head_max_per_slot(6, 2, true, 0) == 4 &&
+              batch_df2_head_max_per_slot(6, 2, false, 0) == 3 &&
+              batch_df2_head_max_per_slot(14, 2, true, 0) == 7,
+              "batch_df2_head_max_per_slot: returns 4 for 2-slot 8-row dprob budget and 7 for 16-row");
     }
     std::printf(g_fail == 0 ? "dflash2_ring_test: ok\n" : "dflash2_ring_test: FAILED\n");
     return g_fail == 0 ? 0 : 1;
