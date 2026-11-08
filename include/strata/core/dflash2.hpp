@@ -300,7 +300,9 @@ private:
     cudaGraphExec_t body_exec_[kRows + 1] = {};
     cudaGraphExec_t batch_body_exec_[kRows + 1][kRows + 1] = {};
     cudaGraphExec_t batch_full_exec_[2 * kDrafts + 1] = {};
+    cudaGraphExec_t batch_full_1_exec_[2][kDrafts + 1] = {};
     Dflash2Drafter* batch_slots_[2] = {};
+    Dflash2Drafter* batch_full_1_slots_[2] = {};
     const float* batch_taps_[2] = {};
     const float* precomp_taps_ = nullptr;
     int precomp_rows_ = 0;

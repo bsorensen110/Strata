@@ -54,6 +54,9 @@ Dflash2Drafter::~Dflash2Drafter() {
             if (batch_body_exec_[i][j]) cudaGraphExecDestroy(batch_body_exec_[i][j]);
     for (auto& e : batch_full_exec_)
         if (e) cudaGraphExecDestroy(e);
+    for (int s = 0; s < 2; ++s)
+        for (auto& e : batch_full_1_exec_[s])
+            if (e) cudaGraphExecDestroy(e);
     auto fr = [](void* p) { if (p) cudaFree(p); };
     if (h_logq_) cudaFreeHost(h_logq_);
     if (h_logd_) cudaFreeHost(h_logd_);
@@ -901,6 +904,9 @@ void Dflash2Drafter::set_max_drafts(int n) {
             if (batch_body_exec_[i][j]) { cudaGraphExecDestroy(batch_body_exec_[i][j]); batch_body_exec_[i][j] = nullptr; }
     for (auto& e : batch_full_exec_)
         if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    for (int s = 0; s < 2; ++s)
+        for (auto& e : batch_full_1_exec_[s])
+            if (e) { cudaGraphExecDestroy(e); e = nullptr; }
     clear_precomputed_context();
     graph_taps_ = nullptr;
     ndraft_ = n;
@@ -1972,14 +1978,37 @@ bool Dflash2Drafter::capture_batch_body(const BatchSlotItem* items, int n_items,
 }
 
 bool Dflash2Drafter::capture_batch_full(const BatchSlotItem* items, int n_items, int total_rows, std::string& err) {
-    if (n_items != 2 || total_rows < 1 || total_rows > 2 * kDrafts) return false;
-    if (batch_slots_[0] != items[0].slot || batch_slots_[1] != items[1].slot) {
-        for (auto& e : batch_full_exec_)
-            if (e) { cudaGraphExecDestroy(e); e = nullptr; }
-        batch_slots_[0] = items[0].slot;
-        batch_slots_[1] = items[1].slot;
+    if ((n_items != 1 && n_items != 2) || total_rows < 1 || total_rows > n_items * kDrafts) return false;
+    cudaGraphExec_t* target_exec = nullptr;
+    if (n_items == 1) {
+        int s_idx = 0;
+        if (batch_full_1_slots_[0] == items[0].slot) {
+            s_idx = 0;
+        } else if (batch_full_1_slots_[1] == items[0].slot) {
+            s_idx = 1;
+        } else if (batch_full_1_slots_[0] == nullptr) {
+            s_idx = 0;
+            batch_full_1_slots_[0] = items[0].slot;
+        } else if (batch_full_1_slots_[1] == nullptr) {
+            s_idx = 1;
+            batch_full_1_slots_[1] = items[0].slot;
+        } else {
+            s_idx = 0;
+            for (auto& e : batch_full_1_exec_[0])
+                if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+            batch_full_1_slots_[0] = items[0].slot;
+        }
+        target_exec = &batch_full_1_exec_[s_idx][total_rows];
+    } else {
+        if (batch_slots_[0] != items[0].slot || batch_slots_[1] != items[1].slot) {
+            for (auto& e : batch_full_exec_)
+                if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+            batch_slots_[0] = items[0].slot;
+            batch_slots_[1] = items[1].slot;
+        }
+        target_exec = &batch_full_exec_[total_rows];
     }
-    if (batch_full_exec_[total_rows]) return true;
+    if (*target_exec) return true;
     kernels::native_mmvq_il_tune(4);
     kernels::native_mmvq_il_tune(0);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin batch full capture"; return false; }
@@ -1989,13 +2018,13 @@ bool Dflash2Drafter::capture_batch_full(const BatchSlotItem* items, int n_items,
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&batch_full_exec_[total_rows], graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess || cudaGraphInstantiate(target_exec, graph, 0) != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("dflash2: capture_batch_full: ") + cudaGetErrorString(ce);
         return false;
     }
     cudaGraphDestroy(graph);
-    cudaGraphUpload(batch_full_exec_[total_rows], cs_);
+    cudaGraphUpload(*target_exec, cs_);
     cudaStreamSynchronize(cs_);
     return true;
 }
@@ -2011,10 +2040,10 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
         const char* e = std::getenv("STRATA_DF2_BATCHBODY");
         return !e || !e[0] || e[0] != '0';
     }();
-    const bool use_batch_body = batch_body_on && n_items >= 2 && rt_bctx_ != nullptr;
+    const bool use_batch_body = batch_body_on && (n_items >= 2 || (n_items == 1 && precomp_taps_ != nullptr && precomp_rows_ > 0)) && rt_bctx_ != nullptr;
 
     int precomp_offs[kBatchMaxSlots] = {};
-    bool can_use_precomp = use_batch_body && n_items == 2 && precomp_taps_ != nullptr && precomp_rows_ > 0;
+    bool can_use_precomp = use_batch_body && (n_items == 1 || n_items == 2) && precomp_taps_ != nullptr && precomp_rows_ > 0;
     int total_rows = 0;
     for (int idx = 0; idx < n_items; ++idx) {
         const BatchSlotItem& it = items[idx];
@@ -2089,9 +2118,11 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
     bool head_recorded_in_graph = false;
     if (use_batch_body) {
         if (can_use_precomp) {
-            if (!prof_ && n_items == 2) {
+            if (!prof_ && (n_items == 1 || n_items == 2)) {
                 if (!capture_batch_full(items, n_items, total_rows, err)) return false;
-                if (cudaGraphLaunch(batch_full_exec_[total_rows], cs_) != cudaSuccess) {
+                cudaGraphExec_t g_exec = n_items == 2 ? batch_full_exec_[total_rows]
+                                                      : batch_full_1_exec_[batch_full_1_slots_[1] == items[0].slot ? 1 : 0][total_rows];
+                if (cudaGraphLaunch(g_exec, cs_) != cudaSuccess) {
                     err = std::string("dflash2 draft_batch_slots (batch_full): ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }

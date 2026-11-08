@@ -14819,7 +14819,7 @@ int main(int argc, char** argv) {
                 const char* e = std::getenv("STRATA_DF2_TAP_OVERLAP");
                 return !e || !e[0] || e[0] != '0';
             }();
-            if (batch_df2 && df2_tap_overlap && stages.empty() && A >= 2) {
+            if (batch_df2 && df2_tap_overlap && stages.empty() && A >= 1) {
                 ver.set_taps_ready(
                     [](void* u, const float* taps_dev, int n_rows, const int64_t* pos_in) {
                         static_cast<strata::core::Dflash2Drafter*>(u)->precompute_batch_context(taps_dev, n_rows, pos_in);
@@ -14957,7 +14957,7 @@ int main(int argc, char** argv) {
                         d.clear_deferred();
                         const size_t tap_stride = (size_t) d.tap_layers().size() * (size_t) g.n_embd;
                         const float* slot_taps = nullptr;
-                        if (stages.empty() && A >= 2 &&
+                        if (stages.empty() && A >= 1 &&
                             df2.has_precomputed_context(ver.tap_dev() + (size_t) first[t] * tap_stride, kp, pos[first[t]])) {
                             slot_taps = ver.tap_dev() + (size_t) first[t] * tap_stride;
                         } else {
@@ -15002,7 +15002,8 @@ int main(int argc, char** argv) {
                 const char* e = std::getenv("STRATA_DF2_BATCHHEAD");
                 return e == nullptr || e[0] == '\0' || std::strcmp(e, "0") != 0;
             }();
-            const bool use_bhead = df2_batch_head && stages.empty() && df2_launched.size() >= 2 &&
+            const bool use_bhead = df2_batch_head && stages.empty() &&
+                                   (df2_launched.size() >= 2 || (df2_launched.size() == 1 && df2_tap_overlap)) &&
                                    df2_launched.size() <= (size_t) strata::core::Dflash2Drafter::kBatchMaxSlots;
             strata::core::Dflash2Drafter::BatchSlotItem df2_bitems[strata::core::Dflash2Drafter::kBatchMaxSlots] = {};
             int32_t df2_bdd[strata::core::Dflash2Drafter::kBatchMaxSlots][strata::core::Dflash2Drafter::kDrafts] = {};
