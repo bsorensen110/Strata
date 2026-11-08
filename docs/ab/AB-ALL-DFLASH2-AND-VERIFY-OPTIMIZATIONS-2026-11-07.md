@@ -1,11 +1,11 @@
 # DFlash2 & Target Verifier Optimization Campaign (2026-11-07)
 
 - **Worktree**: `/home/soren/Strata-perf-dflash2-on-main-20261103`
-- **Branch**: `perf/dflash2-tap-overlap-16row` (`0d468cf6b`, 26 code commits + docs on top of `fork-main` @ `d80835e40`)
+- **Branch**: `perf/dflash2-tap-overlap-16row` (`0247ac749`, 31 code commits + docs on top of `fork-main` @ `d80835e40`)
 - **Hardware**: AMD Radeon AI PRO R9700 (`gfx1201` / RDNA4, 32 GiB VRAM, ROCm nightly `10.2.0a20260914`)
 - **Model**: `qwen3.8-flash-next-unsloth-ud-iq4_xs-v31` + `qwen3.8-flash-next-dflash2.q4_0-selq4.pack` (`--batch 2`, `--spec 8`, `--draft-conf 0.5`, `--resident-experts --resident-budget-gib 34`)
 
-## 1. Atomic Commit Stack (`d80835e40..0d468cf6b`)
+## 1. Atomic Commit Stack (`d80835e40..0247ac749`)
 
 1. `b44d8bc61` `perf(dflash2): support 16-way grouped GEMM dispatch`
 2. `62b915718` `perf(dflash2): batch all-layer K/V projections with strided scratch`
@@ -33,6 +33,11 @@
 24. `db4964732` `perf(batch): overlap DFlash2 context with verify in read_windows and yield to active batch slots`
 25. `d3711bb3f` `perf(batch): enable precomputed context and captured batch_full graph when 1 slot is active in step_batch`
 26. `0d468cf6b` `perf(batch): batch DFlash2 ring copy into direct_slot_copy sync and overlap BADM initial draft with checkpoint setup`
+27. `6b09a8335` `perf(cpu): enable parallel activation quantization across cold modes and fuse intermediate H quantization into gate/up phase`
+28. `a3aee7b03` `perf(expert-source): move RouterLookahead submit past GPU plan publish, fast-dedupe routed experts, and skip lookahead/claim_todo when all layer experts are in VRAM/RAM`
+29. `7e5c0e10c` `perf(dflash2): stage precomputed batch context log copies in precompute_batch_context, flush on CPU during batch_full launch, and elide redundant finish stream syncs`
+30. `b8b65f534` `perf(verify): overlap PLE gather with Layer 0, add adapt_gate_wait, and batch penalty staging and multi-row sample_tokens in run_slot_rows`
+31. `0247ac749` `perf(snapshot): pre-populate CheckpointPool on background CPU thread, move dropped slot checkpoints in park_slot/park_current, and batch snapshot DMA syncs`
 
 ## 2. Microbenchmark & Parity Verification (`gfx1201`, `strata.service` stopped)
 
@@ -106,3 +111,43 @@
   - **2-Slot Concurrent `2x256` Burst (`batch2`)**:
     - Control (`0_prod_control`): mean **125.8 tok/s** aggregate (`125.7` R1 / `125.9` R2; per-slot **63.7 tok/s**; engine **136.4 / 136.3 rows/s**; `emit 3.81 / 3.67 ms`, `adapt wait 3.69 / 3.97 ms`)
     - Candidate (`1_cand_concurrent`): mean **128.9 tok/s** aggregate (**+2.5% mean / +4.4% warm**, `126.5` R1 / **131.4 tok/s** warm R2; per-slot **65.3 tok/s** [`64.0` R1 / **66.6 tok/s** R2]; engine **148.3 / 154.1 rows/s [+13.1% warm engine rows/s]**; `emit 2.79 / 2.76 ms [−25.6%]`, `adapt wait 1.08 / 1.08 ms [−72.8%]`, acceptance **346/164 = 211.0%**)
+
+## 6. CPU-Side Concurrent Batched Processing Optimizations (`6b09a8335..0247ac749`)
+
+- **Mechanisms**:
+  1. **Parallel Multi-Token Activation Quantization (`defer_act_quant`) & Fused Intermediate `H` Quantization in `ExpertPool` (`6b09a8335`)**:
+     - Raised `kMaxActQuantToks` from `32` to `1024` and removed the `d.cold_mode == 0` restriction in `expert_pool_dispatch_multi` (`src/core/expert_source.cpp`) so Linux doorbell/mapped mode (`d.cold_mode == 4`) and `PREFILL_CPU_SHARE` (`src/prefill/prefill.cpp`) quantize multi-token activations in parallel across `ExpertPool` worker threads during Phase 1 (`mode 5` / `mode 3`) instead of serially on the calling thread.
+     - Added per-expert `gu_rows_done` atomic row tracking in `SplitBufMulti`: the worker thread completing the final gate+up row slice of expert `e` immediately quantizes `sb.ff[t]` into `sb.hq[t]` / `sb.a2[t]` while `sb.ff[t]` is hot in L1/L2 cache, eliminating Phase 2 (`mode 6` / `mode 4`) startup contention.
+  2. **RouterLookahead Off-Critical-Path Submission, Resident-Layer Fast-Skip, and $O(1)$ Bitmap Deduplication (`a3aee7b03`)**:
+     - Moved `RouterLookahead::submit` after `gpu_plan.publish(...)` in `expert_source.cpp` so CPU lookahead router GEMV/top-K runs while the GPU is already executing the current layer's MoE kernel.
+     - Added `ExpertSource::has_resident_blob(layer, expert)` and skipped `RouterLookahead::submit` and `FileExpertSource::claim_todo` when all routed cold experts in a layer are already resident in pinned RAM (`complement_ready_`), avoiding pointless background file-pread queueing and mutex contention.
+     - Replaced $O(N^2)$ linear-scan expert deduplication in `expert_pool_dispatch_multi` with direct 512-entry lookup tables (`seen_i0[512]`, `miss_seen[512]`).
+  3. **CPU-Overlapped DFlash2 KV Ring Log Maintenance & Duplicate Sync Elision (`7e5c0e10c`)**:
+     - Staged `pos_d_` and `slot_d_` D2H copies into `h_logq_` / `h_logd_` inside `precompute_batch_context` before recording `bctx_ready_[s]`, then launched `batch_full_exec_` immediately in `draft_batch_slots_launch` and flushed the staged ring logs into CPU `log_pos_` / `log_slot_` while the GPU executes the draft graph.
+     - Elided the duplicate `cudaStreamSynchronize(items[0].drafter->cs_)` in `draft_batch_slots_finish` when `n_items >= 2` (`cs_` is already `items[0].drafter->cs_`).
+  4. **Verifier CPU/GPU Overlap (`ple_done_ev_`, `adapt_gate_wait`, and Batched Multi-Row `sample_tokens`) (`b8b65f534`)**:
+     - Replaced blocking `cudaStreamSynchronize(ple_stream_)` before Layer 0 in `Verifier::run_slot_rows` with `cudaEventRecord(ple_done_ev_, ple_stream_)` + `cudaStreamWaitEvent(cs_, ple_done_ev_, 0)` so CPU Layer-0 setup and GPU Layer-0 execution overlap with PLE gather DMA.
+     - Added guarded `adapt_gate_wait` (`adapt_gate_->active && adapt_gate_->has[l] != 0`) in `Verifier::run_slot_rows`.
+     - Batched penalty staging and contiguous multi-row `cuda::sample_tokens` calls in `Verifier::run_slot_rows` across rows sharing sampling parameters without per-token grammar state transitions.
+  5. **Background CPU `CheckpointPool` Warmup, Zero-Copy `park_slot`/`park_current` Move, and Batched Snapshot DMA Syncs (`0247ac749`)**:
+     - Defaulted `STRATA_CKPT_POOL_READY=2` on HIP so `CheckpointPool` pre-allocates and pre-faults two 118 MB `ConvCheckpoint` structs on a background `std::async` CPU thread at startup and after each checkpoint consumption.
+     - Enabled `park_drops` move semantics in `park_slot` and `park_current` when `STRATA_SLOT_CKPT_MOVE=1` (default on) so dropped slot checkpoints move into `ConversationSnapshot` in $O(1)$ without 118 MB host-vector reallocation/copy on the engine thread.
+     - Queued running-state and KV-snapshot DMA copies (`queued = true`) on `private_stream` in `conversation_state.cpp` and `conversation_snapshot.cpp` with a single `sync_private_stream()` barrier at completion.
+- **Paired End-to-End A/B Results (`0_prod_control` @ `cfb22e5b4` vs `1_cand_concurrent` @ `0247ac749`)**:
+  - **Solo Refactor Parity (`2x192`, `temp=0`)**:
+    - Control (`0_prod_control`): **74.4 tok/s** wall (`60.8` cold / `88.0` warm; engine decode `85.6` cold / **136.0 tok/s** warm), hash `ece1433a582a4c38`
+    - Candidate (`1_cand_concurrent` @ `0247ac749`): **78.6 tok/s** wall (**+5.6% vs control**, `64.4` cold / **92.8 tok/s** warm; engine decode `90.4` cold / **144.8 tok/s** warm [**+6.5% warm engine decode**]), hash `ece1433a582a4c38` (exact bitwise match)
+  - **Concurrent Decode (Slot 0: 256 tok) + Long Prefill & Decode (Slot 1: 4,712 prompt tok + 128 generated tok)**:
+    - Control (`0_prod_control`):
+      - Combined aggregate throughput: **46.3 tok/s** (`44.6` R1 / `48.1` R2; wall `8.62s` / `7.98s`)
+      - Slot 0 decode throughput during co-prefill: **32.8 tok/s** (`31.2` R1 / `34.4` R2; wall `8.20s` / `7.43s`)
+      - Slot 1 total latency: **7.95s** (`8.27s` R1 / `7.63s` R2); engine 4,712-token prompt read: `6,210 ms (758.8 tok/s)` R1 / `5,915 ms (796.6 tok/s)` R2
+      - Window telemetry: `33.81 ms/window = run 29.03 + commit 0.01 + emit 3.56 + adapt wait 1.20`
+    - Candidate (`1_cand_concurrent` @ `0247ac749`):
+      - Combined aggregate throughput: **48.8 tok/s** (**+5.3% vs control**, `47.7` R1 / **49.8 tok/s** R2; wall `8.05s` / `7.71s`)
+      - Slot 0 decode throughput during co-prefill: **36.5 tok/s** (**+11.3% vs control**, `35.1` R1 / **38.0 tok/s** R2; wall `7.30s` / **`6.73s` [−0.90s faster]**)
+      - Slot 1 total latency: **7.53s** (**−5.3% vs control**, `7.70s` R1 / **`7.36s`** R2); engine 4,712-token prompt read: **`5,879 ms (801.6 tok/s)` R1 / `5,816 ms (810.2 tok/s)` R2**
+      - Window telemetry: **`31.57 ms/window` (−6.6% vs control)** = `run 29.10 + commit 0.01 + emit 2.21 (−37.9% vs control) + adapt wait 0.26 (−78.3% vs control)`
+  - **2-Slot Concurrent `2x256` Burst (`batch2`)**:
+    - Control (`0_prod_control`): mean **126.6 tok/s** aggregate (`127.4` R1 / `125.8` R2; per-slot **63.8 tok/s**; slot admission copies `41.7 ms`, `44.4 ms`, `38.2 ms`; engine **147.5 / 135.1 rows/s**; warm R2 `CPU pool 8.15 ms/window`, `emit 3.75 ms/window`, `adapt wait 3.98 ms/window`)
+    - Candidate (`1_cand_concurrent` @ `0247ac749`): mean **132.5 tok/s** aggregate (**+4.7% vs control, +2.8% vs pre-CPU candidate `0d468cf6b`**, **134.0 tok/s** R1 / **131.0 tok/s** R2; per-slot **68.2 tok/s [+6.8% vs control]**; slot admission copies **`17.6 ms`, `10.0 ms`, `14.4 ms`, `14.0 ms` [−67% vs control]**; engine **152.3 / 154.5 rows/s [+14.4% warm engine rows/s]**; warm R2 **`CPU pool 6.91 ms/window [−15.2% vs control, −11.1% vs pre-CPU 7.77 ms]`**, **`emit 2.82 ms/window [−24.8% vs control]`**, **`adapt wait 1.25 ms/window [−68.6% vs control]`**, acceptance **347/163 = 212.9%**)
