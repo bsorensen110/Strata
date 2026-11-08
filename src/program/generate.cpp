@@ -17417,6 +17417,13 @@ int main(int argc, char** argv) {
                 std::fflush(stdout);
                 return true;
             };
+            static const double decode_share = [] {
+                const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
+                return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
+            }();
+            bool batch_fatal = false;
+            int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
+            double il_ms = 0;
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 // (STRATA_LOGPOS reads every window's logits: the serial loop)
@@ -17432,8 +17439,10 @@ int main(int argc, char** argv) {
                 const int S_read = (batch_df2 && !use_mtp && n_stages == 1) ? std::max(S, ver.max_t()) : S;
                 std::vector<int32_t> win((size_t) S_read), outw((size_t) S_read), nxt((size_t) S_read);
                 pp_exact = true;   // between windows the session is exactly at `a`
+                double win_ms_accum = 0.0;
                 for (int64_t q = a; q < b;) {
                     if (stop_req.load()) { e = "cancelled"; return false; }
+                    const Clock::time_point wt0 = Clock::now();
                     pp_exact = false;   // until this window and the drafter's rows are in
                     int T = (int) std::min<int64_t>(S_read, b - q);
                     // --lookup-max-t: the prompt's windows take the allowed sizes too (each size is a graph of its own);
@@ -17449,6 +17458,23 @@ int main(int argc, char** argv) {
                     drive.d.layers = 0;
                     drive.d.experts = 0;
                     drive.d.failed = false;
+#if defined(STRATA_HAVE_DFLASH2)
+                    static const bool win_tap_overlap = [] {
+                        const char* env_v = std::getenv("STRATA_DF2_TAP_OVERLAP");
+                        return !env_v || !env_v[0] || env_v[0] != '0';
+                    }();
+                    struct ScopedWinTapsReady {
+                        strata::core::Verifier& v;
+                        explicit ScopedWinTapsReady(strata::core::Verifier& ver_in, strata::core::Dflash2Drafter* d) : v(ver_in) {
+                            if (d != nullptr) {
+                                v.set_taps_ready([](void* u, const float* taps_dev, int n_rows, const int64_t* pos_in) noexcept {
+                                    static_cast<strata::core::Dflash2Drafter*>(u)->precompute_batch_context(taps_dev, n_rows, pos_in);
+                                }, d);
+                            }
+                        }
+                        ~ScopedWinTapsReady() { v.set_taps_ready(nullptr, nullptr); }
+                    } scoped_win_taps(ver, (use_df2 && win_tap_overlap && stages.empty()) ? &df2 : nullptr);
+#endif
                     if (!ver.run(T, win.data(), q, win_pool_fn, win_pool_user, outw.data(), e) || drive.d.failed) {
                         if (drive.d.failed && drive.d.fail) e = drive.d.fail;
                         return false;
@@ -17482,6 +17508,32 @@ int main(int argc, char** argv) {
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
+                    win_ms_accum += std::chrono::duration<double, std::milli>(Clock::now() - wt0).count();
+                    if (q < b && (b - a) >= 128 && o.batch > 0 && stages.empty() && decode_share > 0.0 && batch_on()) {
+                        int n_act_w = 0;
+                        for (const auto& x : bs) n_act_w += x.active ? 1 : 0;
+                        const double eff_share = strata::program::batch_decode_share(decode_share, n_act_w);
+                        const double budget = win_ms_accum * eff_share;
+                        if (budget >= 25.0) {
+                            win_ms_accum = 0.0;
+                            if (!ver.wait_commit(e)) return false;
+                            ver.set_head_sampling(true);
+                            const Clock::time_point bt0 = Clock::now();
+                            while (batch_on() && !stop_req.load()) {
+                                if (!batch_step()) {
+                                    ver.set_head_sampling(false);
+                                    batch_fatal = true;
+                                    e = err.empty() ? std::string("a batch decode window failed during the prompt read") : err;
+                                    return false;
+                                }
+                                ++il_parts;
+                                const double dt = std::chrono::duration<double, std::milli>(Clock::now() - bt0).count();
+                                if (dt >= budget) break;
+                            }
+                            il_ms += std::chrono::duration<double, std::milli>(Clock::now() - bt0).count();
+                            ver.set_head_sampling(false);
+                        }
+                    }
                 }
                 // the batched prompt path (other streams), checkpoints and snapshots may follow: the last commit first
                 if (!ver.wait_commit(e)) return false;
@@ -17680,13 +17732,6 @@ int main(int argc, char** argv) {
             // decode for a share of the time the chunk took (STRATA_BATCH_DECODE_SHARE, default 0.5), so a long
             // prompt does not stop the others.  The slots' windows then see the cache without the slots this prompt
             // borrowed (marked missing: those experts run on the CPU), never a prompt buffer.
-            static const double decode_share = [] {
-                const char* v = std::getenv("STRATA_BATCH_DECODE_SHARE");
-                return v != nullptr ? std::max(0.0, std::atof(v)) : 0.5;
-            }();
-            bool batch_fatal = false;
-            int64_t il_parts = 0;   // the slots' windows run between this prompt's chunks
-            double il_ms = 0;
             int64_t yielded_at = -1;   // BYIELD: the read stopped here and its slot holds it
             int yielded_slot = -1;
             // `BYIELD <slot>` (the server: a shorter request is waiting): at the next chunk boundary the part read so
