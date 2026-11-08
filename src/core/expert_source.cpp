@@ -2192,6 +2192,19 @@ void FileExpertSource::claim_todo(int64_t layer, const int64_t* experts, int64_t
     // 149-cold mode 3: the GGUF in place, mapped and buffered: an expert the page cache holds whole is computed from
     // the mapping (its three tensors' rows), not assembled into a stage buffer first.  Decided here, before the lock.
     zc_keys_.clear();
+    if (complement_ready_) {
+        bool all_resident = true;
+        for (int64_t i = 0; i < n; ++i) {
+            const int64_t e = experts[i];
+            if (e < 0 || e >= n_expert_) continue;
+            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+            if (resident_blob(index) == nullptr && (override_.empty() || override_[index] == nullptr)) {
+                all_resident = false;
+                break;
+            }
+        }
+        if (all_resident) return;
+    }
     std::vector<char> zc_ok;
     if (zc && !role_ptr_.empty() && !unmapped_ && direct_.empty() && strata::kernels::cpu::expert_layout().native &&
         strata::kernels::cpu::expert_layout().fmt[(size_t) layer].tail_off == 0) {
@@ -3110,6 +3123,18 @@ void RouterLookahead::submit(int64_t layer, const float* x, int64_t n_tok, const
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (busy_ || pending_) { skipped_.fetch_add(1, std::memory_order_relaxed); return; }
+        if (!stats_on_ && fs_ == nullptr && src_ != nullptr && host_res != nullptr) {
+            const int depth = !src_->read_ahead_open() ? 1 : depth_;
+            bool any_cold = false;
+            for (int dj = 0; dj < depth && layer + 1 + dj < (int64_t) routers_.size() && !any_cold; ++dj) {
+                const int64_t tl = layer + 1 + dj;
+                const int32_t* hr = host_res + (size_t) (tl * n_expert_);
+                for (int64_t e = 0; e < n_expert_; ++e) {
+                    if (hr[e] < 0 && !src_->has_resident_blob(tl, e)) { any_cold = true; break; }
+                }
+            }
+            if (!any_cold) return;
+        }
         n_tok_ = std::min<int64_t>(n_tok, 16);
         std::memcpy(x_.data(), x, (size_t) (n_tok_ * n_embd_) * sizeof(float));
         layer_ = layer + 1;
@@ -3242,6 +3267,14 @@ void RouterLookahead::run() {
         const int depth = src_ != nullptr && !src_->read_ahead_open() ? 1 : depth_;   // 149: the gate closed
         for (int dj = 0; dj < depth && layer0 + dj < (int64_t) routers_.size(); ++dj) {
         layer = layer0 + dj;
+        if (dj > 0 && !stats_on_ && fs == nullptr && src_ != nullptr && host_res != nullptr) {
+            bool any_cold = false;
+            const int32_t* hr = host_res + (size_t) (layer * n_expert_);
+            for (int64_t e = 0; e < n_expert_; ++e) {
+                if (hr[e] < 0 && !src_->has_resident_blob(layer, e)) { any_cold = true; break; }
+            }
+            if (!any_cold) continue;
+        }
         want.clear();
         wconf.clear();
         const bool scored = src_->wants_scores();
@@ -4929,13 +4962,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         d.fail_layer = d.layers;
         return;
     }
-    if (d.lookahead != nullptr) {
-        if (d.lookahead->stats_on()) {
-            if (d.layers == 0) d.lookahead->stats_window_start();
-            d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
-        }
-        d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1
-    }
     if (k < 1 || n_tok * k > kMaxWindowEntries) {
         d.failed = true;
         d.fail = "a verify window routes more entries than the expert pool's window tables hold";
@@ -4991,13 +5017,22 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
 #endif
             return false;
         };
+        int16_t seen_i0[512];
+        const bool fast_seen = d.n_expert > 0 && d.n_expert <= 512;
+        if (fast_seen) std::memset(seen_i0, 0xff, (size_t) d.n_expert * sizeof(int16_t));
         for (int64_t i = 0; i < n; ++i) {
             first_of[i] = i;
             next_same[i] = -1;
             const int32_t ei = lid[i];
-            for (int q = 0; q < nd; ++q) {
-                const int64_t j = distinct[q];
-                if (lid[j] == ei) { first_of[i] = j; break; }
+            if (fast_seen && ei >= 0 && ei < d.n_expert) {
+                const int16_t prev = seen_i0[ei];
+                if (prev >= 0) first_of[i] = prev;
+                else seen_i0[ei] = (int16_t) i;
+            } else {
+                for (int q = 0; q < nd; ++q) {
+                    const int64_t j = distinct[q];
+                    if (lid[j] == ei) { first_of[i] = j; break; }
+                }
             }
             const int rk = (int) (i % k);
             if (first_of[i] == i) {
@@ -5166,6 +5201,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     : (e >= 0 && e < d.n_expert && d.peer != nullptr && d.peer->has(d.layers, e)) ? 2 : -1;
         }
     }
+    if (d.lookahead != nullptr) {
+        if (d.lookahead->stats_on()) {
+            if (d.layers == 0) d.lookahead->stats_window_start();
+            d.lookahead->stats_score(d.layers, ids, n_tok * k, d.host_res, d.pcie_num);
+        }
+        d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);   // CS-T: warm layer + 1 after publishing GPU plan
+    }
     if (!d.usage.empty())
         for (int64_t i = 0; i < n; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
@@ -5254,10 +5296,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     int64_t npend = 0;
     double cold_r_ms = 0;
     if (any_cpu) {   // CS-T: the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)
-        for (int64_t i = 0; i < n_tok * k; ++i)
-            if (kind[i] == -1 && ids[i] >= 0 && ids[i] < d.n_expert &&
-                std::find(miss.begin(), miss.end(), (int64_t) ids[i]) == miss.end())
-                miss.push_back(ids[i]);
+        int8_t miss_seen[512];
+        const bool fast_miss = d.n_expert > 0 && d.n_expert <= 512;
+        if (fast_miss) std::memset(miss_seen, 0, (size_t) d.n_expert);
+        for (int64_t i = 0; i < n_tok * k; ++i) {
+            const int32_t ei = ids[i];
+            if (kind[i] != -1 || ei < 0 || ei >= d.n_expert) continue;
+            if (fast_miss) {
+                if (!miss_seen[ei]) { miss_seen[ei] = 1; miss.push_back(ei); }
+            } else if (std::find(miss.begin(), miss.end(), (int64_t) ei) == miss.end()) {
+                miss.push_back(ei);
+            }
+        }
         if (d.cold_mode == 0) {
             d.src->prefetch(d.layers, miss.data(), (int64_t) miss.size());
         } else {
