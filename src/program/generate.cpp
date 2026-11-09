@@ -11870,11 +11870,18 @@ int main(int argc, char** argv) {
             return df2.landing();
         };
         if (batch_df2 && use_df2) {   // the slot drafters bind to the solo drafter's head and embedding and capture their graphs on their own landing
+            std::vector<strata::core::Dflash2Drafter*> slot_ptrs;
+            slot_ptrs.reserve(slot_df2.size());
             for (size_t b = 0; b < slot_df2.size(); ++b) {
                 auto& d = *slot_df2[b];
                 if (!d.clone_bind(df2, err)) { std::fprintf(stderr, "strata serve: STRATA_BATCH_DF2: slot %zu: %s\n", b, err.c_str()); return 1; }
                 d.set_max_drafts((o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec) - 1);
                 if (!d.prepare(d.landing(), err)) { std::fprintf(stderr, "strata serve: STRATA_BATCH_DF2: slot %zu: %s\n", b, err.c_str()); return 1; }
+                slot_ptrs.push_back(&d);
+            }
+            if (!df2.prewarm_batch_slots(slot_ptrs.data(), (int) slot_ptrs.size(), err)) {
+                std::fprintf(stderr, "strata serve: STRATA_BATCH_DF2: prewarm: %s\n", err.c_str());
+                return 1;
             }
             std::fprintf(stderr, "strata serve: STRATA_BATCH_DF2: %zu slot drafters ready (batch windows carry each slot's token and its spare-row drafts)\n", slot_df2.size());
         } else if (batch_df2) {   // the solo drafter did not start (a fallback is loaded): the slots decode without drafts
@@ -20079,9 +20086,26 @@ int main(int argc, char** argv) {
                     if (!df2.context(tp + (size_t) r0 * tap_stride, chunk, p + r0, err)) return false;
                 }
                 if (head_n > 0) {
-                    (void) cudaMemcpyAsync(const_cast<float*>(tp), tp + (size_t) head_n * tap_stride,
-                                           (size_t) tail_m * tap_stride * sizeof(float),
-                                           cudaMemcpyDeviceToDevice, df2.stream());
+                    if (strata::core::dflash2_tail_shift_overlaps(head_n, tail_m)) {
+                        if (tp != df2.landing() && df2.landing() != nullptr) {
+                            const size_t bytes = (size_t) tail_m * tap_stride * sizeof(float);
+                            (void) cudaMemcpyAsync(df2.landing(), tp + (size_t) head_n * tap_stride,
+                                                   bytes, cudaMemcpyDeviceToDevice, df2.stream());
+                            (void) cudaMemcpyAsync(const_cast<float*>(tp), df2.landing(),
+                                                   bytes, cudaMemcpyDeviceToDevice, df2.stream());
+                        } else {
+                            for (int r = 0; r < tail_m; ++r) {
+                                (void) cudaMemcpyAsync(const_cast<float*>(tp) + (size_t) r * tap_stride,
+                                                       tp + (size_t) (head_n + r) * tap_stride,
+                                                       tap_stride * sizeof(float),
+                                                       cudaMemcpyDeviceToDevice, df2.stream());
+                            }
+                        }
+                    } else {
+                        (void) cudaMemcpyAsync(const_cast<float*>(tp), tp + (size_t) head_n * tap_stride,
+                                               (size_t) tail_m * tap_stride * sizeof(float),
+                                               cudaMemcpyDeviceToDevice, df2.stream());
+                    }
                 }
                 if (!df2.draft(tp, tail_m, p + head_n, outv[(size_t) a_], dd, pp, err)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
@@ -20557,14 +20581,15 @@ int main(int argc, char** argv) {
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
                     mtp.set_draft_history(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
+                const bool stop_now = stop_req.load();
 #if defined(STRATA_HAVE_DFLASH2)
                 // The request ends here, so no draft follows and the window's committed rows would never reach the drafter's ring or its log: every turn would
                 // leave a hole of a + 1 positions behind it, which a later turn that resumes after this one finds blank (and cannot rebuild). Update them now.
                 // On BGEN admission that continues in slot_df2[admit_slot], skip updating the solo drafter: copy_to_slot copies the prefix and slot_df2 consumes
                 // the admission window's taps directly when producing its first drafts.
                 static const bool df2_end_update = std::getenv("STRATA_DF2_END_UPDATE") == nullptr || std::getenv("STRATA_DF2_END_UPDATE")[0] != '0';   // =0: the pre-fix behaviour (diagnostics)
-                const bool will_admit_df2 = admit_slot >= 0 && batch_df2 && !eos && admit_max_new > 1;
-                if (df2_end_update && use_df2 && req_df2 && !will_admit_df2 && (eos || produced_n >= max_new)) {
+                const bool will_admit_df2 = admit_slot >= 0 && batch_df2 && !eos && !stop_now && admit_max_new > 1;
+                if (df2_end_update && use_df2 && req_df2 && !will_admit_df2 && (eos || produced_n >= max_new || stop_now)) {
                     const float* tp_end = df2_win_taps(a + 1, err);   // (on a layer split: every stage's taps gathered onto the drafter's card)
                     if (tp_end == nullptr || !df2.context(tp_end, a + 1, p, err)) { if (adapt_thr.joinable()) adapt_thr.join(); std::printf("ERR %s\n", err.c_str()); return 1; }
                 } else if (will_admit_df2 && use_df2 && req_df2 && (a + 1) > (int) strata::core::Dflash2Drafter::kRows) {
@@ -20574,7 +20599,7 @@ int main(int argc, char** argv) {
                 }
 #endif
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
-                const bool drafted = !draft_on || eos || produced_n >= max_new ||
+                const bool drafted = !draft_on || eos || produced_n >= max_new || stop_now ||
                                      (req_df2 ? ((!merged && defer_df2(a)) || draft_df2(a)) : mtp.draft_long(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
                                                                                nullptr, gated_proposal ? &generation : nullptr));
                 {
@@ -20652,7 +20677,7 @@ int main(int argc, char** argv) {
                     policy.observe_chain(T_mtp, chain_n, a, cm,
                                          std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
-                if (stop_req.load()) { finish = "cancel"; break; }
+                if (stop_now || stop_req.load()) { finish = "cancel"; break; }
                 x = outv[(size_t) a];
                 p += a + 1;
             }
