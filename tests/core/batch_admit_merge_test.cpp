@@ -44,6 +44,42 @@ int main() {
     check(std::fabs(b_legacy - 619.0) < 1e-6,
           "legacy inter-chunk decode budget preserves wall_ms * eff_share when net_share is off");
 
+    // 4. single_stage_hybrid_admit_merge stays active on single-stage live verifier regardless of pcie_frac.
+    check(single_stage_hybrid_admit_merge(true, 1, true),
+          "single-stage live verifier enables hybrid admit merge even after pcie_auto_step raises pcie_frac");
+    check(!single_stage_hybrid_admit_merge(false, 1, true),
+          "merge_rem_on=false disables hybrid admit merge");
+    check(!single_stage_hybrid_admit_merge(true, 2, true),
+          "multi-stage pipeline disables hybrid admit merge");
+    check(!single_stage_hybrid_admit_merge(true, 1, false),
+          "inactive verifier disables hybrid admit merge");
+
+    // 5. prompt_last_turn_boundary locates the prompt's turn checkpoint even when resume > turn_at (from_live BGEN).
+    const int32_t chat_ids[62] = {
+        1, 2, 100, 3, 4, 5, 100, 300, 6, 7, 100, 200
+    };
+    // Turn tokens at indices 2 (user), 6 (tail_role_token=300 at index 7), 10 (assistant=200 at index 11).
+    check(prompt_last_turn_boundary(chat_ids, 62, 100, -1, true, -1) == 10,
+          "finds last turn token at index 10 even when resume is 61");
+    check(prompt_last_turn_boundary(chat_ids, 62, 100, 300, true, -1) == 6,
+          "steps back across trailing tail_role_token turn to index 6");
+    check(prompt_last_turn_boundary(chat_ids, 62, 100, -1, true, 10) == -1,
+          "excludes root_at so shared system-prompt root checkpoint is not moved");
+    check(prompt_last_turn_boundary(chat_ids, 62, 100, -1, false, -1) == -1,
+          "req_ckpt=false returns -1");
+
+    // 6. should_move_slot_checkpoints_to_solo moves checkpoints on both same-slot BGEN and full solo GEN handoff.
+    check(should_move_slot_checkpoints_to_solo(true, true, 0, 0, false),
+          "same-slot BGEN continuation moves checkpoints");
+    check(should_move_slot_checkpoints_to_solo(true, true, -1, 0, false),
+          "full slot->solo GEN handoff (admit_slot=-1, slot_ck=nullptr) moves checkpoints in O(1)");
+    check(!should_move_slot_checkpoints_to_solo(true, true, -1, 0, true),
+          "partial turn-checkpoint restore (has_slot_ck=true) preserves slot checkpoint copy");
+    check(!should_move_slot_checkpoints_to_solo(true, true, 1, 0, false),
+          "cross-slot BGEN (admit_slot=1 != slot_source=0) preserves slot checkpoint copy");
+    check(!should_move_slot_checkpoints_to_solo(false, true, -1, 0, false),
+          "slot_ckpt_move=false disables checkpoint move");
+
     // 7. dflash2_ring_copy_slots clamps copy width to [0, k_ring].
     check(dflash2_ring_copy_slots(0, 2064) == 0, "empty ring copies 0 slots");
     check(dflash2_ring_copy_slots(62, 2064) == 62, "62-token conversation copies only 62 of 2064 ring slots");

@@ -29,6 +29,48 @@ inline double inter_chunk_decode_budget_ms(double eff_share, double wall_ms,
     return std::max(0.0, eff_share * pf_ms - mid);
 }
 
+/// Returns true when single-stage hybrid MoE batch admission may merge a partial read_windows remainder
+/// with the final prompt token into a single admission verify window, regardless of dynamic pcie_frac.
+inline bool single_stage_hybrid_admit_merge(bool merge_rem_on, int n_pipe, bool verifier0_live) noexcept {
+    return merge_rem_on && n_pipe == 1 && verifier0_live;
+}
+
+/// Finds the prompt's own last turn checkpoint boundary in `(0, n - 1)` regardless of `resume`
+/// (so a `from_live` BGEN continuation whose `resume > turn_at` still recognizes and moves its own
+/// turn checkpoint in O(1)), returning -1 when disabled or when the boundary equals `root_at`.
+template <class Tok>
+inline int64_t prompt_last_turn_boundary(const Tok* ids, int64_t n, int64_t turn_token,
+                                         int64_t tail_role_token, bool req_ckpt, int64_t root_at) noexcept {
+    if (!req_ckpt || ids == nullptr || n <= 1 || turn_token < 0) return -1;
+    int64_t turn_at = -1;
+    for (int64_t i = n - 1; i > 0; --i) {
+        if ((int64_t) ids[i] == turn_token) {
+            turn_at = i;
+            break;
+        }
+    }
+    if (turn_at > 0 && tail_role_token >= 0) {
+        for (int64_t i = turn_at - 1; i > 0; --i) {
+            if ((int64_t) ids[i] == turn_token) {
+                if ((int64_t) ids[i + 1] == tail_role_token) turn_at = i;
+                break;
+            }
+        }
+    }
+    if (turn_at <= 0 || turn_at == root_at) return -1;
+    return turn_at;
+}
+
+/// Returns true when checkpoints in `bs[slot_source].checks` should be moved in O(1) rather than copied:
+/// either on a same-slot BGEN continuation (`admit_slot == slot_source`), or on a full slot->solo GEN
+/// handoff (`admit_slot < 0 && slot_source >= 0 && !has_slot_ck`) when `solo_handoff_fast` is enabled.
+inline bool should_move_slot_checkpoints_to_solo(bool slot_ckpt_move, bool solo_handoff_fast,
+                                                 int admit_slot, int slot_source, bool has_slot_ck) noexcept {
+    if (!slot_ckpt_move || slot_source < 0) return false;
+    if (admit_slot == slot_source) return true;
+    return solo_handoff_fast && admit_slot < 0 && !has_slot_ck;
+}
+
 /// Returns the number of written DFlash2 KV ring slots `[0, n_slots)` that must be copied by
 /// `Dflash2Drafter::copy_state_from` given `src.ring_hi_` and ring capacity `k_ring`.
 inline int dflash2_ring_copy_slots(int64_t ring_hi, int k_ring) noexcept {
