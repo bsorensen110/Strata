@@ -29,4 +29,11 @@ inline double inter_chunk_decode_budget_ms(double eff_share, double wall_ms,
     return std::max(0.0, eff_share * pf_ms - mid);
 }
 
+/// Returns the number of written DFlash2 KV ring slots `[0, n_slots)` that must be copied by
+/// `Dflash2Drafter::copy_state_from` given `src.ring_hi_` and ring capacity `k_ring`.
+inline int dflash2_ring_copy_slots(int64_t ring_hi, int k_ring) noexcept {
+    if (ring_hi <= 0 || k_ring <= 0) return 0;
+    return ring_hi >= (int64_t) k_ring ? k_ring : (int) ring_hi;
+}
+
 }  // namespace strata::core

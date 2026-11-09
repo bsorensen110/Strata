@@ -1,6 +1,7 @@
 // src/core/dflash2.cpp - see include/strata/core/dflash2.hpp.
 #include "strata/core/dflash2.hpp"
 
+#include "strata/core/batch_admit_merge.hpp"
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/weights.hpp"
@@ -837,10 +838,19 @@ bool Dflash2Drafter::copy_state_from(Dflash2Drafter& src, std::string& err, bool
     if (!already_synced) {
         if (cudaStreamSynchronize(src.cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess) { err = "dflash2: sync before a state copy"; return false; }
     }
-    const size_t ring_bytes = (size_t) kRing * NKV_ * HD_ * ring_elem_bytes();
-    for (int l = 0; l < L_; ++l)
-        if (cudaMemcpyAsync(kring_[l], src.kring_[l], ring_bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
-            cudaMemcpyAsync(vring_[l], src.vring_[l], ring_bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) { err = "dflash2: ring copy"; return false; }
+    const int n_slots = dflash2_ring_copy_slots(src.ring_hi_, kRing);
+    if (n_slots >= kRing) {
+        const size_t ring_bytes = (size_t) kRing * NKV_ * HD_ * ring_elem_bytes();
+        for (int l = 0; l < L_; ++l)
+            if (cudaMemcpyAsync(kring_[l], src.kring_[l], ring_bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+                cudaMemcpyAsync(vring_[l], src.vring_[l], ring_bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) { err = "dflash2: ring copy"; return false; }
+    } else if (n_slots > 0) {
+        const size_t pitch = (size_t) kRing * HD_ * ring_elem_bytes();
+        const size_t width = (size_t) n_slots * HD_ * ring_elem_bytes();
+        for (int l = 0; l < L_; ++l)
+            if (cudaMemcpy2DAsync(kring_[l], pitch, src.kring_[l], pitch, width, (size_t) NKV_, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+                cudaMemcpy2DAsync(vring_[l], pitch, src.vring_[l], pitch, width, (size_t) NKV_, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) { err = "dflash2: ring copy"; return false; }
+    }
     if (cudaMemcpyAsync(tag_, src.tag_, (size_t) kRing * 8, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) { err = "dflash2: tag copy"; return false; }
     if (sync_after) {
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: state copy: ") + cudaGetErrorString(cudaGetLastError()); return false; }
@@ -1286,6 +1296,7 @@ bool Dflash2Drafter::rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* 
     if (!ok) return false;
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: ring rebuild: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     for (int32_t p : pos) slot_pos_[(size_t) (p % kRing)] = ((int64_t) epoch_ << 32) | p;
+    ring_hi_ = std::max<int64_t>(ring_hi_, (int64_t) pos.back() + 1);
     *rebuilt = (int64_t) rows;
     return true;
 }

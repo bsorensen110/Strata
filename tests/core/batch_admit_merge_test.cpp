@@ -44,6 +44,12 @@ int main() {
     check(std::fabs(b_legacy - 619.0) < 1e-6,
           "legacy inter-chunk decode budget preserves wall_ms * eff_share when net_share is off");
 
+    // 7. dflash2_ring_copy_slots clamps copy width to [0, k_ring].
+    check(dflash2_ring_copy_slots(0, 2064) == 0, "empty ring copies 0 slots");
+    check(dflash2_ring_copy_slots(62, 2064) == 62, "62-token conversation copies only 62 of 2064 ring slots");
+    check(dflash2_ring_copy_slots(274, 2064) == 274, "274-token solo handoff copies only 274 of 2064 ring slots");
+    check(dflash2_ring_copy_slots(4712, 2064) == 2064, "wrapped ring copies full 2064 slots");
+
     if (g_fail == 0) std::printf("batch_admit_merge_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }
