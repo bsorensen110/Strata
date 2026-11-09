@@ -87,4 +87,34 @@ inline bool should_evict_batch_graph_for_vram(size_t free_vram_bytes, size_t flo
     return free_vram_bytes < floor_vram_bytes;
 }
 
+/// Returns true when `Dflash2Drafter::begin_request` is continuing or rewinding the current lineage `cur_`.
+/// A cold start (`resume <= 0`) on a non-empty drafter (`cur_hist_size > 0`) is a new conversation, not a
+/// continuation of `cur_`: returning false ensures `cur_` is stashed and `invalidate_ring()` resets `ring_hi_ = 0`.
+inline bool dflash2_begin_request_covered(int64_t lcp, int64_t resume, size_t cur_hist_size) noexcept {
+    if (resume <= 0) return cur_hist_size == 0;
+    return lcp >= resume;
+}
+
+/// Clamps `ring_hi_` when `Dflash2Drafter::begin_request` rewinds/truncates `cur_.hist` to `resume`.
+inline int64_t dflash2_rewind_ring_hi(int64_t ring_hi, int64_t resume) noexcept {
+    const int64_t cap = std::max<int64_t>(0, resume);
+    return std::min(ring_hi, cap);
+}
+
+/// Returns true when shifting `[head_n, head_n + tail_m)` to `[0, tail_m)` in place would overlap
+/// source and destination ranges (`0 < head_n < tail_m`), requiring a temporary staging buffer instead
+/// of a direct in-place `cudaMemcpyAsync(..., cudaMemcpyDeviceToDevice)`.
+inline bool dflash2_tail_shift_overlaps(int head_n, int tail_m) noexcept {
+    return head_n > 0 && tail_m > 0 && head_n < tail_m;
+}
+
+/// Returns true when `Dflash2Drafter::prepare` should eagerly capture single-slot `exec_[1..8]` and
+/// `body_exec_[1..8]` CUDA graphs at startup. When `blob_shared && batch_body_on`, batch slots run
+/// through the main drafter's `batch_full_1_exec_` / `batch_full_exec_` graphs, so skipping the 16
+/// unused single-slot graphs per slot clone saves ~80 MiB of VRAM and 32 graph instantiations at startup
+/// (while keeping lazy capture in `draft_launch` / `draft_batch_slots_launch` if ever reached).
+inline bool dflash2_clone_eager_single_graphs(bool blob_shared, bool batch_body_on) noexcept {
+    return !blob_shared || !batch_body_on;
+}
+
 }  // namespace strata::core

@@ -99,6 +99,42 @@ int main() {
     check(!should_evict_batch_graph_for_vram(500 * mib, 544 * mib, 0),
           "does not evict when no batch graphs are cached");
 
+    // 9. dflash2_begin_request_covered and dflash2_rewind_ring_hi prevent ring_hi_ from staying stuck
+    //    at a prior long prompt's 4712-token high-water mark when a new request starts at resume == 0.
+    check(dflash2_begin_request_covered(0, 0, 0),
+          "cold start on an already-empty drafter is covered without invalidation");
+    check(!dflash2_begin_request_covered(0, 0, 4712),
+          "cold start (resume == 0) on a 4712-token drafter is NOT covered and must stash + invalidate_ring");
+    check(!dflash2_begin_request_covered(0, 0, 52),
+          "cold start (resume == 0) on a 52-token drafter is NOT covered and must stash + invalidate_ring");
+    check(dflash2_begin_request_covered(64, 64, 64),
+          "exact continuation at resume == 64 is covered");
+    check(dflash2_begin_request_covered(100, 64, 120),
+          "rewind within same conversation (lcp 100 >= resume 64) is covered");
+    check(!dflash2_begin_request_covered(32, 64, 120),
+          "diverged prefix (lcp 32 < resume 64) is not covered");
+    check(dflash2_rewind_ring_hi(120, 64) == 64,
+          "rewind from 120 to 64 clamps ring_hi_ to 64");
+    check(dflash2_rewind_ring_hi(40, 64) == 40,
+          "ring_hi_ below resume is unchanged");
+    check(dflash2_rewind_ring_hi(4712, 0) == 0,
+          "rewind to 0 resets ring_hi_ to 0");
+
+    // 10. dflash2_tail_shift_overlaps detects overlapping [head_n, head_n + tail_m) -> [0, tail_m) D2D copies.
+    check(!dflash2_tail_shift_overlaps(0, 8), "head_n == 0 has no shift");
+    check(dflash2_tail_shift_overlaps(1, 8), "adm_rows == 9 (head_n=1, tail_m=8) overlaps [1,9) with [0,8)");
+    check(dflash2_tail_shift_overlaps(7, 8), "adm_rows == 15 (head_n=7, tail_m=8) overlaps [7,15) with [0,8)");
+    check(!dflash2_tail_shift_overlaps(8, 8), "adm_rows == 16 (head_n=8, tail_m=8) is disjoint [8,16) -> [0,8)");
+    check(!dflash2_tail_shift_overlaps(9, 8), "head_n > tail_m is disjoint");
+
+    // 11. dflash2_clone_eager_single_graphs skips 16 per-slot single-slot graph captures when batch_body_on is true.
+    check(dflash2_clone_eager_single_graphs(false, true),
+          "main drafter (!blob_shared) always captures single-slot graphs");
+    check(dflash2_clone_eager_single_graphs(true, false),
+          "slot clone captures single-slot graphs when batch_body_on is disabled");
+    check(!dflash2_clone_eager_single_graphs(true, true),
+          "slot clone skips eager single-slot graph capture when batch_body_on is enabled");
+
     if (g_fail == 0) std::printf("batch_admit_merge_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }
