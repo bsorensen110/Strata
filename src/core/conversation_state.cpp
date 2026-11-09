@@ -289,7 +289,7 @@ namespace {
 // conversation_checkpoint_save; `staged` (STRATA_CKPT_ASYNC): the GDN bytes land in `c.gdn` on the background thread
 // after this returns (conversation_checkpoint_join waits for them)
 bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const ModelGeometry& g, std::string& error,
-                     bool& staged) {
+                     bool& staged, bool sync_after = true) {
     staged = false;
     const auto j0 = std::chrono::steady_clock::now();
     conversation_checkpoint_join(nullptr);   // (the staging buffer is reused)
@@ -375,7 +375,7 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
             const int r = ckpt_gather_small(c, ss, z, layers, error);
             if (r != 0) {
                 if (r < 0) return false;
-                return staged || sync_copy(error);
+                return staged || !sync_after || sync_copy(error);
             }
         }
         if (!copy(c.ple.data(), ss.ple_hist, c.ple.size(), error, /*queued=*/true)) return false;
@@ -385,7 +385,7 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
                 !copy(c.dead.data() + j * z.dead, st.idx_dead, z.dead, error, /*queued=*/true) ||
                 !copy(c.block_pos.data() + j * z.block_pos, st.idx_block_pos, z.block_pos, error, /*queued=*/true)) return false;
         }
-        return sync_copy(error);
+        return !sync_after || sync_copy(error);
     }();
     if (atr) std::fprintf(stderr, "strata parktrace: save small copies %.2f ms\n",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count());
@@ -523,6 +523,10 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 
 // (conversation_snapshot.cpp) STRATA_PARK_TRACE: conversation_kv_save's time since the park's begin, by part (ms)
 void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms);
+bool conversation_kv_save_queued(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                                 int64_t upto, bool include_index, std::string& error,
+                                 int64_t unchanged_tokens, size_t* reused_bytes,
+                                 bool sync_after, bool* out_need_sync);
 
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
@@ -565,8 +569,14 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     // STRATA_PARK_VRAM_MIB: the retained layers' tokens go now (joined above, so no wait): held past the launch below,
     // their replacement would join the copy just launched
     for (auto& k : captured.kv) k.pending.reset();
+    struct PendingCopySync {
+        bool active = false;
+        ~PendingCopySync() {
+            if (active) (void) conversation_detail::sync_private_stream();
+        }
+    } pending_sync{!ptr};
     bool live_staged = false;
-    const bool live_saved = checkpoint_save(captured.live, ss, g, error, live_staged);
+    const bool live_saved = checkpoint_save(captured.live, ss, g, error, live_staged, /*sync_after=*/ptr);
     // STRATA_CKPT_ASYNC: the running state lands in live.gdn after the save returns; the image waits for that copy
     // before the vector is freed (an eviction within the copy's ~70 ms), as `pending` does for the K/V.  The join is
     // selective: a no-op once the copy has landed or another checkpoint's is in flight.
@@ -588,8 +598,8 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     double kv_max = 0, kv_sum = 0;   // (STRATA_PARK_TRACE: the per-layer save time)
     for (size_t j = 0; j < layers; ++j) {
         const auto k0 = now();
-        if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes)) return false;
+        if (!conversation_kv_save_queued(captured.kv[j], owned(ss, j), g, upto, true, error,
+                                         unchanged, reused_bytes, /*sync_after=*/ptr, nullptr)) return false;
         const double kt = ms(k0, now());
         kv_sum += kt; kv_max = std::max(kv_max, kt);
     }
@@ -605,8 +615,11 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     }
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
-    if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
-                                       std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+    if (draft && !conversation_kv_save_queued(captured.kv.back(), *draft, g, upto, false, error,
+                                              std::max<int64_t>(0, unchanged - 1), reused_bytes,
+                                              /*sync_after=*/ptr, nullptr)) return false;
+    pending_sync.active = false;
+    if (!ptr && !sync_copy(error)) return false;
     abandon.on = false;
     if (staged && !conversation_park_async_launch(error)) return false;
     if (staged) {

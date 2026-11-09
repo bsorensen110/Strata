@@ -289,9 +289,10 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
     return conversation_kv_capture_bytes({}, st, g, upto, index, bytes, error) ? bytes : 0;
 }
 
-bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                          int64_t upto, bool index, std::string& error,
-                          int64_t unchanged_tokens, size_t* reused_bytes) {
+bool conversation_kv_save_queued(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                                 int64_t upto, bool index, std::string& error,
+                                 int64_t unchanged_tokens, size_t* reused_bytes,
+                                 bool sync_after, bool* out_need_sync) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -383,7 +384,8 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (!copied) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
-    if (need_sync) {
+    if (out_need_sync) *out_need_sync = *out_need_sync || need_sync;
+    if (need_sync && sync_after) {
         const auto t_sync = park_trace_on() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const cudaError_t se = conversation_detail::sync_private_stream();
         if (park_trace_on()) {
@@ -395,6 +397,12 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         }
     }
     return true;
+}
+
+bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                          int64_t upto, bool index, std::string& error,
+                          int64_t unchanged_tokens, size_t* reused_bytes) {
+    return conversation_kv_save_queued(image, st, g, upto, index, error, unchanged_tokens, reused_bytes, true, nullptr);
 }
 
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
