@@ -251,7 +251,7 @@ public:
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
     /// Defer input activation quantization (`x_f` -> `nact` / `act`) to run in parallel across the pool's threads at
     /// the start of the next `mode 5` / `mode 3` gate/up phase instead of serially on the host thread before publish.
-    static constexpr int kMaxActQuantToks = 1024;
+    static constexpr int kMaxActQuantToks = 4096;
     void defer_act_quant(const float* x_f, uint8_t* nact, ActQ* act, const int* toks, int count, bool native) noexcept {
         act_xf_ = x_f;
         act_nact_ = nact;
@@ -264,7 +264,7 @@ public:
         act_done_.store(0, std::memory_order_relaxed);
     }
     void clear_act_quant() noexcept { act_count_ = 0; }
-    static constexpr int kMaxSplitMulti = 96;
+    static constexpr int kMaxSplitMulti = 384;
     /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
     int64_t multi_bytes = 0;

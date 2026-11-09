@@ -6,6 +6,8 @@
 // honoured by Prefill::arm_cpu_share whatever this says.
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -70,6 +72,38 @@ constexpr int64_t gfx12_share_limit(bool fused_iq2s, bool batch_active = false) 
 /// resident_slots: the expert cache's live slots; total_pairs: layers x routed experts per layer (<= 0: unknown, arm).
 constexpr bool default_share_has_work(int64_t resident_slots, int64_t total_pairs) {
     return total_pairs <= 0 || resident_slots < total_pairs;
+}
+
+/// Maximum routed tokens per expert eligible for the CPU ExpertPool during prefill (STRATA_PREFILL_CPU_SHARE_MAXT).
+/// Experts with `c > base_maxt` are sliced into `ceil(c / base_maxt)` ExpertJobMulti jobs of up to `base_maxt` tokens each.
+inline int32_t prefill_cpu_share_max_t_from(const char* v, int32_t base_maxt, bool multi_slice_default) {
+    if (v != nullptr && v[0] != '\0') return std::max<int32_t>(base_maxt, std::atoi(v));
+    return multi_slice_default ? 4 * base_maxt : base_maxt;
+}
+
+/// Chunk-size bucket (`0..kCpuShareBuckets-1`) for isolating adaptive CPU-share EMAs and gate ratios across prompt scales.
+constexpr int kCpuShareBuckets = 4;
+constexpr int cpu_share_bucket(int64_t T) {
+    return T < 128 ? 0 : (T < 512 ? 1 : (T < 1536 ? 2 : 3));
+}
+
+/// Whether the CPU pool should take the next candidate non-resident expert (`next_jobs` slices of `<= MAXT` tokens).
+/// When `cpu_c_ms > 0` (per job slice) and `cpu_g_ms > 0` (per GPU-streamed expert), balances total CPU job time against
+/// 0.88 * remaining GPU/PCIe stream time (leaving 12% margin for H2D row DMA); reduces identically to
+/// `cur_cpu_experts < llround((g / (c + g)) * nstream)` for 1-slice experts.
+inline bool cpu_share_can_take_next(int64_t cur_jobs, int64_t next_jobs, int64_t nstream,
+                                    int64_t cur_cpu_experts, double share,
+                                    double cpu_c_ms = 0.0, double cpu_g_ms = 0.0) {
+    if (nstream <= 0 || next_jobs <= 0 || cur_cpu_experts >= nstream) return false;
+    if (next_jobs > 1 && cpu_c_ms > 0.0 && cpu_g_ms > 0.0) {
+        const int64_t max_exp = (int64_t) std::llround(0.9 * (double) nstream);
+        if (cur_cpu_experts >= max_exp) return false;
+        const double lhs = ((double) cur_jobs + 0.5 * (double) next_jobs) * cpu_c_ms;
+        const double rhs = 0.88 * ((double) (nstream - cur_cpu_experts) - 0.5) * cpu_g_ms;
+        return lhs <= rhs;
+    }
+    const int64_t take = (int64_t) std::llround(share * (double) nstream);
+    return cur_jobs + next_jobs <= take;
 }
 
 

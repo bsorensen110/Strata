@@ -613,7 +613,10 @@ bool whole_tiles(int t, int64_t w_rows, int n_experts) {
             if (!any) c0 = c;
             any = true;
             // every tile width accumulates each output over the same K tiles in the same order
-            if (c.I != c0.I || c.K_vram != c0.K_vram || c.sram_layout != c0.sram_layout) return false;
+            const bool same_i = (c.stream_k || c0.stream_k)
+                ? (c.I == c0.I)
+                : (c.I > 0 && c.nthreads > 0 && c.I * c0.nthreads == c0.I * c.nthreads && w_rows % c.I == 0);
+            if (!same_i || c.K_vram != c0.K_vram || c.sram_layout != c0.sram_layout) return false;
             stream_k = stream_k || c.stream_k;
         }
         if (!any) return false;

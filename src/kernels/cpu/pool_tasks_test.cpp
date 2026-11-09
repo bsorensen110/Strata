@@ -45,6 +45,8 @@ static void unset_env(const char* k) {
 }
 
 int main(int argc, char** argv) {
+    static_assert(cpu::ExpertPool::kMaxActQuantToks >= 4096, "kMaxActQuantToks must cover >=4096-token prefill chunks");
+    static_assert(cpu::ExpertPool::kMaxSplitMulti >= 384, "kMaxSplitMulti must cover >=384 multi-slice prefill jobs in 1 wave");
     if (argc != 1 && argc != 4) return 2;
     // its activation quantiser is the AVX one at least (act_quant_any): a CPU without AVX (Westmere) would stop on an illegal instruction
     if (!cpu::cpu_avx1_ok()) { std::printf("pool_tasks_test: no AVX on this CPU, skipped\n"); return 0; }

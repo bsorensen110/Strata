@@ -37,6 +37,20 @@ inline size_t staged_pending_cap(bool group_resident, bool full_group_lookahead,
     return stage;
 }
 
+/// Whether the staged walk (`!stream_all`) can issue another non-resident transfer at `staged` given `pending`
+/// unconsumed transfers and `open_group_slots` (`gg_nslots`) already-decremented slots held in the open MMQ group.
+/// Accounting for `open_group_slots` directly allows up to `stage_grp` transfers (2 full MMQ groups) in flight when
+/// `open_group_slots == 0` while guaranteeing `pending + open_group_slots <= stage_grp` inside an open group.
+inline bool staged_can_issue(bool stream_ahead, bool group_resident, bool full_group_lookahead,
+                             size_t pending, size_t open_group_slots,
+                             size_t stage, size_t stage_grp, size_t mmq_group,
+                             size_t staged, size_t j, size_t lookahead) {
+    if (!stream_ahead) return staged <= j + lookahead;
+    if (group_resident && full_group_lookahead && stage_grp > mmq_group)
+        return pending + open_group_slots < stage_grp;
+    return pending < staged_pending_cap(group_resident, full_group_lookahead, stage, stage_grp, mmq_group);
+}
+
 /// Event slot that releases a non-empty fused streamed batch [first, end) in the ring.
 inline int copy_release_event_slot(size_t first, size_t end, int ring) {
     if (ring <= 0 || end <= first) return -1;

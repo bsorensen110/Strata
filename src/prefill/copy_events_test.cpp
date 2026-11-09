@@ -191,6 +191,75 @@ int main() {
         check(caught, "the model finds the stale-event race in the rule 'idx >= ring'");
     }
 
+    // staged_can_issue: in grouped staged walk (STAGE_GRP = 32, MMQ_GROUP = 16), up to 32 transfers (2 full groups)
+    // can be pending when gg_nslots == 0, while pending + gg_nslots <= 32 prevents reusing an open group's slot before flush.
+    check(strata::prefill::staged_can_issue(true, true, true, 31, 0, 8, 32, 16, 0, 0, 15),
+          "grouped lookahead: allows 31st transfer when open group has 0 slots");
+    check(!strata::prefill::staged_can_issue(true, true, true, 32, 0, 8, 32, 16, 0, 0, 15),
+          "grouped lookahead: blocks 32nd transfer when 32 are already pending");
+    check(strata::prefill::staged_can_issue(true, true, true, 16, 15, 8, 32, 16, 0, 0, 15),
+          "grouped lookahead: allows 16 pending when open group holds 15 slots");
+    check(!strata::prefill::staged_can_issue(true, true, true, 17, 15, 8, 32, 16, 0, 0, 15),
+          "grouped lookahead: blocks 17th pending when open group holds 15 slots (prevents slot overwrite before flush)");
+    check(strata::prefill::staged_can_issue(true, true, false, 7, 0, 8, 32, 16, 0, 0, 15) &&
+          !strata::prefill::staged_can_issue(true, true, false, 8, 0, 8, 32, 16, 0, 0, 15),
+          "grouped lookahead off: keeps legacy STAGE=8 cap");
+    {
+        // Simulate a grouped staged walk over 32 resident + 64 staged experts with STAGE_GRP=32, MMQ_GROUP=16
+        constexpr size_t n_exp = 96, stage_grp = 32, mmq_group = 16;
+        std::vector<int> stage_of(n_exp, -1), used_of(stage_grp, -1);
+        std::vector<long long> rec_time(stage_grp, 0), slot_flush(stage_grp, 0);
+        std::vector<bool> live(stage_grp, false);
+        int stage_next = 0, gg_nslots = 0;
+        int gg_slots[mmq_group] = {};
+        size_t staged = 0, pending = 0, max_pending_at_start = 0;
+        long long tick = 0;
+        bool walk_ok = true;
+        for (size_t j = 0; j < n_exp; ++j) {
+            while (staged < n_exp &&
+                   strata::prefill::staged_can_issue(true, true, true, pending, (size_t) gg_nslots, 8, stage_grp, mmq_group,
+                                                     staged, j, stage_grp - mmq_group - 1)) {
+                const bool resident = staged < 32;
+                if (!resident) {
+                    const int sl = stage_next;
+                    stage_next = (stage_next + 1) % (int) stage_grp;
+                    if (live[(size_t) sl]) {
+                        const int rel = used_of[(size_t) sl];
+                        if (rel < 0 || rec_time[(size_t) rel] < slot_flush[(size_t) sl]) walk_ok = false;
+                        // Also ensure sl is not currently sitting in the open group's gg_slots
+                        for (int k = 0; k < gg_nslots; ++k)
+                            if (gg_slots[k] == sl) walk_ok = false;
+                    }
+                    live[(size_t) sl] = true;
+                    slot_flush[(size_t) sl] = ++tick;   // cannot be reused until a flush after this tick
+                    stage_of[staged] = sl;
+                    ++pending;
+                }
+                ++staged;
+            }
+            if (j == 0) max_pending_at_start = pending;
+            const size_t q = j % mmq_group;
+            const bool last_of_group = q + 1 == mmq_group || j + 1 == n_exp;
+            if (stage_of[j] >= 0) {
+                gg_slots[gg_nslots++] = stage_of[j];
+            }
+            if (last_of_group) {
+                if (gg_nslots > 0) {
+                    const int rel = gg_slots[gg_nslots - 1];
+                    rec_time[(size_t) rel] = ++tick;
+                    for (int i = 0; i < gg_nslots; ++i) {
+                        used_of[(size_t) gg_slots[i]] = rel;
+                        slot_flush[(size_t) gg_slots[i]] = tick;
+                    }
+                    gg_nslots = 0;
+                }
+            }
+            if (stage_of[j] >= 0) --pending;
+        }
+        check(walk_ok && max_pending_at_start == 32 && pending == 0 && gg_nslots == 0,
+              "grouped staged walk: pre-stages 32 transfers across resident prefix without clobbering open group slots");
+    }
+
     if (g_fail == 0) std::printf("copy_events_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }
