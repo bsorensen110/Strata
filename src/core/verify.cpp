@@ -5,6 +5,7 @@
 #define STRATA_VERIFY_HGL 1
 #endif
 #include "strata/core/batch_rows.hpp"
+#include "strata/core/batch_admit_merge.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -4780,6 +4781,21 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     // (into a local: what a failed instantiate leaves in the output is not specified, and `ex` is a member that
     // capture() reads as "captured" when it is not null)
     capture_oom_ = false;
+    static const size_t hip_free_floor_bytes = []() -> size_t {
+        if (const char* e = std::getenv("STRATA_BATCH_GRAPH_FREE_MIB")) {
+            const long v = std::strtol(e, nullptr, 10);
+            return v > 0 ? (size_t) v * 1024ULL * 1024ULL : 0;
+        }
+        return 0;
+    }();
+    if (hip_free_floor_bytes > 0 && !exec_bm_.empty()) {
+        size_t free_b = 0, total_b = 0;
+        for (bool evicted = true;
+             evicted && cudaMemGetInfo(&free_b, &total_b) == cudaSuccess &&
+             should_evict_batch_graph_for_vram(free_b, hip_free_floor_bytes, exec_bm_.size());) {
+            if (!evict_batch_graph(key, evicted, err)) return false;
+        }
+    }
     cudaGraphExec_t got = nullptr;
     cudaError_t ie = cudaGraphInstantiate(&got, graph, flags);
     int freed = 0;

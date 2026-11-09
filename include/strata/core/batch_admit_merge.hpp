@@ -36,4 +36,13 @@ inline int dflash2_ring_copy_slots(int64_t ring_hi, int k_ring) noexcept {
     return ring_hi >= (int64_t) k_ring ? k_ring : (int) ring_hi;
 }
 
+/// Returns true when `Verifier::instantiate_evicting` should proactively evict the least-recently-used
+/// captured batch window graph (`exec_bm_`) before instantiating a new graph so free VRAM stays at or
+/// above `floor_vram_bytes` (preventing ROCm `<512 MiB` GTT paging `#2065`).
+inline bool should_evict_batch_graph_for_vram(size_t free_vram_bytes, size_t floor_vram_bytes,
+                                              size_t cached_batch_graphs) noexcept {
+    if (floor_vram_bytes == 0 || cached_batch_graphs == 0) return false;
+    return free_vram_bytes < floor_vram_bytes;
+}
+
 }  // namespace strata::core

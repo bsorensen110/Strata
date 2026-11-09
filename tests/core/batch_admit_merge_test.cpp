@@ -50,6 +50,19 @@ int main() {
     check(dflash2_ring_copy_slots(274, 2064) == 274, "274-token solo handoff copies only 274 of 2064 ring slots");
     check(dflash2_ring_copy_slots(4712, 2064) == 2064, "wrapped ring copies full 2064 slots");
 
+    // 8. should_evict_batch_graph_for_vram prevents ROCm <512 MiB GTT paging (#2065).
+    const size_t mib = 1024ULL * 1024ULL;
+    check(should_evict_batch_graph_for_vram(510 * mib, 544 * mib, 16),
+          "evicts LRU batch graph when free VRAM is below 544 MiB floor");
+    check(!should_evict_batch_graph_for_vram(560 * mib, 544 * mib, 16),
+          "keeps batch graph when free VRAM is above 544 MiB floor");
+    check(!should_evict_batch_graph_for_vram(544 * mib, 544 * mib, 16),
+          "keeps batch graph when free VRAM equals 544 MiB floor");
+    check(!should_evict_batch_graph_for_vram(500 * mib, 0, 16),
+          "disabled when floor is 0");
+    check(!should_evict_batch_graph_for_vram(500 * mib, 544 * mib, 0),
+          "does not evict when no batch graphs are cached");
+
     if (g_fail == 0) std::printf("batch_admit_merge_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }
