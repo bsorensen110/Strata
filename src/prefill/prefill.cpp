@@ -1199,19 +1199,11 @@ struct Prefill::Impl {
     std::vector<uint8_t> cpu_nact;
     std::vector<kernels::cpu::ActQ> cpu_actq;   // a Q2_0 layer's activations (the pool's Q2_0 kernels read ActQ)
     std::vector<kernels::cpu::ExpertJobMulti> cpu_jobs;
+    std::vector<char> cpu_need;
     // the measured share: running means of the CPU's ms per job slice and the GPU's per streamed expert, and the share
     // they balance at (cpu_share_env), isolated per chunk-size bucket so short prompts do not clobber 2K chunks.
-    static constexpr int CPU_RATIOS = 5;
-    struct CpuShareBucket {
-        double c_ms = 0, g_ms = 0, share_now = 0.5;
-        int64_t layers = 0, first_l = -1;
-        int last_arm = 0, last_l = 0;
-        double last_w = 0;
-        double ratio[CPU_RATIOS] = {};
-        int nratio = 0;
-        bool gate = false;
-    };
-    CpuShareBucket cpu_buckets[share_rules::kCpuShareBuckets] = {};
+    static constexpr int CPU_RATIOS = share_rules::kCpuShareRatios;
+    share_rules::CpuShareBucket cpu_buckets[share_rules::kCpuShareBuckets] = {};
     cudaEvent_t cpu_ev[2] = {};   // the GPU's expert work of the last CPU-sharing layer, read once the stream is done
     bool cpu_pend = false;
     int pend_bucket = 0;
@@ -4970,34 +4962,50 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // eligible layers alternate, without first, until CPU_MIN_RATIOS ratios are in; then the
                         // cheaper arm, and every CPU_PROBE-th layer the other one (a prime: the probes move across
                         // the layers from one chunk to the next), so both stay measured.
+                        const int64_t cpu_max_t = std::max<int64_t>(T, stream_all_min() - 1);
+                        const size_t cpu_alloc_want = (size_t) cpu_max_t * N;
+                        const size_t cpu_rows_cap = (size_t) std::min<int64_t>(
+                            cpu_max_t * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
+                        const bool cpu_buffers_warm = (m.cpu_x_n >= cpu_alloc_want && m.cpu_rows_n >= cpu_rows_cap);
                         if (cpu_maybe && cpu_share_env() < 0.0) {
+                            static const bool dbg_gate = std::getenv("STRATA_DBG_CPU_GATE") != nullptr;
+                            static const bool probe_gate = share_rules::cpu_share_gate_probe_from(
+                                std::getenv("STRATA_PREFILL_CPU_GATE_PROBE"), dbg_gate, single_card_gfx12_default());
+                            if (!probe_gate && cb.nratio == 0) cb.gate = true;
+                            if (!probe_gate && cb.c_ms == 0.0 && m.cpu_buckets[0].c_ms > 0.0)
+                                cb.share_now = std::clamp(m.cpu_buckets[0].share_now, 0.25, 0.70);
                             constexpr int64_t CPU_PROBE = 29;
                             constexpr int CPU_MIN_RATIOS = 3;
                             const int64_t i = cb.layers++;
-                            cpu_arm = cb.nratio < CPU_MIN_RATIOS ? (i & 1) != 0 : (i % CPU_PROBE == 0) != cb.gate;
                             if (cb.first_l < 0) cb.first_l = l;
-                            cpu_cold = l == cb.first_l;
-                            if (m.cpu_wall[0] == nullptr)
-                                for (cudaEvent_t& e : m.cpu_wall) cudaEventCreate(&e);
-                            cpu_set = m.pend_wall ? (m.pend_set ^ 1) : (int) (i & 1);
-                            cudaEventRecord(m.cpu_wall[2 * cpu_set], m.cs);
+                            cpu_cold = probe_gate ? (l == cb.first_l) : !cpu_buffers_warm;
+                            cpu_arm = share_rules::cpu_share_should_run(
+                                i, cb.nratio, CPU_MIN_RATIOS, CPU_PROBE, cb.gate, probe_gate, cpu_buffers_warm);
+                            if (probe_gate) {
+                                if (m.cpu_wall[0] == nullptr)
+                                    for (cudaEvent_t& e : m.cpu_wall) cudaEventCreate(&e);
+                                cpu_set = m.pend_wall ? (m.pend_set ^ 1) : (int) (i & 1);
+                                cudaEventRecord(m.cpu_wall[2 * cpu_set], m.cs);
+                            }
                         }
-                        if (cpu_maybe && cpu_arm) {
-                            const size_t want = (size_t) T * N;
-                            if (m.cpu_x_n < want) {
+                        if (cpu_maybe) {
+                            const size_t alloc_want = cpu_alloc_want;
+                            if (m.cpu_x_n < alloc_want) {
                                 cpu_cold = true;
                                 if (m.cpu_x) cudaFreeHost(m.cpu_x);
                                 m.cpu_x = nullptr;
                                 m.cpu_x_n = 0;
-                                if (cudaHostAlloc((void**) &m.cpu_x, want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
+                                if (cudaHostAlloc((void**) &m.cpu_x, alloc_want * sizeof(float), cudaHostAllocDefault) != cudaSuccess) {
                                     (void) cudaGetLastError();
                                     m.cpu_x = nullptr;
                                     cpu_share_off("the activation buffer");
                                 } else {
-                                    m.cpu_x_n = want;
+                                    m.cpu_x_n = alloc_want;
                                 }
                             }
-                            if (cpu_maybe) cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
+                            const size_t want = (size_t) T * N;
+                            if (cpu_maybe && cpu_arm)
+                                cudaMemcpyAsync(m.cpu_x, m.mixed, want * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
                         }
                         // #579: a stall here is the GPU (this layer's attention and router, or the previous layer's
                         // work), not the host: the watchdog's report says so (only its text changes)
@@ -5007,7 +5015,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         if (on_routes) on_routes(l, ids_h, T * K);   // 149-prefetch: the RAM policy's prompt seed
                         if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
-                            const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
+                            const int64_t max_t = cpu_max_t;
+                            const size_t cap = cpu_rows_cap;
                             if (m.cpu_rows_n < cap) {
                                 if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
                                 m.cpu_rows = nullptr;
@@ -5019,6 +5028,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 } else {
                                     m.cpu_rows_n = cap;
                                 }
+                            }
+                            if (cpu_maybe && m.cpu_rows_n > 0) {
+                                const size_t n1 = m.cpu_rows_n / N;
+                                if (m.cpu_ones_n < n1) {
+                                    if (m.cpu_ones) cudaFreeHost(m.cpu_ones);
+                                    m.cpu_ones = nullptr;
+                                    m.cpu_ones_n = 0;
+                                    if (cudaHostAlloc((void**) &m.cpu_ones, n1 * sizeof(float), cudaHostAllocDefault) == cudaSuccess) {
+                                        std::fill(m.cpu_ones, m.cpu_ones + n1, 1.0f);
+                                        m.cpu_ones_n = n1;
+                                    } else {
+                                        (void) cudaGetLastError();
+                                    }
+                                }
+                                constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
+                                if (m.cpu_nact.size() < (size_t) max_t * AB) m.cpu_nact.resize((size_t) max_t * AB);
+                                if (m.cpu_need.size() < (size_t) max_t) m.cpu_need.resize((size_t) max_t);
                             }
                         }
                         if (m.cpu_pend) {   // the measured share: the last CPU-sharing layer's GPU time is final now
@@ -5284,7 +5310,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const bool q2 = strata::kernels::cpu::q2_native_kernels(cf.gu_type);
                                 if (q2 && m.cpu_actq.size() < (size_t) T) m.cpu_actq.resize((size_t) T);
                                 if (!q2 && m.cpu_nact.size() < (size_t) T * AB) m.cpu_nact.resize((size_t) T * AB);
-                                std::vector<char> need((size_t) T, 0);
+                                m.cpu_need.assign((size_t) T, 0);
+                                char* const need = m.cpu_need.data();
                                 for (int32_t e = 0; e < m.g->n_expert; ++e)   // the tokens the CPU's experts read
                                     if (on_cpu[(size_t) e])
                                         for (int32_t r = 0; r < m.cnt[(size_t) e]; ++r)

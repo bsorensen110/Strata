@@ -156,6 +156,39 @@ inline void mmq_staged_sort_rows(const int32_t* ids, int64_t routes, int32_t k,
                                  order.begin() + (ptrdiff_t) ((gi + 1) * group));
         }
         std::copy(reordered.begin(), reordered.end(), order.begin());
+    } else if (sort_mode == 4 && layer_resident != nullptr && group > 0 && span > 0) {
+        std::stable_sort(order.begin(), order.begin() + (ptrdiff_t) span, cmp_cnt);
+        size_t n_res = 0;
+        for (size_t i = 0; i < span; ++i)
+            if (layer_resident[(size_t) order[i]] >= 0) ++n_res;
+        const size_t lead_groups = (n_res >= 4 * group && span >= 3 * group) ? 2
+                                 : ((n_res >= group && span >= 2 * group) ? 1 : 0);
+        const size_t lead_res = lead_groups * group;
+        std::vector<uint8_t> taken(span, 0);
+        size_t rem_lead = lead_res;
+        for (size_t i = span; i > 0 && rem_lead > 0; --i) {
+            if (layer_resident[(size_t) order[i - 1]] >= 0) {
+                taken[i - 1] = 1;
+                --rem_lead;
+            }
+        }
+        std::vector<int32_t> lead, rest;
+        lead.reserve(lead_res);
+        rest.reserve(span - lead_res);
+        for (size_t i = 0; i < span; ++i) {
+            if (taken[i]) lead.push_back(order[i]);
+            else rest.push_back(order[i]);
+        }
+        std::vector<int32_t> reordered;
+        reordered.reserve(span);
+        reordered.insert(reordered.end(), lead.begin(), lead.end());
+        const size_t rem_grp = rest.size() / group;
+        for (size_t g = rem_grp; g > 0; --g) {
+            const size_t gi = g - 1;
+            reordered.insert(reordered.end(), rest.begin() + (ptrdiff_t) (gi * group),
+                             rest.begin() + (ptrdiff_t) ((gi + 1) * group));
+        }
+        std::copy(reordered.begin(), reordered.end(), order.begin());
     } else {
         std::stable_sort(order.begin(), order.begin() + (ptrdiff_t) std::min(span, order.size()), cmp_cnt);
     }

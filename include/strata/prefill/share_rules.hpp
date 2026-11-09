@@ -83,8 +83,38 @@ inline int32_t prefill_cpu_share_max_t_from(const char* v, int32_t base_maxt, bo
 
 /// Chunk-size bucket (`0..kCpuShareBuckets-1`) for isolating adaptive CPU-share EMAs and gate ratios across prompt scales.
 constexpr int kCpuShareBuckets = 4;
+constexpr int kCpuShareRatios = 5;
 constexpr int cpu_share_bucket(int64_t T) {
     return T < 128 ? 0 : (T < 512 ? 1 : (T < 1536 ? 2 : 3));
+}
+
+struct CpuShareBucket {
+    double c_ms = 0, g_ms = 0, share_now = 0.5;
+    int64_t layers = 0, first_l = -1;
+    int last_arm = 0, last_l = 0;
+    double last_w = 0;
+    double ratio[kCpuShareRatios] = {};
+    int nratio = 0;
+    bool gate = false;
+};
+
+/// Whether the runtime should alternate/probe `cpu_arm = false` layers to test if CPU share regresses wall time.
+/// On single-card gfx12 (`single_card_gfx12 == true`), CPU share is always a net win, so off-probing is disabled by
+/// default unless `STRATA_PREFILL_CPU_GATE_PROBE=1` or `STRATA_DBG_CPU_GATE` is set.
+inline bool cpu_share_gate_probe_from(const char* v, bool dbg_gate, bool single_card_gfx12) {
+    if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0;
+    if (dbg_gate) return true;
+    return !single_card_gfx12;
+}
+
+/// Decides whether layer call `i` (0-indexed within its chunk-size bucket) should enable CPU expert sharing (`cpu_arm`).
+/// When `probe_gate` is false (default on single-card gfx12), only a cold layer (`i == 0 && !buffers_warm`) skips CPU
+/// share while buffers warm up; once buffers are pre-allocated (`buffers_warm == true`), even `i == 0` runs CPU share
+/// and calibrates `c_ms`/`g_ms` immediately for `i == 1`.
+constexpr bool cpu_share_should_run(int64_t i, int nratio, int min_ratios, int64_t probe_period,
+                                    bool gate, bool probe_gate, bool buffers_warm = false) {
+    if (!probe_gate) return gate && (i > 0 || buffers_warm);
+    return nratio < min_ratios ? (i & 1) != 0 : (i % probe_period == 0) != gate;
 }
 
 /// Whether the CPU pool should take the next candidate non-resident expert (`next_jobs` slices of `<= MAXT` tokens).

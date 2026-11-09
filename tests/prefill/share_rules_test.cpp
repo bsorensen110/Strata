@@ -151,11 +151,43 @@ int main() {
         CHECK(order3 == want_order3);
         CHECK(off3[6] == 28 && off3[7] == 30);
 
+        // Mode 4 (sort_mode = 4, default on single-card gfx12): extracts lead pure-resident group(s) from the heaviest
+        // resident experts so m.cs launches immediately at j=0 with zero wait-copy stall while m.copy prefetches STAGE_GRP
+        // non-resident blobs, and keeps remaining resident + staged experts mixed in descending count-matched groups.
+        // In res3, experts {0(cnt=8), 2(cnt=2), 3(cnt=5)} are resident (n_res = 3, group = 2 -> 1 lead group = {3(5), 0(8)}).
+        // Remaining 4 experts {2(cnt=2,res), 1(cnt=3,stg), 4(cnt=4,stg), 5(cnt=6,stg)} form 2 groups: {2,1} and {4,5},
+        // emitted in descending group order -> {4, 5}, {2, 1}!
+        std::vector<int32_t> order4 = {0, 1, 2, 3, 4, 5};
+        std::vector<int32_t> off4 = {0, 8, 11, 13, 18, 22, 28, 30};
+        d::mmq_staged_sort_rows(ids3.data(), routes3, 1, count3, res3.data(), 2, true,
+                                off4, order4, slot3.data(), src3.data(), /*sort_mode=*/4);
+        const std::vector<int32_t> want_order4 = {3, 0, 4, 5, 2, 1};
+        CHECK(order4 == want_order4);
+        CHECK(off4[6] == 28 && off4[7] == 30);
+
         // Multi-slice CPU share helpers & T-bucket isolation
         CHECK(prefill_cpu_share_max_t_from(nullptr, 8, false) == 8);
         CHECK(prefill_cpu_share_max_t_from(nullptr, 8, true) == 32);
         CHECK(prefill_cpu_share_max_t_from("16", 8, true) == 16);
         CHECK(prefill_cpu_share_max_t_from("8", 8, true) == 8);
+
+        // Gate probing & should-run rules
+        CHECK(!cpu_share_gate_probe_from(nullptr, false, true));
+        CHECK(cpu_share_gate_probe_from(nullptr, false, false));
+        CHECK(cpu_share_gate_probe_from(nullptr, true, true));
+        CHECK(cpu_share_gate_probe_from("1", false, true));
+        CHECK(!cpu_share_gate_probe_from("0", false, false));
+
+        CHECK(!cpu_share_should_run(0, 0, 3, 29, true, false, false));
+        CHECK(cpu_share_should_run(0, 0, 3, 29, true, false, true));
+        CHECK(cpu_share_should_run(1, 0, 3, 29, true, false));
+        CHECK(cpu_share_should_run(2, 0, 3, 29, true, false));
+        CHECK(cpu_share_should_run(4, 0, 3, 29, true, false));
+        CHECK(cpu_share_should_run(29, 5, 3, 29, true, false));
+        CHECK(!cpu_share_should_run(0, 0, 3, 29, true, true));
+        CHECK(cpu_share_should_run(1, 0, 3, 29, true, true));
+        CHECK(!cpu_share_should_run(2, 0, 3, 29, true, true));
+        CHECK(!cpu_share_should_run(29, 5, 3, 29, true, true));
 
         CHECK(cpu_share_bucket(19) == 0);
         CHECK(cpu_share_bucket(51) == 0);
@@ -172,6 +204,8 @@ int main() {
         // With c_ms = 0.04, g_ms = 0.08, nstream = 300:
         CHECK(cpu_share_can_take_next(/*cur_jobs=*/60, /*next_jobs=*/2, /*nstream=*/300, /*cur_cpu_experts=*/60, 0.67, 0.04, 0.08));
         CHECK(cpu_share_can_take_next(/*cur_jobs=*/210, /*next_jobs=*/2, /*nstream=*/300, /*cur_cpu_experts=*/135, 0.67, 0.04, 0.08));
+        // At cur_jobs=220, cur_cpu_experts=140: lhs = 221 * 0.04 = 8.84 ms > 0.88 * 159.5 * 0.08 = 11.2288 ms -> still ok;
+        // At cur_jobs=240, cur_cpu_experts=150: lhs = 241 * 0.04 = 9.64 ms <= 0.88 * 149.5 * 0.08 = 10.5248 ms -> still ok;
         // At cur_jobs=254, cur_cpu_experts=157: lhs = 255 * 0.04 = 10.20 ms > 0.88 * 142.5 * 0.08 = 10.032 ms -> rejected!
         CHECK(!cpu_share_can_take_next(/*cur_jobs=*/254, /*next_jobs=*/2, /*nstream=*/300, /*cur_cpu_experts=*/157, 0.67, 0.04, 0.08));
     }
