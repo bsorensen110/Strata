@@ -438,8 +438,12 @@ void dot_rows_nt_g(int nt, const uint8_t* w, size_t row_bytes, int n, const void
         case 2: dot_rows<TY, 2, GATHER>(w, row_bytes, n, act, out, r0, r1); break;
         case 3: dot_rows<TY, 3, GATHER>(w, row_bytes, n, act, out, r0, r1); break;
         case 4: dot_rows<TY, 4, GATHER>(w, row_bytes, n, act, out, r0, r1); break;
-        default: for (int t0 = 0; t0 < nt; t0 += 4) {
-            const int k = nt - t0 < 4 ? nt - t0 : 4;
+        case 5: dot_rows<TY, 5, GATHER>(w, row_bytes, n, act, out, r0, r1); break;
+        case 6: dot_rows<TY, 6, GATHER>(w, row_bytes, n, act, out, r0, r1); break;
+        case 7: dot_rows<TY, 7, GATHER>(w, row_bytes, n, act, out, r0, r1); break;
+        case 8: dot_rows<TY, 8, GATHER>(w, row_bytes, n, act, out, r0, r1); break;
+        default: for (int t0 = 0; t0 < nt; t0 += 8) {
+            const int k = nt - t0 < 8 ? nt - t0 : 8;
             dot_rows_nt_g<TY, GATHER>(k, w, row_bytes, n, act + t0, out + t0, r0, r1);
         }
     }
@@ -854,26 +858,34 @@ void iq512x_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void
 
 void iq4nl512_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                         float* const* out, int r0, int r1) {
-    for (int t0 = 0; t0 < nt; t0 += 4) {
-        const int m = nt - t0 < 4 ? nt - t0 : 4;
+    for (int t0 = 0; t0 < nt; t0 += 8) {
+        const int m = nt - t0 < 8 ? nt - t0 : 8;
         switch (m) {
             case 1: iq4nl512_rows_nt<1>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
             case 2: iq4nl512_rows_nt<2>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
             case 3: iq4nl512_rows_nt<3>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
-            default: iq4nl512_rows_nt<4>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
+            case 4: iq4nl512_rows_nt<4>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
+            case 5: iq4nl512_rows_nt<5>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
+            case 6: iq4nl512_rows_nt<6>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
+            case 7: iq4nl512_rows_nt<7>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
+            default: iq4nl512_rows_nt<8>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
         }
     }
 }
 
 void q2_512_down_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* hq, int nt,
                       float* const* out, int r0, int r1) {
-    for (int t0 = 0; t0 < nt; t0 += 4) {
-        const int m = nt - t0 < 4 ? nt - t0 : 4;
+    for (int t0 = 0; t0 < nt; t0 += 8) {
+        const int m = nt - t0 < 8 ? nt - t0 : 8;
         switch (m) {
             case 1: q2_512_rows_nt<1>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
             case 2: q2_512_rows_nt<2>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
             case 3: q2_512_rows_nt<3>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
-            default: q2_512_rows_nt<4>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
+            case 4: q2_512_rows_nt<4>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
+            case 5: q2_512_rows_nt<5>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
+            case 6: q2_512_rows_nt<6>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
+            case 7: q2_512_rows_nt<7>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
+            default: q2_512_rows_nt<8>(w, row_bytes, n, hq + t0, out + t0, r0, r1); break;
         }
     }
 }
@@ -1225,7 +1237,11 @@ void kq512_row(int type, const uint8_t* w, int n, const void* const* act, int nt
         case 1: kq512_row_nt<1>(type, w, n, act, out); break;
         case 2: kq512_row_nt<2>(type, w, n, act, out); break;
         case 3: kq512_row_nt<3>(type, w, n, act, out); break;
-        default: kq512_row_nt<4>(type, w, n, act, out); break;
+        case 4: kq512_row_nt<4>(type, w, n, act, out); break;
+        case 5: kq512_row_nt<5>(type, w, n, act, out); break;
+        case 6: kq512_row_nt<6>(type, w, n, act, out); break;
+        case 7: kq512_row_nt<7>(type, w, n, act, out); break;
+        default: kq512_row_nt<8>(type, w, n, act, out); break;
     }
 }
 
@@ -1482,11 +1498,13 @@ void kq512_gu_row(int type, const uint8_t* g_ptr, const uint8_t* u_ptr, int n, c
 
 void kq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
-    for (int t0 = 0; t0 < nt; t0 += kKQMaxT) {
-        const int m = nt - t0 < kKQMaxT ? nt - t0 : kKQMaxT;
-        float g[kKQMaxT], u[kKQMaxT];
-        for (int r = r0; r < r1; ++r) {
-            kq512_gu_row(type, blob + (size_t) r * gu_row, blob + up_off + (size_t) r * gu_row, n, act + t0, m, g, u);
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* gr = blob + (size_t) r * gu_row;
+        const uint8_t* ur = blob + up_off + (size_t) r * gu_row;
+        for (int t0 = 0; t0 < nt; t0 += kKQMaxT) {
+            const int m = nt - t0 < kKQMaxT ? nt - t0 : kKQMaxT;
+            float g[kKQMaxT], u[kKQMaxT];
+            kq512_gu_row(type, gr, ur, n, act + t0, m, g, u);
             for (int t = 0; t < m; ++t) ff[t0 + t][r] = (g[t] / (1.f + std::exp(-g[t]))) * u[t];
         }
     }
@@ -1494,11 +1512,13 @@ void kq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
 
 void kq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                 int r0, int r1) {
-    for (int t0 = 0; t0 < nt; t0 += kKQMaxT) {
-        const int m = nt - t0 < kKQMaxT ? nt - t0 : kKQMaxT;
-        float s[kKQMaxT];
-        for (int r = r0; r < r1; ++r) {
-            kq512_row(type, w + (size_t) r * row_bytes, n, act + t0, m, s);
+    constexpr int kKQDownMaxT = 8;
+    for (int r = r0; r < r1; ++r) {
+        const uint8_t* wr = w + (size_t) r * row_bytes;
+        for (int t0 = 0; t0 < nt; t0 += kKQDownMaxT) {
+            const int m = nt - t0 < kKQDownMaxT ? nt - t0 : kKQDownMaxT;
+            float s[kKQDownMaxT];
+            kq512_row(type, wr, n, act + t0, m, s);
             for (int t = 0; t < m; ++t) out[t0 + t][r] = s[t];
         }
     }

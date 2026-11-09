@@ -2,6 +2,7 @@
 // Compare the invariant entry points with the production singleton dispatch, including SwiGLU.
 // Synthetic packed blocks only: no GPU, model download or private fixtures.
 #include "ggml.h"
+#include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/tq_cpu.hpp"
 #include <cmath>
@@ -12,6 +13,7 @@
 #include <utility>
 
 namespace cpu = strata::kernels::cpu;
+static_assert(cpu::kIq512MaxRowGroupTokens == 8, "AVX-512 multi-token row kernels must cover full MAXT=8 slices in one pass");
 namespace {
 constexpr int width = 8, hidden = 512;
 size_t checked = 0;
@@ -118,7 +120,8 @@ int main() {
         if (!check_format(pair.first, pair.second, 64)) return 1;
     // STRATA_KQ256 / kq512 selects grouped K-quant kernels only when their target arithmetic matches.
     if (!check_format(12, 7, 64) || !check_format(12, 8, 64) || !check_format(13, 8, 64) ||
-        !check_format(14, 8, 64) || !check_format(12, 6, 64) || !check_format(6, 8, 64)) return 1;
+        !check_format(14, 8, 64) || !check_format(12, 6, 64) || !check_format(6, 8, 64) ||
+        !check_format(12, 12, 256) || !check_format(13, 13, 256) || !check_format(14, 14, 256)) return 1;
     // 0.2 adds Trellis formats and folded expert inputs. Exercise both their
     // production singleton dispatch and every grouped width through the new API.
     for (int gu : {144, 145, 146})

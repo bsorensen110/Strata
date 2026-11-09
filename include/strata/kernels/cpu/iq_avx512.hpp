@@ -7,6 +7,8 @@
 
 namespace strata::kernels::cpu {
 
+inline constexpr int kIq512MaxRowGroupTokens = 8;
+
 bool iq512_supported(int ggml_type) noexcept;
 /// Whether the grid lookups of these rows are gathers (the default where cpu_gather_fast(), STRATA_IQ_GATHER=1 / 0 force it): the
 /// same words, so the same bits as the scalar lookups, and 1.3-2x faster where a gather is cheap (Sapphire Rapids).

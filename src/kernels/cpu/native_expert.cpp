@@ -756,7 +756,7 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
         return e != nullptr && e[0] != '\0' ? std::atoi(e) != 0 : cpu_gather_fast();
     }();
     static const bool kq512 = avx512 && std::getenv("STRATA_NO_KQ512") == nullptr;
-    if (kq512 && nt >= 2 && f.tail_off == 0 && (f.d_type == 6 || f.d_type == 7 || f.d_type == 8) && kq512_reference_ok(f.d_type)) {
+    if (kq512 && nt >= 2 && f.tail_off == 0 && kq512_supported(f.d_type) && kq512_reference_ok(f.d_type)) {
         kq512_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
