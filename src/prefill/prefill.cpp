@@ -1984,6 +1984,47 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             (void) cudaGetLastError();
         }
     }
+    if (cpu_pool_ != nullptr && cpu_share_on() && !m.cpu_dead && !force_pageable() && single_card_gfx12_default()) {
+        const int64_t cpu_max_t = std::max<int64_t>(1, stream_all_min() - 1);
+        const size_t alloc_want = (size_t) cpu_max_t * N;
+        const size_t cap = (size_t) std::min<int64_t>(
+            cpu_max_t * K, (int64_t) strata::kernels::cpu::MAXT * g.n_expert) * N;
+        if (m.cpu_x_n < alloc_want) {
+            if (m.cpu_x) cudaFreeHost(m.cpu_x);
+            m.cpu_x = nullptr;
+            m.cpu_x_n = 0;
+            if (cudaHostAlloc((void**) &m.cpu_x, alloc_want * sizeof(float), cudaHostAllocDefault) == cudaSuccess)
+                m.cpu_x_n = alloc_want;
+            else
+                (void) cudaGetLastError();
+        }
+        if (m.cpu_rows_n < cap) {
+            if (m.cpu_rows) cudaFreeHost(m.cpu_rows);
+            m.cpu_rows = nullptr;
+            m.cpu_rows_n = 0;
+            if (cudaHostAlloc((void**) &m.cpu_rows, cap * sizeof(float), cudaHostAllocDefault) == cudaSuccess)
+                m.cpu_rows_n = cap;
+            else
+                (void) cudaGetLastError();
+        }
+        if (m.cpu_rows_n > 0) {
+            const size_t n1 = m.cpu_rows_n / N;
+            if (m.cpu_ones_n < n1) {
+                if (m.cpu_ones) cudaFreeHost(m.cpu_ones);
+                m.cpu_ones = nullptr;
+                m.cpu_ones_n = 0;
+                if (cudaHostAlloc((void**) &m.cpu_ones, n1 * sizeof(float), cudaHostAllocDefault) == cudaSuccess) {
+                    std::fill(m.cpu_ones, m.cpu_ones + n1, 1.0f);
+                    m.cpu_ones_n = n1;
+                } else {
+                    (void) cudaGetLastError();
+                }
+            }
+            constexpr size_t AB = strata::kernels::cpu::kNativeActBytes;
+            if (m.cpu_nact.size() < (size_t) cpu_max_t * AB) m.cpu_nact.resize((size_t) cpu_max_t * AB);
+            if (m.cpu_need.size() < (size_t) cpu_max_t) m.cpu_need.resize((size_t) cpu_max_t);
+        }
+    }
     // STRATA_PLE_COPY_STREAM: a stream of its own, not the expert copy stream - that one may hold a ring of blobs and
     // waits on their slots' release, so a wait on it could idle the compute stream for longer than the DMA itself
     if (ple_copy_stream_on() && m.ple_raw_dev != nullptr &&
