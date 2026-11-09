@@ -929,6 +929,11 @@ void Dflash2Drafter::set_max_drafts(int n) {
 bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     if (!bound_) { err = "dflash2: not bound"; return false; }
     if (prof_ != nullptr) return true;   // the profile runs without graphs
+    static const bool batch_body_on = [] {
+        const char* e = std::getenv("STRATA_DF2_BATCHBODY");
+        return !e || !e[0] || e[0] != '0';
+    }();
+    if (!dflash2_clone_eager_single_graphs(blob_shared_, batch_body_on)) return true;
     const OnDevice on_device(device_);
     const Clock::time_point t0 = Clock::now();
     for (int i = 0; i < 8; ++i) h_meta_[i] = i;
@@ -938,6 +943,34 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     }
     graph_taps_ = taps;
     ms_capture = ms_since(t0);
+    return true;
+}
+
+bool Dflash2Drafter::prewarm_batch_slots(Dflash2Drafter* const* slots, int n_slots, std::string& err) {
+    if (!bound_ || blob_shared_) { err = "dflash2: prewarm_batch_slots requires bound parent drafter"; return false; }
+    if (prof_ != nullptr || slots == nullptr || n_slots < 1 || rt_bctx_ == nullptr) return true;
+    static const bool batch_body_on = [] {
+        const char* e = std::getenv("STRATA_DF2_BATCHBODY");
+        return !e || !e[0] || e[0] != '0';
+    }();
+    if (!batch_body_on) return true;
+    const OnDevice on_device(device_);
+    const Clock::time_point t0 = Clock::now();
+    std::memset(h_meta_, 0, 256 * sizeof(int32_t));
+    for (int i = 0; i < 16; ++i) h_bmeta_[i] = 0;
+    const int n1 = std::min(n_slots, 2);
+    for (int b = 0; b < n1; ++b) {
+        if (slots[b] == nullptr || !slots[b]->bound_ || slots[b]->device_ != device_) continue;
+        const int kw = std::max(1, std::min((int) kDrafts, slots[b]->max_drafts()));
+        BatchSlotItem it{};
+        it.slot = slots[b];
+        it.n_new = 1;
+        it.k_want = kw;
+        h_bmeta_[0] = 0;
+        h_bmeta_[1] = kw;
+        if (!capture_batch_full(&it, 1, kw, err)) return false;
+    }
+    ms_capture += ms_since(t0);
     return true;
 }
 
@@ -1319,15 +1352,15 @@ bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume
     };
     if (!log_on_) {   // the pre-log rule: a history that does not cover the resumed prefix starts the ring over
         const int64_t lcp = lcp_of(cur_.hist);
-        const bool stale = ring_hi_ > lcp && lcp < resume;
+        const bool stale = (resume <= 0 && ring_hi_ > 0) || (ring_hi_ > lcp && lcp < resume);
         if (stale) { ++epoch_; ring_hi_ = 0; }
         if (cold) *cold = stale;
         cur_.hist.assign(ids, ids + resume);
         return true;
     }
-    bool covered = lcp_of(cur_.hist) >= resume;
+    bool covered = dflash2_begin_request_covered(lcp_of(cur_.hist), resume, cur_.hist.size());
     bool swapped = false;
-    if (!covered) {   // a parked lineage may be the one this request resumes
+    if (!covered && resume > 0) {   // a parked lineage may be the one this request resumes
         for (size_t i = stash_.size(); i-- > 0;) {
             if (lcp_of(stash_[i].hist) < resume) continue;
             Lineage got = std::move(stash_[i]);
@@ -1352,7 +1385,19 @@ bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume
         copy.chunks = cur_.chunks;
         stash_push(std::move(copy));
     }
-    if ((int64_t) cur_.hist.size() > resume) { cur_.hist.resize((size_t) resume); cur_.truncate(resume); }
+    if ((int64_t) cur_.hist.size() > resume) {
+        cur_.hist.resize((size_t) resume);
+        cur_.truncate(resume);
+        if (covered) {
+            const int64_t clear_hi = std::min<int64_t>(ring_hi_, resume + kRing);
+            for (int64_t p = std::max<int64_t>(0, resume); p < clear_hi; ++p) {
+                const size_t sl = (size_t) (p % kRing);
+                if ((slot_pos_[sl] >> 32) == (int64_t) epoch_ && (slot_pos_[sl] & 0xFFFFFFFFll) >= resume)
+                    slot_pos_[sl] = -1;
+            }
+            ring_hi_ = dflash2_rewind_ring_hi(ring_hi_, resume);
+        }
+    }
     if (!covered) cur_.hist.assign(ids, ids + resume);
     // the window the first draft reads, below `resume` (the prompt's own taps cover [resume, n)): every slot that does not hold its row is rebuilt from the log
     int64_t rebuilt = 0, missing = 0;

@@ -165,6 +165,7 @@ int main(int argc, char** argv) {
             const std::vector<int32_t> idsB = ids_of(2, 3000);
             bool cold = false;
             d.begin_request(idsB.data(), 3000, 0, &cold);
+            check(d.ring_hi() == 0, "cold start at resume == 0 resets ring_hi_ from 4227 to 0");
             if (!feed(d, dev, 2, 0, 3000, err)) return 2;
         }
         const std::vector<int32_t> ids = ids_of(1, N);

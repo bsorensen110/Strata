@@ -188,6 +188,9 @@ public:
 
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
+    /// Pre-captures the 1-slot (`batch_full_1_exec_`) precomputed batch graphs on the parent drafter
+    /// for `slots[0..n_slots-1]` so the first BGEN admission does not stall in `capture_batch_full`.
+    bool prewarm_batch_slots(Dflash2Drafter* const* slots, int n_slots, std::string& err);
 
     /// The most drafts a window will use (the engine's widest window - 1, 1..kDrafts; default kDrafts).  The head, the top-k and the selector's walk run for that
     /// many rows only: the first `n` drafts and probabilities are bitwise the ones a full block makes (every row is its own column, the walk goes left to right);
