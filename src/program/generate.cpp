@@ -15006,7 +15006,7 @@ int main(int argc, char** argv) {
                 for (int k = 0; k < nact && nact > 0; ++k) {
                     const BSlot& q = bs[(size_t) act_ids[k]];
                     const int even_want = spare / nact + (k < spare % nact ? 1 : 0);
-                    int room = df2_dprob_budget ? spare : even_want;
+                    int room = q.stop ? 0 : (df2_dprob_budget ? spare : even_want);
                     room = std::min(room, (int) strata::core::Dflash2Drafter::kDrafts);
                     room = std::min<int>(room, (int) std::max<int64_t>(0, q.max_new - q.produced - 1));
                     room = std::min<int>(room, (int) std::max<int64_t>(0, (int64_t) o.max_context - q.p - 2));
@@ -15070,9 +15070,9 @@ int main(int argc, char** argv) {
             for (size_t offset = 0; offset < bs.size(); ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
                 if (!bs[(size_t) b].active) continue;
-                const int extra = batch_df2 ? (b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? df2_extra[b] : 0) : batch_mtp ? 1 : 0;
-                if (S + 1 + extra > win_cap) break;
                 BSlot& q = bs[(size_t) b];
+                const int extra = q.stop ? 0 : (batch_df2 ? (b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? df2_extra[b] : 0) : batch_mtp ? 1 : 0);
+                if (S + 1 + extra > win_cap) break;
                 if (batch_mtp && !q.draft_ready && !batch_df2) {
                     err = "batch MTP: a live slot has no draft";
                     return false;
@@ -15283,6 +15283,7 @@ int main(int argc, char** argv) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                         sl.active = false;
+                        sl.draft_ready = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
 #if defined(STRATA_HAVE_DFLASH2)
                         if (batch_df2 && sl.cached && (size_t) b < slot_df2.size()) {
@@ -15294,8 +15295,24 @@ int main(int argc, char** argv) {
                                 return false;
                             }
                             d.clear_deferred();
-                            if (!ver.gather_taps(d.landing(), d.device(), first[t], fin_kp, 0, d.stream(), err) ||
-                                !d.context(d.landing(), fin_kp, pos[first[t]], err)) {
+                            if (sl.stop && solo_handoff_fast && !eos && sl.produced < sl.max_new && sl.p + 2 <= o.max_context) {
+                                sl.x = y;
+                                sl.p += 1;
+                                const size_t tap_stride = (size_t) d.tap_layers().size() * (size_t) g.n_embd;
+                                const float* slot_taps = nullptr;
+                                if (stages.empty() && A >= 1 &&
+                                    df2.has_precomputed_context(ver.tap_dev() + (size_t) first[t] * tap_stride, fin_kp, pos[first[t]])) {
+                                    slot_taps = ver.tap_dev() + (size_t) first[t] * tap_stride;
+                                } else {
+                                    if (!ver.gather_taps(d.landing(), d.device(), first[t], fin_kp, 0, d.stream(), err)) {
+                                        std::printf("ERR batch DFlash2 slot %d: %s\n", b, err.c_str());
+                                        return false;
+                                    }
+                                    slot_taps = d.landing();
+                                }
+                                df2_launched.push_back({b, fin_kp, pos[first[t]], y, slot_taps, first[t]});
+                            } else if (!ver.gather_taps(d.landing(), d.device(), first[t], fin_kp, 0, d.stream(), err) ||
+                                       !d.context(d.landing(), fin_kp, pos[first[t]], err)) {
                                 std::printf("ERR batch DFlash2 slot %d: %s\n", b, err.c_str());
                                 return false;
                             }
@@ -15378,6 +15395,7 @@ int main(int argc, char** argv) {
             if (use_bhead) {
                 int nact_next = 0;
                 for (const auto& q : bs) nact_next += q.active ? 1 : 0;
+                nact_next = std::max<int>(nact_next, (int) df2_launched.size());
                 const int spare_next = std::max(0, win_cap - std::max(1, nact_next));
                 const int max_per_slot = strata::core::batch_df2_head_max_per_slot(
                     spare_next, nact_next, df2_dprob_budget, df2_head_max_per_slot_env);
@@ -15385,8 +15403,9 @@ int main(int argc, char** argv) {
                     const Df2LaunchEntry& le = df2_launched[idx];
                     strata::core::Dflash2Drafter& d = *slot_df2[(size_t) le.b];
                     const BSlot& q = bs[(size_t) le.b];
-                    int kw = std::min(d.max_drafts(), std::min(df2_cap, max_per_slot));
-                    kw = std::min<int>(kw, (int) std::max<int64_t>(1, q.max_new - q.produced));
+                    int kw = q.active ? std::min(d.max_drafts(), std::min(df2_cap, max_per_slot))
+                                      : std::min(d.max_drafts(), df2_cap);
+                    if (q.active) kw = std::min<int>(kw, (int) std::max<int64_t>(1, q.max_new - q.produced));
                     kw = std::min<int>(kw, (int) std::max<int64_t>(1, (int64_t) o.max_context - q.p - 1));
                     df2_bitems[idx] = {&d, le.taps ? le.taps : d.landing(), le.kp, le.pos0, le.anchor, std::max(1, kw), df2_bdd[idx], df2_bpp[idx]};
                 }
@@ -17292,6 +17311,9 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+            bool slot_handoff_draft_ready = false;
+            std::array<int32_t, 8> slot_handoff_draft{};
+            std::array<float, 8> slot_handoff_dprob{};
             if (slot_source >= 0) {
                 lent_slot = -1;   // (a longer start than the main session's)
                 const auto t0 = Clock::now();
@@ -17322,8 +17344,11 @@ int main(int argc, char** argv) {
                     // copies of this conversation a turn back - whose deepest checkpoint the chain holds again - go
                     // as superseded (#342) instead of taking a parked entry each until the cache evicts another chat.
                     // STRATA_SLOT_CKPT_MOVE: the slot this request continues in drops its checkpoints at the
-                    // admission, so they move (the one continued from moves on into the slot then: moved_in)
-                    const bool move_cks = slot_ckpt_move_env() && admit_slot == slot_source;
+                    // admission, so they move (the one continued from moves on into the slot then: moved_in).
+                    // On a full slot->solo GEN handoff (`admit_slot < 0 && slot_ck == nullptr`), the main session
+                    // supersedes the slot's shorter history, so its checkpoints move in O(1) as well.
+                    const bool move_cks = strata::core::should_move_slot_checkpoints_to_solo(
+                        slot_ckpt_move_env(), solo_handoff_fast, admit_slot, slot_source, slot_ck != nullptr);
                     const int64_t ck_len = slot_ck != nullptr ? (int64_t) slot_ck->ids.size() : -1;
                     std::vector<ConvCheckpoint>& sc = bs[(size_t) slot_source].checks;
                     // a shorter checkpoint comes along only when it is a prefix of the tokens copied back (text only):
@@ -17371,6 +17396,16 @@ int main(int argc, char** argv) {
                         if (move_cks) moved_in = ck_len;
                     } else {
                         live = bs[(size_t) slot_source].ids;
+                        if (solo_handoff_fast && batch_df2 && admit_slot < 0 && bs[(size_t) slot_source].draft_ready &&
+                            slot_tokens == n - 1 && bs[(size_t) slot_source].x == (int32_t) ids[(size_t) (n - 1)]) {
+                            slot_handoff_draft_ready = true;
+                            slot_handoff_draft = bs[(size_t) slot_source].draft;
+                            slot_handoff_dprob = bs[(size_t) slot_source].dprob;
+                        }
+                        if (move_cks && admit_slot < 0) {
+                            bs[(size_t) slot_source].cached = false;
+                            bs[(size_t) slot_source].ids.clear();
+                        }
                     }
                     live_imgs.clear();
                     resume = slot_tokens;
@@ -19106,7 +19141,8 @@ int main(int argc, char** argv) {
                     return false;
 #endif
                 }();
-                const bool single_stage_hybrid = merge_rem_on && n_pipe == 1 && o.pcie_frac <= 0.0f;
+                const bool single_stage_hybrid =
+                    strata::core::single_stage_hybrid_admit_merge(merge_rem_on, n_pipe, !host_res.empty());
                 const int64_t win_w = (batch_df2 && !use_mtp && n_pipe == 1)
                                           ? std::max<int64_t>(S, ver.max_t())
                                           : std::min<int64_t>(S, mt);
@@ -19238,7 +19274,22 @@ int main(int argc, char** argv) {
             auto source_policy = policy;
             strata::core::MtpDrafter::DraftResult generation;
             strata::core::gated::Packet proposal; // immutable through the synchronous verifier call
-            bool first_window = true;
+            int slot_handoff_draft_n = 0;
+            if (slot_handoff_draft_ready) {
+                for (size_t j = 0; j < slot_handoff_dprob.size() && j < dprob.size(); ++j) {
+                    if (slot_handoff_dprob[j] <= 0.0f) break;
+                    ++slot_handoff_draft_n;
+                }
+            }
+            const bool slot_pre_drafted = slot_handoff_draft_ready && slot_handoff_draft_n > 0 && max_new > 1 &&
+                                          merge_T == 0 && !cancelled && req_df2 && draft_on && !gated_proposal;
+            if (slot_pre_drafted) {
+                for (size_t j = 0; j < slot_handoff_draft.size() && j < drafts.size(); ++j) {
+                    drafts[j] = slot_handoff_draft[j];
+                    dprob[j] = slot_handoff_dprob[j];
+                }
+            }
+            bool first_window = !slot_pre_drafted;
             int last_adm_rows = 1;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             // STRATA_FOLLOW=<file> (token forcing, measurement only, off by default; tools/force_check.py): one line per request in the order the
@@ -20100,6 +20151,7 @@ int main(int argc, char** argv) {
                         wr.draft_conf = o.draft_conf; wr.dprob = dprob.data();
                         T = strata::spec::choose_window(wr);
                         if (req_df2 && draft_on && !first_window && strata::spec::df2_gate_on()) T = df2_gate.choose(dprob.data(), S_mtp);
+                        if (rounds == 0 && slot_pre_drafted) T = std::min(T, 1 + slot_handoff_draft_n);
                     }
                     if (first_window) T = merge_T > 0 ? merge_T : 1;
                     // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -20956,8 +21008,11 @@ int main(int argc, char** argv) {
                             }
                     // STRATA_SLOT_CKPT_MOVE: this request's own turn checkpoint (or the one it moved out of this slot)
                     // moves into the slot; a pinned prefix, a root and any other the chain shares are copied as before
+                    const int64_t prompt_turn_at = strata::core::prompt_last_turn_boundary(
+                        ids.data(), n, o.prompt_cache > 0 ? o.turn_token : -1, o.tail_role_token, req_ckpt, root_at);
                     const bool move_best = slot_ckpt_move_env() && best != nullptr && !best_lent && !sl.img &&
                                            !best->pinned && ((turn_at > 0 && (int64_t) best->ids.size() == turn_at) ||
+                                            (prompt_turn_at > 0 && (int64_t) best->ids.size() == prompt_turn_at) ||
                                             (int64_t) best->ids.size() == moved_in);
                     const auto tc3 = Clock::now();
                     if (move_best) {
