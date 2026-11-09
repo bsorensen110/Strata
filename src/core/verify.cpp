@@ -3638,11 +3638,6 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         cur_layer_ = want - 1;
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
-        if (grp == 0 && taps_ready_cb_ != nullptr && !tap_layers_.empty() && l == (int64_t) tap_layers_.back() + 1) {
-            int64_t pos_buf[kVerifyLongT];
-            for (int r = 0; r < T; ++r) pos_buf[r] = pos0 + r;
-            taps_ready_cb_(taps_ready_user_, tap_dev_, T, pos_buf);
-        }
         progress_at("verify window: the CPU experts of layer", l);
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (pool != nullptr)
@@ -3687,6 +3682,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         if (h_bal_ != nullptr) bal_p_[(size_t) ((k / G) * 2 + grp)] = ms_since(b);
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+        if (grp == 0 && taps_ready_cb_ != nullptr && !tap_layers_.empty() && l == (int64_t) tap_layers_.back() + 1) {
+            int64_t pos_buf[kVerifyLongT];
+            for (int r = 0; r < T; ++r) pos_buf[r] = pos0 + r;
+            taps_ready_cb_(taps_ready_user_, tap_dev_, T, pos_buf);
+        }
     }
     // (#646 staged the next stage's inputs here; 0.1.39b keeps the layer split's order: each stage stages its own)
     if (chain) {
@@ -5039,10 +5039,6 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             !adapt_gate_wait((int32_t) l, err)) return false;
         cur_layer_ = want - 1;
         set_plan_slot(0);
-        if (taps_ready_cb_ != nullptr && !tap_layers_.empty() && l == (int64_t) tap_layers_.back() + 1) {
-            // Let the verifier expose the finalized taps directly to the drafter on the same device.
-            taps_ready_cb_(taps_ready_user_, tap_dev_, S, pos);
-        }
         progress_at("verify batch: the CPU experts of layer", l);
         // The recorded graph consumes the helper mask and weighted sum just as
         // the solo graph does. Reset both and supply this layer's routing weights.
@@ -5071,6 +5067,11 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         *flag = want;
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
+        if (taps_ready_cb_ != nullptr && !tap_layers_.empty() && l == (int64_t) tap_layers_.back() + 1) {
+            // Let the verifier expose the finalized taps directly to the drafter on the same device
+            // after releasing the current layer's doorbell so the CPU pool and GPU combine are not delayed.
+            taps_ready_cb_(taps_ready_user_, tap_dev_, S, pos);
+        }
     }
     if (le_ >= g.n_layers && !sample_rows(S, err, false)) return false;
     if (post_layers_cb_ != nullptr) post_layers_cb_(post_layers_user_);
