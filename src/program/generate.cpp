@@ -2025,11 +2025,8 @@ bool adapt_overlap() {
 bool adapt_overlap_resident() {
     static const bool v = [] {
         const char* e = std::getenv("STRATA_ADAPT_OVERLAP_RESIDENT");
-#if defined(STRATA_USE_HIP) && !defined(_WIN32)
-        return e == nullptr || e[0] == '\0' || e[0] != '0';
-#else
-        return e && e[0] == '1';
-#endif
+        return e == nullptr || e[0] == '\0' || e[0] != '0';   // 2026-11-10: default on every backend (was HIP/Linux):
+                                                              // a host-thread overlap, arch-neutral, =0 is the off switch
     }();
     return v;
 }

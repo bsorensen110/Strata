@@ -344,11 +344,8 @@ bool qsa_slots_on() { static const bool v = env_on("STRATA_QSA_SLOTS"); return v
 bool batch_attn_rows_on() {
     static const bool v = [] {
         if (const char* e = std::getenv("STRATA_BATCH_ATTN_ROWS")) return std::atoi(e) != 0;
-#if defined(STRATA_USE_HIP)
-        return true;
-#else
-        return false;
-#endif
+        return true;   // 2026-11-10: default on every backend - the rows kernel is arch-neutral (one call per row's own
+                       // arithmetic), gated at run time by batch_rec_ + kAttnRowsMax, parity-tested on CUDA at rebase
     }();
     return v;
 }

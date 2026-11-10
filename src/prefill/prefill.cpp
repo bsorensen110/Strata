@@ -3915,11 +3915,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // before the issuer thread, so they outlive it on every return (IssuerJoin joins it first).
         static const bool rs_env = routed_stream::enabled_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM"), false);
         static const bool copy_wait_dedupe = [] {
-#if defined(STRATA_USE_HIP)
-            const bool def_on = !rs_env;
-#else
-            const bool def_on = false;
-#endif
+            const bool def_on = !rs_env;   // 2026-11-10: every backend (was HIP): one wait kernel per staging copy instead
+                                           // of a spin node per layer; STRATA_PREFILL_COPY_WAIT_DEDUPE=0 is the off switch
             return strata::prefill::copy_wait_dedupe_from(std::getenv("STRATA_PREFILL_COPY_WAIT_DEDUPE"), def_on);
         }();
         static const int rs_depth = routed_stream::depth_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM_DEPTH"));
