@@ -27,6 +27,17 @@
 #include <signal.h>
 #include <unistd.h>
 #endif
+#include <cstdint>
+#ifdef _MSC_VER
+#include <intrin.h>
+namespace {
+inline int ctzll64(uint64_t m) { unsigned long i = 0; _BitScanForward64(&i, m); return static_cast<int>(i); }
+}
+#else
+namespace {
+inline int ctzll64(uint64_t m) { return __builtin_ctzll(m); }
+}
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -5495,7 +5506,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         if (plan_fast_ok && n_tok <= 64 && n_tok <= strata::kernels::cpu::MAXT) {
             uint64_t m = cpu_tok_mask;
             while (m != 0) {
-                act_toks[n_act_toks++] = __builtin_ctzll(m);
+                act_toks[n_act_toks++] = ctzll64(m);
                 m &= m - 1;
             }
         } else {
