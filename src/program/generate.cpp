@@ -16607,13 +16607,15 @@ int main(int argc, char** argv) {
                         // file size follows from them.  The RAM the parse needs at its peak is asked first.
                         strata::core::SessionReadLimits limits;
                         limits.progress = moving;
-                        const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        // transient read: admit on a read headroom, not the persistent park floor -- refusing
+                        // these turns a load into a full prompt re-read (see the disk restore path).
+                        const uint64_t floor = std::min<uint64_t>((uint64_t) o.conversation_cache_min_free_mib, 512) << 20;
                         limits.admit = [floor, &o](uint64_t need, std::string& why) {
                             const auto mem = strata::core::sample_host_memory();
                             const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
                             if (strata::core::conversation_memory_admit(avail, need, floor)) return true;
-                            why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a floor of " +
-                                  std::to_string((long long) o.conversation_cache_min_free_mib) + " MiB needed, " +
+                            why = "not enough RAM to read it (" + std::to_string(need >> 20) + " MiB plus a read headroom of " +
+                                  std::to_string((long long) (floor >> 20)) + " MiB needed, " +
                                   ram_note(mem) + ")";
                             return false;
                         };
@@ -17209,14 +17211,19 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: conversation cache: %s\n", rerr.c_str());
                     return false;
                 }
-                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                // Reads are transient: the parsed image is freed once the state lands in the pools, while the
+                // configured floor guards a persistent resident cost (a park keeps its bytes in L1).  At batch
+                // width MemAvailable sits near that floor, so gating a restore at need + park_floor refused
+                // nearly every disk read and silently fell back to full prompt re-reads.  A read needs only a
+                // headroom covering the parse peak between the preflight and the free; never above the floor.
+                const uint64_t floor = std::min<uint64_t>((uint64_t) o.conversation_cache_min_free_mib, 512) << 20;
                 limits.admit = [&](uint64_t need, std::string& why) {
                     const auto mem = strata::core::sample_host_memory();
                     if (strata::core::conversation_memory_admit(
                             mem ? std::optional<uint64_t>(mem->available) : std::nullopt, (size_t) need, floor))
                         return true;
                     why = "physical RAM admission (" + std::to_string(need >> 20) + " MiB needed plus " +
-                          std::to_string(o.conversation_cache_min_free_mib) + " MiB floor, " + ram_note(mem) + ")";
+                          std::to_string(floor >> 20) + " MiB read headroom, " + ram_note(mem) + ")";
                     return false;
                 };
                 limits.progress = [](uint64_t done, uint64_t) {
