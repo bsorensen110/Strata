@@ -334,6 +334,7 @@ SET_DEFAULTS = {
     ("metal", "iq3_s"): SetDefault("mtp"),
     ("cuda", "iq3_s"): SetDefault("dflash2", True, None, "resident", big_blackwell_conf=0.55),
     ("cuda", "unsloth-ud-iq4_xs-v31"): SetDefault("dflash2", True, None, "resident"),
+    ("cuda", "iq3_xxs"): SetDefault("dflash2", True),          # owner, 2026-11-10: the RTX 5080 production card streams (~3.2k slots of 24.6k), so the "resident" where cannot hold; the tuned pack is the same selq4 format with the backend's own conf, chosen by the owner for this set
     ("hip", "iq3_s"): SetDefault("dflash2", True, None, "gfx1151"),
     ("hip", "unsloth-ud-q4_k_xl"): SetDefault("dflash2", True, None, "gfx1151"),
     ("hip", "unsloth-ud-iq4_xs"): SetDefault("dflash2", True, None, "gfx1151"),
