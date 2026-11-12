@@ -1886,10 +1886,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         gg.keep[gg.n] = keep_rows ? one_ : nullptr;   // STRATA_BATCH_SELF_COMMIT: the window keeps its one-row groups itself
                         ++gg.n;
                     }
-                    gdn_q_done = gdn_groups_qfuse && !use_quant_il_wout;
+                    gdn_q_done = gdn_groups_qfuse;
                     strata::kernels::gdn_step_norm_groups(gg, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS,
                                                           y_, (int) HK, (int) HV, keep_rows, cs, tb,
-                                                          gdn_q_done ? (void*) xq_ : nullptr);
+                                                          gdn_q_done ? (void*) xq_ : nullptr,
+                                                          (gdn_q_done && use_quant_il_wout) ? (void*) xil_ : nullptr);
                 } else
                 if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
                     for (int t = tb; t < te;) {
@@ -1905,12 +1906,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 } else {
                     gdn_q_done = g_qfuse();
                     gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                        (int) HV, te, self_commit ? one_ : nullptr, cs, tb, gdn_q_done ? (void*) xq_ : nullptr);
+                                        (int) HV, te, self_commit ? one_ : nullptr, cs, tb,
+                                        gdn_q_done ? (void*) xq_ : nullptr,
+                                        (gdn_q_done && use_quant_il_wout) ? (void*) xil_ : nullptr);
                 }
                 stamp(l, 6, grp);
                 // STRATA_QFUSE / STRATA_GDN_GROUPS_QFUSE: done above by gdn_step_norm_groups / gdn_step_norm_multi
                 if (!gdn_q_done) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
-                else il_ready = false;
+                else il_ready = use_quant_il_wout;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
             } else {
                 // ======================= QSA =======================

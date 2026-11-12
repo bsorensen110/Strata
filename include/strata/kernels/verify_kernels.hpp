@@ -65,10 +65,11 @@ void gdn_conv_l2_groups(const GdnGroups& groups, const float* qkv, const float* 
 /// same arithmetic as one call each: bit-identical).  `commit`: every group keeps *keep[i] tokens, no outputs used.
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
-                          void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+                          void* stream, int t_out_begin = 0, void* xq_out = nullptr, void* xq_il_out = nullptr);
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr);
+                         const int32_t* n_keep, void* stream, int t_out_begin = 0, void* xq_out = nullptr,
+                         void* xq_il_out = nullptr);
 /// The commit of `n_layers` GDN layers in two launches (engine-latency): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as

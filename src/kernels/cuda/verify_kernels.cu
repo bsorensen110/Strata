@@ -12,6 +12,7 @@
 #include "strata/kernels/window_start.hpp"  // KVA: the draft layer's window floor
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/gfx_arch.hpp"   // #3264: the gfx12 test of the multi-block head ops
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/pdl.hpp"
 
 #include <cuda_fp16.h>
@@ -320,7 +321,23 @@ __device__ __forceinline__ void gdn_step_commit_body(float* __restrict__ state, 
 // S26 (STRATA_QFUSE=1): the q8_1 image of a 32-column block, written by the warp that holds those columns with
 // native_quantize_q8_1_kernel's quantizer (the same XOR-tree max and sum, d = amax / 127, roundf(x / d), ds = (d, sum)).
 struct GdnQ81 { half2 ds; int8_t qs[32]; };
-__device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t idx, float xi) {
+struct GdnQ81Il {
+    int* bm = nullptr;
+    int* pm = nullptr;
+    float* d = nullptr;
+    int cp = 0;
+    int nb = 0;
+};
+inline GdnQ81Il make_gdn_q81_il(void* xq_il_out, int value_dim, int out_tok) {
+    if (!xq_il_out || out_tok < 2 || out_tok > 8) return {};
+    const int cp = native_q8_1_il_cp(out_tok);
+    const int nb = value_dim / 32;
+    const size_t words = (size_t) nb * 8 * (size_t) cp;
+    int* bm = static_cast<int*>(xq_il_out);
+    return {bm, bm + words, reinterpret_cast<float*>(bm + 2 * words), cp, nb};
+}
+__device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t idx, float xi,
+                                               const GdnQ81Il& il = {}, int il_tok = 0, int il_blk = 0) {
     // no contraction: xi is a product here, and fma(a, b, shfl) would round the first sum unlike the separate
     // quantizer, which reads xi from memory (S26 harness: ds.sum differed by 1 ulp without this)
 #pragma clang fp contract(off)
@@ -331,8 +348,21 @@ __device__ __forceinline__ void gdn_q8_1_store(GdnQ81* __restrict__ xq, size_t i
     for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
     const float d = q8_1_finite(q81_div(amax, 127.0f));   // #606: as native_quantize_q8_1_kernel - finite blocks bit for bit (#3948: and its division)
     const int8_t q = q8_1_quant(xi, d, amax);
-    xq[idx / 32].qs[idx % 32] = q;
-    if (idx % 32 == 0) xq[idx / 32].ds = q8_1_ds(d, sum);   // #606: clamped (the QFUSE path bypassed the finite helper)
+    const half2 ds = q8_1_ds(d, sum);                     // #606: clamped (the QFUSE path bypassed the finite helper)
+    const int lane = (int) (idx & 31);
+    xq[idx / 32].qs[lane] = q;
+    if (lane == 0) xq[idx / 32].ds = ds;
+    if (il.bm != nullptr) {
+        unsigned v = unsigned(uint8_t(q)) << (8 * (lane & 3));
+        v |= __shfl_xor_sync(0xffffffffu, v, 1);
+        v |= __shfl_xor_sync(0xffffffffu, v, 2);
+        const int pp = lane >> 2;
+        if ((lane & 3) == 0) {
+            il.bm[(size_t(il_blk) * 8 + pp) * il.cp + il_tok] = int(v);
+            il.pm[(size_t(pp) * il.nb + il_blk) * il.cp + il_tok] = int(v);
+        }
+        if (lane == 0) il.d[size_t(il_blk) * il.cp + il_tok] = __low2float(ds);
+    }
 }
 
 template <bool ALL_OUT, bool Q>
@@ -344,7 +374,9 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
                                                                      const float* __restrict__ gamma, float eps,
                                                                      float* __restrict__ y, int h_k, int h_v, int T,
                                                                      const int32_t* __restrict__ n_keep, int t_out_begin,
-                                                                     GdnQ81* __restrict__ xq, GdnGroups grp = {}) {
+                                                                     GdnQ81* __restrict__ xq, GdnGroups grp = {},
+                                                                     GdnQ81Il xq_il = {}) {
+    int il_tok0 = 0;
     if (grp.n > 0) {   // group blockIdx.y - its slot's state and its rows of the window's buffers
         const int gi = blockIdx.y, f = grp.first[gi];
         state = grp.state[gi];
@@ -353,7 +385,10 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
         beta += (size_t) f * h_v;
         z += (size_t) f * S * h_v;
         y += (size_t) f * S * h_v;
-        if constexpr (Q) xq += (size_t) (f - t_out_begin) * (S * h_v / 32);
+        if constexpr (Q) {
+            xq += (size_t) (f - t_out_begin) * (S * h_v / 32);
+            il_tok0 = f - t_out_begin;
+        }
         t_out_begin = 0;
         T = grp.ntok[gi];
         n_keep = grp.keep[gi];
@@ -434,7 +469,9 @@ __global__ void __launch_bounds__(S * RG) gdn_step_norm_multi_kernel(float* __re
             const float scale = rsqrtf(ss / (float) S + eps);
             const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
             if (!(Q && grp.n > 0)) y[(size_t) t * value_dim + head * S + col] = yv;
-            if constexpr (Q) gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
+            if constexpr (Q)
+                gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv,
+                               xq_il, il_tok0 + (t - t_out_begin), (head * S + col) >> 5);
         }
     }
     if (!ALL_OUT && n_keep != nullptr && n > 0) {
@@ -601,7 +638,7 @@ template<bool Q>
 __global__ void __launch_bounds__(S * RG) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
                                                              float eps, float* __restrict__ y, int h_v, int T,
                                                              const int32_t* __restrict__ n_keep, int t_out_begin,
-                                                             GdnQ81* __restrict__ xq) {
+                                                             GdnQ81* __restrict__ xq, GdnQ81Il xq_il = {}) {
     __shared__ float wsum[S * RG / 32];
     const int head = blockIdx.x, t = blockIdx.y + t_out_begin, col = threadIdx.x, rg = threadIdx.y;
     const int tid = rg * S + col;
@@ -623,7 +660,8 @@ __global__ void __launch_bounds__(S * RG) gdn_out_norm_kernel(const float* __res
         if constexpr (Q) {
             const float yv = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
             y[(size_t) t * value_dim + head * S + col] = yv;
-            gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv);
+            gdn_q8_1_store(xq, (size_t) (t - t_out_begin) * value_dim + head * S + col, yv,
+                           xq_il, t - t_out_begin, (head * S + col) >> 5);
         } else {
             y[(size_t) t * value_dim + head * S + col] = oc * scale * gamma[col] * (1.0f / (1.0f + __expf(-zz)));
         }
@@ -1335,16 +1373,19 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
-                          void* stream, int t_out_begin, void* xq_out) {
+                          void* stream, int t_out_begin, void* xq_out, void* xq_il_out) {
     if (groups.n < 1 || groups.n > 8 || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k) {
         std::fprintf(stderr, "gdn_step_norm_groups: invalid arguments\n");
         std::exit(1);
     }
-    for (int i = 0; i < groups.n; ++i)
+    int out_tok = 0;
+    for (int i = 0; i < groups.n; ++i) {
         if (!groups.state[i] || groups.ntok[i] < 1 || groups.ntok[i] > kVerifyMaxT || (commit && !groups.keep[i])) {
             std::fprintf(stderr, "gdn_step_norm_groups: invalid group %d\n", i);
             std::exit(1);
         }
+        out_tok += groups.ntok[i];
+    }
     const dim3 g1((unsigned) h_v, (unsigned) groups.n), b1(S, RG);
     GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);
     // the kernel gdn_step_norm_multi picks for these calls: a window's rows (all outputs, no keep) or a commit of
@@ -1354,7 +1395,8 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
             nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
     else if (xq != nullptr)
         gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
-            nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, t_out_begin, xq, groups);
+            nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, t_out_begin, xq, groups,
+            make_gdn_q81_il(xq_il_out, S * h_v, out_tok));
     else
         gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
             nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
@@ -1363,7 +1405,7 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
 
 void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin, void* xq_out) {
+                         const int32_t* n_keep, void* stream, int t_out_begin, void* xq_out, void* xq_il_out) {
     GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);   // S26: non-null = also the outputs' q8_1 (STRATA_QFUSE)
     // n_tok: up to kVerifyLongT (a long window's second token group replays the state from its first token); the
     // default kernels loop over the tokens, the STRATA_GDN_SPLIT ones hold kVerifyMaxT per thread
@@ -1373,6 +1415,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
         std::fprintf(stderr, "gdn_step_norm_multi: invalid arguments\n");
         std::exit(1);
     }
+    const GdnQ81Il xq_il = xq ? make_gdn_q81_il(xq_il_out, S * h_v, n_tok - t_out_begin) : GdnQ81Il{};
     // S26: the split runs where it is faster (gfx1151 harness, h_v 48: the commit 8-19% per call; a window of 2+ rows
     // 3-13%; one row: no gain, the old kernel stays) - bitwise equal in every case
     if (split && (t_out_begin >= n_tok || n_tok - t_out_begin >= 2)) {
@@ -1388,7 +1431,7 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
             gdn_step_split_kernel<true><<<grid, block, 0, (cudaStream_t) stream>>>(
                 state, h, conv_channels, gate, beta, y, h_k, h_v, n_tok, n_keep, t_out_begin);
             const dim3 ng((unsigned) h_v, (unsigned) (n_tok - t_out_begin));
-            if (xq) gdn_out_norm_kernel<true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, xq);
+            if (xq) gdn_out_norm_kernel<true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, xq, xq_il);
             else gdn_out_norm_kernel<false><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(z, gamma, eps, y, h_v, n_tok, n_keep, t_out_begin, nullptr);
         }
         check("gdn_step_norm_multi (split)");
@@ -1411,9 +1454,9 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
     const bool all_out = n_keep == nullptr && t_out_begin <= 0;
     if (xq && t_out_begin < n_tok) {
         if (all_out) gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
-            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq);
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, xq, {}, xq_il);
         else gdn_step_norm_multi_kernel<false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
-            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, xq);
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin, xq, {}, xq_il);
     } else if (all_out) {
         gdn_step_norm_multi_kernel<true, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
             state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, nullptr, 0, nullptr);
