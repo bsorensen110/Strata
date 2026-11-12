@@ -5991,6 +5991,9 @@ struct Model::Impl {
                             if (!pk.read_at(l.mx_file[r], l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r] + (uint64_t) X * nb, nb,
                                             ram_part[(size_t) j.slot][(size_t) X] + cp_lay[(size_t) l.il][(size_t) r]))
                                 bad.store(true);
+                        // The copy lives in ram_part now, so drop the file's pages from the OS page cache.
+                        os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) j.e * l.mx_stride[r],
+                                   mx_part_bytes(l, r), false);
                     }
                     const int64_t db = done_b.fetch_add((int64_t) l.blob) + (int64_t) l.blob;
                     if (o.verbose && i % 2048 == 0)
