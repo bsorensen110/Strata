@@ -224,32 +224,49 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
     if (n_tok < 1 || n_tok > kVerifyMaxT || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens (16 in a wide build), native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
+    const auto il_ok = [&](int type, int n_in, int n_out) {
+        return nw.q8_il != nullptr && n_tok >= 2 && n_tok <= 8 &&
+               native_mmvq_il_supported(type, n_tok, n_out) &&
+               ((type != 18 && type != 21) || n_in <= 4096);
+    };
+    const bool gate_il = il_ok(nw.gate_type, (int) n_embd, (int) n_ff);
+    const bool up_il = il_ok(nw.up_type, (int) n_embd, (int) n_ff);
+    const bool down_il = il_ok(nw.down_type, (int) n_ff, (int) n_embd);
     // the activation's q8_1: the caller's (STRATA_VERIFY_QDEDUP, x_q8_1_ready) or the descriptor's, else quantized here
     const void* x_q8_1 = x_q8_1_ready ? x_q8_1_ready : nw.x_q8_1;
     if (!x_q8_1) {
-        native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
+        if (gate_il || up_il) native_quantize_q8_1_il(x, nw.q8_1, nw.q8_il, (int) n_embd, n_tok, stream);
+        else native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
         x_q8_1 = nw.q8_1;
+    } else if (gate_il || up_il) {
+        native_q8_1_interleave(x_q8_1, nw.q8_il, (int) n_embd, n_tok, stream);
     }
     // gate and up in one launch where the pair applies (bitwise identical to the two calls)
     const bool use_pair = (pair || default_pair) && nw.gate_type == nw.up_type;
     if (use_pair && fused_swiglu_q81_enabled() &&
         native_mmvq_pair_swiglu(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream)) {
-        native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
+        if (down_il) native_quantize_q8_1_il(gate, nw.q8_1, nw.q8_il, (int) n_ff, n_tok, stream);
+        else native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     } else {
         if (!(use_pair &&
               native_mmvq_pair(nw.gate_type, nw.gate_data, nw.up_data, x_q8_1, gate, up, (int) n_embd, (int) n_ff, n_tok, stream))) {
-            native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
-            native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
+            if (gate_il) native_mmvq_il(nw.gate_type, nw.gate_data, x_q8_1, nw.q8_il, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+            else native_mmvq(nw.gate_type, nw.gate_data, x_q8_1, gate, (int) n_embd, (int) n_ff, n_tok, stream);
+            if (up_il) native_mmvq_il(nw.up_type, nw.up_data, x_q8_1, nw.q8_il, up, (int) n_embd, (int) n_ff, n_tok, stream);
+            else native_mmvq(nw.up_type, nw.up_data, x_q8_1, up, (int) n_embd, (int) n_ff, n_tok, stream);
         }
         const int n = (int) (n_ff * n_tok);
         if (fused_swiglu_q81_enabled()) {
-            native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
+            if (down_il) native_swiglu_quantize_q8_1_il(gate, up, nw.q8_1, nw.q8_il, (int) n_ff, n_tok, stream);
+            else native_swiglu_quantize_q8_1(gate, up, nw.q8_1, (int) n_ff, n_tok, stream);
         } else {
             native_swiglu_kernel<<<(unsigned) ((n + THREADS - 1) / THREADS), THREADS, 0, cs>>>(gate, up, gate, n);
-            native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
+            if (down_il) native_quantize_q8_1_il(gate, nw.q8_1, nw.q8_il, (int) n_ff, n_tok, stream);
+            else native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
         }
     }
-    native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    if (down_il) native_mmvq_il(nw.down_type, nw.down_data, nw.q8_1, nw.q8_il, out, (int) n_ff, (int) n_embd, n_tok, stream);
+    else native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
     if (gate_deferred) {   // the caller computed g (raw) with the router and scales `out` in the combine
         const cudaError_t e = cudaGetLastError();
         if (e != cudaSuccess) throw std::runtime_error(std::string("shared_expert_multi: ") + cudaGetErrorString(e));

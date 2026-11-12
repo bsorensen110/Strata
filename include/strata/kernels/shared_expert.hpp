@@ -38,6 +38,7 @@ struct NativeSharedWeights {
     const void* up_data = nullptr;
     const void* down_data = nullptr;
     void* q8_1 = nullptr;
+    void* q8_il = nullptr;          // optional interleaved Q8_1 scratch for native_mmvq_il (2..8 cols)
     const void* x_q8_1 = nullptr;   // optional pre-quantized Q8_1 input for gate/up in shared_expert_multi
 };
 

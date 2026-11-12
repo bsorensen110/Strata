@@ -1153,6 +1153,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
         xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));   // 147-verify: 5-8 columns too
+        sh_xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));
         qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
         gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
         z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
@@ -2447,6 +2448,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
+            nsw.q8_il = (n >= 2 && n <= 8 && g_mmvq_il()) ? (sh_fork ? sh_xil_ : xil_) : nullptr;
             // STRATA_VERIFY_QDEDUP=1 (or by default when STRATA_QFUSE_HC already wrote nat_xq_ in gr_read_group and the
             // shared expert runs on the same stream): the shared expert's gate/up reuse nat_xq_ directly instead of
             // launching a second native_quantize_q8_1(xm) pass per layer (quantize_q8_1_rows and native_quantize_q8_1

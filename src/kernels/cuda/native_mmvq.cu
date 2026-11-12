@@ -2586,12 +2586,9 @@ __global__ void native_q8_1_interleave_kernel(const Q81Block* __restrict__ y, in
 
 // native_quantize_q8_1_kernel and native_q8_1_interleave_kernel in one launch: the same q8_1 blocks, and the
 // interleaved copy's ints and scales (an int is four codes, gathered from lanes 4p..4p+3 with two shuffles).
-__global__ void native_quantize_q8_1_il_kernel(const float* __restrict__ x, Q81Block* __restrict__ y,
-                                               int* __restrict__ bm, int* __restrict__ pm, float* __restrict__ dl,
-                                               int n_in, int n_total, int cp) {
-    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
-    if (i >= n_total) return;   // n_total is a multiple of 32: only whole warps return
-    const float xi = x[i];
+__device__ __forceinline__ void quantize_q8_1_il_store(float xi, int i, Q81Block* __restrict__ y,
+                                                       int* __restrict__ bm, int* __restrict__ pm,
+                                                       float* __restrict__ dl, int n_in, int cp) {
     const float amax = warp_max(fabsf(xi));
     const float sum = warp_sum(xi);
     const float d = q8_1_finite(amax / 127.0f);
@@ -2609,6 +2606,26 @@ __global__ void native_quantize_q8_1_il_kernel(const float* __restrict__ x, Q81B
         pm[(std::size_t(pp) * nb + b) * cp + c] = int(v);
     }
     if (lane == 0) dl[std::size_t(b) * cp + c] = __low2float(ds);
+}
+
+__global__ void native_quantize_q8_1_il_kernel(const float* __restrict__ x, Q81Block* __restrict__ y,
+                                               int* __restrict__ bm, int* __restrict__ pm, float* __restrict__ dl,
+                                               int n_in, int n_total, int cp) {
+    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
+    if (i >= n_total) return;   // n_total is a multiple of 32: only whole warps return
+    quantize_q8_1_il_store(x[i], i, y, bm, pm, dl, n_in, cp);
+}
+
+__launch_bounds__(QUANT_THREADS, 1)
+__global__ void native_swiglu_quantize_q8_1_il_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                                      Q81Block* __restrict__ y, int* __restrict__ bm,
+                                                      int* __restrict__ pm, float* __restrict__ dl, int n_in,
+                                                      int n_total, int cp) {
+    const int i = int(blockIdx.x) * QUANT_THREADS + int(threadIdx.x);
+    if (i >= n_total) return;   // n_total is a multiple of 32: only whole warps return
+    const float gi = gate[i];
+    const float xi = __fmul_rn(__fdividef(gi, __fadd_rn(1.0f, __expf(-gi))), up[i]);
+    quantize_q8_1_il_store(xi, i, y, bm, pm, dl, n_in, cp);
 }
 
 #undef STRATA_IL_PF
@@ -3959,6 +3976,25 @@ void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in,
     native_quantize_q8_1_il_kernel<<<unsigned((n_total + QUANT_THREADS - 1) / QUANT_THREADS), QUANT_THREADS, 0,
                                      static_cast<cudaStream_t>(stream)>>>(
         x, static_cast<Q81Block*>(x_q8_1), const_cast<int*>(parts.bm), const_cast<int*>(parts.pm),
+        const_cast<float*>(parts.d), n_in, n_total, cp);
+    launch_check();
+}
+
+void native_swiglu_quantize_q8_1_il(const float* gate, const float* up, void* x_q8_1, void* x_il,
+                                    int n_in, int ncols, void* stream) {
+    validate_shape(n_in, ncols);
+    if (ncols < 2 || ncols > 8) throw std::invalid_argument("native_swiglu_quantize_q8_1_il requires 2 <= ncols <= 8");
+    validate_pointer(gate);
+    validate_pointer(up);
+    validate_pointer(x_q8_1);
+    validate_pointer(x_il);
+    validate_stream(stream);
+    const int cp = native_q8_1_il_cp(ncols);
+    const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
+    const int n_total = n_in * ncols;
+    native_swiglu_quantize_q8_1_il_kernel<<<unsigned((n_total + QUANT_THREADS - 1) / QUANT_THREADS), QUANT_THREADS, 0,
+                                            static_cast<cudaStream_t>(stream)>>>(
+        gate, up, static_cast<Q81Block*>(x_q8_1), const_cast<int*>(parts.bm), const_cast<int*>(parts.pm),
         const_cast<float*>(parts.d), n_in, n_total, cp);
     launch_check();
 }

@@ -46,6 +46,8 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols,
 
 void native_swiglu_quantize_q8_1(const float* gate, const float* up, void* x_q8_1,
                                  int n_in, int ncols, void* stream);
+void native_swiglu_quantize_q8_1_il(const float* gate, const float* up, void* x_q8_1, void* x_il,
+                                    int n_in, int ncols, void* stream);
 
 void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
