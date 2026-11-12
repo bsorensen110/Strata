@@ -47,6 +47,9 @@ struct FusedGrArgs {
     /// bytes native_quantize_q8_1 would write); q8_cnt = n_embd / 32 zeroed counters owned by the caller (token 0's)
     uint8_t* q8_mixed = nullptr;
     unsigned* q8_cnt = nullptr;
+    /// Optional interleaved q8_1 destination (native_q8_1_il_bytes(n_embd, n_tok)) written alongside q8_mixed when
+    /// 2 <= n_tok <= kFusedGrMaxT and token 0 sets q8_il.
+    void* q8_il = nullptr;
     /// STRATA_HC_Q8: non-null when w_down / w_up hold int8 codes (same [row][col] layout) with one fp32 scale per
     /// 32 contiguous values here ([row][col / 32]).  w_inject stays bf16.
     const float* s_down = nullptr;

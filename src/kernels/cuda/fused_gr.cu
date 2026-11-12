@@ -10,6 +10,7 @@
 #include "strata/core/bw_dense_defaults.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "s26_tsum.cuh"
@@ -303,6 +304,10 @@ __global__ void __launch_bounds__(THREADS) gr_up_kernel(FusedGrArgs a) {
 struct GrMulti {
     FusedGrArgs a[kFusedGrMaxT];
     float* xn;
+    int* q8_il_bm = nullptr;
+    int* q8_il_pm = nullptr;
+    float* q8_il_d = nullptr;
+    int q8_il_cp = 0;
     int T;
 };
 
@@ -314,6 +319,30 @@ struct GrMulti {
 // d = amax / 127, roundf(x / d), ds = (d, sum) - the bytes the separate launch writes.
 struct GrQ81 { half2 ds; int8_t qs[32]; };
 static_assert(2 * 16 == 32, "two up blocks per q8_1 group");
+__device__ __forceinline__ void gr_q8_write(const GrMulti& m, int tok, int blk, int lane, float xi) {
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    const float d = q8_1_finite(q81_div(amax, 127.0f));   // #606: as native_quantize_q8_1_kernel - finite blocks bit for bit
+    const int8_t q = q8_1_quant(xi, d, amax);
+    const half2 ds = q8_1_ds(d, sum);                     // #606: clamped scale/sum - an unclamped pair NaN-poisons the dot path
+    GrQ81* y = reinterpret_cast<GrQ81*>(m.a[tok].q8_mixed) + blk;
+    y->qs[lane] = q;
+    if (lane == 0) y->ds = ds;
+    if (m.q8_il_bm != nullptr) {
+        unsigned v = unsigned(uint8_t(q)) << (8 * (lane & 3));
+        v |= __shfl_xor_sync(0xffffffffu, v, 1);
+        v |= __shfl_xor_sync(0xffffffffu, v, 2);
+        const int pp = lane >> 2, nb = N / 32, cp = m.q8_il_cp;
+        if ((lane & 3) == 0) {
+            m.q8_il_bm[(size_t(blk) * 8 + pp) * cp + tok] = int(v);
+            m.q8_il_pm[(size_t(pp) * nb + blk) * cp + tok] = int(v);
+        }
+        if (lane == 0) m.q8_il_d[size_t(blk) * cp + tok] = __low2float(ds);
+    }
+}
 __device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0) {
     __shared__ int last;
     __threadfence();
@@ -330,16 +359,7 @@ __device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0) {
     if (warp >= m.T) return;
     const int c0 = (d0 / 32) * 32;
     const float xi = *reinterpret_cast<const volatile float*>(m.a[warp].mixed + c0 + lane);
-    float amax = fabsf(xi), sum = xi;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-    const float d = q8_1_finite(q81_div(amax, 127.0f));   // #606: as native_quantize_q8_1_kernel - finite blocks bit for bit
-    const int8_t q = q8_1_quant(xi, d, amax);
-    GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + c0 / 32;
-    y->qs[lane] = q;
-    if (lane == 0) y->ds = q8_1_ds(d, sum);   // #606: clamped scale/sum - an unclamped pair NaN-poisons the dot path
+    gr_q8_write(m, warp, c0 / 32, lane, xi);
 }
 // Step 1 of `gr_down_kernel`, one block per token, same threads and reduction order: rs[t] and xn[t] to global.
 __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
@@ -819,16 +839,7 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q32_kernel(GrMulti m) {
         for (int c = 0; c < HC; ++c) s += g[warp][c][lane];
         const float xi = s / (float) HC;
         m.a[warp].mixed[d0 + lane] = xi;
-        float amax = fabsf(xi), sum = xi;
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-#pragma unroll
-        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-        const float d = q8_1_finite(q81_div(amax, 127.0f));
-        const int8_t q = q8_1_quant(xi, d, amax);
-        GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + d0 / 32;
-        y->qs[lane] = q;
-        if (lane == 0) y->ds = q8_1_ds(d, sum);
+        gr_q8_write(m, warp, d0 / 32, lane, xi);
     }
 }
 
@@ -2469,18 +2480,7 @@ __global__ void __launch_bounds__(Q32_THREADS) gr_up_q8_q32_kernel(GrMulti m, co
         for (int c = 0; c < HC; ++c) s += g[warp][c][lane];
         const float xi = s / (float) HC;
         m.a[warp].mixed[d0 + lane] = xi;
-        if (m.a[0].q8_mixed != nullptr) {
-            float amax = fabsf(xi), sum = xi;
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-#pragma unroll
-            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
-            const float d = q8_1_finite(q81_div(amax, 127.0f));
-            const int8_t q = q8_1_quant(xi, d, amax);
-            GrQ81* y = reinterpret_cast<GrQ81*>(m.a[warp].q8_mixed) + d0 / 32;
-            y->qs[lane] = q;
-            if (lane == 0) y->ds = q8_1_ds(d, sum);
-        }
+        if (m.a[0].q8_mixed != nullptr) gr_q8_write(m, warp, d0 / 32, lane, xi);
     }
 }
 
@@ -3007,8 +3007,16 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
 #endif
     bool q8 = a[0].q8_cnt != nullptr || q32_no_cnt;
     for (int t = 0; t < n_tok; ++t) q8 = q8 && a[t].q8_mixed != nullptr;
-    if (!q8)
+    if (!q8) {
         for (int t = 0; t < n_tok; ++t) m.a[t].q8_mixed = nullptr;
+    } else if (n_tok >= 2 && a[0].q8_il != nullptr) {
+        const int cp = native_q8_1_il_cp(n_tok);
+        const size_t words = size_t(N / 32) * 8 * size_t(cp);
+        m.q8_il_bm = static_cast<int*>(a[0].q8_il);
+        m.q8_il_pm = m.q8_il_bm + words;
+        m.q8_il_d = reinterpret_cast<float*>(m.q8_il_bm + 2 * words);
+        m.q8_il_cp = cp;
+    }
     m.xn = xn_scratch;
     m.T = n_tok;
     cudaStream_t st = (cudaStream_t) stream;
@@ -3200,6 +3208,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         FusedGrArgs s[kFusedGrMaxT];
         for (int k = 0; k < ct; ++k) s[k] = a[c0 + k];
         s[0].q8_cnt = a[0].q8_cnt;
+        s[0].q8_il = nullptr;
         q8 = fused_gr_read_multi_slice(s, ct, xn_scratch + (size_t) c0 * D, stream, c0 == 0 ? stamp_buf : nullptr, stamp_i0);
     }
     return q8;
