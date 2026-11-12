@@ -36,10 +36,21 @@
 #include "strata/prefill/moe_fused.hpp"
 
 #if defined(__HIPCC__) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || \
-                           defined(__gfx1150__) || defined(__gfx1151__))
-#define STRATA_F16_DEVICE 1
+                           defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__))
+#define STRATA_F16_W11 1
 #else
-#define STRATA_F16_DEVICE 0
+#define STRATA_F16_W11 0
+#endif
+#if defined(__HIPCC__) && (defined(__gfx1200__) || defined(__gfx1201__))
+#define STRATA_F16_W12 1
+#else
+#define STRATA_F16_W12 0
+#endif
+#define STRATA_F16_DEVICE (STRATA_F16_W11 || STRATA_F16_W12)
+#if STRATA_F16_W12
+#define F16_DROW(l, half_id) (8 * (half_id) + (l))
+#else
+#define F16_DROW(l, half_id) (2 * (l) + (half_id))
 #endif
 
 namespace strata::prefill::fused::f16 {
@@ -75,12 +86,21 @@ inline int pick_bn(int64_t n, int n_expert) {
     return (double) n / (n_expert > 0 ? n_expert : 1) >= kTileRows ? 2 * kTileRows : kTileRows;
 }
 
+using v8h = __attribute__((__vector_size__(8 * sizeof(_Float16)))) _Float16;
 using v16h = __attribute__((__vector_size__(16 * sizeof(_Float16)))) _Float16;
 using v8f = __attribute__((__vector_size__(8 * sizeof(float)))) float;
 
 __device__ __forceinline__ v8f wmma_f16(v16h a, v16h b, v8f c) {
-#if STRATA_F16_DEVICE
+#if STRATA_F16_W11
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#else
+    __builtin_trap();
+    return c;
+#endif
+}
+__device__ __forceinline__ v8f wmma_f16_w12(v8h a, v8h b, v8f c) {
+#if STRATA_F16_W12
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
 #else
     __builtin_trap();
     return c;
@@ -158,11 +178,24 @@ template <int BN>
 __device__ __forceinline__ void mma_tiles(v8f (&acc)[BN / 16], v16h a_lo, v16h a_hi, const uint4* s_act, int kb, int sub_lane,
                                           int live_tiles) {
     constexpr int STRIDE = ActStage<BN>::STRIDE;
+#if STRATA_F16_W12
+    const int half_id = (threadIdx.x >> 4) & 1;
+    const v8h a_lo8 = reinterpret_cast<const v8h*>(&a_lo)[half_id];
+    const v8h a_hi8 = reinterpret_cast<const v8h*>(&a_hi)[half_id];
+#endif
 #pragma unroll
     for (int j = 0; j < BN / 16; ++j) {
         asm volatile("" ::: "memory");   // one token tile's fragments live at a time (gufo: hoisting spills)
         if (j >= live_tiles) continue;
         const uint4* frag = s_act + (kb * 4) * STRIDE + j * 16 + sub_lane;
+#if STRATA_F16_W12
+        const uint4 bq_lo = frag[half_id * STRIDE], bq_hi = frag[(2 + half_id) * STRIDE];
+        v8h b_lo, b_hi;
+        __builtin_memcpy(&b_lo, &bq_lo, 16);
+        __builtin_memcpy(&b_hi, &bq_hi, 16);
+        acc[j] = wmma_f16_w12(a_lo8, b_lo, acc[j]);
+        acc[j] = wmma_f16_w12(a_hi8, b_hi, acc[j]);
+#else
         uint4 bq[4];
 #pragma unroll
         for (int q = 0; q < 4; ++q) bq[q] = frag[q * STRIDE];
@@ -171,6 +204,7 @@ __device__ __forceinline__ void mma_tiles(v8f (&acc)[BN / 16], v16h a_lo, v16h a
         __builtin_memcpy(&b_hi, &bq[2], 32);
         acc[j] = wmma_f16(a_lo, b_lo, acc[j]);
         acc[j] = wmma_f16(a_hi, b_hi, acc[j]);
+#endif
     }
 }
 
@@ -190,7 +224,7 @@ __device__ __forceinline__ void gu_epilogue(const v8f (&acc)[BN / 16], uint8_t* 
     for (int j = 0; j < BN / 16; ++j) {
         if (j >= live_tiles) break;   // uniform
 #pragma unroll
-        for (int l = 0; l < 8; ++l) scratch[sub_lane * GU_EPI_STRIDE + 2 * l + half_id] = acc[j][l];
+        for (int l = 0; l < 8; ++l) scratch[sub_lane * GU_EPI_STRIDE + F16_DROW(l, half_id)] = acc[j][l];
         __syncthreads();
         if (tid < 32) {
             const int t = tid >> 1, hh = tid & 1, r = j * 16 + t;
@@ -240,7 +274,7 @@ __device__ __forceinline__ void down_epilogue(const v8f (&acc)[BN / 16], uint8_t
     for (int j = 0; j < BN / 16; ++j) {
         if (j >= live_tiles) break;   // uniform
 #pragma unroll
-        for (int l = 0; l < 8; ++l) tile[sub_lane * 16 + 2 * l + half_id] = acc[j][l];
+        for (int l = 0; l < 8; ++l) tile[sub_lane * 16 + F16_DROW(l, half_id)] = acc[j][l];
         __builtin_amdgcn_wave_barrier();
 #pragma unroll
         for (int q = 0; q < 8; ++q) {

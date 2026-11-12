@@ -1965,7 +1965,7 @@ bool q50_on(const DevInfo& d) {
 bool d_covered_on(int t, const DevInfo& d) {
 #if defined(__HIPCC__)
     if (t == T_Q5_0) return d.w12 ? q50_on(d) : q50_on(d) && f16::requested();   // gfx1151 has no int8 kernel for Q5_0 down (the F16 prompt set must be on); gfx12 has only the int8 one
-    if (t == T_Q8_0 && !d.w12 && (f16::requested() || q8d_f16_default(d))) return true;
+    if (t == T_Q8_0 && (f16::requested() || (!d.w12 && q8d_f16_default(d)))) return true;
 #endif
     (void) d;
     return d_covered(t);
@@ -2139,10 +2139,10 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         const uint8_t* xa8 = (const uint8_t*) xa;
         uint8_t* ha8 = (uint8_t*) ha;
 #define STRATA_NW_GU(T) do { if (occ_gu) native_w11_kernel<T, true, true, NW_LB><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); else native_w11_kernel<T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); } while (0)
-        // STRATA_PF_F16=1: gfx11's F16 matrix cores - the K-quants' kernels (moe_f16_kq.cu) and native_f16_kernel for
-        // f16_gu / f16_d (gfx12's WMMA layout differs, so it keeps the int8 kernels)
-        const bool f16 = !d.w12 && f16::requested();
-        const bool f16_q8d = !f16 && g.d_type == T_Q8_0 && q8d_f16_default(d);   // (the Q8_0 down only)
+        // STRATA_PF_F16=1: gfx11 / gfx12 F16 matrix cores - the K-quants' kernels (moe_f16_kq.cu) and native_f16_kernel for
+        // f16_gu / f16_d (on gfx12 default keeps the int8 kernels unless STRATA_PF_F16=1 is requested)
+        const bool f16 = f16::requested();
+        const bool f16_q8d = !f16 && !d.w12 && g.d_type == T_Q8_0 && q8d_f16_default(d);   // (the Q8_0 down only)
         const bool f16_wide = f16::pick_bn(n, n_expert) == 2 * kTileRows;
         // STRATA_PF_DM16 (the prompt path asks per call): when this layer's down runs on an F16 kernel its rows go to `dm` as FP16 (moe_combine16 reads them)
         const bool d16 = g_dm16_want && ((f16 && (f16kq::covers_down(g.d_type) || f16_d(g.d_type))) || f16_q8d);

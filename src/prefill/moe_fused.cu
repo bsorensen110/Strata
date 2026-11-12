@@ -407,14 +407,32 @@ expert_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ act, c
 #else
 #define STRATA_FUSED_W11 0
 #endif
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define STRATA_FUSED_W12 1
+#else
+#define STRATA_FUSED_W12 0
+#endif
+#define STRATA_FUSED_WMMA (STRATA_FUSED_W11 || STRATA_FUSED_W12)
+typedef int w11_i2 __attribute__((ext_vector_type(2)));
 typedef int w11_i4 __attribute__((ext_vector_type(4)));
 typedef int w11_i8 __attribute__((ext_vector_type(8)));
+#if STRATA_FUSED_W12
+using w11_frag = uint2;
+using w11_ab = w11_i2;
+#define W11_DROW(i, hi) (8 * (hi) + (i))
+#else
+using w11_frag = uint4;
+using w11_ab = w11_i4;
+#define W11_DROW(i, hi) (2 * (i) + (hi))
+#endif
 constexpr int W_ROWS = 128;                       // weight rows per work item (GU: 64 features = one H block)
 constexpr int W_THREADS = 256;                    // 8 waves: 4 along the weight rows (32 each) x 2 along the tile (32)
 
-__device__ __forceinline__ w11_i8 wmma_iu8(w11_i4 a, w11_i4 b, w11_i8 c) {
+__device__ __forceinline__ w11_i8 wmma_iu8(w11_ab a, w11_ab b, w11_i8 c) {
 #if STRATA_FUSED_W11
     return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(false, a, true, b, c, false);
+#elif STRATA_FUSED_W12
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(false, a, true, b, c, false);
 #else
     __builtin_trap();
     return c;
@@ -425,10 +443,10 @@ template <bool GU>
 __global__ void __launch_bounds__(W_THREADS)
 expert_w11_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ act, const int32_t* __restrict__ src,
                   uint8_t* __restrict__ out, float* __restrict__ dm) {
-#if STRATA_FUSED_W11
+#if STRATA_FUSED_WMMA
     constexpr int NKB = GU ? SC_GU : SC_D;            // 64-weight blocks along K
     constexpr int NFB = (GU ? GU_ROWS : D_ROWS) / W_ROWS;  // work items per tile
-    static_assert(GU_ROWS % W_ROWS == 0 && D_ROWS % W_ROWS == 0, "the Strata Q2 gfx11 kernel: weight rows are whole work items of 128");
+    static_assert(GU_ROWS % W_ROWS == 0 && D_ROWS % W_ROWS == 0, "the Strata Q2 gfx11/gfx12 kernel: weight rows are whole work items of 128");
     constexpr int CODE_LD = GU ? ROW_GU : ROW_D;      // code bytes per weight row
     constexpr size_t O_CODES = GU ? O_GU_CODES : O_D_CODES, O_SC = GU ? O_GU_SC : O_D_SC;
     constexpr int ACT_LD = NKB * AB;                  // bytes per activation row
@@ -469,21 +487,28 @@ expert_w11_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ ac
             for (int mt = 0; mt < 2; ++mt) arow[mt] = blob + O_CODES + (size_t) (rbase + 32 * wm + 16 * mt + l16) * CODE_LD;
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt) brow[nt] = act + (size_t) srow[32 * wn + 16 * nt + l16] * ACT_LD;
-            uint4 ac[2], bq[2][4];
+            uint4 ac[2];
+            w11_frag bq[2][4];
             float4 bs[2];
-            auto fetch = [&](int kb, uint4 (&a)[2], uint4 (&q)[2][4], float4 (&s)[2]) {
+            auto fetch = [&](int kb, uint4 (&a)[2], w11_frag (&q)[2][4], float4 (&s)[2]) {
 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt) a[mt] = *reinterpret_cast<const uint4*>(arow[mt] + kb * 16);
 #pragma unroll
                 for (int nt = 0; nt < 2; ++nt) {
+#if STRATA_FUSED_W12
+                    const uint2* p = reinterpret_cast<const uint2*>(brow[nt] + kb * AB) + hi;
+                    q[nt][0] = p[0]; q[nt][1] = p[2]; q[nt][2] = p[4]; q[nt][3] = p[6];
+#else
                     const uint4* p = reinterpret_cast<const uint4*>(brow[nt] + kb * AB);
                     q[nt][0] = p[0]; q[nt][1] = p[1]; q[nt][2] = p[2]; q[nt][3] = p[3];
+#endif
                     s[nt] = *reinterpret_cast<const float4*>(brow[nt] + kb * AB + 64);
                 }
             };
             fetch(0, ac, bq, bs);
             for (int kb = 0; kb < NKB; ++kb) {
-                uint4 nac[2], nbq[2][4];
+                uint4 nac[2];
+                w11_frag nbq[2][4];
                 float4 nbs[2];
                 if (kb + 1 < NKB) fetch(kb + 1, nac, nbq, nbs);
                 w11_i8 c[2][2][2];                                // [half][mt][nt]
@@ -495,17 +520,26 @@ expert_w11_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ ac
                         for (int nt = 0; nt < 2; ++nt) c[h][mt][nt] = w11_i8{0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
                 for (int ks = 0; ks < 4; ++ks) {                  // k-step = 16-weight word ks of the block
-                    w11_i4 A[2];
+                    w11_ab A[2];
 #pragma unroll
                     for (int mt = 0; mt < 2; ++mt) {
                         const unsigned wd = ks == 0 ? ac[mt].x : ks == 1 ? ac[mt].y : ks == 2 ? ac[mt].z : ac[mt].w;
+#if STRATA_FUSED_W12
+                        const int sh = 4 * hi;
+                        A[mt] = w11_i2{(int) ((wd >> sh) & M2), (int) ((wd >> (sh + 2)) & M2)};
+#else
                         A[mt] = w11_i4{(int) (wd & M2), (int) ((wd >> 2) & M2), (int) ((wd >> 4) & M2),
                                        (int) ((wd >> 6) & M2)};
+#endif
                     }
 #pragma unroll
                     for (int nt = 0; nt < 2; ++nt) {
-                        const uint4 q = bq[nt][ks];
-                        const w11_i4 B = w11_i4{(int) q.x, (int) q.y, (int) q.z, (int) q.w};
+                        const w11_frag q = bq[nt][ks];
+#if STRATA_FUSED_W12
+                        const w11_ab B = w11_i2{(int) q.x, (int) q.y};
+#else
+                        const w11_ab B = w11_i4{(int) q.x, (int) q.y, (int) q.z, (int) q.w};
+#endif
 #pragma unroll
                         for (int mt = 0; mt < 2; ++mt) c[ks >> 1][mt][nt] = wmma_iu8(A[mt], B, c[ks >> 1][mt][nt]);
                     }
@@ -516,7 +550,7 @@ expert_w11_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ ac
                     float dw[8];
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
-                        const int m = 32 * wm + 16 * mt + 2 * i + hi;
+                        const int m = 32 * wm + 16 * mt + W11_DROW(i, hi);
                         dw[i] = __half2float(__ushort_as_half(wsc[m * NKB + kb]));
                     }
 #pragma unroll
@@ -543,8 +577,20 @@ expert_w11_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ ac
             }
         }
         if constexpr (GU) {
-            // SwiGLU: row 2f is feature f's gate (lanes 0..15), 2f + 1 its up (lanes 16..31) - the same (mt, i)
+            // SwiGLU: row 2f is feature f's gate, 2f + 1 its up
             if (on) {
+#if STRATA_FUSED_W12
+#pragma unroll
+                for (int mt = 0; mt < 2; ++mt)
+#pragma unroll
+                    for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+                        for (int p = 0; p < 4; ++p) {
+                            const float gt = acc[mt][nt][2 * p];
+                            const float up = acc[mt][nt][2 * p + 1];
+                            hs[32 * wn + 16 * nt + l16][16 * wm + 8 * mt + 4 * hi + p] = gt / (1.0f + __expf(-gt)) * up;
+                        }
+#else
 #pragma unroll
                 for (int mt = 0; mt < 2; ++mt)
 #pragma unroll
@@ -555,6 +601,7 @@ expert_w11_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ ac
                             const float gt = acc[mt][nt][i];
                             if (hi == 0) hs[32 * wn + 16 * nt + l16][16 * wm + 8 * mt + i] = gt / (1.0f + __expf(-gt)) * up;
                         }
+#endif
             }
             __syncthreads();
             // H block fb (features 64 fb .. 64 fb + 63) to int8: a thread per (tile row, half)
@@ -588,9 +635,15 @@ expert_w11_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ ac
                 for (int nt = 0; nt < 2; ++nt) {
                     const int r = 32 * wn + 16 * nt + l16;
                     if (r < nrows) {
+#if STRATA_FUSED_W12
+                        float4* d4 = reinterpret_cast<float4*>(dm + (size_t) (row0 + r) * kMoeEmbd + rbase + 32 * wm + 16 * mt + 8 * hi);
+                        d4[0] = make_float4(acc[mt][nt][0], acc[mt][nt][1], acc[mt][nt][2], acc[mt][nt][3]);
+                        d4[1] = make_float4(acc[mt][nt][4], acc[mt][nt][5], acc[mt][nt][6], acc[mt][nt][7]);
+#else
                         float* d = dm + (size_t) (row0 + r) * kMoeEmbd + rbase + 32 * wm + 16 * mt + hi;
 #pragma unroll
                         for (int i = 0; i < 8; ++i) d[2 * i] = acc[mt][nt][i];
+#endif
                     }
                 }
         }
@@ -604,7 +657,7 @@ expert_w11_kernel(const Batch b, const Tables tb, const uint8_t* __restrict__ ac
 unsigned blocks(int64_t n, int per) { return (unsigned) ((n + per - 1) / per); }
 
 struct DevInfo {
-    bool done = false;
+    bool done = false, w12 = false;
     int cc = 0, sms = 0, occ_gu = 0, occ_d = 0;
 };
 std::mutex g_mu;
@@ -636,15 +689,17 @@ const DevInfo& dev_info() {
     // empty in a hipcc build: never available here (the prompt path keeps its own expert GEMMs)
     return d;
 #elif defined(__HIPCC__)
-    {   // gfx11 (RDNA3 / RDNA3.5) with this build's code for it: the WMMA kernels
+    {   // gfx11 (RDNA3 / RDNA3.5) and gfx12 (RDNA4) with this build's code for it: the WMMA kernels
         cudaDeviceProp prop;
         cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
         hipFuncAttributes fa{};
-        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess || !strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName) ||
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess ||
+            (!strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName) && !strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName)) ||
             hipFuncGetAttributes(&fa, reinterpret_cast<const void*>(expert_w11_kernel<true>)) != hipSuccess) {
             cudaGetLastError();
             return d;
         }
+        d.w12 = strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName);
         if (hipOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_gu, expert_w11_kernel<true>, W_THREADS, 0) != hipSuccess ||
             hipOccupancyMaxActiveBlocksPerMultiprocessor(&d.occ_d, expert_w11_kernel<false>, W_THREADS, 0) != hipSuccess)
             d.occ_gu = d.occ_d = 0;
@@ -745,6 +800,10 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
     // the most tiles the batch can have: every row in it, plus a partial tile per expert
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
 #if defined(__HIPCC__)
+    if (d.w12 && ((uintptr_t) dm & 15u) != 0) {
+        std::fprintf(stderr, "prefill fused experts (gfx12): the down output `dm` is not 16-byte aligned (%p)\n", (const void*) dm);
+        std::exit(1);
+    }
     const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (GU_ROWS / W_ROWS), (int64_t) d.sms * wgp_blocks(d.occ_gu));
     const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (D_ROWS / W_ROWS), (int64_t) d.sms * wgp_blocks(d.occ_d));
     expert_w11_kernel<true><<<g_gu, W_THREADS, 0, s>>>(b, tb, (const uint8_t*) xa, src, (uint8_t*) ha, nullptr);

@@ -60,18 +60,32 @@ macro(strata_hip_mmq)
         list(APPEND _strata_mmq_sources "${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu")
       endforeach()
     endif()
+    # STRATA_MMQ_TAB: the pointer-table MMQ (src/prefill/moe_mmq_tab.cuh, STRATA_MMQ_DIRECT=1), one generated TU per
+    # type so parallel builds compile the 9 template instances across cores.
+    if(STRATA_MMQ_TAB AND NOT STRATA_HIP_GFX906)
+      set(_strata_tab_cuh ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_mmq_tab.cuh)
+      set(_strata_mmq_tab_types q2_0 iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl iq4_xs q8_0)
+      foreach(_t IN LISTS _strata_mmq_tab_types)
+        string(TOUPPER ${_t} _strata_tab_T)
+        configure_file(src/prefill/mmq_tab_instance.cu.in ${CMAKE_BINARY_DIR}/mmq_tab/mmq-tab-${_t}.cu @ONLY)
+        list(APPEND _strata_mmq_sources "${CMAKE_BINARY_DIR}/mmq_tab/mmq-tab-${_t}.cu")
+      endforeach()
+    endif()
     set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
     # moe_fused.cu is Strata's own CUDA-shaped source: it takes the HIP compat headers, ggml's MMQ sources do not
     set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_f16_kq.cu
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
     target_include_directories(strata_mmq
-      PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
+      PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}" "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     if(_strata_mmq_tq_overlay)
       target_include_directories(strata_mmq BEFORE PRIVATE ${_strata_tq_overlay_dir} ${_strata_tq_overlay_dir}/include)
     endif()
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
+    if(STRATA_MMQ_TAB AND NOT STRATA_HIP_GFX906)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TAB=1)
+    endif()
     if(STRATA_MMQ_KQUANTS)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_KQUANTS=1)
     endif()
@@ -111,6 +125,17 @@ macro(strata_hip_mmq)
     add_test(NAME hip_prefill_mmq_parity COMMAND hip_prefill_mmq_parity)
     set_tests_properties(hip_prefill_mmq_parity PROPERTIES TIMEOUT 120)
     list(APPEND _strata_hip_tests hip_prefill_mmq_parity)
+
+    if(STRATA_MMQ_TAB AND NOT STRATA_HIP_GFX906)
+      set_source_files_properties(tests/cuda/prefill_mmq_tab_test.cu PROPERTIES LANGUAGE HIP)
+      add_executable(hip_prefill_mmq_tab_test tests/cuda/prefill_mmq_tab_test.cu)
+      target_include_directories(hip_prefill_mmq_tab_test PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}" "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill")
+      target_compile_definitions(hip_prefill_mmq_tab_test PRIVATE GGML_USE_HIP=1)
+      target_link_libraries(hip_prefill_mmq_tab_test PRIVATE strata_mmq ggml-base hip::device strata_hip_runtime)
+      add_test(NAME hip_prefill_mmq_tab_test COMMAND hip_prefill_mmq_tab_test)
+      set_tests_properties(hip_prefill_mmq_tab_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+      list(APPEND _strata_hip_tests hip_prefill_mmq_tab_test)
+    endif()
 endmacro()
 
 # HIP gfx906: every CUDA source of the tree (and the ggml-cuda MMQ sources) compiled as HIP

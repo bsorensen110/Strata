@@ -23,6 +23,7 @@
 #include "strata/core/pinned_ring.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/stream_watch.hpp"
 #include "strata/platform/aux_cpus.hpp"
 
 #include "strata/core/layout.hpp"
@@ -1507,7 +1508,7 @@ struct MmqPlan {
 // q8_1, so the answers differ from the default).  Only when EVERY visible CUDA card is compute capability 7.0 or
 // newer: the tiles need tensor cores, and a Volta + Pascal rig (one process, one decision) keeps MMQ.
 bool pf_wmma() {
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)
     return false;
 #else
     static const bool on = [] {
@@ -1516,8 +1517,15 @@ bool pf_wmma() {
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) return false;
         for (int d = 0; d < n; ++d) {
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, d) != cudaSuccess) return false;
+            if (std::strncmp(prop.gcnArchName, "gfx11", 5) != 0 && std::strncmp(prop.gcnArchName, "gfx12", 5) != 0)
+                return false;
+#else
             int major = 0;
             if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess || major < 7) return false;
+#endif
         }
         return true;
     }();
@@ -3379,6 +3387,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const bool forced_single = force_single_, forced_planned = force_planned_;
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // the stall report asks this stream (the one the waits below block on) whether its work is done (#5718 follow-up)
+    const core::WatchedStream watched("the prompt's GPU work", (void*) m.cs, m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
