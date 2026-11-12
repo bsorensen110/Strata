@@ -362,12 +362,19 @@ void qsa_attend_step(const float* q, const uint16_t* k_scratch, const uint16_t* 
                      const int32_t* step, int64_t max_ids, const QsaShapes& s, float* attn, float* weights,
                      void* stream);
 
-struct KvHostPools;   // kv_stream.hpp
+struct KvHostPools;     // kv_stream.hpp
+struct KvAppendSlots;   // kv_stream.hpp
 
 /// The cell's position comes from `step`, so this is the form a graph may contain. With a host copy (KV streaming)
 /// the cell is written there too, and to VRAM only if its block is resident.
 void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
                     const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                     const KvHostPools* host = nullptr);
+void kv_append_steps(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
+                     int step_stride, int n_steps, const float* kcur, const float* vcur, int cur_stride,
+                     const QsaShapes& s, void* stream, const KvHostPools* host = nullptr);
+void kv_append_groups(const KvAppendSlots& slots, const int32_t* step_base, int step_stride,
+                      const float* kcur_base, const float* vcur_base, int cur_stride,
+                      const QsaShapes& s, void* stream);
 
 }  // namespace strata::kernels

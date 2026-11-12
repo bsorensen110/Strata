@@ -40,6 +40,9 @@ inline uint64_t kv_q4_bytes_per_cell(const QsaShapes& s) {
 /// Orthonormal Fast Walsh-Hadamard Transform of rows of 256 floats (scale 1/16): its own inverse.
 void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream);
 inline void fwht256_inplace_cuda(float* data, int64_t n_rows, void* stream) { fwht256_cuda(data, data, n_rows, stream); }
+void fwht256_pair_inplace_cuda(float* a, float* b, int64_t n_rows, void* stream);
+
+struct KvAppendSlots;   // kv_stream.hpp
 
 /// Append the (already rotated) cell at step[kStepPos]. With a host copy (KV streaming) it is written there too,
 /// and to VRAM only if its block is resident.
@@ -50,6 +53,9 @@ void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, 
 void kv_append_q4_steps(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
                         int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
                         void* stream, const KvHostPools* host = nullptr);
+
+void kv_append_q4_groups(const KvAppendSlots& slots, const int32_t* step_base, int step_stride,
+                         const float* kcur_base, const float* vcur_base, const QsaShapes& s, void* stream);
 
 /// The prompt path: T consecutive (rotated) cells from pos0, K/V [T, n_head_kv, 256]; also into `stage` (identity
 /// layout, the one-layer staging pool of a streamed session) when given.

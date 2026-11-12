@@ -22,13 +22,11 @@ void check(const char* what) {
 
 // Fast Walsh-Hadamard Transform for N = 256: one warp per row, 8 values per lane in registers.
 // Orthonormal (scale 1/sqrt(256) = 1/16), so it is its own inverse.
-__global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict__ dst, int64_t n_rows, float scale) {
+__device__ __forceinline__ void fwht256_body(const float* __restrict__ src, float* __restrict__ dst,
+                                             int64_t r, float scale) {
     constexpr int warp_size = 32;
     constexpr int N = 256;
     constexpr int el_w = N / warp_size;   // 8
-
-    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
-    if (r >= n_rows) return;
 
     const float* row_src = src + r * N;
     float* row_dst = dst + r * N;
@@ -68,6 +66,19 @@ __global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict_
     for (int i = 0; i < el_w; ++i) row_dst[i * warp_size + lane] = reg[i];
 }
 
+__global__ void fwht256_kernel(const float* __restrict__ src, float* __restrict__ dst, int64_t n_rows, float scale) {
+    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= n_rows) return;
+    fwht256_body(src, dst, r, scale);
+}
+
+__global__ void fwht256_pair_kernel(float* __restrict__ a, float* __restrict__ b, int64_t n_rows, float scale) {
+    const int64_t r = (int64_t) blockIdx.x * blockDim.y + threadIdx.y;
+    if (r >= n_rows) return;
+    float* buf = blockIdx.y == 0 ? a : b;
+    fwht256_body(buf, buf, r, scale);
+}
+
 // One 32-value group in one warp (lane = element), ggml's q4_0: d = (the value of largest |x|) / -8,
 // q = clamp(trunc(x / d + 8.5), 0, 15). Returns the scale bits; `byte` is lane t's packed byte for t < 16
 // (element t in the low nibble, t + 16 in the high one). Ties in |x| resolve to the larger value in EVERY lane,
@@ -96,18 +107,13 @@ __device__ __forceinline__ void q4_store(uint8_t* pool, long long row, int b, in
     if (lane < 16) blk->qs[lane] = byte;
 }
 
-// One block = one 32-value group of one KV head of K (plane 0) or V (plane 1) for token step_idx; 32 threads.
-__global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
-                                    const int32_t* __restrict__ table, const int32_t* __restrict__ step,
-                                    int step_stride, int planes,
-                                    const float* __restrict__ kcur, const float* __restrict__ vcur,
-                                    int kv_heads, int head_dim, int page_size, KvHostPools host) {
-    const int step_idx = (int) (blockIdx.z / (unsigned) planes);
-    const bool is_v = (blockIdx.z % (unsigned) planes) == 1u;
-    const long long pos = (long long) __ldg(step + (long long) step_idx * step_stride + kStepPos);
-    const int h = blockIdx.x, b = blockIdx.y, t = threadIdx.x;
-    const long long step_off = (long long) step_idx * kv_heads * head_dim;
-    const float x = (is_v ? vcur : kcur)[step_off + h * head_dim + b * QK4_0 + t];
+__device__ __forceinline__ void kv_append_q4_write(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
+                                                   const int32_t* __restrict__ table, const int32_t* __restrict__ step_p,
+                                                   const float* __restrict__ k_row, const float* __restrict__ v_row,
+                                                   bool is_v, int h, int b, int t, int kv_heads, int head_dim,
+                                                   int page_size, const KvHostPools& host) {
+    const long long pos = (long long) __ldg(step_p + kStepPos);
+    const float x = (is_v ? v_row : k_row)[h * head_dim + b * QK4_0 + t];
     uint8_t byte;
     const uint16_t d = q4_group(x, t, byte);
     const long long page = (long long) table[pos / page_size];
@@ -117,6 +123,37 @@ __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restr
         q4_store(host.chunk_base(is_v ? host.v_q4 : host.k_q4, is_v ? host.v_q4_chunks : host.k_q4_chunks, blk),
                  host.local_row(pos, kv_heads, h, page_size), b, t, d, byte);
     }
+}
+
+// One block = one 32-value group of one KV head of K (plane 0) or V (plane 1) for token step_idx; 32 threads.
+__global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restrict__ v_q4,
+                                    const int32_t* __restrict__ table, const int32_t* __restrict__ step,
+                                    int step_stride, int planes,
+                                    const float* __restrict__ kcur, const float* __restrict__ vcur,
+                                    int kv_heads, int head_dim, int page_size, KvHostPools host) {
+    const int step_idx = (int) (blockIdx.z / (unsigned) planes);
+    const bool is_v = (blockIdx.z % (unsigned) planes) == 1u;
+    const long long step_off = (long long) step_idx * kv_heads * head_dim;
+    kv_append_q4_write(k_q4, v_q4, table, step + (long long) step_idx * step_stride, kcur + step_off, vcur + step_off,
+                       is_v, blockIdx.x, blockIdx.y, threadIdx.x, kv_heads, head_dim, page_size, host);
+}
+
+__global__ void kv_append_q4_groups_kernel(KvAppendSlots slots, const int32_t* __restrict__ step_base,
+                                           int step_stride, const float* __restrict__ kcur_base,
+                                           const float* __restrict__ vcur_base, int planes, int kv_heads, int head_dim,
+                                           int page_size) {
+    const int z = (int) blockIdx.z;
+    const int slot_idx = z / (slots.max_ntok * planes);
+    const int rem = z - slot_idx * (slots.max_ntok * planes);
+    const int local_t = rem / planes;
+    const KvAppendSlot& sl = slots.s[slot_idx];
+    if (local_t >= sl.ntok) return;
+    const bool is_v = (rem % planes) == 1;
+    const int global_t = sl.first + local_t;
+    const long long row_off = (long long) global_t * kv_heads * head_dim;
+    kv_append_q4_write(static_cast<uint8_t*>(sl.k_dst), static_cast<uint8_t*>(sl.v_dst), sl.page_table,
+                       step_base + (long long) global_t * step_stride, kcur_base + row_off, vcur_base + row_off,
+                       is_v, blockIdx.x, blockIdx.y, threadIdx.x, kv_heads, head_dim, page_size, sl.host);
 }
 
 // The prompt path: grid (T, kv_heads, groups), K then V; also into the staging pool (identity layout) when given.
@@ -198,6 +235,15 @@ void fwht256_cuda(const float* src, float* dst, int64_t n_rows, void* stream) {
     check("fwht256 launch");
 }
 
+void fwht256_pair_inplace_cuda(float* a, float* b, int64_t n_rows, void* stream) {
+    if (n_rows <= 0) return;
+    const int rows_per_block = 4;
+    const int64_t num_blocks = (n_rows + rows_per_block - 1) / rows_per_block;
+    fwht256_pair_kernel<<<dim3((unsigned) num_blocks, 2), dim3(32, rows_per_block), 0, (cudaStream_t) stream>>>(
+        a, b, n_rows, 1.0f / 16.0f);
+    check("fwht256_pair launch");
+}
+
 void kv_append_q4_steps(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,
                         int step_stride, int n_steps, const float* kcur, const float* vcur, const QsaShapes& s,
                         void* stream, const KvHostPools* host) {
@@ -209,6 +255,19 @@ void kv_append_q4_steps(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table,
         k_q4, v_q4, page_table, step, step_stride, planes, kcur, vcur, (int) s.n_head_kv, (int) s.head_dim,
         (int) s.page_size, host ? *host : KvHostPools{});
     check("kv_append_q4 launch");
+}
+
+void kv_append_q4_groups(const KvAppendSlots& slots, const int32_t* step_base, int step_stride,
+                         const float* kcur_base, const float* vcur_base, const QsaShapes& s, void* stream) {
+    if (slots.n <= 0 || slots.max_ntok <= 0) return;
+    need_256(s, "kv_append_q4 (groups)");
+    const int planes = slots.one_plane ? 1 : 2;
+    const dim3 grid((unsigned) s.n_head_kv, (unsigned) (s.head_dim / QK4_0),
+                    (unsigned) (slots.n * slots.max_ntok * planes));
+    kv_append_q4_groups_kernel<<<grid, 32, 0, (cudaStream_t) stream>>>(
+        slots, step_base, step_stride, kcur_base, vcur_base, planes, (int) s.n_head_kv, (int) s.head_dim,
+        (int) s.page_size);
+    check("kv_append_q4 (groups) launch");
 }
 
 void kv_append_q4_step(uint8_t* k_q4, uint8_t* v_q4, const int32_t* page_table, const int32_t* step,

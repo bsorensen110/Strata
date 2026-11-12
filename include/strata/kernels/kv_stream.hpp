@@ -71,6 +71,28 @@ struct KvHostPools {
     }
 };
 
+/// Multi-slot descriptor for kv_append*_groups: appends consecutive tokens across up to kKvAppendMaxSlots
+/// sequence slots (sharing one layer's KV format) in a single kernel launch.
+inline constexpr int kKvAppendMaxSlots = 8;
+
+struct KvAppendSlot {
+    void* k_dst = nullptr;
+    void* v_dst = nullptr;
+    uint16_t* k_scale = nullptr;
+    uint16_t* v_scale = nullptr;
+    const int32_t* page_table = nullptr;
+    int32_t first = 0;   ///< token offset relative to caller's step_base / cur_base
+    int32_t ntok = 0;    ///< number of consecutive tokens for this slot
+    KvHostPools host{};
+};
+
+struct KvAppendSlots {
+    KvAppendSlot s[kKvAppendMaxSlots]{};
+    int n = 0;
+    int max_ntok = 0;
+    bool one_plane = false;   ///< true when v_dst == k_dst (hybrid K/V single-plane half)
+};
+
 /// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0, and
 /// K8V4 (`--kv k8v4`: K as int8 codes + scales, V as rotated q4_0 - three runs, `k_q`, `k_scale`, `v_q4`).
 /// (A bool `int8` argument still reads as kKvF16 / kKvInt8.)  kKvHybrid is 3, the number conversation snapshots

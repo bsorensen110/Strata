@@ -33,6 +33,9 @@ inline uint64_t kv_q8_bytes_per_cell(const QsaShapes& s) {
 void kv_append_q8_steps(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
                         const int32_t* step, int step_stride, const float* kcur, const float* vcur, int cur_stride,
                         int n_tok, const QsaShapes& s, void* stream, const KvHostPools* host);
+void kv_append_q8_groups(const KvAppendSlots& slots, const int32_t* step_base, int step_stride,
+                         const float* kcur_base, const float* vcur_base, int cur_stride,
+                         const QsaShapes& s, void* stream);
 void kv_append_q8_step(int8_t* k_q, int8_t* v_q, uint16_t* k_scale, uint16_t* v_scale, const int32_t* page_table,
                        const int32_t* step, const float* kcur, const float* vcur, const QsaShapes& s, void* stream,
                        const KvHostPools* host = nullptr);

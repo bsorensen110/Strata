@@ -2117,43 +2117,103 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
-                    fwht256_inplace_cuda(kcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
-                    fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
+                    fwht256_pair_inplace_cuda(kcur_ + tb * NKV * HD, vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 } else if (st.kv_hybrid) {   // K8V4: only V is rotated
                     fwht256_inplace_cuda(vcur_ + tb * NKV * HD, (int64_t) n * NKV, cs);
                 }
                 stamp(l, 8, grp);
                 if (!sidem) idx_snap(cs);
-                // #783 PR-d (stuchapin909): the window's K/V cells in one launch per slot instead of one per token
+                // #783 PR-d (stuchapin909): the window's K/V cells in one launch per slot (or across slots when batching)
                 if (dec_batch && !g_no_batch_kv) {
+                    KvAppendSlots slots;
+                    enum KvKind { kKvKindHybrid, kKvKindQ4, kKvKindQ8, kKvKindF16 };
+                    int kind0 = -1;
+                    bool homogeneous = g_batch_attn_rows;
                     for (int t = tb; t < te;) {
                         const int first = t;
                         while (t < te && (!batch_rec_ || brow_[t] == brow_[first])) ++t;
-                        const int m = t - first;
                         const QsaState& sx = slot_ss(first).qsa_states[qi];
-                        const int32_t* step_b = step_ + first * kStepCount;
-                        const float* kc_b = kcur_ + first * NKV * HD;
-                        const float* vc_b = vcur_ + first * NKV * HD;
-                        if (sx.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
-                            // #1188: a streamed state's host copy gets the window's cells too, as the per-token path below
-                            // writes them - without it a block that was not resident when its cells were appended came
-                            // back from the host copy without them, and free generation degenerated into repetition
-                            const KvHostPools hk = kv_hybrid_k_half(sx.host), hv = kv_hybrid_v_half(sx.host);
-                            const bool mirror = sx.host.present();
-                            kv_append_q8_steps(sx.k_q, sx.k_q, sx.k_scale, sx.k_scale, sx.page_table, step_b, kStepCount,
-                                               kc_b, kc_b, (int) (NKV * HD), m, s, cs, mirror ? &hk : nullptr);
-                            kv_append_q4_steps(sx.v_q4, sx.v_q4, sx.page_table, step_b, kStepCount, m, vc_b, vc_b, s, cs,
-                                               mirror ? &hv : nullptr);
-                        } else if (sx.kv_q4)
-                            kv_append_q4_steps(sx.k_q4, sx.v_q4, sx.page_table, step_b, kStepCount, m, kc_b, vc_b, s, cs,
-                                               &sx.host);
-                        else if (sx.kv_int8)
-                            kv_append_q8_steps(sx.k_q, sx.v_q, sx.k_scale, sx.v_scale, sx.page_table, step_b, kStepCount,
-                                               kc_b, vc_b, (int) (NKV * HD), m, s, cs, &sx.host);
-                        else
-                            for (int u = first; u < t; ++u)
-                                kv_append_step(sx.k_pool, sx.v_pool, sx.page_table, step_ + u * kStepCount,
-                                               kcur_ + u * NKV * HD, vcur_ + u * NKV * HD, s, cs, &sx.host);
+                        const int kind = sx.kv_hybrid ? kKvKindHybrid
+                                                      : (sx.kv_q4 ? kKvKindQ4 : (sx.kv_int8 ? kKvKindQ8 : kKvKindF16));
+                        if (kind0 < 0) kind0 = kind;
+                        else if (kind != kind0) homogeneous = false;
+                        if (slots.n < kKvAppendMaxSlots) {
+                            KvAppendSlot& sl = slots.s[slots.n++];
+                            sl.first = first - tb;
+                            sl.ntok = t - first;
+                            if (sl.ntok > slots.max_ntok) slots.max_ntok = sl.ntok;
+                            sl.page_table = sx.page_table;
+                            sl.host = sx.host;
+                            if (kind == kKvKindHybrid) {
+                                sl.k_dst = sx.k_q; sl.v_dst = sx.v_q4;
+                                sl.k_scale = sx.k_scale;
+                            } else if (kind == kKvKindQ4) {
+                                sl.k_dst = sx.k_q4; sl.v_dst = sx.v_q4;
+                            } else if (kind == kKvKindQ8) {
+                                sl.k_dst = sx.k_q; sl.v_dst = sx.v_q;
+                                sl.k_scale = sx.k_scale; sl.v_scale = sx.v_scale;
+                            } else {
+                                sl.k_dst = sx.k_pool; sl.v_dst = sx.v_pool;
+                            }
+                        } else {
+                            homogeneous = false;
+                        }
+                    }
+                    if (homogeneous && slots.n > 1) {
+                        const int32_t* step_b = step_ + tb * kStepCount;
+                        const float* kc_b = kcur_ + tb * NKV * HD;
+                        const float* vc_b = vcur_ + tb * NKV * HD;
+                        if (kind0 == kKvKindHybrid) {
+                            KvAppendSlots ks = slots;
+                            ks.one_plane = true;
+                            for (int j = 0; j < ks.n; ++j) {
+                                ks.s[j].v_dst = ks.s[j].k_dst;
+                                ks.s[j].v_scale = ks.s[j].k_scale;
+                                ks.s[j].host = ks.s[j].host.present() ? kv_hybrid_k_half(ks.s[j].host) : KvHostPools{};
+                            }
+                            kv_append_q8_groups(ks, step_b, kStepCount, kc_b, kc_b, (int) (NKV * HD), s, cs);
+                            slots.one_plane = true;
+                            for (int j = 0; j < slots.n; ++j) {
+                                slots.s[j].k_dst = slots.s[j].v_dst;
+                                slots.s[j].host = slots.s[j].host.present() ? kv_hybrid_v_half(slots.s[j].host) : KvHostPools{};
+                            }
+                            kv_append_q4_groups(slots, step_b, kStepCount, vc_b, vc_b, s, cs);
+                        } else if (kind0 == kKvKindQ4) {
+                            kv_append_q4_groups(slots, step_b, kStepCount, kc_b, vc_b, s, cs);
+                        } else if (kind0 == kKvKindQ8) {
+                            kv_append_q8_groups(slots, step_b, kStepCount, kc_b, vc_b, (int) (NKV * HD), s, cs);
+                        } else {
+                            kv_append_groups(slots, step_b, kStepCount, kc_b, vc_b, (int) (NKV * HD), s, cs);
+                        }
+                    } else {
+                        for (int t = tb; t < te;) {
+                            const int first = t;
+                            while (t < te && (!batch_rec_ || brow_[t] == brow_[first])) ++t;
+                            const int m = t - first;
+                            const QsaState& sx = slot_ss(first).qsa_states[qi];
+                            const int32_t* step_b = step_ + first * kStepCount;
+                            const float* kc_b = kcur_ + first * NKV * HD;
+                            const float* vc_b = vcur_ + first * NKV * HD;
+                            if (sx.kv_hybrid) {   // K8V4: the unused half's lanes folded onto the used pool (layer.cpp)
+                                // #1188: a streamed state's host copy gets the window's cells too, as the per-token path below
+                                // writes them - without it a block that was not resident when its cells were appended came
+                                // back from the host copy without them, and free generation degenerated into repetition
+                                const KvHostPools hk = kv_hybrid_k_half(sx.host), hv = kv_hybrid_v_half(sx.host);
+                                const bool mirror = sx.host.present();
+                                kv_append_q8_steps(sx.k_q, sx.k_q, sx.k_scale, sx.k_scale, sx.page_table, step_b, kStepCount,
+                                                   kc_b, kc_b, (int) (NKV * HD), m, s, cs, mirror ? &hk : nullptr);
+                                kv_append_q4_steps(sx.v_q4, sx.v_q4, sx.page_table, step_b, kStepCount, m, vc_b, vc_b, s, cs,
+                                                   mirror ? &hv : nullptr);
+                            } else if (sx.kv_q4)
+                                kv_append_q4_steps(sx.k_q4, sx.v_q4, sx.page_table, step_b, kStepCount, m, kc_b, vc_b, s, cs,
+                                                   &sx.host);
+                            else if (sx.kv_int8)
+                                kv_append_q8_steps(sx.k_q, sx.v_q, sx.k_scale, sx.v_scale, sx.page_table, step_b, kStepCount,
+                                                   kc_b, vc_b, (int) (NKV * HD), m, s, cs, &sx.host);
+                            else
+                                kv_append_steps(sx.k_pool, sx.v_pool, sx.page_table, step_b, kStepCount, m, kc_b, vc_b,
+                                                (int) (NKV * HD), s, cs, &sx.host);
+                        }
                     }
                 } else
                 for (int t = tb; t < te; ++t) {

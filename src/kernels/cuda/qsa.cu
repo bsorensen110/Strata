@@ -119,28 +119,62 @@ __device__ __forceinline__ float h2f(uint16_t bits) { return f32_from_f16(bits);
 
 // ================= 1. kv_append =================
 
-__global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_pool,
-                                 const int32_t* __restrict__ table, const int32_t* __restrict__ step,
-                                 const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
-                                 int head_dim, int page_size, KvHostPools host) {
-    const long long pos = (long long) __ldg(step + kStepPos);
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= kv_heads * head_dim) return;
+__device__ __forceinline__ void kv_append_f16_write(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_pool,
+                                                    const int32_t* __restrict__ table, const int32_t* __restrict__ step_p,
+                                                    const float* __restrict__ k_row, const float* __restrict__ v_row,
+                                                    int i, int kv_heads, int head_dim, int page_size,
+                                                    const KvHostPools& host) {
+    const long long pos = (long long) __ldg(step_p + kStepPos);
     const int h = i / head_dim, d = i - h * head_dim;
     // `[page][kv_head][page_size][head_dim]`: one head's consecutive cells are contiguous inside a page.
     // KV streaming: the host copy (identity layout) always, the VRAM page only if the block is resident.
     const long long page = (long long) table[pos / page_size];
     if (page >= 0) {
         const long long row = (page * kv_heads + h) * page_size + (pos % page_size);
-        k_pool[row * head_dim + d] = f16_from_f32(kcur[i]);
-        v_pool[row * head_dim + d] = f16_from_f32(vcur[i]);
+        k_pool[row * head_dim + d] = f16_from_f32(k_row[i]);
+        v_pool[row * head_dim + d] = f16_from_f32(v_row[i]);
     }
     if (host.k_pool != nullptr) {
         const long long blk = pos / page_size;
         const long long row = host.local_row(pos, kv_heads, h, page_size);
-        host.chunk_base(host.k_pool, host.k_pool_chunks, blk)[row * head_dim + d] = f16_from_f32(kcur[i]);
-        host.chunk_base(host.v_pool, host.v_pool_chunks, blk)[row * head_dim + d] = f16_from_f32(vcur[i]);
+        host.chunk_base(host.k_pool, host.k_pool_chunks, blk)[row * head_dim + d] = f16_from_f32(k_row[i]);
+        host.chunk_base(host.v_pool, host.v_pool_chunks, blk)[row * head_dim + d] = f16_from_f32(v_row[i]);
     }
+}
+
+__global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_pool,
+                                 const int32_t* __restrict__ table, const int32_t* __restrict__ step,
+                                 const float* __restrict__ kcur, const float* __restrict__ vcur, int kv_heads,
+                                 int head_dim, int page_size, KvHostPools host) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_heads * head_dim) return;
+    kv_append_f16_write(k_pool, v_pool, table, step, kcur, vcur, i, kv_heads, head_dim, page_size, host);
+}
+
+__global__ void kv_append_steps_kernel(uint16_t* __restrict__ k_pool, uint16_t* __restrict__ v_pool,
+                                       const int32_t* __restrict__ table, const int32_t* __restrict__ step,
+                                       int step_stride, const float* __restrict__ kcur,
+                                       const float* __restrict__ vcur, int cur_stride, int kv_heads, int head_dim,
+                                       int page_size, KvHostPools host) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_heads * head_dim) return;
+    const int j = (int) blockIdx.y;
+    kv_append_f16_write(k_pool, v_pool, table, step + (size_t) j * step_stride, kcur + (size_t) j * cur_stride,
+                        vcur + (size_t) j * cur_stride, i, kv_heads, head_dim, page_size, host);
+}
+
+__global__ void kv_append_groups_kernel(KvAppendSlots slots, const int32_t* __restrict__ step_base, int step_stride,
+                                        const float* __restrict__ kcur_base, const float* __restrict__ vcur_base,
+                                        int cur_stride, int kv_heads, int head_dim, int page_size) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= kv_heads * head_dim) return;
+    const int local_t = (int) blockIdx.y;
+    const KvAppendSlot& sl = slots.s[blockIdx.z];
+    if (local_t >= sl.ntok) return;
+    const int global_t = sl.first + local_t;
+    kv_append_f16_write(static_cast<uint16_t*>(sl.k_dst), static_cast<uint16_t*>(sl.v_dst), sl.page_table,
+                        step_base + (size_t) global_t * step_stride, kcur_base + (size_t) global_t * cur_stride,
+                        vcur_base + (size_t) global_t * cur_stride, i, kv_heads, head_dim, page_size, sl.host);
 }
 
 // ================= 2. indexer_key_append =================
@@ -604,6 +638,36 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
         host ? *host : KvHostPools{});
     check_launch("kv_append");
     if (stream == nullptr) check_sync("kv_append");
+}
+
+void kv_append_steps(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, const int32_t* step,
+                     int step_stride, int n_steps, const float* kcur, const float* vcur, int cur_stride,
+                     const QsaShapes& s, void* stream, const KvHostPools* host) {
+    validate(s, "kv_append (steps)");
+    if (n_steps < 1) return;
+    if (step == nullptr) fail("kv_append (steps): step is null");
+    const long long n = s.n_head_kv * s.head_dim;
+    const dim3 grid(grid_for(n, THREADS), (unsigned) n_steps);
+    kv_append_steps_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(
+        k_pool, v_pool, page_table, step, step_stride, kcur, vcur, cur_stride, (int) s.n_head_kv,
+        (int) s.head_dim, (int) s.page_size, host ? *host : KvHostPools{});
+    check_launch("kv_append (steps)");
+    if (stream == nullptr) check_sync("kv_append (steps)");
+}
+
+void kv_append_groups(const KvAppendSlots& slots, const int32_t* step_base, int step_stride,
+                      const float* kcur_base, const float* vcur_base, int cur_stride,
+                      const QsaShapes& s, void* stream) {
+    validate(s, "kv_append (groups)");
+    if (slots.n <= 0 || slots.max_ntok <= 0) return;
+    if (step_base == nullptr) fail("kv_append (groups): step_base is null");
+    const long long n = s.n_head_kv * s.head_dim;
+    const dim3 grid(grid_for(n, THREADS), (unsigned) slots.max_ntok, (unsigned) slots.n);
+    kv_append_groups_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(
+        slots, step_base, step_stride, kcur_base, vcur_base, cur_stride, (int) s.n_head_kv,
+        (int) s.head_dim, (int) s.page_size);
+    check_launch("kv_append (groups)");
+    if (stream == nullptr) check_sync("kv_append (groups)");
 }
 
 void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
