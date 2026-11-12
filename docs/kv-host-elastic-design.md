@@ -1,6 +1,6 @@
 # Elastic host K/V copy for streamed (mode-1) layers — design
 
-Status: designed, not implemented. Measured on the R9700 production box, 2026-11-11, engine fork-a223b54e5.
+Status: implemented (`--kv-host-grow` / `STRATA_KV_HOST_GROW=1`, `STRATA_KV_HOST_GROW_INIT`, `STRATA_KV_HOST_GROW_STEP`). Measured on the R9700 production box, 2026-11-11, engine fork-a223b54e5.
 
 ## The RAM the box pays today
 
