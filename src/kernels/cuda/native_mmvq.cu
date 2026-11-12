@@ -652,7 +652,7 @@ __device__ __forceinline__ float q6_q8_dot_impl(int vl, int vh, const int* __res
     }
     return d * sumf;
 }
-#if !defined(__HIPCC__)   // CUDA only: the native_mmvq_il_pf_kernel family below (itself CUDA only) is the only user
+#if !defined(STRATA_HIP_GFX906)   // CUDA and wave32 HIP (RDNA2/3/4): the native_mmvq_il_pf_kernel family below is the only user
 // q6_q8_dot_impl with the two scales already in registers (the interleaved kernels' hoisted loads, P1): the same
 // expression in the same order
 __device__ __forceinline__ float q6_q8_dot_sc(int vl, int vh, const int* __restrict__ u, int sc0, int sc1, float d,
@@ -672,20 +672,30 @@ __device__ __forceinline__ float q6_q8_dot_sc(int vl, int vh, const int* __restr
 
 // P1: loads the compiler may not sink into a later branch (it moved the Q6_K scale and d loads of the hoisted group
 // into the dot sections, where each one is a dependent L1 round trip); the same ld.global.nc the __restrict__ loads use
+#if defined(__HIPCC__)
+__device__ __forceinline__ int ldg_nc_u16(const void* p) { return int(*static_cast<const uint16_t*>(p)); }
+__device__ __forceinline__ int ldg_nc_s8(const void* p) { return int(*static_cast<const int8_t*>(p)); }
+__device__ __forceinline__ int ldg_nc_u8(const void* p) { return int(*static_cast<const uint8_t*>(p)); }
+__device__ __forceinline__ int ldg_nc_s32(const void* p) { return *static_cast<const int*>(p); }
+__device__ __forceinline__ const void* madw(const void* base, int k, int stride) {
+    return static_cast<const char*>(base) + static_cast<std::ptrdiff_t>(k) * static_cast<std::ptrdiff_t>(stride);
+}
+#else
 __device__ __forceinline__ int ldg_nc_u16(const void* p) { unsigned v; asm volatile("ld.global.nc.u16 %0, [%1];" : "=r"(v) : "l"(p)); return int(v); }
 __device__ __forceinline__ int ldg_nc_s8(const void* p) { int v; asm volatile("ld.global.nc.s8 %0, [%1];" : "=r"(v) : "l"(p)); return v; }
 __device__ __forceinline__ int ldg_nc_u8(const void* p) { unsigned v; asm volatile("ld.global.nc.u8 %0, [%1];" : "=r"(v) : "l"(p)); return int(v); }
 __device__ __forceinline__ int ldg_nc_s32(const void* p) { int v; asm volatile("ld.global.nc.s32 %0, [%1];" : "=r"(v) : "l"(p)); return v; }
-__device__ __forceinline__ int ldg_nc_b2(const void* p, int i32) {   // load_int_b2 pinned: two u16, little-endian
-    const auto* x = static_cast<const uint16_t*>(p) + 2 * i32;
-    return ldg_nc_u16(x) | (ldg_nc_u16(x + 1) << 16);
-}
 // P1: base + k * stride as one IMAD.WIDE.U32 (an asm so the front end does not share k * stride between pointers and
 // turn each into a 64-bit add pair)
 __device__ __forceinline__ const void* madw(const void* base, int k, int stride) {
     const void* r;
     asm("mad.wide.u32 %0, %1, %2, %3;" : "=l"(r) : "r"(k), "r"(stride), "l"(base));
     return r;
+}
+#endif
+__device__ __forceinline__ int ldg_nc_b2(const void* p, int i32) {   // load_int_b2 pinned: two u16, little-endian
+    const auto* x = static_cast<const uint16_t*>(p) + 2 * i32;
+    return ldg_nc_u16(x) | (ldg_nc_u16(x + 1) << 16);
 }
 // P2: (float) p for |p| < 2^22 as an add on the FMA pipe instead of the quarter-rate I2F: p + 1.5 * 2^23
 // as float bits is exactly 1.5 * 2^23 + p (unit ulp), and the subtraction is exact (Sterbenz), so the value is the
@@ -711,7 +721,7 @@ __device__ __forceinline__ float q6_q8_dot_fast(int vl, int vh, const int* __res
     }
     return d * sumf;
 }
-#endif  // !__HIPCC__
+#endif  // !STRATA_HIP_GFX906
 
 __device__ __forceinline__ float q6_q8_dot(const Q6KBlock* __restrict__ w,
                                           const Q81Block* __restrict__ x, int iqs) {
@@ -1735,8 +1745,8 @@ void launch_multi(const void* weights, const void* x_q8_1, float* y, int n_in, i
 // the wave shuffles come from hip_compat/intrinsics.hpp on HIP, and the 32-lane chunk layout is a wave32 layout there
 // (RDNA4 runs 32-lane waves).  The P1 / P2 hoisted-load variants (native_mmvq_il_pf_kernel) stay CUDA-only: their address
 // arithmetic is PTX (mad.wide.u32, ld.global.nc).
-#if defined(__HIPCC__)
-#define STRATA_IL_PF 0   // HIP: native_mmvq_il_kernel only; STRATA_MMVQ_IL_PF and the kIlPf_80 table select nothing
+#if defined(STRATA_HIP_GFX906)
+#define STRATA_IL_PF 0   // wave64 HIP (gfx906): native_mmvq_il_kernel only
 #else
 #define STRATA_IL_PF 1
 #endif

@@ -382,7 +382,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_rows_kernel(const float* _
                                                       part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
 }
 
-#if !defined(__HIPCC__)
+#if !defined(STRATA_HIP_GFX906)
 // Turing (INT8 pools): attn_chunk_kernel<1> bit for bit, rearranged for the SM's shared-memory pipe, which the
 // default kernel saturates (its time grew with the queries even with the SMs half empty).  Three changes, none to an
 // operand or the order of an operation:
@@ -486,9 +486,12 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_v3_kernel(const float* 
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
 }
 bool attn_v3_on() {
-    static int on[16] = {};   // by device ordinal: 0 unknown, 1 yes, -1 no
     static const int env = [] { const char* v = std::getenv("STRATA_ATTN_V3"); return v ? (v[0] == '0' ? 0 : 1) : -1; }();
     if (env >= 0) return env == 1;
+#if defined(__HIPCC__)
+    return false;
+#else
+    static int on[16] = {};   // by device ordinal: 0 unknown, 1 yes, -1 no
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return false;
     if (on[dev] == 0) {
@@ -499,6 +502,7 @@ bool attn_v3_on() {
         on[dev] = ok && strata::sm75_default(maj, mnr) ? 1 : -1;   // Turing only, with STRATA_SM75_PERF=1
     }
     return on[dev] > 0;
+#endif
 }
 #endif
 
@@ -1054,7 +1058,7 @@ bool query_swizzle_gfx906_device() {
 // 147-verify: unset, it is on for a compute capability 12.0 card (sm120_series.hpp; RTX PRO 5000, a 4-token verify round
 // -2.6%, bitwise); STRATA_ATTN_DAILY=0 (anything but "1") keeps upstream's kernels there too.
 [[maybe_unused]] bool daily_attn() {
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)
     return false;
 #else
     static const int env = [] {
@@ -1063,6 +1067,9 @@ bool query_swizzle_gfx906_device() {
         return v[0] == '1' && v[1] == '\0' ? 1 : 0;
     }();
     if (env >= 0) return env != 0;
+#if defined(__HIPCC__)
+    return false;
+#else
     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
@@ -1074,6 +1081,7 @@ bool query_swizzle_gfx906_device() {
         per_dev[dev] = ok && strata::sm120_default(maj, mnr) ? 2 : 1;
     }
     return per_dev[dev] == 2;
+#endif
 #endif
 }
 
@@ -1246,7 +1254,7 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
         }
     } else
 #endif
-#if !defined(__HIPCC__)
+#if !defined(STRATA_HIP_GFX906)
     if (kernel < 0 && kv_mode == 1 && attn_v3_on())   // (the parity harness names its kernel: never the environment)
         attn_chunk_q8_v3_kernel<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv, (int) s.page_size,
                                                           scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
