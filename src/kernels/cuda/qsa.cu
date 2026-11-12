@@ -136,9 +136,10 @@ __global__ void kv_append_kernel(uint16_t* __restrict__ k_pool, uint16_t* __rest
         v_pool[row * head_dim + d] = f16_from_f32(vcur[i]);
     }
     if (host.k_pool != nullptr) {
-        const long long row = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
-        host.k_pool[row * head_dim + d] = f16_from_f32(kcur[i]);
-        host.v_pool[row * head_dim + d] = f16_from_f32(vcur[i]);
+        const long long blk = pos / page_size;
+        const long long row = host.local_row(pos, kv_heads, h, page_size);
+        host.chunk_base(host.k_pool, host.k_pool_chunks, blk)[row * head_dim + d] = f16_from_f32(kcur[i]);
+        host.chunk_base(host.v_pool, host.v_pool_chunks, blk)[row * head_dim + d] = f16_from_f32(vcur[i]);
     }
 }
 

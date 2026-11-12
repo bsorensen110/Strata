@@ -23,42 +23,66 @@ void check(const char* what) {
 constexpr int RT = 1024;   // the resolve block
 
 // The per-block byte runs of the (up to four) pool arrays: block b of array i is bytes [b * len, (b + 1) * len).
+// When `block_shift > 0`, `src[i]` points to the chunk pointer table (`const uint8_t* const*`) instead of a flat base.
 struct Runs {
     const uint8_t* src[4];
     uint8_t* dst[4];
     int len[4];
     int n;
+    int block_shift;
 };
+
+template <typename T>
+const uint8_t* host_src_or_chunks(const T* flat, const T* const* chunks, int32_t shift) {
+    return shift > 0 ? reinterpret_cast<const uint8_t*>(chunks) : reinterpret_cast<const uint8_t*>(flat);
+}
 
 Runs runs_of(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const QsaShapes& s) {
     const int rows = (int) (s.n_head_kv * s.page_size);
+    const int32_t sh = host.block_shift;
     Runs r{};
+    r.block_shift = sh;
     if (fmt == kKvHybrid) {   // K8V4: int8 K codes, their scales, rotated q4_0 V
         const int codes = rows * (int) s.head_dim, scales = rows * (int) (s.head_dim / KV_Q8_GROUP) * 2;
         const int v = rows * (int) kv_q4_bytes_per_head((int) s.head_dim);
-        r.src[0] = (const uint8_t*) host.k_q;     r.dst[0] = (uint8_t*) slots.k_q;     r.len[0] = codes;
-        r.src[1] = (const uint8_t*) host.k_scale; r.dst[1] = (uint8_t*) slots.k_scale; r.len[1] = scales;
-        r.src[2] = (const uint8_t*) host.v_q4;    r.dst[2] = (uint8_t*) slots.v_q4;    r.len[2] = v;
+        r.src[0] = host_src_or_chunks(host.k_q, host.k_q_chunks, sh);         r.dst[0] = (uint8_t*) slots.k_q;     r.len[0] = codes;
+        r.src[1] = host_src_or_chunks(host.k_scale, host.k_scale_chunks, sh); r.dst[1] = (uint8_t*) slots.k_scale; r.len[1] = scales;
+        r.src[2] = host_src_or_chunks(host.v_q4, host.v_q4_chunks, sh);       r.dst[2] = (uint8_t*) slots.v_q4;    r.len[2] = v;
         r.n = 3;
     } else if (fmt == kKvQ4) {
         const int bytes = rows * (int) kv_q4_bytes_per_head((int) s.head_dim);
-        r.src[0] = (const uint8_t*) host.k_q4; r.dst[0] = (uint8_t*) slots.k_q4; r.len[0] = bytes;
-        r.src[1] = (const uint8_t*) host.v_q4; r.dst[1] = (uint8_t*) slots.v_q4; r.len[1] = bytes;
+        r.src[0] = host_src_or_chunks(host.k_q4, host.k_q4_chunks, sh); r.dst[0] = (uint8_t*) slots.k_q4; r.len[0] = bytes;
+        r.src[1] = host_src_or_chunks(host.v_q4, host.v_q4_chunks, sh); r.dst[1] = (uint8_t*) slots.v_q4; r.len[1] = bytes;
         r.n = 2;
     } else if (fmt == kKvInt8) {
         const int codes = rows * (int) s.head_dim, scales = rows * (int) (s.head_dim / KV_Q8_GROUP) * 2;
-        r.src[0] = (const uint8_t*) host.k_q;     r.dst[0] = (uint8_t*) slots.k_q;     r.len[0] = codes;
-        r.src[1] = (const uint8_t*) host.v_q;     r.dst[1] = (uint8_t*) slots.v_q;     r.len[1] = codes;
-        r.src[2] = (const uint8_t*) host.k_scale; r.dst[2] = (uint8_t*) slots.k_scale; r.len[2] = scales;
-        r.src[3] = (const uint8_t*) host.v_scale; r.dst[3] = (uint8_t*) slots.v_scale; r.len[3] = scales;
+        r.src[0] = host_src_or_chunks(host.k_q, host.k_q_chunks, sh);         r.dst[0] = (uint8_t*) slots.k_q;     r.len[0] = codes;
+        r.src[1] = host_src_or_chunks(host.v_q, host.v_q_chunks, sh);         r.dst[1] = (uint8_t*) slots.v_q;     r.len[1] = codes;
+        r.src[2] = host_src_or_chunks(host.k_scale, host.k_scale_chunks, sh); r.dst[2] = (uint8_t*) slots.k_scale; r.len[2] = scales;
+        r.src[3] = host_src_or_chunks(host.v_scale, host.v_scale_chunks, sh); r.dst[3] = (uint8_t*) slots.v_scale; r.len[3] = scales;
         r.n = 4;
     } else {
         const int bytes = rows * (int) s.head_dim * 2;
-        r.src[0] = (const uint8_t*) host.k_pool; r.dst[0] = (uint8_t*) slots.k_pool; r.len[0] = bytes;
-        r.src[1] = (const uint8_t*) host.v_pool; r.dst[1] = (uint8_t*) slots.v_pool; r.len[1] = bytes;
+        r.src[0] = host_src_or_chunks(host.k_pool, host.k_pool_chunks, sh); r.dst[0] = (uint8_t*) slots.k_pool; r.len[0] = bytes;
+        r.src[1] = host_src_or_chunks(host.v_pool, host.v_pool_chunks, sh); r.dst[1] = (uint8_t*) slots.v_pool; r.len[1] = bytes;
         r.n = 2;
     }
     return r;
+}
+
+// Maximum contiguous block run starting at `b` up to `b1` that stays within one host chunk when chunked.
+int64_t chunk_run(const Runs& r, int64_t b, int64_t b1) {
+    if (r.block_shift <= 0) return b1 - b;
+    const int64_t c_end = ((b >> r.block_shift) + 1) << r.block_shift;
+    return std::min<int64_t>(b1, c_end) - b;
+}
+
+const uint8_t* chunk_src(const Runs& r, int a, int64_t b) {
+    if (r.block_shift > 0) {
+        const int64_t mask = (1ll << r.block_shift) - 1;
+        return reinterpret_cast<const uint8_t* const*>(r.src[a])[b >> r.block_shift] + (b & mask) * r.len[a];
+    }
+    return r.src[a] + b * r.len[a];
 }
 
 // Block-wide exclusive prefix sum of one int per thread (RT threads); `total` is the sum over the block.
@@ -167,10 +191,15 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
 // One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
 __global__ void copy_kernel(KvStreamMap m, Runs r) {
     const int need = m.ctl[2];
+    const long long mask = r.block_shift > 0 ? ((1ll << r.block_shift) - 1) : 0;
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
         const long long b = m.miss_block[k], sl = m.miss_slot[k];
+        const long long lb = r.block_shift > 0 ? (b & mask) : b;
         for (int a = 0; a < r.n; ++a) {
-            const uint4* src = reinterpret_cast<const uint4*>(r.src[a] + b * r.len[a]);
+            const uint8_t* base = r.block_shift > 0
+                                      ? reinterpret_cast<const uint8_t* const*>(r.src[a])[b >> r.block_shift]
+                                      : r.src[a];
+            const uint4* src = reinterpret_cast<const uint4*>(base + lb * r.len[a]);
             uint4* dst = reinterpret_cast<uint4*>(r.dst[a] + sl * r.len[a]);
             for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) dst[i] = src[i];
         }
@@ -242,9 +271,9 @@ void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt
                      int64_t n_slots, const QsaShapes& s, void* stream) {
     const Runs r = runs_of(slots, host, fmt, s);
     for (int64_t b = b0; b < b1;) {
-        const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);   // up to the ring's end
+        const int64_t sl = b % n_slots, run = std::min<int64_t>(chunk_run(r, b, b1), n_slots - sl);   // up to the ring's or chunk's end
         for (int a = 0; a < r.n; ++a)
-            if (cudaMemcpyAsync(r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a], (size_t) (run * r.len[a]),
+            if (cudaMemcpyAsync(r.dst[a] + sl * r.len[a], chunk_src(r, a, b), (size_t) (run * r.len[a]),
                                 cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
                 check("ring restore");
         b += run;
@@ -255,20 +284,28 @@ void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int 
                         const QsaShapes& s, void* stream) {
     if (n_blocks <= 0) return;
     const Runs r = runs_of(stage, host, fmt, s);
-    for (int a = 0; a < r.n; ++a)
-        if (cudaMemcpyAsync(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]), cudaMemcpyDefault,
-                            (cudaStream_t) stream) != cudaSuccess)
-            check("stage");
+    for (int64_t b = 0; b < n_blocks;) {
+        const int64_t run = chunk_run(r, b, n_blocks);
+        for (int a = 0; a < r.n; ++a)
+            if (cudaMemcpyAsync(r.dst[a] + b * r.len[a], chunk_src(r, a, b), (size_t) (run * r.len[a]),
+                                cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
+                check("stage");
+        b += run;
+    }
 }
 
 void kv_unstage_to_host(const QsaAttnPools& stage, const KvHostPools& host, int fmt, int64_t b0, int64_t b1,
                         const QsaShapes& s, void* stream) {
     if (b1 <= b0) return;
     const Runs r = runs_of(stage, host, fmt, s);   // src: the host copy, dst: the staging pool (identity layout both)
-    for (int a = 0; a < r.n; ++a)
-        if (cudaMemcpyAsync((void*) (r.src[a] + b0 * r.len[a]), r.dst[a] + b0 * r.len[a], (size_t) ((b1 - b0) * r.len[a]),
-                            cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
-            check("unstage");
+    for (int64_t b = b0; b < b1;) {
+        const int64_t run = chunk_run(r, b, b1);
+        for (int a = 0; a < r.n; ++a)
+            if (cudaMemcpyAsync((void*) chunk_src(r, a, b), r.dst[a] + b * r.len[a], (size_t) (run * r.len[a]),
+                                cudaMemcpyDefault, (cudaStream_t) stream) != cudaSuccess)
+                check("unstage");
+        b += run;
+    }
 }
 
 KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
