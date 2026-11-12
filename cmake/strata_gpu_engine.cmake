@@ -1041,9 +1041,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       # sm_89's opt-in tables (#3453, STRATA_MMVQ_IL_89=1): the table check only (no case matches MMVQ_IL_ONLY)
       add_test(NAME mmvq_il_parity_89table COMMAND mmvq_il_parity)
       set_tests_properties(mmvq_il_parity_89table PROPERTIES ENVIRONMENT "STRATA_MMVQ_IL_89=1;MMVQ_IL_ONLY=no-such-case")
+    endif()
+    if(STRATA_ENABLE_CUDA OR (STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906))
       # the opt-in STRATA_MMVQ_IL_PF kernels (hoisted group loads, exact integer forms): every variant bit-checked against
-      # native_mmvq for every type, shape, T and rows choice.  CUDA only: the pf kernels' address arithmetic is PTX
-      # (native_mmvq.cu's STRATA_IL_PF), so a HIP build runs native_mmvq_il_kernel for every variant and measures nothing.
+      # native_mmvq for every type, shape, T and rows choice (CUDA and wave32 HIP).
       add_test(NAME mmvq_il_parity_pf COMMAND mmvq_il_parity --pf 0,2,3,4,5,6)
       set_tests_properties(mmvq_il_parity_pf PROPERTIES TIMEOUT 900)
     endif()
@@ -1194,8 +1195,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME gfx906_gdn_rec_head COMMAND gfx906_gdn_rec_head)
     set_tests_properties(gfx906_gdn_rec_head PROPERTIES TIMEOUT 120)
   endif()
-  if(STRATA_ENABLE_CUDA)
-    # the Volta prompt experts (gemm_iq_f16_grouped, STRATA_PF_WMMA) against a double reference; skipped below sm_70
+  if(STRATA_ENABLE_CUDA OR (STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906))
+    # the Volta / RDNA3 / RDNA4 prompt experts (gemm_iq_f16_grouped, STRATA_PF_WMMA) against a double reference; skipped below sm_70 / off gfx11-gfx12
     add_executable(pf_wmma_parity src/kernels/pf_wmma_parity.cpp)
     target_include_directories(pf_wmma_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(pf_wmma_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})

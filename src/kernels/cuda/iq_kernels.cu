@@ -3480,8 +3480,16 @@ bool tq_stage_on() {
 // token) gate/up 221 -> 140 us and down 182 -> 86 us.  Bitwise the same sums as before.  STRATA_TQ_STAGE=0 or STRATA_TQ_SUB8=0 turn it off
 // (CUDA only: the AMD builds keep the old kernels), STRATA_IQ_STAGE_GRID=0 as for every staged table.
 bool tq_sub8_on() {
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)
     return false;
+#elif defined(__HIPCC__)
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_TQ_STAGE");
+        if (v != nullptr && v[0] == '0') return false;
+        v = std::getenv("STRATA_TQ_SUB8");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on && g_stage_grid && !g_no_sub16_gu && !tq_stage_on();
 #else
     static const bool on = [] {
         const char* v = std::getenv("STRATA_TQ_STAGE");
@@ -6730,26 +6738,115 @@ int hash_slots(const LayerVram& L, const unsigned long long* slot_ptrs, int64_t 
 
 }  // namespace strata::core::nibble
 
-// ---- Volta prompt experts (STRATA_PF_WMMA): a group's experts as one launch of FP16 tensor-core tiles, the weights
+// ---- Volta / RDNA3 / RDNA4 prompt experts (STRATA_PF_WMMA): a group's experts as one launch of FP16 tensor-core tiles, the weights
 // dequantized into shared memory by dq_dispatch (the FP16 path's own formulas), the activations FP16, FP32 sums.
 // Replaces MMQ's dp4a products on sm_70, and the FP16 path's dequantize-to-global + one cuBLAS call per expert.
+#if !defined(STRATA_HIP_GFX906)
 #if !defined(__HIPCC__)
 #include <mma.h>
+#endif
 namespace strata::kernels {
 namespace {
-constexpr int WG_BM = 64, WG_BN = 128, WG_THREADS = 256, WG_XK = 128, WG_MT = 4;
-// A block: BN = 128 weight rows of one expert x up to WG_MT * BM = 256 of its token rows (blockIdx.y walks an expert's
+#if defined(__HIPCC__) && (defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__))
+#define STRATA_PF_WMMA_HIP 1
+#define STRATA_PF_WMMA_GFX12 0
+#elif defined(__HIPCC__) && (defined(__gfx1200__) || defined(__gfx1201__))
+#define STRATA_PF_WMMA_HIP 1
+#define STRATA_PF_WMMA_GFX12 1
+#else
+#define STRATA_PF_WMMA_HIP 0
+#define STRATA_PF_WMMA_GFX12 0
+#endif
+#if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700) || STRATA_PF_WMMA_HIP
+#define STRATA_PF_WMMA_DEV 1
+#else
+#define STRATA_PF_WMMA_DEV 0
+#endif
+
+#if STRATA_PF_WMMA_HIP
+namespace hip_wmma {
+struct matrix_a {};
+struct matrix_b {};
+struct accumulator {};
+struct row_major {};
+struct col_major {};
+struct mem_row_major_t {};
+static constexpr mem_row_major_t mem_row_major{};
+using v8f = float __attribute__((ext_vector_type(8)));
+#if STRATA_PF_WMMA_GFX12
+using ab_vec = _Float16 __attribute__((ext_vector_type(8)));
+#else
+using ab_vec = _Float16 __attribute__((ext_vector_type(16)));
+#endif
+template <typename Use, int M, int N, int K, typename T, typename Layout = void>
+struct fragment;
+template <typename Layout>
+struct fragment<matrix_a, 16, 16, 16, __half, Layout> { ab_vec v; };
+template <typename Layout>
+struct fragment<matrix_b, 16, 16, 16, __half, Layout> { ab_vec v; };
+template <>
+struct fragment<accumulator, 16, 16, 16, float, void> { v8f v; };
+
+__device__ __forceinline__ void fill_fragment(fragment<accumulator, 16, 16, 16, float>& f, float val) {
+    f.v = v8f{val, val, val, val, val, val, val, val};
+}
+template <typename Use, typename Layout>
+__device__ __forceinline__ void load_matrix_sync(fragment<Use, 16, 16, 16, __half, Layout>& f, const __half* p, int ldm) {
+    const int lane = threadIdx.x & 31, rc = lane & 15;
+#if STRATA_PF_WMMA_GFX12
+    const int hi = (lane >> 4) & 1;
+    f.v = *reinterpret_cast<const ab_vec*>(p + rc * ldm + 8 * hi);
+#else
+    f.v = *reinterpret_cast<const ab_vec*>(p + rc * ldm);
+#endif
+}
+template <typename LA, typename LB>
+__device__ __forceinline__ void mma_sync(fragment<accumulator, 16, 16, 16, float>& d,
+                                         const fragment<matrix_a, 16, 16, 16, __half, LA>& a,
+                                         const fragment<matrix_b, 16, 16, 16, __half, LB>& b,
+                                         const fragment<accumulator, 16, 16, 16, float>& c) {
+#if STRATA_PF_WMMA_GFX12
+    d.v = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a.v, b.v, c.v);
+#else
+    d.v = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a.v, b.v, c.v);
+#endif
+}
+__device__ __forceinline__ void store_matrix_sync(float* p, const fragment<accumulator, 16, 16, 16, float>& d, int ldm, mem_row_major_t) {
+    const int lane = threadIdx.x & 31, col = lane & 15, hi = (lane >> 4) & 1;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+#if STRATA_PF_WMMA_GFX12
+        const int row = 8 * hi + i;
+#else
+        const int row = 2 * i + hi;
+#endif
+        p[row * ldm + col] = d.v[i];
+    }
+}
+}  // namespace hip_wmma
+#endif  // STRATA_PF_WMMA_HIP
+
+#if defined(__HIPCC__)
+constexpr int WG_BM = 64, WG_BN = 64, WG_THREADS = 256, WG_XK = 128, WG_MT = 4, WG_FA = 1;
+#else
+constexpr int WG_BM = 64, WG_BN = 128, WG_THREADS = 256, WG_XK = 128, WG_MT = 4, WG_FA = 2;
+#endif
+// A block: BN weight rows of one expert x up to WG_MT * BM = 256 of its token rows (blockIdx.y walks an expert's
 // rows in such chunks), so every weight superblock is dequantized ONCE per chunk into shared memory (WK 256: an IQ
 // superblock through dq_dispatch; WK 128: two Q2_0 blocks, or four IQ4_NL blocks); the activations stream through a
-// BM x 128 tile.  8 warps of 32 x 32 per m-tile (2 x 2 fragments), FP32 accumulators for the chunk's m-tiles in registers.
+// BM x 128 tile.  8 warps per m-tile, FP32 accumulators for the chunk's m-tiles in registers.
 template<int WK, bool Q20, bool IQNL = false>
 __global__ void __launch_bounds__(WG_THREADS) gemm_iq_f16_grouped_kernel(int ty, const uint8_t* __restrict__ W,
                                                                          size_t expert_bytes, size_t row_bytes, int K,
                                                                          const __half* __restrict__ X, int ldx,
                                                                          const int32_t* __restrict__ bounds, int ch_per_e,
                                                                          float* __restrict__ Y, int ldy) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700   // the sm_60 pass of a multi-arch build has no nvcuda::wmma (the host never launches these there)
+#if STRATA_PF_WMMA_DEV   // the sm_60 / wave64 pass of a multi-arch build has no wmma (the host never launches these there)
+#if STRATA_PF_WMMA_HIP
+    namespace wmma = hip_wmma;
+#else
     using namespace nvcuda;
+#endif
     constexpr int LDW = WK + 8, LDX = WG_XK + 8;
     extern __shared__ __align__(16) unsigned char wg_smem[];
     __half* sw = reinterpret_cast<__half*>(wg_smem);            // [BN][LDW]
@@ -6762,12 +6859,13 @@ __global__ void __launch_bounds__(WG_THREADS) gemm_iq_f16_grouped_kernel(int ty,
     const int n0 = blockIdx.x * WG_BN;
     const uint8_t* we = W + (size_t) e * expert_bytes;
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
-    const int wm = warp >> 2, wn = warp & 3;                     // rows wm*32, cols wn*32 of an m-tile
-    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[WG_MT][2][2];
+    const int wm = (WG_BN == 64) ? (warp >> 1) : (warp >> 2);    // rows wm*(16*WG_FA), cols wn*32 of an m-tile
+    const int wn = (WG_BN == 64) ? (warp & 1) : (warp & 3);
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[WG_MT][WG_FA][2];
 #pragma unroll
     for (int t = 0; t < WG_MT; ++t)
 #pragma unroll
-        for (int a = 0; a < 2; ++a)
+        for (int a = 0; a < WG_FA; ++a)
 #pragma unroll
             for (int b = 0; b < 2; ++b) wmma::fill_fragment(acc[t][a][b], 0.0f);
     // the activation tiles in order (k0, m-tile, half): the next one's 4 uint4 per thread are loaded into registers
@@ -6792,16 +6890,18 @@ __global__ void __launch_bounds__(WG_THREADS) gemm_iq_f16_grouped_kernel(int ty,
             // IQ4_NL down (WK 128 = 4 x block_iq4_nl): one thread per (row, 64-value half) - the four blocks of the
             // 128-value window sit in two halves of two blocks, and each thread's values are exactly dq_iq4_nl's
             const int r = tid >> 1, half = tid & 1;
-            const block_iq4_nl* bp = reinterpret_cast<const block_iq4_nl*>(we + (size_t) (n0 + r) * row_bytes) + k0 / 32 + half * 2;
-            __half* o = sw + r * LDW + half * 64;
+            if (r < WG_BN) {
+                const block_iq4_nl* bp = reinterpret_cast<const block_iq4_nl*>(we + (size_t) (n0 + r) * row_bytes) + k0 / 32 + half * 2;
+                __half* o = sw + r * LDW + half * 64;
 #pragma unroll
-            for (int bl = 0; bl < 2; ++bl) {
-                const block_iq4_nl* b = bp + bl;
-                const float d = (float) b->d;
+                for (int bl = 0; bl < 2; ++bl) {
+                    const block_iq4_nl* b = bp + bl;
+                    const float d = (float) b->d;
 #pragma unroll
-                for (int p = 0; p < 16; ++p) {
-                    o[bl * 32 + p] = cvt<__half>(d * kvalues_iq4nl[b->qs[p] & 0xf]);
-                    o[bl * 32 + p + 16] = cvt<__half>(d * kvalues_iq4nl[b->qs[p] >> 4]);
+                    for (int p = 0; p < 16; ++p) {
+                        o[bl * 32 + p] = cvt<__half>(d * kvalues_iq4nl[b->qs[p] & 0xf]);
+                        o[bl * 32 + p + 16] = cvt<__half>(d * kvalues_iq4nl[b->qs[p] >> 4]);
+                    }
                 }
             }
         } else if constexpr (!Q20) {
@@ -6809,17 +6909,19 @@ __global__ void __launch_bounds__(WG_THREADS) gemm_iq_f16_grouped_kernel(int ty,
                 dq_dispatch<__half>(ty, we + (size_t) (n0 + r) * row_bytes, k0 / 256, sw + r * LDW, lane);
         } else {
             const int r = tid >> 1, blk = tid & 1;   // one thread per (row, 64-value block)
-            const block_q2_0* b = reinterpret_cast<const block_q2_0*>(we + (size_t) (n0 + r) * row_bytes) + k0 / 64 + blk;
-            const float d = (float) b->d;
-            uint4 q4;
-            memcpy(&q4, b->qs, 16);
-            const uint8_t* qb = reinterpret_cast<const uint8_t*>(&q4);
-            __half* o = sw + r * LDW + blk * 64;
+            if (r < WG_BN) {
+                const block_q2_0* b = reinterpret_cast<const block_q2_0*>(we + (size_t) (n0 + r) * row_bytes) + k0 / 64 + blk;
+                const float d = (float) b->d;
+                uint4 q4;
+                memcpy(&q4, b->qs, 16);
+                const uint8_t* qb = reinterpret_cast<const uint8_t*>(&q4);
+                __half* o = sw + r * LDW + blk * 64;
 #pragma unroll
-            for (int c = 0; c < 16; ++c) {
-                const int v = qb[c];
-                *reinterpret_cast<__half2*>(o + 4 * c) = __floats2half2_rn(d * (float) ((v & 3) - 1), d * (float) (((v >> 2) & 3) - 1));
-                *reinterpret_cast<__half2*>(o + 4 * c + 2) = __floats2half2_rn(d * (float) (((v >> 4) & 3) - 1), d * (float) (((v >> 6) & 3) - 1));
+                for (int c = 0; c < 16; ++c) {
+                    const int v = qb[c];
+                    *reinterpret_cast<__half2*>(o + 4 * c) = __floats2half2_rn(d * (float) ((v & 3) - 1), d * (float) (((v >> 2) & 3) - 1));
+                    *reinterpret_cast<__half2*>(o + 4 * c + 2) = __floats2half2_rn(d * (float) (((v >> 4) & 3) - 1), d * (float) (((v >> 6) & 3) - 1));
+                }
             }
         }
 #pragma unroll
@@ -6837,15 +6939,16 @@ __global__ void __launch_bounds__(WG_THREADS) gemm_iq_f16_grouped_kernel(int ty,
                 if (it + 1 < total) load_x(it + 1);
 #pragma unroll
                 for (int kk = 0; kk < WG_XK; kk += 16) {
-                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a[2];
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a[WG_FA];
                     wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b[2];
 #pragma unroll
-                    for (int f = 0; f < 2; ++f) {
-                        wmma::load_matrix_sync(a[f], sx + (wm * 32 + f * 16) * LDX + kk, LDX);
-                        wmma::load_matrix_sync(b[f], sw + (wn * 32 + f * 16) * LDW + xh * WG_XK + kk, LDW);
-                    }
+                    for (int f = 0; f < WG_FA; ++f)
+                        wmma::load_matrix_sync(a[f], sx + (wm * (16 * WG_FA) + f * 16) * LDX + kk, LDX);
 #pragma unroll
-                    for (int fa = 0; fa < 2; ++fa)
+                    for (int f = 0; f < 2; ++f)
+                        wmma::load_matrix_sync(b[f], sw + (wn * 32 + f * 16) * LDW + xh * WG_XK + kk, LDW);
+#pragma unroll
+                    for (int fa = 0; fa < WG_FA; ++fa)
 #pragma unroll
                         for (int fb = 0; fb < 2; ++fb) wmma::mma_sync(acc[t][fa][fb], a[fa], b[fb], acc[t][fa][fb]);
                 }
@@ -6860,10 +6963,10 @@ __global__ void __launch_bounds__(WG_THREADS) gemm_iq_f16_grouped_kernel(int ty,
         if (t >= nmt) break;
         const int rows = min(WG_BM, crow - t * WG_BM);
 #pragma unroll
-        for (int fa = 0; fa < 2; ++fa)
+        for (int fa = 0; fa < WG_FA; ++fa)
 #pragma unroll
             for (int fb = 0; fb < 2; ++fb)
-                wmma::store_matrix_sync(so + (wm * 32 + fa * 16) * LDO + wn * 32 + fb * 16, acc[t][fa][fb], LDO, wmma::mem_row_major);
+                wmma::store_matrix_sync(so + (wm * (16 * WG_FA) + fa * 16) * LDO + wn * 32 + fb * 16, acc[t][fa][fb], LDO, wmma::mem_row_major);
         __syncthreads();
         for (int i = tid; i < rows * (WG_BN / 4); i += WG_THREADS) {
             const int r = i / (WG_BN / 4), c = (i % (WG_BN / 4)) * 4;
@@ -6963,8 +7066,12 @@ __global__ void __launch_bounds__(W2_NT, 2) gemm_iq_f16_w2_kernel(const uint8_t*
                                                                   int K, const __half* __restrict__ X, int ldx,
                                                                   const int32_t* __restrict__ bounds, int ch_per_e,
                                                                   float* __restrict__ Y, int ldy) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700   // the sm_60 pass of a multi-arch build has no nvcuda::wmma (the host never launches these there)
+#if STRATA_PF_WMMA_DEV   // the sm_60 / wave64 pass of a multi-arch build has no wmma (the host never launches these there)
+#if STRATA_PF_WMMA_HIP
+    namespace wmma = hip_wmma;
+#else
     using namespace nvcuda;
+#endif
     using tr = w2_traits<TY>;
     constexpr int NL = w2_nl<TY>(), NSUB = tr::raw_k / W2_KT;
     __shared__ __align__(128) __half xs[W2_RB * W2_LD];
@@ -7082,11 +7189,19 @@ bool w2_on() {
 bool gemm_iq_f16_grouped(int ty, const void* W, size_t expert_bytes, int n_out, int K, const void* X, int ldx,
                          const int32_t* bounds, int n_experts, int max_rows, float* Y, int ldy, void* stream) {
     if (n_out % WG_BN != 0 || n_experts <= 0 || max_rows <= 0 || ldy % 4 != 0) return false;
-    {   // the tiles are tensor-core kernels: a pre-Volta card has no body for them (the sm_60 pass compiles them empty)
-        int cur = 0, major = 0;
-        if (cudaGetDevice(&cur) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, cur) != cudaSuccess ||
-            major < 7)
+    {   // the tiles are tensor-core / WMMA kernels: a pre-Volta CUDA card or non-WMMA HIP card has no body for them
+        int cur = 0;
+        if (cudaGetDevice(&cur) != cudaSuccess) return false;
+#if defined(__HIPCC__)
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, cur) != cudaSuccess ||
+            (!gfx_arch_is_gfx12(prop.gcnArchName) && !gfx_arch_is_gfx11_wmma(prop.gcnArchName)))
             return false;
+#else
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, cur) != cudaSuccess || major < 7)
+            return false;
+#endif
     }
     // STRATA_PF_WMMA2=1 (opt-in): IQ2_S gate/up and IQ4_NL down through gemm_iq_f16_w2_kernel (above)
     if (w2_on() && n_out % W2_RB == 0 && ldx % 8 == 0 && ldy % 8 == 0 && (uintptr_t) X % 16 == 0 && (uintptr_t) Y % 32 == 0 &&

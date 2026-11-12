@@ -142,9 +142,16 @@ int main() {
     int n_dev = 0, ran = 0, fails = 0;
     cudaGetDeviceCount(&n_dev);
     for (int dev = 0; dev < n_dev; ++dev) {
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess ||
+            (std::strncmp(prop.gcnArchName, "gfx11", 5) != 0 && std::strncmp(prop.gcnArchName, "gfx12", 5) != 0))
+            continue;
+#else
         int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
         if (major < 7) continue;
+#endif
         cudaSetDevice(dev);
         std::printf("device %d\n", dev);
         ++ran;
