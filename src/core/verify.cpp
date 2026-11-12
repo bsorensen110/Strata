@@ -1790,15 +1790,33 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_ && !fuse_ab) {   // contiguous rows may be proposals for the same slot
+                    strata::kernels::GdnGroups cg;
+                    bool cg_ok = g_batch_gdn_groups;
                     for (int t = tb; t < te;) {
                         const int first = t;
                         while (t < te && brow_[t] == brow_[first]) ++t;
+                        if (!cg_ok || cg.n >= 8) { cg_ok = false; break; }
                         SessionState& sx = slot_ss(first);
-                        const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
-                                          (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                        gdn_conv_l2_multi(cx, qkv + (size_t) first * C, (const float*) wc->data,
-                                          hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0,
-                                          keep_rows);
+                        cg.state[cg.n] = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
+                                         (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        cg.first[cg.n] = first;
+                        cg.ntok[cg.n] = t - first;
+                        ++cg.n;
+                    }
+                    if (cg_ok && cg.n >= 1) {
+                        strata::kernels::gdn_conv_l2_groups(cg, qkv, (const float*) wc->data, hb, (int) C,
+                                                            (int) (2 * HK), EPS, keep_rows, cs);
+                    } else {
+                        for (int t = tb; t < te;) {
+                            const int first = t;
+                            while (t < te && brow_[t] == brow_[first]) ++t;
+                            SessionState& sx = slot_ss(first);
+                            const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
+                                              (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                            gdn_conv_l2_multi(cx, qkv + (size_t) first * C, (const float*) wc->data,
+                                              hb + (size_t) first * C, (int) C, (int) (2 * HK), EPS, t - first, cs, 0,
+                                              keep_rows);
+                        }
                     }
                 } else
                 // a one-token window keeps its token: it advances the conv history and the state itself (commit)

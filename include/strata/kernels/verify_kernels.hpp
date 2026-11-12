@@ -57,6 +57,10 @@ struct GdnGroups {
     int ntok[8] = {};
     int n = 0;
 };
+/// gdn_conv_l2_multi over several slots' groups at once (grid.y = group, grid.z = token; per group and token the
+/// same arithmetic as one call each: bit-identical). `groups.state[i]` is each slot's conv history pointer.
+void gdn_conv_l2_groups(const GdnGroups& groups, const float* qkv, const float* conv_w, float* h, int channels,
+                        int qk_heads, float eps, bool commit, void* stream);
 /// gdn_step_norm_multi over several slots' groups at once (the generic kernel, grid.y = group; per group the
 /// same arithmetic as one call each: bit-identical).  `commit`: every group keeps *keep[i] tokens, no outputs used.
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,

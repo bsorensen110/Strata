@@ -89,6 +89,16 @@ __global__ void __launch_bounds__(S) gdn_conv_l2_multi_kernel(float* hist, const
     gdn_conv_l2_body(blockIdx.x, blockIdx.y, hist, qkv, w, h, C, qk_heads, eps, t_begin, commit);
 }
 
+__global__ void __launch_bounds__(S) gdn_conv_l2_groups_kernel(GdnGroups groups, const float* __restrict__ qkv,
+                                                               const float* __restrict__ w, float* __restrict__ h,
+                                                               int C, int qk_heads, float eps, bool commit) {
+    const int sg = (int) blockIdx.y;
+    const int by = (int) blockIdx.z;
+    if (sg >= groups.n || by >= groups.ntok[sg]) return;
+    const size_t row_off = (size_t) groups.first[sg] * C;
+    gdn_conv_l2_body(blockIdx.x, by, groups.state[sg], qkv + row_off, w, h + row_off, C, qk_heads, eps, 0, commit);
+}
+
 __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int C,
                                        const int32_t* __restrict__ n_keep) {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1204,6 +1214,26 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
     gdn_conv_l2_multi_kernel<<<dim3((unsigned) (channels / S), (unsigned) n_tok), S, 0, (cudaStream_t) stream>>>(
         const_cast<float*>(history), qkv, conv_w, h, channels, qk_heads, eps, t_begin, commit);
     check("gdn_conv_l2_multi");
+}
+
+void gdn_conv_l2_groups(const GdnGroups& groups, const float* qkv, const float* conv_w, float* h, int channels,
+                        int qk_heads, float eps, bool commit, void* stream) {
+    if (groups.n < 1 || groups.n > 8 || !qkv || !conv_w || !h || channels % S != 0) {
+        std::fprintf(stderr, "gdn_conv_l2_groups: invalid arguments\n");
+        std::exit(1);
+    }
+    int max_ntok = 0;
+    for (int i = 0; i < groups.n; ++i) {
+        if (!groups.state[i] || groups.first[i] < 0 || groups.ntok[i] < 1 || groups.ntok[i] > kVerifyMaxT ||
+            (commit && groups.ntok[i] != 1)) {
+            std::fprintf(stderr, "gdn_conv_l2_groups: invalid group %d\n", i);
+            std::exit(1);
+        }
+        if (groups.ntok[i] > max_ntok) max_ntok = groups.ntok[i];
+    }
+    gdn_conv_l2_groups_kernel<<<dim3((unsigned) (channels / S), (unsigned) groups.n, (unsigned) max_ntok), S, 0,
+                                (cudaStream_t) stream>>>(groups, qkv, conv_w, h, channels, qk_heads, eps, commit);
+    check("gdn_conv_l2_groups");
 }
 
 void gdn_conv_ab_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels, int qk_heads,
