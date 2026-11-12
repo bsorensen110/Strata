@@ -112,9 +112,11 @@ __global__ void kv_append_q4_kernel(uint8_t* __restrict__ k_q4, uint8_t* __restr
     const uint16_t d = q4_group(x, t, byte);
     const long long page = (long long) table[pos / page_size];
     if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, t, d, byte);
-    if (host.k_q4 != nullptr)
-        q4_store(is_v ? host.v_q4 : host.k_q4, ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size), b, t,
-                 d, byte);
+    if (host.k_q4 != nullptr) {
+        const long long blk = pos / page_size;
+        q4_store(host.chunk_base(is_v ? host.v_q4 : host.k_q4, is_v ? host.v_q4_chunks : host.k_q4_chunks, blk),
+                 host.local_row(pos, kv_heads, h, page_size), b, t, d, byte);
+    }
 }
 
 // The prompt path: grid (T, kv_heads, groups), K then V; also into the staging pool (identity layout) when given.
@@ -133,7 +135,11 @@ __global__ void kv_append_q4_batch_kernel(uint8_t* __restrict__ k_q4, uint8_t* _
     const long long page = (long long) table[pos / page_size];
     const long long row_id = ((pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
     if (page >= 0) q4_store(is_v ? v_q4 : k_q4, (page * kv_heads + h) * page_size + (pos % page_size), b, th, d, byte);
-    if (host.k_q4 != nullptr) q4_store(is_v ? host.v_q4 : host.k_q4, row_id, b, th, d, byte);
+    if (host.k_q4 != nullptr) {
+        const long long blk = pos / page_size;
+        q4_store(host.chunk_base(is_v ? host.v_q4 : host.k_q4, is_v ? host.v_q4_chunks : host.k_q4_chunks, blk),
+                 host.local_row(pos, kv_heads, h, page_size), b, th, d, byte);
+    }
     if (stage.k_q4 != nullptr) q4_store(is_v ? stage.v_q4 : stage.k_q4, row_id, b, th, d, byte);
 }
 

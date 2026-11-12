@@ -25,6 +25,12 @@
 
 #include <cstdint>
 
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define STRATA_KV_STREAM_HD __host__ __device__
+#else
+#define STRATA_KV_STREAM_HD
+#endif
+
 namespace strata::kernels {
 
 /// The host copy of one layer's K/V: device-mapped pointers (UVA) into pinned memory, identity layout
@@ -38,7 +44,31 @@ struct KvHostPools {
     uint16_t* v_scale = nullptr;
     uint8_t* k_q4 = nullptr;      ///< q4_0 mode (kv_q4.hpp): block_q4_0 codes, 144 B per cell and head
     uint8_t* v_q4 = nullptr;
+    /// Elastic host K/V (--kv-host-grow): fixed device-resident chunk-pointer tables (one device pointer per chunk of
+    /// `1 << block_shift` KV blocks). Null (`block_shift == 0`) when the host copy is a single flat allocation.
+    uint16_t* const* k_pool_chunks = nullptr;
+    uint16_t* const* v_pool_chunks = nullptr;
+    int8_t* const* k_q_chunks = nullptr;
+    int8_t* const* v_q_chunks = nullptr;
+    uint16_t* const* k_scale_chunks = nullptr;
+    uint16_t* const* v_scale_chunks = nullptr;
+    uint8_t* const* k_q4_chunks = nullptr;
+    uint8_t* const* v_q4_chunks = nullptr;
+    int32_t block_shift = 0;      ///< log2(blocks_per_chunk); 0 = flat unchunked host copy
+    int32_t block_mask = 0;       ///< (1 << block_shift) - 1
+    int32_t elastic_id = -1;      ///< index in the elastic host pool table, or -1
+    int32_t pad = 0;
+
     bool present() const { return k_pool != nullptr || k_q != nullptr || k_q4 != nullptr; }
+    STRATA_KV_STREAM_HD bool chunked() const { return block_shift > 0; }
+    STRATA_KV_STREAM_HD int64_t local_block(int64_t b) const { return block_shift > 0 ? (b & block_mask) : b; }
+    template <typename T>
+    STRATA_KV_STREAM_HD T* chunk_base(T* flat, T* const* chunks, int64_t b) const {
+        return block_shift > 0 ? chunks[b >> block_shift] : flat;
+    }
+    STRATA_KV_STREAM_HD int64_t local_row(int64_t pos, int64_t kv_heads, int64_t h, int64_t page_size) const {
+        return (local_block(pos / page_size) * kv_heads + h) * page_size + (pos % page_size);
+    }
 };
 
 /// The KV storage format, for the functions below that move whole blocks (`fmt`): fp16, int8 (+ scales), q4_0, and
@@ -54,11 +84,16 @@ enum KvFormat : int { kKvF16 = 0, kKvInt8 = 1, kKvQ4 = 2, kKvHybrid = 3 };
 inline KvHostPools kv_hybrid_k_half(const KvHostPools& h) {
     KvHostPools r;
     r.k_q = h.k_q; r.v_q = h.k_q; r.k_scale = h.k_scale; r.v_scale = h.k_scale;
+    r.k_q_chunks = h.k_q_chunks; r.v_q_chunks = h.k_q_chunks;
+    r.k_scale_chunks = h.k_scale_chunks; r.v_scale_chunks = h.k_scale_chunks;
+    r.block_shift = h.block_shift; r.block_mask = h.block_mask; r.elastic_id = h.elastic_id;
     return r;
 }
 inline KvHostPools kv_hybrid_v_half(const KvHostPools& h) {
     KvHostPools r;
     r.k_q4 = h.v_q4; r.v_q4 = h.v_q4;
+    r.k_q4_chunks = h.v_q4_chunks; r.v_q4_chunks = h.v_q4_chunks;
+    r.block_shift = h.block_shift; r.block_mask = h.block_mask; r.elastic_id = h.elastic_id;
     return r;
 }
 

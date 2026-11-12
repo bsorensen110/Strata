@@ -50,8 +50,47 @@ template <typename T> T* halloc(size_t n) {   // pinned, mapped; returns the dev
 
 struct Pools {   // one K/V pool set of `pages` pages
     k::KvHostPools p;   // reused as a plain pointer bundle
-    void alloc(int64_t pages, const k::QsaShapes& s, int fmt, bool host) {
-        const size_t rows = (size_t) pages * s.n_head_kv * s.page_size;
+    template <typename T>
+    static void alloc_chunked(T*& flat, T* const*& chunks_out, int64_t pages, size_t elems_per_page, int32_t shift) {
+        const int64_t cblocks = 1ll << shift;
+        const int64_t n_chunks = (pages + cblocks - 1) >> shift;
+        std::vector<T*> hchunks((size_t) n_chunks, nullptr);
+        for (int64_t c = 0; c < n_chunks; ++c) {
+            // Deliberately allocate a scratch block between chunks so adjacent chunks are non-contiguous.
+            (void) halloc<uint8_t>(256);
+            hchunks[(size_t) c] = halloc<T>((size_t) cblocks * elems_per_page);
+        }
+        flat = hchunks[0];
+        T** dchunks = halloc<T*>((size_t) n_chunks);
+        std::memcpy(dchunks, hchunks.data(), (size_t) n_chunks * sizeof(T*));
+        chunks_out = dchunks;
+    }
+    void alloc(int64_t pages, const k::QsaShapes& s, int fmt, bool host, int32_t shift = 0) {
+        const size_t rpp = (size_t) s.n_head_kv * s.page_size;
+        const size_t rows = (size_t) pages * rpp;
+        p.block_shift = host ? shift : 0;
+        p.block_mask = (host && shift > 0) ? ((1 << shift) - 1) : 0;
+        if (host && shift > 0) {
+            if (fmt == k::kKvHybrid) {
+                const size_t q4 = k::kv_q4_bytes_per_head((int) s.head_dim);
+                alloc_chunked(p.k_q, p.k_q_chunks, pages, rpp * s.head_dim, shift);
+                alloc_chunked(p.k_scale, p.k_scale_chunks, pages, rpp * 4, shift);
+                alloc_chunked(p.v_q4, p.v_q4_chunks, pages, rpp * q4, shift);
+            } else if (fmt == k::kKvQ4) {
+                const size_t q4 = k::kv_q4_bytes_per_head((int) s.head_dim);
+                alloc_chunked(p.k_q4, p.k_q4_chunks, pages, rpp * q4, shift);
+                alloc_chunked(p.v_q4, p.v_q4_chunks, pages, rpp * q4, shift);
+            } else if (fmt == k::kKvInt8) {
+                alloc_chunked(p.k_q, p.k_q_chunks, pages, rpp * s.head_dim, shift);
+                alloc_chunked(p.v_q, p.v_q_chunks, pages, rpp * s.head_dim, shift);
+                alloc_chunked(p.k_scale, p.k_scale_chunks, pages, rpp * 4, shift);
+                alloc_chunked(p.v_scale, p.v_scale_chunks, pages, rpp * 4, shift);
+            } else {
+                alloc_chunked(p.k_pool, p.k_pool_chunks, pages, rpp * s.head_dim, shift);
+                alloc_chunked(p.v_pool, p.v_pool_chunks, pages, rpp * s.head_dim, shift);
+            }
+            return;
+        }
         if (fmt == k::kKvHybrid) {
             const size_t b = rows * k::kv_q4_bytes_per_head((int) s.head_dim);
             p.k_q = host ? halloc<int8_t>(rows * s.head_dim) : dalloc<int8_t>(rows * s.head_dim);
@@ -114,8 +153,10 @@ std::vector<int32_t> selection(int64_t n_kv, int64_t width, std::mt19937& rng) {
     return ids;
 }
 
-bool run(int fmt) {
-    const char* name = fmt == k::kKvHybrid ? "k8v4" : fmt == k::kKvQ4 ? "q4_0" : fmt == k::kKvInt8 ? "int8" : "fp16";
+bool run(int fmt, bool chunked = false) {
+    const char* base = fmt == k::kKvHybrid ? "k8v4" : fmt == k::kKvQ4 ? "q4_0" : fmt == k::kKvInt8 ? "int8" : "fp16";
+    char name[32];
+    std::snprintf(name, sizeof(name), "%s%s", base, chunked ? "/chunked" : "");
     k::QsaShapes s = k::qsa_real_shapes();
     const int64_t N = 40000, n_blocks = (N + 3) / 4, n_slots = 8 * 516 + 700;   // must evict: slots < blocks
     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s), NQ = 8;
@@ -126,7 +167,7 @@ bool run(int fmt) {
     Pools ref, slots, host;
     ref.alloc(n_blocks, s, fmt, false);
     slots.alloc(n_slots, s, fmt, false);
-    host.alloc(n_blocks, s, fmt, true);
+    host.alloc(n_blocks, s, fmt, true, chunked ? 10 : 0);   // 1024-block chunks -> 10 non-contiguous chunks
     int32_t* ident = dalloc<int32_t>(n_blocks);
     {
         std::vector<int32_t> t(n_blocks);
@@ -233,14 +274,44 @@ bool run(int fmt) {
         std::printf("  %s ring restore: %s\n", name, ok ? "identical" : "DIFFERS");
         if (!ok) ++bad;
     }
+    // 5. stage / unstage across chunk boundaries: stage [b0, b1) from host to a fresh device pool, unstage into a second
+    //    chunked host pool, restore a ring from that second host pool, and verify bitwise-identical attention.
+    if (chunked) {
+        const int64_t R = 1500, b1 = n_blocks, b0 = b1 - R;
+        Pools staged, host2, ring2;
+        staged.alloc(n_blocks, s, fmt, false);
+        host2.alloc(n_blocks, s, fmt, true, 10);
+        ring2.alloc(R, s, fmt, false);
+        int32_t* rt = dalloc<int32_t>(n_blocks);
+        k::kv_ring_table(rt, n_blocks, R, nullptr);
+        k::kv_stage_from_host(staged.attn(ident), host.p, fmt, b1, s, nullptr);
+        k::kv_unstage_to_host(staged.attn(ident), host2.p, fmt, b0, b1, s, nullptr);
+        k::kv_ring_restore(ring2.attn(rt), host2.p, fmt, b0, b1, R, s, nullptr);
+        const int64_t width = cap;
+        std::vector<int32_t> hids((size_t) cap), hst = {(int32_t) (N - 1), (int32_t) N, (int32_t) (N / 4), (int32_t) width};
+        for (int64_t i = 0; i < width; ++i) hids[i] = (int32_t) (N - width + i);
+        ck(cudaMemcpy(ids, hids.data(), hids.size() * 4, cudaMemcpyHostToDevice), "ids");
+        ck(cudaMemcpy(steps, hst.data(), 16, cudaMemcpyHostToDevice), "steps");
+        k::qsa_decode_attn_batch(q, ref.attn(ident), ids, steps, cap, s, scratch, out_ref, 1, nullptr);
+        k::qsa_decode_attn_batch(q, ring2.attn(rt), ids, steps, cap, s, scratch, out_str, 1, nullptr);
+        ck(cudaDeviceSynchronize(), "stage_unstage");
+        ck(cudaMemcpy(a.data(), out_ref, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "a");
+        ck(cudaMemcpy(b2.data(), out_str, (size_t) NH * D * 4, cudaMemcpyDeviceToHost), "b");
+        const bool ok = std::memcmp(a.data(), b2.data(), (size_t) NH * D * 4) == 0;
+        std::printf("  %s stage/unstage across chunks: %s\n", name, ok ? "identical" : "DIFFERS");
+        if (!ok) ++bad;
+    }
     return bad == 0;
 }
 }  // namespace
 
 int main() {
     std::printf("kv_stream_parity: streamed vs resident KV, bitwise\n");
-    const bool a = run(k::kKvInt8), b = run(k::kKvF16), c = run(k::kKvQ4), d = run(k::kKvHybrid);
-    if (!a || !b || !c || !d) ++g_fail;
+    for (bool chunked : {false, true}) {
+        const bool a = run(k::kKvInt8, chunked), b = run(k::kKvF16, chunked),
+                   c = run(k::kKvQ4, chunked), d = run(k::kKvHybrid, chunked);
+        if (!a || !b || !c || !d) ++g_fail;
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

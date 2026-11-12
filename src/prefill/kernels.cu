@@ -2539,13 +2539,16 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
     const int d = g * 64 + threadIdx.x;
     const float x = (is_v ? V : K)[t * 512 + kvh * 256 + d];
     const int64_t pos = pos0 + t;
-    const int64_t page = table[pos / page_size];
+    const int64_t blk = pos / page_size;
+    const int64_t page = table[blk];
     const int64_t row = (page * 2 + kvh) * page_size + pos % page_size;
-    const int64_t row_id = ((pos / page_size) * 2 + kvh) * page_size + pos % page_size;
+    const int64_t row_id = (blk * 2 + kvh) * page_size + pos % page_size;
+    const int64_t hrow = host.local_row(pos, 2, kvh, page_size);
     if (k_pool != nullptr) {
         const uint16_t h = hf(x);
         if (page >= 0) (is_v ? v_pool : k_pool)[row * 256 + d] = h;
-        if (host.k_pool != nullptr) (is_v ? host.v_pool : host.k_pool)[row_id * 256 + d] = h;
+        if (host.k_pool != nullptr)
+            host.chunk_base(is_v ? host.v_pool : host.k_pool, is_v ? host.v_pool_chunks : host.k_pool_chunks, blk)[hrow * 256 + d] = h;
         if (stage.k_pool != nullptr) (is_v ? stage.v_pool : stage.k_pool)[row_id * 256 + d] = h;
         return;
     }
@@ -2564,8 +2567,9 @@ __global__ void kv_append_kernel(const float* __restrict__ K, const float* __res
         if (threadIdx.x == 0) (is_v ? v_scale : k_scale)[row * 4 + g] = sb;
     }
     if (host.k_q != nullptr) {
-        (is_v ? host.v_q : host.k_q)[row_id * 256 + d] = (int8_t) q;
-        if (threadIdx.x == 0) (is_v ? host.v_scale : host.k_scale)[row_id * 4 + g] = sb;
+        host.chunk_base(is_v ? host.v_q : host.k_q, is_v ? host.v_q_chunks : host.k_q_chunks, blk)[hrow * 256 + d] = (int8_t) q;
+        if (threadIdx.x == 0)
+            host.chunk_base(is_v ? host.v_scale : host.k_scale, is_v ? host.v_scale_chunks : host.k_scale_chunks, blk)[hrow * 4 + g] = sb;
     }
     if (stage.k_q != nullptr) {
         (is_v ? stage.v_q : stage.k_q)[row_id * 256 + d] = (int8_t) q;
