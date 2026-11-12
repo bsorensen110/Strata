@@ -1913,40 +1913,56 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         if (cudaEventCreateWithFlags(&m.used[i], cudaEventDisableTiming) != cudaSuccess) ok = false;
     }
     if (!m.stager) {
-        m.stager = std::make_unique<Stager>();
-        const int hw = (int) std::thread::hardware_concurrency();
-        const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
-        // A GGUF read in place (UD-Q4_K_XL beyond its RAM budget): most of a chunk's blobs are page faults on the
-        // SSD, so the copies need many reads in flight - 32 threads and a 128-deep ring read a 4K chunk in 29 s
-        // instead of 71 s on an RTX 5070 / NVMe PC (4 threads, 16 deep: the defaults, kept for every other source)
+        // Only allocate the stager ring + worker threads when some expert is unpinned, transient, or lacks a stable blob.
+        bool needs_stager = false;
         bool files = false;
-        for (int64_t l = 0; src != nullptr && !files && l < g.n_layers; ++l)
-            for (int64_t e = 0; !files && e < g.n_expert; ++e) files = src->transient(l, e);
-        // #1353: ... but a source answers transient() for every blob it copies out of the GGUF, including the ones whose
-        // pages are already in the page cache (a Q8 pack on a big-RAM box with a warm cache).  Those copies are memcpy
-        // from RAM, where 32 threads and a 128-deep ring ran 4-7x slower than the defaults.  So ask the OS: the SSD
-        // profile only when fewer than 90% of a sample of the blobs' pages are resident (-1: it cannot tell, keep it).
-        if (files && !stv) {
-            const char* ev = std::getenv("STRATA_STAGER_SSD");   // 1 / 0: force the profile (A/B, support)
-            if (ev != nullptr && ev[0] != '\0') files = ev[0] != '0';
-            else if (const double warm = src->cached_share(256); warm >= 0.9) {
-                files = false;
-                std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
+        for (int64_t l = 0; src != nullptr && l < g.n_layers; ++l) {
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                if (src->transient(l, e)) {
+                    needs_stager = true;
+                    files = true;
+                    break;
+                }
+                if (!src->pinned(l, e) || src->blob_stable(l, e) == nullptr) {
+                    needs_stager = true;
+                }
             }
+            if (files) break;
         }
-        const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
-        if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
-        // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
-        // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
-        {
-            const char* bv = std::getenv("STRATA_STAGER_BATCH");
-            const int want = bv ? std::atoi(bv) : files ? 8 : 1;
-            m.stager->batch = std::clamp(want, 1, Stager::kMaxBatch);
+        if (needs_stager) {
+            m.stager = std::make_unique<Stager>();
+            const int hw = (int) std::thread::hardware_concurrency();
+            const char* stv = std::getenv("STRATA_STAGER_THREADS");   // D-5: the host copy threads of unpinned blobs
+            // A GGUF read in place (UD-Q4_K_XL beyond its RAM budget): most of a chunk's blobs are page faults on the
+            // SSD, so the copies need many reads in flight - 32 threads and a 128-deep ring read a 4K chunk in 29 s
+            // instead of 71 s on an RTX 5070 / NVMe PC (4 threads, 16 deep: the defaults, kept for every other source)
+            // #1353: ... but a source answers transient() for every blob it copies out of the GGUF, including the ones whose
+            // pages are already in the page cache (a Q8 pack on a big-RAM box with a warm cache).  Those copies are memcpy
+            // from RAM, where 32 threads and a 128-deep ring ran 4-7x slower than the defaults.  So ask the OS: the SSD
+            // profile only when fewer than 90% of a sample of the blobs' pages are resident (-1: it cannot tell, keep it).
+            if (files && !stv) {
+                const char* ev = std::getenv("STRATA_STAGER_SSD");   // 1 / 0: force the profile (A/B, support)
+                if (ev != nullptr && ev[0] != '\0') files = ev[0] != '0';
+                else if (const double warm = src->cached_share(256); warm >= 0.9) {
+                    files = false;
+                    std::fprintf(stderr, "prefill: the GGUF experts are %.0f%% in the page cache; the stager takes the RAM profile\n", warm * 100.0);
+                }
+            }
+            const int threads = stv ? std::clamp(std::atoi(stv), 1, 32) : files ? 32 : std::max(2, std::min(4, hw / 4));
+            if (files && std::getenv("STRATA_STAGER_RING") == nullptr) m.stager->kRing = 4 * threads;
+            // pp-opt: with files, each thread claims runs of neighbouring blobs and reads them as one request (copy_blobs);
+            // STRATA_STAGER_BATCH=1 is the A/B arm (one blob per request, as before)
+            {
+                const char* bv = std::getenv("STRATA_STAGER_BATCH");
+                const int want = bv ? std::atoi(bv) : files ? 8 : 1;
+                m.stager->batch = std::clamp(want, 1, Stager::kMaxBatch);
+            }
+            if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
+            m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
         }
-        if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
-        m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
     }
-    pf_mark("init: stager ring (pinned host buffers)", tr_last, (uint64_t) m.stager->kRing * (uint64_t) MAXBLOB());
+    if (m.stager)
+        pf_mark("init: stager ring (pinned host buffers)", tr_last, (uint64_t) m.stager->kRing * (uint64_t) MAXBLOB());
     if (!m.warmer && src != nullptr && src->warms()) {
         const char* wv = std::getenv("STRATA_PREFILL_WARM");
         if (wv != nullptr && std::atoi(wv) != 0) {
@@ -3874,7 +3890,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 seq_start[(size_t) l] = seq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
             }
-            m.stager->start(std::move(js));
+            if (m.stager) m.stager->start(std::move(js));
         }
         struct StagerDone {
             Stager* st;
@@ -5906,7 +5922,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     m.warmer->submit(l + 1, std::move(nxt));
                                 }
                             }
-                            m.stager->start(std::move(js));
+                            if (m.stager) m.stager->start(std::move(js));
                         }
                         StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
                         auto stage_one = [&](size_t j) -> bool {
@@ -7269,7 +7285,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
             }
             js.push_back({b, (size_t) lay.blob_bytes(l)});
         }
-        m.stager->start(std::move(js));
+        if (m.stager) m.stager->start(std::move(js));
         return true;
     };
     struct StagerStop {
@@ -7316,7 +7332,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         std::vector<int> job_of(uniq.size(), -1), stage_of(uniq.size(), -1);
         for (size_t u = 0; u < uniq.size(); ++u) job_of[u] = pf_job[(size_t) uniq[u]];
         for (int32_t e = 0; e < NE; ++e)   // prefetched but not routed: not read, if not started yet
-            if (cnt[(size_t) e] == 0 && pf_job[(size_t) e] >= 0) m.stager->skip(pf_job[(size_t) e]);
+            if (m.stager && cnt[(size_t) e] == 0 && pf_job[(size_t) e] >= 0) m.stager->skip(pf_job[(size_t) e]);
         if (!pf_on && m.src != nullptr) {   // STRATA_LM_PREFETCH=0: the routed experts only, started now
             std::vector<Stager::Job> js;
             const bool pdirect = false;   // (STRATA_PREFILL_DIRECT, #1670's other commit, is not ported)
@@ -7335,7 +7351,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                 }
                 js.push_back({b, (size_t) lay.blob_bytes(l)});
             }
-            m.stager->start(std::move(js));
+            if (m.stager) m.stager->start(std::move(js));
         }
         struct StagerDone {
             Stager* st;
