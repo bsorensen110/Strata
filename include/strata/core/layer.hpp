@@ -300,6 +300,21 @@ int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(VmmChunk)>
 /// Physical bytes the elastic pools hold, and what all of them would at the full context.
 uint64_t qsa_kv_elastic_mapped_bytes();
 uint64_t qsa_kv_elastic_full_bytes();
+/// THE ELASTIC HOST K/V (--kv-host-grow; docs/kv-host-elastic-design.md).  A streamed (mode-1 or mode-2) state's
+/// authoritative host copy reserves its full address range up front and commits + pins chunks of `step_cells` (rounded
+/// to a power-of-two number of KV blocks) as the context grows, updating the state's fixed device chunk-pointer tables
+/// in place so captured CUDA graphs stay valid.
+void qsa_set_kv_host_elastic(bool enabled, int64_t init_cells = 16384, int64_t step_cells = 16384);
+bool qsa_kv_host_elastic();
+int64_t qsa_kv_host_elastic_cells();
+int64_t qsa_kv_host_elastic_step_cells();
+uint64_t qsa_kv_host_elastic_need_bytes(int64_t cells);
+bool qsa_kv_host_elastic_grow(int64_t cells);
+bool qsa_kv_host_elastic_grow_state(const QsaState& st, int64_t cells);
+int64_t qsa_kv_host_elastic_shrink(int64_t cells);
+uint64_t qsa_kv_host_elastic_mapped_bytes();
+uint64_t qsa_kv_host_elastic_full_bytes();
+void qsa_kv_host_elastic_release_all();
 int64_t qsa_kv_resident();
 /// The fewest resident cells a streamed layer may have: one verify window's selections (8 queries x 2,051 cells
 /// in whole blocks) must fit at once, with room to spare.

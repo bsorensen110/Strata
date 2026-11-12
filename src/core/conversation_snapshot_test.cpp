@@ -332,6 +332,104 @@ void full_session(int fmt, int mode, int experts) {
     check(spare==a.checkpoints[0].dead,"checkpoint rebuilds spare row over a later completed block");
     check(ss.ple_prev[0]==2 && ss.ple_prev[1]==3,"checkpoint PLE token window");
 }
+
+void elastic_host_kv_test() {
+    ModelGeometry g;
+    const int64_t max_cells = 12288, init_cells = 4096, step_cells = 4096;
+    qsa_set_kv_resident(4096);
+    qsa_set_kv_int8(true);
+    qsa_set_kv_host_elastic(true, init_cells, step_cells);
+    check(qsa_kv_host_elastic(), "elastic host KV enabled");
+    const size_t dev_bytes = (size_t) qsa_state_bytes(g, max_cells, true);
+    void *dev_a = nullptr, *dev_b = nullptr;
+    cuda_check(cudaMalloc(&dev_a, dev_bytes));
+    cuda_check(cudaMalloc(&dev_b, dev_bytes));
+    QsaState a{}, b{};
+    check(qsa_state_init(g, max_cells, dev_a, a) > 0, "init elastic state a");
+    check(qsa_state_init(g, max_cells, dev_b, b) > 0, "init elastic state b");
+    check(a.host.chunked() && b.host.chunked() && a.host.block_shift == 10, "elastic states use 1024-block chunks");
+    check(qsa_kv_host_elastic_cells() == init_cells, "initial committed extent matches init_cells");
+    const uint64_t map0 = qsa_kv_host_elastic_mapped_bytes(), full = qsa_kv_host_elastic_full_bytes();
+    check(map0 > 0 && full == map0 * 3 && qsa_kv_host_bytes() == map0, "initial mapped bytes are 1/3 of full ceiling");
+
+    // Build a 10000-cell ConversationKv image (spans 3 chunks: 0..4095, 4096..8191, 8192..9999).
+    check(qsa_kv_host_elastic_need_bytes(10000) > 0, "need_bytes reports positive delta before grow");
+    check(qsa_kv_host_elastic_grow_state(a, 10000), "grow state a to cover 10000 cells (3 chunks)");
+    check(qsa_kv_host_elastic_mapped_bytes() == map0 * 2, "state a (3 chunks) + state b (1 chunk) = 4 chunks mapped");
+
+    // Populate a's 3 chunks and pooled indexer with deterministic bytes via conversation_kv_restore from a synthetic image.
+    const int64_t upto = 10000;
+    std::string err;
+    ConversationKv img;
+    check(conversation_kv_save(img, a, g, upto, true, err), "save initial 10000-cell image from grown state a");
+    auto fill_buf = [](ConversationBuffer& buf, uint8_t seed) {
+        buf.visit(0, buf.size(), [&](uint8_t* p, size_t n, size_t at) {
+            for (size_t i = 0; i < n; ++i) p[i] = (uint8_t) (seed + (at + i) * 13 + (at + i) / 251);
+            return true;
+        });
+    };
+    fill_buf(img.k, 17);
+    fill_buf(img.v, 53);
+    fill_buf(img.k_scale, 89);
+    fill_buf(img.v_scale, 131);
+    fill_buf(img.pooled, 193);
+
+    // Shrink `a` back to 1 chunk (4096 cells), then restore the 10000-cell image into `a`: restore must auto-grow `a`!
+    check(qsa_kv_host_elastic_shrink(init_cells) > 0, "shrink elastic pools back to init_cells");
+    check(qsa_kv_host_elastic_cells() == init_cells && qsa_kv_host_elastic_mapped_bytes() == map0,
+          "shrink decommits chunks above init_cells");
+    check(conversation_kv_restore(img, a, g, upto, true, err), "restore 10000-cell image auto-grows chunked state a");
+    check(qsa_kv_host_elastic_mapped_bytes() == map0 * 2, "restore grew state a back to 3 chunks");
+
+    ConversationKv saved;
+    check(conversation_kv_save(saved, a, g, upto, true, err), "save 10000-cell image back from chunked state a");
+    check(equal(img, saved), "save/restore round-trip across 3 chunks is byte-identical");
+
+    uint64_t fp = 0;
+    check(conversation_kv_verify(img, a, g, upto, true, fp, err), "conversation_kv_verify succeeds across chunks");
+
+    // Disk-save streaming source across chunks.
+    SessionKvSource src;
+    check(conversation_kv_source(src, a, g, upto, true, err), "conversation_kv_source on chunked state");
+    const std::array<const ConversationBuffer*, 5> parts = {&img.k, &img.v, &img.k_scale, &img.v_scale, &img.pooled};
+    for (size_t i = 0; i < 5; ++i) {
+        std::vector<uint8_t> got(src.sizes[i]), want(src.sizes[i]);
+        const size_t cut = src.sizes[i] / 2;   // split right across chunk 1
+        check(src.read(i, 0, got.data(), cut) && src.read(i, cut, got.data() + cut, src.sizes[i] - cut),
+              "chunked SessionKvSource split read");
+        check(parts[i]->read(want.data(), 0, want.size()) && got == want,
+              "chunked SessionKvSource matches image bytes");
+    }
+
+    // Copy from `a` (10000 cells, 3 chunks) to `b` (still at 4096 cells, 1 chunk):
+    // first 4000 cells fit in chunk 0 without growing `b`; then copying to 10000 with unchanged_tokens=2000 auto-grows `b` to 3 chunks!
+    check(qsa_kv_host_elastic_cells() == init_cells, "min mapped cells across pools is init_cells before b grows");
+    check(conversation_kv_copy(a, b, g, 4000, true, err, false, 0), "conversation_kv_copy within chunk 0 keeps b at 1 chunk");
+    check(qsa_kv_host_elastic_cells() == init_cells, "state b stays at 1 chunk for 4000 cells");
+    check(conversation_kv_copy(a, b, g, upto, true, err, false, 2000), "conversation_kv_copy across chunks auto-grows b");
+    check(qsa_kv_host_elastic_cells() == max_cells && qsa_kv_host_elastic_mapped_bytes() == full,
+          "state b grew to 3 chunks on copy");
+    ConversationKv saved_b;
+    check(conversation_kv_save(saved_b, b, g, upto, true, err), "save from copied state b");
+    check(equal(img, saved_b), "conversation_kv_copy across chunks is byte-identical");
+
+    // Prefix restore (5000 cells -> 2 chunks) into shrunk `b`.
+    check(qsa_kv_host_elastic_shrink(init_cells) > 0, "shrink both states to 1 chunk");
+    check(conversation_kv_restore(img, a, g, upto, true, err), "re-restore a to 3 chunks");
+    check(conversation_kv_restore_prefix(img, b, g, upto, 5000, true, err), "restore 5000-cell prefix into b");
+    check(qsa_kv_host_elastic_cells() == 8192, "prefix restore grew b to 2 chunks (8192 cells), not 3");
+    ConversationKv pref_a, pref_b;
+    check(conversation_kv_save(pref_a, a, g, 5000, true, err) &&
+          conversation_kv_save(pref_b, b, g, 5000, true, err) && equal(pref_a, pref_b),
+          "prefix restore across 2 chunks matches full state prefix");
+
+    qsa_kv_host_elastic_release_all();
+    qsa_set_kv_host_elastic(false);
+    qsa_set_kv_resident(0);
+    qsa_set_kv_int8(false);
+    cudaFree(dev_a);
+    cudaFree(dev_b);
+}
 }
 
 int main() {
@@ -442,5 +540,6 @@ int main() {
     for (int fmt : {kKvF16,kKvInt8,kKvQ4}) for (int mode : {0,1}) for (int experts : {256,512})
         full_session(fmt,mode,experts);
     for (int experts : {256,512}) full_session(3,0,experts);
+    elastic_host_kv_test();
     std::printf("conversation_snapshot_test: %d checks passed\n",checks);
 }

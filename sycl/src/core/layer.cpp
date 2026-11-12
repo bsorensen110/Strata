@@ -712,6 +712,17 @@ uint64_t qsa_kv_elastic_full_bytes() {
     for (const auto& p : g_pools) n += (uint64_t) p->range.chunks() * strata::core::vmm_granularity();
     return n;
 }
+void qsa_set_kv_host_elastic(bool, int64_t, int64_t) {}
+bool qsa_kv_host_elastic() { return false; }
+int64_t qsa_kv_host_elastic_cells() { return 0; }
+int64_t qsa_kv_host_elastic_step_cells() { return 16384; }
+uint64_t qsa_kv_host_elastic_need_bytes(int64_t) { return 0; }
+bool qsa_kv_host_elastic_grow(int64_t) { return false; }
+bool qsa_kv_host_elastic_grow_state(const QsaState&, int64_t) { return true; }
+int64_t qsa_kv_host_elastic_shrink(int64_t) { return 0; }
+uint64_t qsa_kv_host_elastic_mapped_bytes() { return 0; }
+uint64_t qsa_kv_host_elastic_full_bytes() { return 0; }
+void qsa_kv_host_elastic_release_all() {}
 namespace {
 
 /// How one state holds its K/V: `mode` as in QsaState::kv_mode, `slots` VRAM pages of `pages` logical ones.
