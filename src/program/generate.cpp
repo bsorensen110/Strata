@@ -682,6 +682,7 @@ struct Options {
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
+    bool kv_host_grow = false;         ///< the elastic host K/V (--kv-host-grow, STRATA_KV_HOST_GROW=1; kvh_ensure)
     std::string dump_residual;
     /// The head input, `bb.mixed`.  It exists so the head can be SPLIT: steps 1-4 (the per-stream norm, the two
     /// bf16 projections and the stream mean) recompute cheaply in Python, and only the 794 MB GEMV does not.
@@ -3487,6 +3488,8 @@ int main(int argc, char** argv) {
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
+        else if (a == "--kv-host-grow") o.kv_host_grow = true;
+        else if (a == "--no-kv-host-grow") o.kv_host_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--gr-fp32-activations") o.gr_fp32_activations = true;
@@ -6804,6 +6807,19 @@ int main(int argc, char** argv) {
             const char* iv = std::getenv("STRATA_KV_GROW_INIT");
             strata::core::qsa_set_kv_elastic(on, iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384);
             strata::core::ExpertCache::set_vmm(on);
+        }
+        {
+            const char* ev = std::getenv("STRATA_KV_HOST_GROW");
+            const bool asked = ev != nullptr && ev[0] != '\0' ? ev[0] != '0' : o.kv_host_grow;
+            const bool on = asked && o.kv_resident > 0;
+            if (asked && !on)
+                std::fprintf(stderr, "strata generate: --kv-host-grow is off (needs KV streaming, --kv-resident)\n");
+            const char* iv = std::getenv("STRATA_KV_HOST_GROW_INIT");
+            const char* sv = std::getenv("STRATA_KV_HOST_GROW_STEP");
+            strata::core::qsa_set_kv_host_elastic(
+                on,
+                iv != nullptr && std::atoll(iv) > 0 ? std::atoll(iv) : 16384,
+                sv != nullptr && std::atoll(sv) > 0 ? std::atoll(sv) : 16384);
         }
         if (cudaMalloc(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0)) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session state allocation failed\n");
@@ -10389,6 +10405,66 @@ int main(int argc, char** argv) {
                              "the profile\n", (long long) kvg.cells, (long long) (kvg.lo - lo0));
         return true;
     };
+    struct {
+        bool on = false;
+        int64_t cells = 0, step = 16384;
+        int64_t grows = 0, trims = 0;
+    } kvh;
+    auto kvh_start = [&]() {
+        kvh.on = strata::core::qsa_kv_host_elastic() && strata::core::qsa_kv_host_elastic_full_bytes() > 0;
+        if (!kvh.on) return;
+        kvh.cells = strata::core::qsa_kv_host_elastic_cells();
+        kvh.step = std::max<int64_t>(strata::core::qsa_kv_host_elastic_step_cells(), 1);
+        std::fprintf(stderr, "strata generate: the elastic host K/V (--kv-host-grow) starts at %lld of %lld cells "
+                             "(%.2f of %.2f GiB pinned RAM)\n",
+                     (long long) kvh.cells, (long long) o.max_context,
+                     (double) strata::core::qsa_kv_host_elastic_mapped_bytes() / 1073741824.0,
+                     (double) strata::core::qsa_kv_host_elastic_full_bytes() / 1073741824.0);
+    };
+    auto kvh_ensure = [&](int64_t cells) -> bool {
+        if (!kvh.on || cells <= kvh.cells) return true;
+        const int64_t target = std::min<int64_t>(o.max_context, (cells + kvh.step - 1) / kvh.step * kvh.step);
+        const uint64_t need_bytes = strata::core::qsa_kv_host_elastic_need_bytes(target);
+        if (need_bytes == 0) {
+            kvh.cells = strata::core::qsa_kv_host_elastic_cells();
+            return true;
+        }
+        const uint64_t floor = (uint64_t) std::max<int64_t>(o.conversation_cache_min_free_mib, 0) << 20;
+        const auto mem = strata::core::sample_host_memory();
+        const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
+        if (!strata::core::conversation_memory_admit(avail, need_bytes, floor)) {
+            std::fprintf(stderr, "strata: the elastic host K/V refused to grow to %lld cells: needs %.2f GiB + "
+                                 "%lld MiB free RAM floor (%s)\n",
+                         (long long) target, (double) need_bytes / 1073741824.0,
+                         (long long) o.conversation_cache_min_free_mib,
+                         avail ? (std::to_string(*avail >> 20) + " MiB available").c_str() : "available RAM unknown");
+            return false;
+        }
+        if (!strata::core::qsa_kv_host_elastic_grow(target)) return false;
+        kvh.cells = strata::core::qsa_kv_host_elastic_cells();
+        ++kvh.grows;
+        std::fprintf(stderr, "strata: the elastic host K/V grew to %lld cells (%.2f of %.2f GiB pinned RAM)\n",
+                     (long long) kvh.cells,
+                     (double) strata::core::qsa_kv_host_elastic_mapped_bytes() / 1073741824.0,
+                     (double) strata::core::qsa_kv_host_elastic_full_bytes() / 1073741824.0);
+        return true;
+    };
+    auto kvh_trim = [&](int64_t cells, int64_t hold) -> bool {
+        if (!kvh.on) return true;
+        const int64_t want = std::max(cells, hold);
+        const int64_t target = std::max<int64_t>(kvh.step, (want + kvh.step - 1) / kvh.step * kvh.step);
+        if (kvh.cells < target + 2 * kvh.step) return true;
+        const int64_t freed = strata::core::qsa_kv_host_elastic_shrink(target);
+        kvh.cells = strata::core::qsa_kv_host_elastic_cells();
+        if (freed > 0) {
+            ++kvh.trims;
+            std::fprintf(stderr, "strata: the elastic host K/V shrunk to %lld cells (%.2f of %.2f GiB pinned RAM)\n",
+                         (long long) kvh.cells,
+                         (double) strata::core::qsa_kv_host_elastic_mapped_bytes() / 1073741824.0,
+                         (double) strata::core::qsa_kv_host_elastic_full_bytes() / 1073741824.0);
+        }
+        return true;
+    };
     // ---- the resident RAM mode (--resident-experts / --resident-cpu-experts): the experts the GPU cache does not
     // hold are copied from experts.bin into RAM once, so no decode or prompt step reads the file (the plain mmap
     // mode reads them through the OS file cache, which a small-RAM PC keeps giving back to the SSD).  Built here,
@@ -11519,6 +11595,7 @@ int main(int argc, char** argv) {
             }
         }
         kvg_start(borrow != nullptr ? (int64_t) lend_first : xcache.slots());
+        kvh_start();
         if (srcp == &src && src.complement_ready() && src.complement_pinned() && !pf_parts.empty() && !host_res.empty()) {
             const char* vb = std::getenv("STRATA_LEND_RAM_BACKUP");
             const bool lb_on = vb == nullptr || std::atoi(vb) != 0;
@@ -15169,6 +15246,7 @@ int main(int argc, char** argv) {
                 const int b = (int) ((next_slot + offset) % bs.size());
                 if (!bs[(size_t) b].active) continue;
                 BSlot& q = bs[(size_t) b];
+                if (kvh.on && q.p + 64 > kvh.cells && !kvh_ensure(q.p + 64)) q.stop = true;
                 const int extra = q.stop ? 0 : (batch_df2 ? (b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? df2_extra[b] : 0) : batch_mtp ? 1 : 0);
                 if (S + 1 + extra > win_cap) break;
                 if (batch_mtp && !q.draft_ready && !batch_df2) {
@@ -16108,6 +16186,12 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                     rr = pick + 1;
                     PGroup& G = pg[(size_t) pick];
+                    if (kvh.on) {
+                        for (int t = 0; t < GS; ++t) {
+                            BSlot& sl = bs[(size_t) (pick * GS + t)];
+                            if (sl.active && sl.p + 64 > kvh.cells && !kvh_ensure(sl.p + 64)) sl.stop = true;
+                        }
+                    }
                     G.S = 0;
                     if (pmtp) {   // the group's slots: each its token, then its own proposals - as many as could be emitted
                         G.hbase = pmtp_rows_per_group * pick;
@@ -16595,6 +16679,10 @@ int main(int argc, char** argv) {
                         refuse("the K/V cannot grow to the saved conversation: no VRAM is left", strata::core::SessionError::memory);
                         continue;
                     }
+                    if (!kvh_ensure((int64_t) image.live.ids.size() + 256)) {
+                        refuse("the host K/V cannot grow to the saved conversation: not enough free RAM", strata::core::SessionError::memory);
+                        continue;
+                    }
                     conversations.take_reuse();   // retained K/V described the outgoing session
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
@@ -17000,6 +17088,11 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     return 1;
                 }
+            }
+            if (kvh.on && !kvh_ensure(n + 256)) {
+                std::printf("ERR the host K/V cannot grow to this prompt: not enough free RAM\n");
+                std::fflush(stdout);
+                continue;
             }
             nf_hit = false;
             // #879: an earlier window met non-finite logits.  The poison sits in a conversation's K/V and recurrent
@@ -17529,6 +17622,11 @@ int main(int argc, char** argv) {
                 std::printf("ERR the K/V cannot grow to the parked conversation: no VRAM is left\n");
                 return 1;
             }
+            if (incoming && !kvh_ensure((int64_t) incoming->live.ids.size() + 256)) {
+                std::printf("ERR the host K/V cannot grow to the parked conversation: not enough free RAM\n");
+                std::fflush(stdout);
+                continue;
+            }
             if (borrow) {
                 const auto t0 = Clock::now();
                 const strata::core::SavedConversation* donor = borrow_disk_donor ? &*borrow_disk_donor
@@ -17675,6 +17773,14 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                     return 1;
                 }
+            }
+            if (kvh.on) {
+                static const bool hold_on = [] { const char* v = std::getenv("STRATA_KV_GROW_HOLD"); return v != nullptr && std::atoi(v) != 0; }();
+                int64_t keep = hold_on ? conversations.longest_tokens() + 256 : 0;
+                for (const auto& sl : bs)
+                    if (sl.active || sl.cached)
+                        keep = std::max<int64_t>(keep, std::max<int64_t>((int64_t) sl.ids.size(), sl.p) + 256);
+                kvh_trim(n + 256, keep);
             }
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
@@ -20513,6 +20619,11 @@ int main(int argc, char** argv) {
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;
                 }
+                if (kvh.on && p + T + 64 > kvh.cells &&
+                    !kvh_ensure(p + T + 64)) {
+                    std::fprintf(stderr, "strata: stopping generation at %lld tokens (host K/V grow refused)\n", (long long) p);
+                    break;
+                }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
                 // STRATA_SPEC_PROB: the MTP drafts' distributions q, judged by rejection sampling (core/spec_prob.hpp);
@@ -21487,7 +21598,9 @@ int main(int argc, char** argv) {
                 // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
                 kvg_started = true;
                 kvg_start(first);
+                kvh_start();
                 if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+                if (!kvh_ensure(n_prompt + o.max_new + 64)) return 1;
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent.emplace_back((int32_t) i, host_res[i]);
@@ -21547,7 +21660,9 @@ int main(int argc, char** argv) {
         if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
             kvg_started = true;
             kvg_start(xcache.slots());
+            kvh_start();
             if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+            if (!kvh_ensure(n_prompt + o.max_new + 64)) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
@@ -21606,7 +21721,9 @@ int main(int argc, char** argv) {
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
         kvg_started = true;
         kvg_start(xcache.slots());
+        kvh_start();
         if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+        if (!kvh_ensure(n_prompt + o.max_new + 64)) return 1;
     }
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
@@ -22874,6 +22991,9 @@ int main(int argc, char** argv) {
             std::printf("%-24s %lld cells in VRAM, %lld grows, %lld trims, %lld experts given up, %lld refilled\n",
                         "  elastic K/V", (long long) kvg.cells, (long long) kvg.grows, (long long) kvg.trims,
                         (long long) kvg.evicted, (long long) kvg.refilled);
+        if (kvh.on)
+            std::printf("%-24s %lld cells in RAM, %lld grows, %lld trims\n",
+                        "  elastic host K/V", (long long) kvh.cells, (long long) kvh.grows, (long long) kvh.trims);
         if (tgraph.captured && tgraph.calls > 0) {
             const double per = (double) tgraph.calls;
             std::printf("%-24s wait for rings %.3f  pool %.3f ms/token  (%lld flushes over %lld positions)\n",
