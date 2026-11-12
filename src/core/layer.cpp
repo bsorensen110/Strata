@@ -42,8 +42,14 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#include <unistd.h>
 #endif
 #include <memory>
 #include <vector>
@@ -735,6 +741,306 @@ uint64_t qsa_kv_elastic_full_bytes() {
     for (const auto& p : g_pools) n += (uint64_t) p->range.chunks() * strata::core::vmm_granularity();
     return n;
 }
+
+// ---- the elastic host K/V (--kv-host-grow): per-state reserved host VA, committed & registered in power-of-two block chunks
+namespace {
+bool g_kv_host_elastic = false;
+int64_t g_kv_host_elastic_init = 16384;
+int64_t g_kv_host_elastic_step = 16384;
+
+uint64_t os_page_bytes() {
+    static const uint64_t p = []() -> uint64_t {
+#if defined(_WIN32)
+        SYSTEM_INFO si{};
+        GetSystemInfo(&si);
+        return si.dwPageSize >= 4096 ? (uint64_t) si.dwPageSize : 4096ULL;
+#elif !defined(STRATA_GPU_METAL)
+        const long v = sysconf(_SC_PAGESIZE);
+        return v >= 4096 ? (uint64_t) v : 4096ULL;
+#else
+        return 4096ULL;
+#endif
+    }();
+    return p;
+}
+
+int32_t host_elastic_block_shift(const QsaShapes& s) {
+    const int64_t step_cells = std::max<int64_t>(g_kv_host_elastic_step, s.page_size);
+    const int64_t want_blocks = std::max<int64_t>((step_cells + s.page_size - 1) / s.page_size, 1);
+    const uint64_t min_per_block = (uint64_t) std::max<int64_t>(s.n_head_kv * s.page_size, 1) *
+                                   (uint64_t) std::max<int64_t>((s.head_dim / strata::kernels::KV_Q8_GROUP) * 2, 2);
+    const uint64_t page_b = os_page_bytes();
+    int32_t shift = 0;
+    while (((int64_t(1) << shift) < want_blocks || ((uint64_t(1) << shift) * min_per_block) < page_b) && shift < 20)
+        ++shift;
+    return shift;
+}
+
+bool host_chunk_commit(uint8_t* ptr, uint64_t bytes, void*& dev_out) {
+#if defined(_WIN32)
+    if (VirtualAlloc(ptr, (size_t) bytes, MEM_COMMIT, PAGE_READWRITE) == nullptr) return false;
+    if (cudaHostRegister(ptr, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) VirtualFree(ptr, (size_t) bytes, MEM_DECOMMIT);
+        return false;
+    }
+    if (cudaHostGetDevicePointer(&dev_out, ptr, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) cudaHostUnregister(ptr);
+        (void) VirtualFree(ptr, (size_t) bytes, MEM_DECOMMIT);
+        return false;
+    }
+    return true;
+#elif !defined(STRATA_GPU_METAL)
+    if (mprotect(ptr, (size_t) bytes, PROT_READ | PROT_WRITE) != 0) return false;
+    if (cudaHostRegister(ptr, (size_t) bytes, cudaHostRegisterPortable | cudaHostRegisterMapped) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) madvise(ptr, (size_t) bytes, MADV_DONTNEED);
+        (void) mprotect(ptr, (size_t) bytes, PROT_NONE);
+        return false;
+    }
+    if (cudaHostGetDevicePointer(&dev_out, ptr, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        (void) cudaHostUnregister(ptr);
+        (void) madvise(ptr, (size_t) bytes, MADV_DONTNEED);
+        (void) mprotect(ptr, (size_t) bytes, PROT_NONE);
+        return false;
+    }
+    return true;
+#else
+    (void) ptr; (void) bytes; (void) dev_out;
+    return false;
+#endif
+}
+
+void host_chunk_decommit(uint8_t* ptr, uint64_t bytes) {
+#if defined(_WIN32)
+    (void) cudaHostUnregister(ptr);
+    (void) cudaGetLastError();
+    (void) VirtualFree(ptr, (size_t) bytes, MEM_DECOMMIT);
+#elif !defined(STRATA_GPU_METAL)
+    (void) cudaHostUnregister(ptr);
+    (void) cudaGetLastError();
+    (void) madvise(ptr, (size_t) bytes, MADV_DONTNEED);
+    (void) mprotect(ptr, (size_t) bytes, PROT_NONE);
+#else
+    (void) ptr; (void) bytes;
+#endif
+}
+
+struct ElasticHostPool {
+    uint8_t* reserve_base = nullptr;
+    uint64_t reserve_bytes = 0;
+    void* table_host = nullptr;
+    std::vector<uint64_t> arr_off;
+    std::vector<uint64_t> per_block;
+    std::vector<uint64_t> chunk_bytes;
+    std::vector<void**> dev_tables;
+    std::vector<void**> mapped_tables;
+    std::vector<std::vector<void*>> host_tables;
+    int64_t n_blocks = 0;
+    int64_t page_size = 0;
+    int32_t block_shift = 0;
+    int32_t block_mask = 0;
+    int64_t max_chunks = 0;
+    int64_t mapped_chunks = 0;
+    uint64_t bytes_per_chunk_total = 0;
+
+    void release() {
+        if (reserve_base != nullptr) {
+            for (int64_t c = 0; c < mapped_chunks; ++c) {
+                for (size_t a = 0; a < arr_off.size(); ++a)
+                    host_chunk_decommit(reserve_base + arr_off[a] + (uint64_t) c * chunk_bytes[a], chunk_bytes[a]);
+                g_kv_host_bytes = g_kv_host_bytes >= bytes_per_chunk_total ? g_kv_host_bytes - bytes_per_chunk_total : 0;
+            }
+            mapped_chunks = 0;
+#if defined(_WIN32)
+            (void) VirtualFree(reserve_base, 0, MEM_RELEASE);
+#elif !defined(STRATA_GPU_METAL)
+            (void) munmap(reserve_base, (size_t) reserve_bytes);
+#endif
+            reserve_base = nullptr;
+            reserve_bytes = 0;
+        }
+        if (table_host != nullptr) {
+            (void) cudaFreeHost(table_host);
+            (void) cudaGetLastError();
+            table_host = nullptr;
+        }
+    }
+    ~ElasticHostPool() { release(); }
+};
+std::vector<std::unique_ptr<ElasticHostPool>> g_host_pools;
+
+bool host_pool_reserve(ElasticHostPool& p) {
+    if (p.reserve_bytes == 0) return false;
+    const size_t tbl_bytes = p.host_tables.size() * (size_t) p.max_chunks * sizeof(void*) + 64;
+    void* tbl_dev = nullptr;
+    if (strata::core::host_alloc_guarded(&p.table_host, tbl_bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+        cudaHostGetDevicePointer(&tbl_dev, p.table_host, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (p.table_host != nullptr) { (void) cudaFreeHost(p.table_host); p.table_host = nullptr; }
+        return false;
+    }
+    std::memset(p.table_host, 0, tbl_bytes);
+    p.dev_tables.resize(p.host_tables.size());
+    p.mapped_tables.resize(p.host_tables.size());
+    for (size_t a = 0; a < p.host_tables.size(); ++a) {
+        p.mapped_tables[a] = (void**) p.table_host + a * (size_t) p.max_chunks;
+        p.dev_tables[a] = (void**) tbl_dev + a * (size_t) p.max_chunks;
+    }
+#if defined(_WIN32)
+    p.reserve_base = (uint8_t*) VirtualAlloc(nullptr, (size_t) p.reserve_bytes, MEM_RESERVE, PAGE_NOACCESS);
+    return p.reserve_base != nullptr;
+#elif !defined(STRATA_GPU_METAL)
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    void* m = mmap(nullptr, (size_t) p.reserve_bytes, PROT_NONE, flags, -1, 0);
+    if (m == MAP_FAILED) return false;
+    p.reserve_base = (uint8_t*) m;
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool host_pool_sync_tables(ElasticHostPool& p) {
+    for (size_t a = 0; a < p.mapped_tables.size(); ++a) {
+        std::memcpy(p.mapped_tables[a], p.host_tables[a].data(), (size_t) p.max_chunks * sizeof(void*));
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    return true;
+}
+
+int64_t host_pool_cells_mapped(const ElasticHostPool& p) {
+    return std::min<int64_t>(p.n_blocks, p.mapped_chunks << p.block_shift) * p.page_size;
+}
+
+uint64_t host_pool_need_bytes(const ElasticHostPool& p, int64_t cells) {
+    const int64_t want_blocks = std::min<int64_t>(p.n_blocks, std::max<int64_t>((cells + p.page_size - 1) / p.page_size, 1));
+    const int64_t want_chunks = std::min<int64_t>(p.max_chunks,
+        (want_blocks + ((int64_t(1) << p.block_shift) - 1)) >> p.block_shift);
+    if (want_chunks <= p.mapped_chunks) return 0;
+    return (uint64_t) (want_chunks - p.mapped_chunks) * p.bytes_per_chunk_total;
+}
+
+bool host_pool_grow(ElasticHostPool& p, int64_t cells) {
+    const int64_t want_blocks = std::min<int64_t>(p.n_blocks, std::max<int64_t>((cells + p.page_size - 1) / p.page_size, 1));
+    const int64_t want_chunks = std::min<int64_t>(p.max_chunks,
+        (want_blocks + ((int64_t(1) << p.block_shift) - 1)) >> p.block_shift);
+    if (want_chunks <= p.mapped_chunks) return true;
+    const int64_t old_chunks = p.mapped_chunks;
+    for (int64_t c = old_chunks; c < want_chunks; ++c) {
+        for (size_t a = 0; a < p.arr_off.size(); ++a) {
+            uint8_t* ptr = p.reserve_base + p.arr_off[a] + (uint64_t) c * p.chunk_bytes[a];
+            void* dev_p = nullptr;
+            if (!host_chunk_commit(ptr, p.chunk_bytes[a], dev_p)) {
+                for (size_t a2 = 0; a2 < a; ++a2) {
+                    p.host_tables[a2][(size_t) c] = nullptr;
+                    host_chunk_decommit(p.reserve_base + p.arr_off[a2] + (uint64_t) c * p.chunk_bytes[a2], p.chunk_bytes[a2]);
+                }
+                for (int64_t c2 = old_chunks; c2 < c; ++c2) {
+                    for (size_t a2 = 0; a2 < p.arr_off.size(); ++a2) {
+                        p.host_tables[a2][(size_t) c2] = nullptr;
+                        host_chunk_decommit(p.reserve_base + p.arr_off[a2] + (uint64_t) c2 * p.chunk_bytes[a2], p.chunk_bytes[a2]);
+                    }
+                    g_kv_host_bytes = g_kv_host_bytes >= p.bytes_per_chunk_total ? g_kv_host_bytes - p.bytes_per_chunk_total : 0;
+                }
+                (void) host_pool_sync_tables(p);
+                std::fprintf(stderr, "strata: the elastic host K/V could not commit or pin chunk %lld of %lld\n",
+                             (long long) c, (long long) p.max_chunks);
+                return false;
+            }
+            p.host_tables[a][(size_t) c] = dev_p;
+        }
+        g_kv_host_bytes += p.bytes_per_chunk_total;
+    }
+    if (!host_pool_sync_tables(p)) return false;
+    p.mapped_chunks = want_chunks;
+    return true;
+}
+
+int64_t host_pool_shrink(ElasticHostPool& p, int64_t cells) {
+    const int64_t floor_cells = std::max<int64_t>(cells, g_kv_host_elastic_init);
+    const int64_t want_blocks = std::min<int64_t>(p.n_blocks, std::max<int64_t>((floor_cells + p.page_size - 1) / p.page_size, 1));
+    const int64_t want_chunks = std::min<int64_t>(p.max_chunks,
+        (want_blocks + ((int64_t(1) << p.block_shift) - 1)) >> p.block_shift);
+    if (want_chunks >= p.mapped_chunks) return 0;
+    const int64_t freed = p.mapped_chunks - want_chunks;
+    for (int64_t c = want_chunks; c < p.mapped_chunks; ++c) {
+        for (size_t a = 0; a < p.arr_off.size(); ++a) {
+            p.host_tables[a][(size_t) c] = nullptr;
+            host_chunk_decommit(p.reserve_base + p.arr_off[a] + (uint64_t) c * p.chunk_bytes[a], p.chunk_bytes[a]);
+        }
+        g_kv_host_bytes = g_kv_host_bytes >= p.bytes_per_chunk_total ? g_kv_host_bytes - p.bytes_per_chunk_total : 0;
+    }
+    p.mapped_chunks = want_chunks;
+    (void) host_pool_sync_tables(p);
+    return freed;
+}
+}  // namespace
+
+void qsa_set_kv_host_elastic(bool enabled, int64_t init_cells, int64_t step_cells) {
+    g_kv_host_elastic = enabled;
+    if (init_cells > 0) g_kv_host_elastic_init = init_cells;
+    if (step_cells > 0) g_kv_host_elastic_step = step_cells;
+}
+bool qsa_kv_host_elastic() { return g_kv_host_elastic; }
+int64_t qsa_kv_host_elastic_cells() {
+    if (g_host_pools.empty()) return 0;
+    int64_t cells = std::numeric_limits<int64_t>::max();
+    for (const auto& p : g_host_pools) cells = std::min<int64_t>(cells, host_pool_cells_mapped(*p));
+    return cells;
+}
+int64_t qsa_kv_host_elastic_step_cells() {
+    if (!g_host_pools.empty()) {
+        const auto& p = *g_host_pools[0];
+        return (int64_t(1) << p.block_shift) * p.page_size;
+    }
+    return g_kv_host_elastic_step;
+}
+uint64_t qsa_kv_host_elastic_need_bytes(int64_t cells) {
+    uint64_t n = 0;
+    for (const auto& p : g_host_pools) n += host_pool_need_bytes(*p, cells);
+    return n;
+}
+bool qsa_kv_host_elastic_grow(int64_t cells) {
+    std::vector<int64_t> prev;
+    prev.reserve(g_host_pools.size());
+    for (const auto& p : g_host_pools) prev.push_back(host_pool_cells_mapped(*p));
+    for (size_t i = 0; i < g_host_pools.size(); ++i) {
+        if (!host_pool_grow(*g_host_pools[i], cells)) {
+            for (size_t j = 0; j < i; ++j) (void) host_pool_shrink(*g_host_pools[j], prev[j]);
+            return false;
+        }
+    }
+    return true;
+}
+bool qsa_kv_host_elastic_grow_state(const QsaState& st, int64_t cells) {
+    if (st.host.elastic_id < 0 || (size_t) st.host.elastic_id >= g_host_pools.size()) return true;
+    return host_pool_grow(*g_host_pools[(size_t) st.host.elastic_id], cells);
+}
+int64_t qsa_kv_host_elastic_shrink(int64_t cells) {
+    int64_t n = 0;
+    for (auto& p : g_host_pools) n += host_pool_shrink(*p, cells);
+    return n;
+}
+uint64_t qsa_kv_host_elastic_mapped_bytes() {
+    uint64_t n = 0;
+    for (const auto& p : g_host_pools) n += (uint64_t) p->mapped_chunks * p->bytes_per_chunk_total;
+    return n;
+}
+uint64_t qsa_kv_host_elastic_full_bytes() {
+    uint64_t n = 0;
+    for (const auto& p : g_host_pools)
+        for (const uint64_t b : p->per_block) n += (uint64_t) p->n_blocks * b;
+    return n;
+}
+void qsa_kv_host_elastic_release_all() {
+    g_host_pools.clear();
+}
 namespace {
 
 /// How one state holds its K/V: `mode` as in QsaState::kv_mode, `slots` VRAM pages of `pages` logical ones.
@@ -923,7 +1229,66 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.host_step[strata::kernels::kStepCount] = 0;
     // KV streaming: the authoritative K/V of every cell, pinned and device-mapped, in the identity layout
     st.host = strata::kernels::KvHostPools{};
-    if (p.mode != 0) {
+    if (p.mode != 0 && g_kv_host_elastic) {
+        const uint64_t slot_rows = (uint64_t) s.n_head_kv * s.page_size;
+        const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
+        std::vector<uint64_t> per;   // bytes per KV block of each array
+        if (st.kv_hybrid) per = {slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * q4_row};
+        else if (st.kv_q4) per = {slot_rows * q4_row, slot_rows * q4_row};
+        else if (st.kv_int8) per = {slot_rows * s.head_dim, slot_rows * s.head_dim, slot_rows * scale_row, slot_rows * scale_row};
+        else per = {slot_rows * s.head_dim * 2, slot_rows * s.head_dim * 2};
+
+        auto pool = std::make_unique<ElasticHostPool>();
+        pool->n_blocks = pages;
+        pool->page_size = s.page_size;
+        pool->block_shift = host_elastic_block_shift(s);
+        pool->block_mask = (1 << pool->block_shift) - 1;
+        const int64_t bpc = int64_t(1) << pool->block_shift;
+        pool->max_chunks = std::max<int64_t>((pages + bpc - 1) >> pool->block_shift, 1);
+        pool->per_block = per;
+        const uint64_t align_gran = std::max<uint64_t>(65536ULL, os_page_bytes());
+        uint64_t at = 0;
+        for (const uint64_t b : per) {
+            const uint64_t cb = (uint64_t) bpc * b;
+            pool->chunk_bytes.push_back(cb);
+            pool->bytes_per_chunk_total += cb;
+            pool->arr_off.push_back(at);
+            const uint64_t arr_total = (uint64_t) pool->max_chunks * cb;
+            at += (arr_total + align_gran - 1) / align_gran * align_gran;
+        }
+        pool->reserve_bytes = at;
+        pool->host_tables.resize(per.size(), std::vector<void*>((size_t) pool->max_chunks, nullptr));
+        if (!host_pool_reserve(*pool) || !host_pool_grow(*pool, g_kv_host_elastic_init)) {
+            if (p.mode == 1)
+                std::fprintf(stderr, "strata: KV streaming: cannot reserve %.2f GiB or pin initial chunk of RAM for a "
+                                     "layer's elastic KV copy (%.2f GiB pinned so far)\n",
+                             (double) pool->reserve_bytes / 1073741824.0, (double) g_kv_host_bytes / 1073741824.0);
+            return 0;
+        }
+        uint8_t* hb = pool->reserve_base;
+        const uint64_t* o = pool->arr_off.data();
+        void*** dt = pool->dev_tables.data();
+        st.host.block_shift = pool->block_shift;
+        st.host.block_mask = pool->block_mask;
+        st.host.elastic_id = (int32_t) g_host_pools.size();
+        if (st.kv_hybrid) {
+            st.host.k_q = (int8_t*) (hb + o[0]);         st.host.k_q_chunks = (int8_t* const*) dt[0];
+            st.host.k_scale = (uint16_t*) (hb + o[1]);   st.host.k_scale_chunks = (uint16_t* const*) dt[1];
+            st.host.v_q4 = hb + o[2];                    st.host.v_q4_chunks = (uint8_t* const*) dt[2];
+        } else if (st.kv_q4) {
+            st.host.k_q4 = hb + o[0];                    st.host.k_q4_chunks = (uint8_t* const*) dt[0];
+            st.host.v_q4 = hb + o[1];                    st.host.v_q4_chunks = (uint8_t* const*) dt[1];
+        } else if (st.kv_int8) {
+            st.host.k_q = (int8_t*) (hb + o[0]);         st.host.k_q_chunks = (int8_t* const*) dt[0];
+            st.host.v_q = (int8_t*) (hb + o[1]);         st.host.v_q_chunks = (int8_t* const*) dt[1];
+            st.host.k_scale = (uint16_t*) (hb + o[2]);   st.host.k_scale_chunks = (uint16_t* const*) dt[2];
+            st.host.v_scale = (uint16_t*) (hb + o[3]);   st.host.v_scale_chunks = (uint16_t* const*) dt[3];
+        } else {
+            st.host.k_pool = (uint16_t*) (hb + o[0]);    st.host.k_pool_chunks = (uint16_t* const*) dt[0];
+            st.host.v_pool = (uint16_t*) (hb + o[1]);    st.host.v_pool_chunks = (uint16_t* const*) dt[1];
+        }
+        g_host_pools.push_back(std::move(pool));
+    } else if (p.mode != 0) {
         const uint64_t hrows = (uint64_t) pages * s.n_head_kv * s.page_size;
         const uint64_t bytes = (uint64_t) pages * strata::kernels::kv_block_bytes(s, qsa_kv_format(st)) + 4 * 256;
         uint8_t* h = nullptr;
