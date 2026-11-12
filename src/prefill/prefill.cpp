@@ -1507,7 +1507,7 @@ struct MmqPlan {
 // q8_1, so the answers differ from the default).  Only when EVERY visible CUDA card is compute capability 7.0 or
 // newer: the tiles need tensor cores, and a Volta + Pascal rig (one process, one decision) keeps MMQ.
 bool pf_wmma() {
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)
     return false;
 #else
     static const bool on = [] {
@@ -1516,8 +1516,15 @@ bool pf_wmma() {
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) return false;
         for (int d = 0; d < n; ++d) {
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, d) != cudaSuccess) return false;
+            if (std::strncmp(prop.gcnArchName, "gfx11", 5) != 0 && std::strncmp(prop.gcnArchName, "gfx12", 5) != 0)
+                return false;
+#else
             int major = 0;
             if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess || major < 7) return false;
+#endif
         }
         return true;
     }();
