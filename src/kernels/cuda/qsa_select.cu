@@ -2837,16 +2837,15 @@ bool qsa_block_topk_split(const float* scores, const int32_t* steps, int64_t nq,
 }
 #endif
 
-#if !defined(__HIPCC__)
-// ---- the prompt path's top-k with one full read of the scores (Turing).  block_topk_wide_kernel reads a query's scores
-// six times (four radix passes, a count, the emit); past ~90K cells that is DRAM traffic (256 queries at 400K: 0.6 GB a
-// layer, ~1.5 ms on an RTX 2080 Ti).  Here a CTA first reads every 32nd block and takes the KS-th largest of those keys
-// as a bound LB, then reads all blocks once and keeps the ones with key >= LB in shared memory.  When those hold at
-// least `width` cells, the width-th largest cell key (block_topk_kernel's threshold) is >= LB, so every block at or
-// above the threshold is a candidate: the threshold, `above` and the tie budget computed over the candidates with
-// block_topk_kernel's rule are the reference's, and the candidates sorted by block emit the reference's cells in its
-// order.  Otherwise (too few cells above LB, or more than SM_CAP candidates) the query is flagged and
-// block_topk_wide_kernel<true> runs it.  STRATA_TOPK_SAMPLE=0 keeps the wide kernel alone.
+// ---- the prompt path's top-k with one full read of the scores (Turing, or opt-in HIP STRATA_TOPK_SAMPLE=1).
+// block_topk_wide_kernel reads a query's scores six times (four radix passes, a count, the emit); past ~90K cells that
+// is DRAM traffic (256 queries at 400K: 0.6 GB a layer, ~1.5 ms on an RTX 2080 Ti).  Here a CTA first reads every 32nd
+// block and takes the KS-th largest of those keys as a bound LB, then reads all blocks once and keeps the ones with key
+// >= LB in shared memory.  When those hold at least `width` cells, the width-th largest cell key (block_topk_kernel's
+// threshold) is >= LB, so every block at or above the threshold is a candidate: the threshold, `above` and the tie budget
+// computed over the candidates with block_topk_kernel's rule are the reference's, and the candidates sorted by block emit
+// the reference's cells in its order.  Otherwise (too few cells above LB, or more than SM_CAP candidates) the query is
+// flagged and block_topk_wide_kernel<true> runs it.  STRATA_TOPK_SAMPLE=0 keeps the wide kernel alone.
 constexpr int TS_STRIDE = 32, TS_CAP = 4096;
 
 __device__ __forceinline__ int ts_block_scan(int v, int* s_w) {   // exclusive scan over the CTA's TK_T threads
@@ -3034,6 +3033,9 @@ __global__ void __launch_bounds__(TK_T) block_topk_sample_kernel(const float* __
 bool topk_sample_on() {
     static const int env = [] { const char* v = std::getenv("STRATA_TOPK_SAMPLE"); return v ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     if (env >= 0) return env != 0;
+#if defined(__HIPCC__)
+    return false;
+#else
     static int ok[64] = {};   // 0 unknown, 1 yes, 2 no
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return false; }
@@ -3044,8 +3046,8 @@ bool topk_sample_on() {
         ok[dev] = strata::sm75_default(major, minor) ? 1 : 2;
     }
     return ok[dev] == 1;
-}
 #endif
+}
 
 void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64_t max_blocks, int64_t cap,
                     const QsaShapes& s, int32_t* ids, void* stream, int64_t active_blocks) {
@@ -3121,12 +3123,10 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         return v == nullptr || v[0] != '0';
     }();
     if (reach > fit || (turing_wide && counted && reach > 22528)) {   // past the register kernel's reach, or Turing's band
-#if !defined(__HIPCC__)
         if (counted && nq <= TS_MAXQ && reach > 28672 && topk_sample_on()) {   // one read of the scores (below ~115K cells the wide kernel is as fast)
             block_topk_sample_kernel<<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
             block_topk_wide_kernel<true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
         } else
-#endif
         block_topk_wide_kernel<false><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
     } else if (reach <= (int64_t) TK_T * 2)
         block_topk_reg_kernel<2><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
