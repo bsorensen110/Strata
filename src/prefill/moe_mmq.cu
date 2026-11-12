@@ -6,7 +6,7 @@
 #include "common.cuh"
 #include "mmq.cuh"
 #include "quantize.cuh"
-#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
+#if defined(STRATA_MMQ_TAB) && !defined(STRATA_HIP_GFX906)
 #include "moe_mmq_tab.hpp"   // declarations only: the tab kernels live in the per-type mmq-tab-*.cu TUs
 #endif
 #include "strata/prefill/moe_fused.hpp"   // kMoeEmbd, kMoeFF: the compiled geometry's widths
@@ -244,7 +244,7 @@ __global__ void set_bounds_kernel(int32_t* d, int32_t rows) {
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
-#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
+#if defined(STRATA_MMQ_TAB) && !defined(STRATA_HIP_GFX906)
 // STRATA_MMQ_DIRECT: a group's guards (y < g.n, byte stores) and its two zero tails (y == g.n: gate/up, y == g.n + 1:
 // down; uint4 stores when `tail16`, which the host checked: both pointers and the size 16-byte aligned).  Only in a
 // STRATA_MMQ_TAB build: the engine loads every kernel at start (EAGER), so a build without it keeps today's image.
@@ -501,7 +501,7 @@ void Context::run(const Product& p, void* stream) {
             std::fprintf(stderr, "prefill mmq: a pointer table holds at most %d experts (got %d)\n", kGatherGroupMax, p.n);
             std::exit(1);
         }
-#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
+#if defined(STRATA_MMQ_TAB) && !defined(STRATA_HIP_GFX906)
         mmq_x_tab tab{};
         for (int z = 0; z < p.n; ++z) tab.p[z] = (const char*) p.tab->p[z];
         if (!run_tab(&ctx, &a, &tab, s)) {
@@ -568,7 +568,7 @@ void Context::run(const Product& p, void* stream) {
 
 // ---- STRATA_MMQ_DIRECT ----
 bool tab_built() {
-#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
+#if defined(STRATA_MMQ_TAB) && !defined(STRATA_HIP_GFX906)
     return true;
 #else
     return false;
@@ -681,7 +681,7 @@ int direct_mode() {
 size_t direct_slot_guard() { return direct_mode() != 0 ? kSlotGuard : 0; }
 
 void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail_d, size_t tail_bytes, void* stream) {
-#if !defined(STRATA_MMQ_TAB) || defined(__HIPCC__)
+#if !defined(STRATA_MMQ_TAB) || defined(STRATA_HIP_GFX906)
     // never reached: only a direct group calls it, and direct_mode() is 0 without the pointer-table MMQ
     (void) g; (void) guard_bytes; (void) tail_gu; (void) tail_d; (void) tail_bytes; (void) stream;
     std::fprintf(stderr, "prefill mmq: this build has no pointer-table MMQ (STRATA_MMQ_TAB)\n");
