@@ -106,6 +106,17 @@ need a KL / greedy check alongside tok/s.
 - **Multi-slot GDN conv batching (`gdn_conv_l2_groups`)** (`8cd4f9779`, enabled under default
   `STRATA_BATCH_GDN_GROUPS`). Benchmark parallel-slot decode (`c >= 2`) for bit-identical parity
   and launch-overhead savings.
+- **Recent default-on decode launch reductions (benchmark vs pre-patch baseline on R9700):**
+  - `gdn_step_norm_multi` / `gdn_step_norm_groups` `q8_il` fusion (`76d3e8319`): activates when
+    `STRATA_QFUSE=1` and `2 <= n <= 8` (`native_mmvq_il_supported` on wout).
+  - Shared-expert `native_mmvq_il` & `native_swiglu_quantize_q8_1_il` (`0dd018de2`): eliminates
+    separate `q8_1` interleave launches in `shared_expert_multi` (`2 <= n <= 8`).
+  - Paired K/V FWHT (`fwht256_pair_inplace_cuda`) & multi-slot KV append (`kv_append*_groups`)
+    (`0b8b0d91f`): halving FWHT + multi-slot KV append launches for Q4/Q8/FP16/K8V4 (`c >= 2`,
+    gated by `STRATA_BATCH_ATTN_ROWS` and `STRATA_NO_BATCH_KV_STEP`).
+- **Long-context single-read top-k (`STRATA_TOPK_SAMPLE=1`)** (`src/kernels/cuda/qsa_select.cu:3034`,
+  `90926ab93`). Opt-in on HIP (`block_topk_sample_kernel` + `block_topk_wide_kernel<true>` past
+  28,672 blocks, `nq <= 4096`); verify `qsa_select` parity tests and long-context prompt/decode A/B.
 
 ### Existing opt-ins not enabled in `gfx12` defaults (worth A/B testing on R9700)
 
