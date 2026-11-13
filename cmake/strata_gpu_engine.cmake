@@ -491,6 +491,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(dflash2_attn_bench EXCLUDE_FROM_ALL src/core/dflash2_attn_bench.cpp)
   target_include_directories(dflash2_attn_bench PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(dflash2_attn_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_executable(dflash2_round_bench EXCLUDE_FROM_ALL src/core/dflash2_round_bench.cu)   # a solo round on the real pack: time per n_new and a digest of the drafts
+  target_include_directories(dflash2_round_bench PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(dflash2_round_bench PRIVATE strata_engine strata_kernels ${_strata_gpu_runtime_target})
 
   add_executable(strata src/program/generate.cpp)
   strata_utf8_manifest(strata)
