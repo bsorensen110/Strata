@@ -1947,12 +1947,13 @@ static int df2_q8_auto(int rows) {
     return rows <= 1024 ? 20 : rows <= 3072 ? 13 : rows >= 15000 ? 10 : (rows % 32 == 0 ? 1 : 2);
 }
 
-static int df2_q4_auto(int rows) {
+// CUDA: one row a warp for the small matrices (the selector's 256 rows, the 640 of akp/mkp) at up to 8 columns, measured 3 to 6 us a round faster on an RTX 5080.
+static int df2_q4_auto(int rows, int ncols) {
     if (df2_hip_wave32_u1()) return rows <= 640 ? 31 : 26;
-    return 17;
+    return rows <= 640 && ncols <= 8 ? 31 : 17;
 }
 #ifndef DF2_Q4_AUTO
-#define DF2_Q4_AUTO(rows) df2_q4_auto(rows)
+#define DF2_Q4_AUTO(rows, ncols) df2_q4_auto(rows, ncols)
 #endif
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream) {
     if (n < 1 || n > kDf2MaxSegs || n_in % 512 != 0 || ncols < 1 || ncols > 64) throw std::invalid_argument("df2_gemm: unsupported shape");
@@ -2000,7 +2001,7 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
         return;
     }
     if (mats[0].q4) {   // the Q4_0 pack: 4 warps a block when the rows allow, else 2; the rows-a-warp variants (bitwise the same results) by matrix size
-        int v4 = g_gemm_variant != 0 ? g_gemm_variant : tune4 >= 10 ? tune4 : tune4 != 0 ? 1 : DF2_Q4_AUTO(rows);
+        int v4 = g_gemm_variant != 0 ? g_gemm_variant : tune4 >= 10 ? tune4 : tune4 != 0 ? 1 : DF2_Q4_AUTO(rows, ncols);
 #define DF2_ROWS4_CASE(V, W, R, U) case V: if (ncols <= 8) gemm4_rows_kernel<W, R, U, 8><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); else gemm4_rows_kernel<W, R, U, 16><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         switch (v4) {
             DF2_ROWS4_CASE(10, 4, 4, 2)
