@@ -637,6 +637,20 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         stamp("embed_");
         df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, B, N_, eps_, xqp_, xdp_, cs);
         stamp("df2_rms_quant");
+        static const int head_il = [] {
+            const char* e = std::getenv("STRATA_DF2_HEAD_IL");
+            if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
+            if (e && e[0]) return e[0] != '0' ? 1 : 0;
+#if defined(STRATA_USE_HIP)
+            return 1;
+#else
+            return -1;
+#endif
+        }();
+        const bool use_il = !skip_part("head") && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)));
+        const bool want_final_q8 = !skip_part("head") && ndraft_ >= 1 && ndraft_ <= 8;
+        const bool want_final_il = want_final_q8 && use_il && ndraft_ >= 2;
+        bool did_fuse_q8 = false;
         for (int l = 0; l < L_; ++l) {
             const std::string p = "layers." + std::to_string(l) + ".";
             const float* base_a = f32(p + "attention_conv.base_kernel");
@@ -677,26 +691,24 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
             stamp("gemm:mlp.down_proj");
             // the next layer's input norm, or after the last layer the final norm (-> fn_, the rows the head and the selector read)
             const std::string next_gamma = l + 1 < L_ ? "layers." + std::to_string(l + 1) + ".input_layernorm.weight" : std::string("norm.weight");
-            if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_, group_, eps_, xqp_, xdp_, cs);
+            if (!skip_part("small")) {
+                const bool last = l + 1 == L_;
+                df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), last ? fn_ : xn_,
+                                   B, N_, group_, eps_, xqp_, xdp_, cs,
+                                   (last && want_final_q8) ? xq_ : nullptr,
+                                   (last && want_final_il) ? xil_ : nullptr, 1, ndraft_);
+                if (last && want_final_q8) did_fuse_q8 = true;
+            }
             stamp("df2_conv_rms_quant");
         }
-        static const int head_il = [] {
-            const char* e = std::getenv("STRATA_DF2_HEAD_IL");
-            if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
-            if (e && e[0]) return e[0] != '0' ? 1 : 0;
-#if defined(STRATA_USE_HIP)
-            return 1;
-#else
-            return -1;
-#endif
-        }();
-        const bool use_il = !skip_part("head") && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)));
-        if (use_il && ndraft_ >= 2 && ndraft_ <= 8)
-            native_quantize_q8_1_il(fn_ + N_, xq_, xil_, N_, ndraft_, cs);
-        else {
-            native_quantize_q8_1(fn_ + N_, xq_, N_, ndraft_, cs);   // rows 1..7, the head's format
-            if (use_il && ndraft_ > 8)
-                native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
+        if (!did_fuse_q8) {
+            if (use_il && ndraft_ >= 2 && ndraft_ <= 8)
+                native_quantize_q8_1_il(fn_ + N_, xq_, xil_, N_, ndraft_, cs);
+            else {
+                native_quantize_q8_1(fn_ + N_, xq_, N_, ndraft_, cs);   // rows 1..7, the head's format
+                if (use_il && ndraft_ > 8)
+                    native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
+            }
         }
         // df2_conv_rms_quant on the final layer has already quantized fn_ rows 1..7 into xqp_ + N_ and xdp_ + N_ / 32
         if (skip_part("small")) df2_quant_rows(fn_ + N_, N_, ndraft_, xqp_ + N_, xdp_ + N_ / 32, cs);

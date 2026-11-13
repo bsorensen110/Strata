@@ -4,6 +4,8 @@
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#define STRATA_Q81_FASTMATH_DIV 1
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -785,13 +787,24 @@ __global__ void conv_quant_kernel(const float* __restrict__ x, const float* __re
     quant_block(acc, blk, b, H, xq, xd);
 }
 
+struct Df2Q81Block {
+    half2 ds;
+    int8_t qs[32];
+};
+
 // h += conv(x) (the finish convolution with its residual), then RMS norm of the new h with `gamma` -> xn (optional) and the planar quantization.
+// Optionally also emits Q8_1 (xq_q81) and interleaved Q8_1 (bm/pm/dl) for rows [row0_q81, row0_q81 + nrows_q81).
 // One block of 1024 threads per row: a warp owns whole 32-blocks (80 of them for 2560), so the quantization needs no exchange.
 __global__ void __launch_bounds__(1024) conv_rms_quant_kernel(const float* __restrict__ x, const float* __restrict__ dyn, int dyn_stride, const float* __restrict__ base,
                                                               float* __restrict__ h, const float* __restrict__ gamma, float* __restrict__ xn, int H, int group,
-                                                              float eps, int8_t* __restrict__ xq, float* __restrict__ xd) {
+                                                              float eps, int8_t* __restrict__ xq, float* __restrict__ xd,
+                                                              Df2Q81Block* __restrict__ xq_q81, int* __restrict__ bm, int* __restrict__ pm,
+                                                              float* __restrict__ dl, int cp, int row0_q81, int nrows_q81) {
+#pragma clang fp contract(off)
     const int b = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int groups = H / group, nb = H / 32;
+    const bool emit_q81 = xq_q81 != nullptr && b >= row0_q81 && b < row0_q81 + nrows_q81;
+    const int col_q81 = b - row0_q81;
     __shared__ float red[32];
     float v[3];
     float ss = 0.0f;
@@ -827,6 +840,30 @@ __global__ void __launch_bounds__(1024) conv_rms_quant_kernel(const float* __res
             const float y = v[j] * scale * gamma[c];
             if (xn) xn[(size_t) b * H + c] = y;
             quant_block(y, blk, b, H, xq, xd);
+            if (emit_q81) {
+                float amax = fabsf(y), sum = y;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                const float d = q8_1_finite(q81_div(amax, 127.0f));
+                const int8_t q = q8_1_quant(y, d, amax);
+                const size_t q8_idx = (size_t) col_q81 * nb + blk;
+                xq_q81[q8_idx].qs[lane] = q;
+                const auto ds = q8_1_ds(d, sum);
+                if (lane == 0) xq_q81[q8_idx].ds = ds;
+                if (bm != nullptr) {
+                    unsigned vq = unsigned(uint8_t(q)) << (8 * (lane & 3));
+                    vq |= __shfl_xor_sync(0xffffffffu, vq, 1);
+                    vq |= __shfl_xor_sync(0xffffffffu, vq, 2);
+                    const int pp = lane >> 2;
+                    if ((lane & 3) == 0) {
+                        bm[(std::size_t(blk) * 8 + pp) * cp + col_q81] = int(vq);
+                        pm[(std::size_t(pp) * nb + blk) * cp + col_q81] = int(vq);
+                    }
+                    if (lane == 0) dl[std::size_t(blk) * cp + col_q81] = __low2float(ds);
+                }
+            }
         }
     }
 }
@@ -1377,9 +1414,22 @@ void df2_attention_f16(const float* q, const void* kring, const void* vring, con
 }
 
 void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h, const float* gamma, float* xn, int rows, int H, int group,
-                        float eps, void* xq, float* xd, void* stream) {
+                        float eps, void* xq, float* xd, void* stream,
+                        void* xq_q81, void* x_il, int row0_q81, int nrows_q81) {
     if (H > 3 * 1024) throw std::invalid_argument("df2_conv_rms_quant: H too large");
-    conv_rms_quant_kernel<<<rows, 1024, 0, (cudaStream_t) stream>>>(x, dyn, dyn_stride, base, h, gamma, xn, H, group, eps, static_cast<int8_t*>(xq), xd);
+    int *bm = nullptr, *pm = nullptr;
+    float* dl = nullptr;
+    int cp = 0;
+    if (xq_q81 != nullptr && x_il != nullptr && nrows_q81 >= 2 && nrows_q81 <= 8) {
+        cp = nrows_q81 <= 2 ? 2 : (nrows_q81 <= 4 ? 4 : 8);
+        const std::size_t words = std::size_t(H / 32) * 8 * std::size_t(cp);
+        bm = static_cast<int*>(x_il);
+        pm = bm + words;
+        dl = reinterpret_cast<float*>(bm + 2 * words);
+    }
+    conv_rms_quant_kernel<<<rows, 1024, 0, (cudaStream_t) stream>>>(
+        x, dyn, dyn_stride, base, h, gamma, xn, H, group, eps, static_cast<int8_t*>(xq), xd,
+        static_cast<Df2Q81Block*>(xq_q81), bm, pm, dl, cp, row0_q81, nrows_q81);
     check("conv_rms_quant");
 }
 
@@ -1419,6 +1469,19 @@ void df2_attention_variant(int v) { g_attn_variant = v; }
 // 110 SMs) for every matrix, within 0-2 us of the best on a 188-SM RTX PRO 6000.  gfx12 (R9700, gfx1201, p620, 8 columns, cold weights, two bench runs): the same shape with unroll 1
 // (26) is 25-45% faster on every matrix of 1000 rows and more (gate+up 56 -> 44.5 us, down 39 -> 23.4, qkv 26.8 -> 21.4, o 23.6 -> 14.9, fc 61.5 -> 35.2, kv 15.2 -> 10.0), and one
 // warp a row with unroll 1 (31) is 2x faster on the 256 and 640 row matrices (akp / mkp 12.1 -> 6.3 us, selector 11.1 -> 5.2); all bitwise the same results.
+static int df2_q8_auto(int rows) {
+#if defined(STRATA_USE_HIP)
+    static const bool gfx12 = [] {
+        int dev = 0;
+        cudaDeviceProp p;
+        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+               strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+    }();
+    if (gfx12) return rows <= 640 ? 31 : 26;
+#endif
+    return rows <= 1024 ? 20 : rows <= 3072 ? 13 : rows >= 15000 ? 10 : (rows % 32 == 0 ? 1 : 2);
+}
+
 static int df2_q4_auto(int rows) {
 #if defined(STRATA_USE_HIP)
     static const bool gfx12 = [] {
@@ -1509,13 +1572,11 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
         check("gemm4");
         return;
     }
-    static const int tune = [] { const char* e = std::getenv("STRATA_DF2_GEMM"); return e ? std::atoi(e) : 1; }();   // 1 (default): rows a warp by matrix size, bitwise the same results; 0: 8 rows a warp as before
+    static const int tune = [] { const char* e = std::getenv("STRATA_DF2_GEMM"); return e ? std::atoi(e) : 1; }();   // 1 (default): rows a warp by matrix size, bitwise the same results; 0: 8 rows a warp as before; 10+: variant override
     const int variant = g_gemm_variant != 0 ? g_gemm_variant
+                        : tune >= 10        ? tune
                         : tune == 0         ? (rows % 32 == 0 ? 1 : 2)
-                        : rows <= 1024      ? 20
-                        : rows <= 3072      ? 13
-                        : rows >= 15000     ? 10
-                                            : (rows % 32 == 0 ? 1 : 2);
+                                            : df2_q8_auto(rows);
 #define DF2_ROWS_CASE(V, W, R, U) case V: if (ncols <= 8) gemm_rows_kernel<W, R, U, 8><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); else gemm_rows_kernel<W, R, U, 16><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
     switch (variant) {
         case 10: launch_gemm_rows_ncols<4, 4, 2>(rows, st, segs, xqp, xd, n_in, ncols); break;
@@ -1532,6 +1593,28 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
         DF2_ROWS_CASE(21, 8, 1, 8)
         DF2_ROWS_CASE(22, 8, 2, 4)
         DF2_ROWS_CASE(23, 2, 1, 4)
+        DF2_ROWS_CASE(24, 1, 2, 2)
+        DF2_ROWS_CASE(25, 1, 4, 2)
+        case 26: launch_gemm_rows_ncols<2, 2, 1>(rows, st, segs, xqp, xd, n_in, ncols); break;
+        DF2_ROWS_CASE(27, 2, 4, 2)
+        DF2_ROWS_CASE(28, 1, 1, 2)
+        DF2_ROWS_CASE(29, 1, 2, 4)
+        DF2_ROWS_CASE(30, 2, 2, 4)
+        case 31: launch_gemm_rows_ncols<1, 1, 1>(rows, st, segs, xqp, xd, n_in, ncols); break;
+        DF2_ROWS_CASE(32, 1, 1, 4)
+        DF2_ROWS_CASE(33, 1, 1, 8)
+        DF2_ROWS_CASE(34, 2, 1, 2)
+        DF2_ROWS_CASE(35, 4, 1, 2)
+        DF2_ROWS_CASE(36, 4, 2, 1)
+        DF2_ROWS_CASE(37, 8, 2, 1)
+        DF2_ROWS_CASE(38, 2, 1, 1)
+        DF2_ROWS_CASE(39, 4, 1, 1)
+        DF2_ROWS_CASE(40, 1, 2, 1)
+        DF2_ROWS_CASE(41, 1, 4, 1)
+        DF2_ROWS_CASE(42, 2, 4, 1)
+        DF2_ROWS_CASE(43, 4, 4, 1)
+        DF2_ROWS_CASE(44, 8, 1, 1)
+        DF2_ROWS_CASE(45, 1, 8, 1)
         case 3: gemm8_kernel<2, false><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         case 4: gemm8_kernel<1, true, 2><<<rows / 8, 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         case 5: gemm8_kernel<2, true, 1><<<rows / 16, 64, 0, st>>>(segs, xqp, xd, n_in, ncols); break;

@@ -84,9 +84,11 @@ void df2_q8_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t coun
 void df2_q4_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t count, void* stream);
 
 /// h += conv(x) (the finish convolution with the residual), then the RMS norm of the new h (weights gamma) -> xn (optional) and the planar quantization.
+/// Optionally also writes Q8_1 (xq_q81) and interleaved Q8_1 (x_il) for rows [row0_q81, row0_q81 + nrows_q81).
 /// rows <= 8, H <= 3072 (H a multiple of 32).
 void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h, const float* gamma, float* xn, int rows, int H, int group,
-                        float eps, void* xq, float* xd, void* stream);
+                        float eps, void* xq, float* xd, void* stream,
+                        void* xq_q81 = nullptr, void* x_il = nullptr, int row0_q81 = 0, int nrows_q81 = 0);
 /// The block's q (q_heads x 128) and k (k_heads x 128) per row: RMS norm and rope with the table of the block's positions -> qo, ko (row-major).
 void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const float* gk, const float* table, float* qo, float* ko, int rows, int q_heads, int k_heads,
                       float eps, void* stream);
