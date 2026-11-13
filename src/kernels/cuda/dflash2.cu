@@ -146,18 +146,57 @@ template <> struct RegTraits<uint16_t> {
 };
 
 // ---- attention.  grid (8 K/V heads, kDf2MaxChunks), 128 threads.  The 32 queries (4 heads x 8 rows) of a K/V head share each key tile;
-// S = Q K^T in 4 x 4 register tiles (64 threads), the online softmax per query, O += P V in 4 x 8 register tiles (128 threads).
-constexpr int AS = 132;   // smem row stride of the Q / K / V tiles (float4 aligned, conflict-free for the 4 x 4 tiles)
+// S = Q K^T in 4 x 2 register tiles across all 128 threads, online softmax per query, O += P V in 4 x 8 register tiles (128 threads).
 constexpr int PS = 36;    // stride of the transposed probabilities P[key][query]
-template <typename RingT>
+
+static bool df2_attn_f16_smem() {
+#if defined(STRATA_USE_HIP)
+    static const bool on = [] { const char* e = std::getenv("STRATA_DF2_ATTN_F16_SMEM"); return !(e && e[0] == '0'); }();
+#else
+    static const bool on = [] { const char* e = std::getenv("STRATA_DF2_ATTN_F16_SMEM"); return e && e[0] == '1'; }();
+#endif
+    return on;
+}
+
+template <bool F16Smem> struct AttnSmem;
+template <> struct AttnSmem<false> {
+    using Elem = float;
+    static constexpr int kStride = 132;   // float4 aligned, conflict-free
+    static __device__ __forceinline__ void store_f4(Elem* dst, float4 v) { *reinterpret_cast<float4*>(dst) = v; }
+    static __device__ __forceinline__ float4 load_f4(const Elem* src) { return *reinterpret_cast<const float4*>(src); }
+    static __device__ __forceinline__ void load_f8(const Elem* src, float4& a, float4& b) {
+        a = *reinterpret_cast<const float4*>(src);
+        b = *reinterpret_cast<const float4*>(src + 4);
+    }
+    static __device__ __forceinline__ void store_ring_reg(Elem* dst, float4 r) { *reinterpret_cast<float4*>(dst) = r; }
+    static __device__ __forceinline__ void store_ring_reg(Elem* dst, uint2 r) { *reinterpret_cast<float4*>(dst) = unpack_f16x4(r); }
+};
+template <> struct AttnSmem<true> {
+    using Elem = __half;
+    static constexpr int kStride = 136;   // 8-half aligned (16B) -> < 28 KB total LDS (2x wave occupancy on 64 KB RDNA CUs)
+    static __device__ __forceinline__ void store_f4(Elem* dst, float4 v) { *reinterpret_cast<uint2*>(dst) = pack_f16x4(v); }
+    static __device__ __forceinline__ float4 load_f4(const Elem* src) { return unpack_f16x4(*reinterpret_cast<const uint2*>(src)); }
+    static __device__ __forceinline__ void load_f8(const Elem* src, float4& a, float4& b) {
+        const uint4 raw = *reinterpret_cast<const uint4*>(src);
+        a = unpack_f16x4(make_uint2(raw.x, raw.y));
+        b = unpack_f16x4(make_uint2(raw.z, raw.w));
+    }
+    static __device__ __forceinline__ void store_ring_reg(Elem* dst, float4 r) { *reinterpret_cast<uint2*>(dst) = pack_f16x4(r); }
+    static __device__ __forceinline__ void store_ring_reg(Elem* dst, uint2 r) { *reinterpret_cast<uint2*>(dst) = r; }
+};
+
+template <typename RingT, bool F16Smem>
 __device__ void attn_part_device(const float* __restrict__ q, const RingT* __restrict__ kring, const RingT* __restrict__ vring,
                                  const float* __restrict__ kblk, const float* __restrict__ vblk,
                                  const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
                                  const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
     using Traits = RegTraits<RingT>;
     using Reg = typename Traits::Reg;
-    __shared__ __align__(16) float Qs[32 * AS];
-    __shared__ __align__(16) float Ks[32 * AS];   // the K tile, then the V tile
+    using Smem = AttnSmem<F16Smem>;
+    using SmemElem = typename Smem::Elem;
+    constexpr int kSmemStride = Smem::kStride;
+    __shared__ __align__(16) SmemElem Qs[32 * kSmemStride];
+    __shared__ __align__(16) SmemElem Ks[32 * kSmemStride];   // the K tile, then the V tile
     __shared__ __align__(16) float Ps[32 * PS];
     __shared__ float Sc[32 * 33];
     __shared__ float m_s[32], l_s[32], corr_s[32];
@@ -180,7 +219,7 @@ __device__ void attn_part_device(const float* __restrict__ q, const RingT* __res
         const int row = a >> 2, g = a & 3;
         float4 v = *reinterpret_cast<const float4*>(q + ((size_t) row * 32 + kvh * kDf2Gqa + g) * HD + d4 * 4);
         v.x *= scale; v.y *= scale; v.z *= scale; v.w *= scale;
-        *reinterpret_cast<float4*>(&Qs[a * AS + d4 * 4]) = v;
+        Smem::store_f4(&Qs[a * kSmemStride + d4 * 4], v);
     }
     if (tid < 32) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; }
     float O[4][8];
@@ -213,7 +252,7 @@ __device__ void attn_part_device(const float* __restrict__ q, const RingT* __res
 #pragma unroll
         for (int u = 0; u < 8; ++u) {
             const int i = tid + u * 128, t = i / (HD / 4), d4 = i % (HD / 4);
-            *reinterpret_cast<float4*>(&Ks[t * AS + d4 * 4]) = Traits::unpack(reg[u]);
+            Smem::store_ring_reg(&Ks[t * kSmemStride + d4 * 4], reg[u]);
         }
     };
     Reg kreg[8], vreg[8];
@@ -227,31 +266,31 @@ __device__ void attn_part_device(const float* __restrict__ q, const RingT* __res
         }
         fetch(k0, vreg, vring, vblk);   // this tile's V, hidden behind the S stage and the softmax
         __syncthreads();
-        if (tid < 64) {   // S tile: 4 queries x 4 keys per thread
-            const int qg = tid >> 3, kg = tid & 7;
-            float acc[4][4];
+        {   // S tile: 4 queries x 2 keys per thread across all 128 threads
+            const int qg = tid >> 4, kg = tid & 15;
+            float acc[4][2];
 #pragma unroll
             for (int i = 0; i < 4; ++i)
 #pragma unroll
-                for (int j = 0; j < 4; ++j) acc[i][j] = 0.0f;
+                for (int j = 0; j < 2; ++j) acc[i][j] = 0.0f;
 #pragma unroll 4
             for (int d = 0; d < ((variant & 1) ? 0 : HD); d += 4) {
-                float4 qv[4], kv[4];
+                float4 qv[4], kv[2];
 #pragma unroll
-                for (int i = 0; i < 4; ++i) qv[i] = *reinterpret_cast<const float4*>(&Qs[(qg * 4 + i) * AS + d]);
+                for (int i = 0; i < 4; ++i) qv[i] = Smem::load_f4(&Qs[(qg * 4 + i) * kSmemStride + d]);
 #pragma unroll
-                for (int j = 0; j < 4; ++j) kv[j] = *reinterpret_cast<const float4*>(&Ks[(kg * 4 + j) * AS + d]);
+                for (int j = 0; j < 2; ++j) kv[j] = Smem::load_f4(&Ks[(kg * 2 + j) * kSmemStride + d]);
 #pragma unroll
                 for (int i = 0; i < 4; ++i)
 #pragma unroll
-                    for (int j = 0; j < 4; ++j)
+                    for (int j = 0; j < 2; ++j)
                         acc[i][j] += qv[i].x * kv[j].x + qv[i].y * kv[j].y + qv[i].z * kv[j].z + qv[i].w * kv[j].w;
             }
 #pragma unroll
             for (int i = 0; i < 4; ++i)
 #pragma unroll
-                for (int j = 0; j < 4; ++j) {
-                    const int qi = qg * 4 + i, t = kg * 4 + j, k = k0 + t, row = qi >> 2;
+                for (int j = 0; j < 2; ++j) {
+                    const int qi = qg * 4 + i, t = kg * 2 + j, k = k0 + t, row = qi >> 2;
                     bool ok = k < nkeys;
                     if (ok && k < nctx) ok = (lo + k) > (s + row - window) && kvalid[t];   // s + row - j < window, and the slot holds that row
                     Sc[qi * 33 + t] = ok ? acc[i][j] : -INFINITY;
@@ -293,8 +332,8 @@ __device__ void attn_part_device(const float* __restrict__ q, const RingT* __res
 #pragma unroll 4
             for (int t = 0; t < ((variant & 2) ? 0 : 32); ++t) {
                 const float4 p4 = *reinterpret_cast<const float4*>(&Ps[t * PS + qg_pv * 4]);
-                const float4 va = *reinterpret_cast<const float4*>(&Ks[t * AS + dg_pv * 8]);
-                const float4 vb = *reinterpret_cast<const float4*>(&Ks[t * AS + dg_pv * 8 + 4]);
+                float4 va, vb;
+                Smem::load_f8(&Ks[t * kSmemStride + dg_pv * 8], va, vb);
                 const float pv[4] = {p4.x, p4.y, p4.z, p4.w};
                 const float vv[8] = {va.x, va.y, va.z, va.w, vb.x, vb.y, vb.z, vb.w};
 #pragma unroll
@@ -318,46 +357,53 @@ __device__ void attn_part_device(const float* __restrict__ q, const RingT* __res
     }
 }
 
-template <typename RingT>
+template <typename RingT, bool F16Smem>
 __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict__ q, const RingT* __restrict__ kring, const RingT* __restrict__ vring,
                                                        const float* __restrict__ kblk, const float* __restrict__ vblk,
                                                        const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant,
                                                        const int64_t* __restrict__ tag, const int32_t* __restrict__ epoch_ptr) {
-    attn_part_device<RingT>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, variant, tag, epoch_ptr);
+    attn_part_device<RingT, F16Smem>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, variant, tag, epoch_ptr);
 }
 
-template <typename RingT>
+template <typename RingT, bool F16Smem>
 __global__ void __launch_bounds__(128) attn_part_batch_kernel(const float* __restrict__ q, Df2BatchAttn ba,
                                                              const float* __restrict__ kblk, const float* __restrict__ vblk,
                                                              const int32_t* __restrict__ anchor_pos_base, int ring_slots, int window,
                                                              float* __restrict__ part, int variant, const int32_t* __restrict__ epoch_base) {
     const int s_idx = blockIdx.z;
     const size_t part_stride = (size_t) kDf2MaxChunks * kDf2Kv * 32 * 130;
-    attn_part_device<RingT>(q + (size_t) s_idx * kDf2Rows * 32 * HD,
-                            static_cast<const RingT*>(ba.kring[s_idx]),
-                            static_cast<const RingT*>(ba.vring[s_idx]),
-                            kblk + (size_t) s_idx * kDf2Rows * kDf2Kv * HD,
-                            vblk + (size_t) s_idx * kDf2Rows * kDf2Kv * HD,
-                            anchor_pos_base + s_idx, ring_slots, window,
-                            part + (size_t) s_idx * part_stride, variant,
-                            ba.tag[s_idx], epoch_base + s_idx);
+    attn_part_device<RingT, F16Smem>(q + (size_t) s_idx * kDf2Rows * 32 * HD,
+                                     static_cast<const RingT*>(ba.kring[s_idx]),
+                                     static_cast<const RingT*>(ba.vring[s_idx]),
+                                     kblk + (size_t) s_idx * kDf2Rows * kDf2Kv * HD,
+                                     vblk + (size_t) s_idx * kDf2Rows * kDf2Kv * HD,
+                                     anchor_pos_base + s_idx, ring_slots, window,
+                                     part + (size_t) s_idx * part_stride, variant,
+                                     ba.tag[s_idx], epoch_base + s_idx);
 }
 
 __device__ __forceinline__ void quant_block(float v, int blk, int col, int K, int8_t* __restrict__ xq, float* __restrict__ xd);
 
-__global__ void attn_merge_kernel(const float* __restrict__ part, int8_t* __restrict__ xq, float* __restrict__ xd) {
+__device__ __forceinline__ int attn_active_chunks(int s, int window) {
+    const int lo = s - (window - 1) > 0 ? s - (window - 1) : 0;
+    const int nkeys = (s - lo) + kDf2Rows;
+    const int n = (nkeys + kDf2Chunk - 1) / kDf2Chunk;
+    return n < kDf2MaxChunks ? n : kDf2MaxChunks;
+}
+
+__global__ void attn_merge_kernel(const float* __restrict__ part, const int32_t* __restrict__ anchor_pos, int window,
+                                  int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int a = blockIdx.x;                      // kvh * 32 + qi
     const int kvh = a >> 5, qi = a & 31, d = threadIdx.x;
+    const int n_chunks = attn_active_chunks(*anchor_pos, window);
     float mc_arr[kDf2MaxChunks];
     float M = -INFINITY;
-#pragma unroll
-    for (int c = 0; c < kDf2MaxChunks; ++c) {
+    for (int c = 0; c < n_chunks; ++c) {
         mc_arr[c] = part[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130];
         M = fmaxf(M, mc_arr[c]);
     }
     float L = 0.0f, o = 0.0f;
-#pragma unroll
-    for (int c = 0; c < kDf2MaxChunks; ++c) {
+    for (int c = 0; c < n_chunks; ++c) {
         const float mc = mc_arr[c];
         if (mc == -INFINITY) continue;
         const float* p = part + (((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130;
@@ -370,21 +416,21 @@ __global__ void attn_merge_kernel(const float* __restrict__ part, int8_t* __rest
     quant_block(L > 0.0f ? o / L : 0.0f, (kvh * kDf2Gqa + g) * (HD / 32) + (d >> 5), row, 32 * HD, xq, xd);
 }
 
-__global__ void attn_merge_batch_kernel(const float* __restrict__ part, int8_t* __restrict__ xq, float* __restrict__ xd) {
+__global__ void attn_merge_batch_kernel(const float* __restrict__ part, const int32_t* __restrict__ anchor_pos_base, int window,
+                                        int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int a = blockIdx.x, s_idx = blockIdx.y;
     const int kvh = a >> 5, qi = a & 31, d = threadIdx.x;
+    const int n_chunks = attn_active_chunks(anchor_pos_base[s_idx], window);
     const size_t part_stride = (size_t) kDf2MaxChunks * kDf2Kv * 32 * 130;
     const float* part_s = part + (size_t) s_idx * part_stride;
     float mc_arr[kDf2MaxChunks];
     float M = -INFINITY;
-#pragma unroll
-    for (int c = 0; c < kDf2MaxChunks; ++c) {
+    for (int c = 0; c < n_chunks; ++c) {
         mc_arr[c] = part_s[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130];
         M = fmaxf(M, mc_arr[c]);
     }
     float L = 0.0f, o = 0.0f;
-#pragma unroll
-    for (int c = 0; c < kDf2MaxChunks; ++c) {
+    for (int c = 0; c < n_chunks; ++c) {
         const float mc = mc_arr[c];
         if (mc == -INFINITY) continue;
         const float* p = part_s + (((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130;
@@ -1505,19 +1551,27 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
                    int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
-    attn_part_kernel<float><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+    if (df2_attn_f16_smem())
+        attn_part_kernel<float, true><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+    else
+        attn_part_kernel<float, false><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
     check("attn_part");
-    attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
+    attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, anchor_pos, window, static_cast<int8_t*>(xq), xd);
     check("attn_merge");
 }
 
 void df2_attention_f16(const float* q, const void* kring, const void* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
                        int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
-    attn_part_kernel<uint16_t><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, static_cast<const uint16_t*>(kring),
-                                                                                               static_cast<const uint16_t*>(vring),
-                                                                                               kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+    if (df2_attn_f16_smem())
+        attn_part_kernel<uint16_t, true><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, static_cast<const uint16_t*>(kring),
+                                                                                                         static_cast<const uint16_t*>(vring),
+                                                                                                         kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
+    else
+        attn_part_kernel<uint16_t, false><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, static_cast<const uint16_t*>(kring),
+                                                                                                          static_cast<const uint16_t*>(vring),
+                                                                                                          kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant, tag, epoch);
     check("attn_part_f16");
-    attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
+    attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, anchor_pos, window, static_cast<int8_t*>(xq), xd);
     check("attn_merge");
 }
 
@@ -1879,11 +1933,15 @@ void df2_attention_batch(const float* q, Df2BatchAttn ba, const float* kblk, con
                          const int32_t* anchor_pos_base, int ring_slots, int window, float* part,
                          void* xq, float* xd, int n_slots, void* stream, const int32_t* epoch_base) {
     if (n_slots <= 0) return;
-    attn_part_batch_kernel<float><<<dim3(kDf2Kv, kDf2MaxChunks, (unsigned) n_slots), 128, 0, (cudaStream_t) stream>>>(
-        q, ba, kblk, vblk, anchor_pos_base, ring_slots, window, part, g_attn_variant, epoch_base);
+    if (df2_attn_f16_smem())
+        attn_part_batch_kernel<float, true><<<dim3(kDf2Kv, kDf2MaxChunks, (unsigned) n_slots), 128, 0, (cudaStream_t) stream>>>(
+            q, ba, kblk, vblk, anchor_pos_base, ring_slots, window, part, g_attn_variant, epoch_base);
+    else
+        attn_part_batch_kernel<float, false><<<dim3(kDf2Kv, kDf2MaxChunks, (unsigned) n_slots), 128, 0, (cudaStream_t) stream>>>(
+            q, ba, kblk, vblk, anchor_pos_base, ring_slots, window, part, g_attn_variant, epoch_base);
     check("attn_part_batch");
     attn_merge_batch_kernel<<<dim3(kDf2Kv * 32, (unsigned) n_slots), HD, 0, (cudaStream_t) stream>>>(
-        part, static_cast<int8_t*>(xq), xd);
+        part, anchor_pos_base, window, static_cast<int8_t*>(xq), xd);
     check("attn_merge_batch");
 }
 
@@ -1891,11 +1949,15 @@ void df2_attention_batch_f16(const float* q, Df2BatchAttn ba, const float* kblk,
                              const int32_t* anchor_pos_base, int ring_slots, int window, float* part,
                              void* xq, float* xd, int n_slots, void* stream, const int32_t* epoch_base) {
     if (n_slots <= 0) return;
-    attn_part_batch_kernel<uint16_t><<<dim3(kDf2Kv, kDf2MaxChunks, (unsigned) n_slots), 128, 0, (cudaStream_t) stream>>>(
-        q, ba, kblk, vblk, anchor_pos_base, ring_slots, window, part, g_attn_variant, epoch_base);
+    if (df2_attn_f16_smem())
+        attn_part_batch_kernel<uint16_t, true><<<dim3(kDf2Kv, kDf2MaxChunks, (unsigned) n_slots), 128, 0, (cudaStream_t) stream>>>(
+            q, ba, kblk, vblk, anchor_pos_base, ring_slots, window, part, g_attn_variant, epoch_base);
+    else
+        attn_part_batch_kernel<uint16_t, false><<<dim3(kDf2Kv, kDf2MaxChunks, (unsigned) n_slots), 128, 0, (cudaStream_t) stream>>>(
+            q, ba, kblk, vblk, anchor_pos_base, ring_slots, window, part, g_attn_variant, epoch_base);
     check("attn_part_batch_f16");
     attn_merge_batch_kernel<<<dim3(kDf2Kv * 32, (unsigned) n_slots), HD, 0, (cudaStream_t) stream>>>(
-        part, static_cast<int8_t*>(xq), xd);
+        part, anchor_pos_base, window, static_cast<int8_t*>(xq), xd);
     check("attn_merge_batch");
 }
 
