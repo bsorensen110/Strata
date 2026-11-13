@@ -1474,7 +1474,9 @@ __global__ void pack_head_rows_batch_kernel(const float* __restrict__ fn_in, con
                                             float* __restrict__ fn_out, float* __restrict__ hsel_out,
                                             const int32_t* __restrict__ batch_meta, int N, int rank,
                                             const int8_t* __restrict__ xq_in, const float* __restrict__ xd_in,
-                                            int8_t* __restrict__ xq_out, float* __restrict__ xd_out) {
+                                            int8_t* __restrict__ xq_out, float* __restrict__ xd_out,
+                                            Df2Q81Block* __restrict__ xq_q81_out, int* __restrict__ bm, int* __restrict__ pm,
+                                            float* __restrict__ dl, int cp, int il_rows, int max_q81_rows) {
     const int i = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
     const int r = blockIdx.y, s = blockIdx.z;
     const int row_off = batch_meta[s * 4 + 0];
@@ -1484,8 +1486,35 @@ __global__ void pack_head_rows_batch_kernel(const float* __restrict__ fn_in, con
     const size_t dst_r = (size_t) (row_off + r);
     const int nb = N / 32;
     if (i < N) {
-        fn_out[dst_r * N + i] = fn_in[src_r * N + i];
+        const float y = fn_in[src_r * N + i];
+        fn_out[dst_r * N + i] = y;
         if (xq_in && xq_out) xq_out[dst_r * N + i] = xq_in[src_r * N + i];
+        if (xq_q81_out != nullptr && (int) dst_r < max_q81_rows) {
+            const int blk = i >> 5;
+            const int lane = threadIdx.x & 31;
+            float amax = fabsf(y), sum = y;
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+            const float d = q8_1_finite(q81_div(amax, 127.0f));
+            const int8_t q = q8_1_quant(y, d, amax);
+            const size_t q8_idx = dst_r * (size_t) nb + blk;
+            xq_q81_out[q8_idx].qs[lane] = q;
+            const auto ds = q8_1_ds(d, sum);
+            if (lane == 0) xq_q81_out[q8_idx].ds = ds;
+            if (bm != nullptr && (int) dst_r < il_rows) {
+                unsigned vq = unsigned(uint8_t(q)) << (8 * (lane & 3));
+                vq |= __shfl_xor_sync(0xffffffffu, vq, 1);
+                vq |= __shfl_xor_sync(0xffffffffu, vq, 2);
+                const int pp = lane >> 2;
+                if ((lane & 3) == 0) {
+                    bm[(std::size_t(blk) * 8 + pp) * cp + dst_r] = int(vq);
+                    pm[(std::size_t(pp) * nb + blk) * cp + dst_r] = int(vq);
+                }
+                if (lane == 0) dl[std::size_t(blk) * cp + dst_r] = __low2float(ds);
+            }
+        }
     } else if (hsel_in && hsel_out && i < N + rank) {
         hsel_out[dst_r * rank + (i - N)] = hsel_in[src_r * rank + (i - N)];
     } else if (xd_in && xd_out && i >= N && i < N + nb) {
@@ -1890,12 +1919,25 @@ void df2_pack_head_rows(const float* fn_in, const float* hsel_in, float* fn_out,
 void df2_pack_head_rows_batch(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out,
                               const int32_t* batch_meta, int n_items, int N, int rank, void* stream,
                               const void* xq_in, const float* xd_in,
-                              void* xq_out, float* xd_out) {
+                              void* xq_out, float* xd_out,
+                              uint8_t* xq_q81_out, uint8_t* xil_q81_out,
+                              int il_rows, int max_q81_rows) {
     if (n_items <= 0) return;
+    int *bm = nullptr, *pm = nullptr;
+    float* dl = nullptr;
+    int cp = 0;
+    if (xq_q81_out != nullptr && xil_q81_out != nullptr && il_rows >= 2 && il_rows <= 8) {
+        cp = il_rows <= 2 ? 2 : (il_rows <= 4 ? 4 : 8);
+        const std::size_t words = std::size_t(N / 32) * 8 * std::size_t(cp);
+        bm = reinterpret_cast<int*>(xil_q81_out);
+        pm = bm + words;
+        dl = reinterpret_cast<float*>(bm + 2 * words);
+    }
     const int extra = (hsel_in && hsel_out) ? rank : ((xd_in && xd_out) ? (N / 32) : 0);
     pack_head_rows_batch_kernel<<<dim3((unsigned) ((N + extra + 255) / 256), (unsigned) (kDf2Rows - 1), (unsigned) n_items), 256, 0, (cudaStream_t) stream>>>(
         fn_in, hsel_in, fn_out, hsel_out, batch_meta, N, rank,
-        static_cast<const int8_t*>(xq_in), xd_in, static_cast<int8_t*>(xq_out), xd_out);
+        static_cast<const int8_t*>(xq_in), xd_in, static_cast<int8_t*>(xq_out), xd_out,
+        static_cast<Df2Q81Block*>(static_cast<void*>(xq_q81_out)), bm, pm, dl, cp, il_rows, max_q81_rows);
     check("pack_head_rows_batch");
 }
 

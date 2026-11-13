@@ -47,6 +47,51 @@ int df2_beam() {
     return b;
 }
 
+int df2_head_il_mode() {
+    static const int mode = [] {
+        const char* e = std::getenv("STRATA_DF2_HEAD_IL");
+        if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
+        if (e && e[0]) return e[0] != '0' ? 1 : 0;
+#if defined(STRATA_USE_HIP)
+        return 1;
+#else
+        return -1;
+#endif
+    }();
+    return mode;
+}
+
+int df2_head_il_rows() {
+    static const int r = [] {
+        const char* e = std::getenv("STRATA_DF2_HEAD_IL_ROWS");
+        if (e && e[0]) {
+            const int v = std::atoi(e);
+            if (v == 1 || v == 2 || v == 4) return v;
+        }
+        return 4;
+    }();
+    return r;
+}
+
+int df2_head_chunk() {
+    static const int c = [] {
+        const char* e = std::getenv("STRATA_DF2_HEAD_CHUNK");
+        if (e && e[0]) return std::max(1, std::min(14, std::atoi(e)));
+#if defined(STRATA_USE_HIP)
+        return 8;
+#else
+        return (int) (2 * Dflash2Drafter::kDrafts);
+#endif
+    }();
+    return c;
+}
+
+bool df2_head_use_il(int head_type, int nc, int n_dvocab, int head_il) {
+    if (nc < 2 || nc > 8) return false;
+    if (!kernels::native_mmvq_il_supported(head_type, 2, n_dvocab)) return false;   // gate out non-IL quant types (Q8_0, F16, ...)
+    return head_il == 1 || (head_il < 0 && kernels::native_mmvq_il_supported(head_type, nc, n_dvocab));
+}
+
 }  // namespace
 
 Dflash2Drafter::~Dflash2Drafter() {
@@ -646,17 +691,8 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         stamp("embed_");
         df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, B, N_, eps_, xqp_, xdp_, cs);
         stamp("df2_rms_quant");
-        static const int head_il = [] {
-            const char* e = std::getenv("STRATA_DF2_HEAD_IL");
-            if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
-            if (e && e[0]) return e[0] != '0' ? 1 : 0;
-#if defined(STRATA_USE_HIP)
-            return 1;
-#else
-            return -1;
-#endif
-        }();
-        const bool use_il = !skip_part("head") && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)));
+        const int head_il = df2_head_il_mode();
+        const bool use_il = !skip_part("head") && df2_head_use_il(head_type_, ndraft_, (int) n_dvocab_, head_il);
         const bool want_final_q8 = !skip_part("head") && ndraft_ >= 1 && ndraft_ <= 8;
         const bool want_final_il = want_final_q8 && use_il && ndraft_ >= 2;
         bool did_fuse_q8 = false;
@@ -731,13 +767,10 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         if (!skip_part("head")) {
             // the verify window's head kernel (interleaved activations, rows a warp by the card's table): bitwise native_mmvq's output, so the drafts are the same
             if (use_il) {
-                if (head_il == 1 && !native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)) {
-                    native_mmvq_il_tune(4);
-                    native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
-                    native_mmvq_il_tune(0);
-                } else {
-                    native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
-                }
+                const bool force_rows = (std::getenv("STRATA_DF2_HEAD_IL_ROWS") != nullptr) || !native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_);
+                if (force_rows) native_mmvq_il_tune(df2_head_il_rows());
+                native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
+                if (force_rows) native_mmvq_il_tune(0);
             } else
                 native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
         }
@@ -1959,7 +1992,15 @@ bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n
         if (total_rows > 0 && total_rows <= total_B) {
             uint8_t* xqp_pack = xqp_ + (size_t) total_B * N_;
             float* xdp_pack = xdp_ + (size_t) total_B * (N_ / 32);
-            df2_pack_head_rows_batch(fn_, nullptr, fn_batch_, nullptr, m_bmeta_, n_items, N_, rank_, cs, xqp_, xdp_, xqp_pack, xdp_pack);
+            const int nc0 = std::min(df2_head_chunk(), total_rows);
+            const bool fuse_q8 = !skip_part("head") && xq_ != nullptr;
+            const bool use_il0 = fuse_q8 && df2_head_use_il(head_type_, nc0, (int) n_dvocab_, df2_head_il_mode());
+            df2_pack_head_rows_batch(fn_, nullptr, fn_batch_, nullptr, m_bmeta_, n_items, N_, rank_, cs,
+                                     xqp_, xdp_, xqp_pack, xdp_pack,
+                                     fuse_q8 ? xq_ : nullptr,
+                                     (use_il0 && nc0 >= 2) ? xil_ : nullptr,
+                                     (use_il0 && nc0 >= 2) ? nc0 : 0,
+                                     fuse_q8 ? nc0 : 0);
             gemm({"candidate_selector.hidden_projection.weight"}, {hsel_batch_}, total_rows, cs, xqp_pack, xdp_pack);
         } else {
             gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, total_B, cs, xqp_, xdp_);
@@ -1972,47 +2013,30 @@ bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n
     return true;
 }
 
-bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t cs, std::string& err) {
+bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t cs, std::string& err, bool q81_prepacked) {
     try {
         using namespace kernels;
-        static const int head_il = [] {
-            const char* e = std::getenv("STRATA_DF2_HEAD_IL");
-            if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
-            if (e && e[0]) return e[0] != '0' ? 1 : 0;
-#if defined(STRATA_USE_HIP)
-            return 1;
-#else
-            return -1;
-#endif
-        }();
-        static const int head_chunk = [] {
-            const char* e = std::getenv("STRATA_DF2_HEAD_CHUNK");
-            if (e && e[0]) return std::max(1, std::min(14, std::atoi(e)));
-#if defined(STRATA_USE_HIP)
-            return 8;
-#else
-            return (int) (2 * kDrafts);
-#endif
-        }();
+        const int head_il = df2_head_il_mode();
+        const int head_chunk = df2_head_chunk();
+        const bool force_il_rows_env = std::getenv("STRATA_DF2_HEAD_IL_ROWS") != nullptr;
         for (int c0 = 0; c0 < total_rows; c0 += head_chunk) {
             const int nc = std::min(head_chunk, total_rows - c0);
-            const bool use_il = !skip_part("head") && nc <= 8 && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)));
-            if (use_il && nc >= 2 && nc <= 8)
-                native_quantize_q8_1_il(fn_batch_ + (size_t) c0 * N_, xq_, xil_, N_, nc, cs);
-            else {
-                native_quantize_q8_1(fn_batch_ + (size_t) c0 * N_, xq_, N_, nc, cs);
-                if (use_il && nc > 8)
-                    native_q8_1_interleave(xq_, xil_, N_, nc, cs);
+            const bool use_il = !skip_part("head") && df2_head_use_il(head_type_, nc, (int) n_dvocab_, head_il);
+            if (!(q81_prepacked && c0 == 0)) {
+                if (use_il && nc >= 2 && nc <= 8)
+                    native_quantize_q8_1_il(fn_batch_ + (size_t) c0 * N_, xq_, xil_, N_, nc, cs);
+                else {
+                    native_quantize_q8_1(fn_batch_ + (size_t) c0 * N_, xq_, N_, nc, cs);
+                    if (use_il && nc > 8)
+                        native_q8_1_interleave(xq_, xil_, N_, nc, cs);
+                }
             }
             if (!skip_part("head")) {
                 if (use_il) {
-                    if (head_il == 1 && !native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)) {
-                        native_mmvq_il_tune(4);
-                        native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, nc, cs);
-                        native_mmvq_il_tune(0);
-                    } else {
-                        native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, nc, cs);
-                    }
+                    const bool force_rows = force_il_rows_env || !native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_);
+                    if (force_rows) native_mmvq_il_tune(df2_head_il_rows());
+                    native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, nc, cs);
+                    if (force_rows) native_mmvq_il_tune(0);
                 } else {
                     native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, nc, cs);
                 }
@@ -2095,12 +2119,10 @@ bool Dflash2Drafter::capture_batch_full(const BatchSlotItem* items, int n_items,
         target_exec = &batch_full_exec_[total_rows];
     }
     if (*target_exec) return true;
-    kernels::native_mmvq_il_tune(4);
-    kernels::native_mmvq_il_tune(0);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin batch full capture"; return false; }
     kernels::copy_i32_from_mapped(d_meta_ + 64, m_meta_ + 64, 96, cs_);
     const bool ok = record_batch_body_precomp(items, n_items, cs_, err, total_rows) &&
-                    record_batch_head(n_items, total_rows, cs_, err);
+                    record_batch_head(n_items, total_rows, cs_, err, /*q81_prepacked=*/!skip_part("head"));
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
