@@ -1218,83 +1218,191 @@ __device__ __forceinline__ float q4row_at(const uint8_t* row, int i) {
     return (float) ((j < 16 ? (byte & 15) : (byte >> 4)) - 8) * d;
 }
 
-// ---- the selector's walk: one block of 256 threads per slot
+// ---- the selector's walk: one block of 256 threads per slot (BEAM = 4 Viterbi log-prob beam search; BEAM = 1 greedy)
 template <bool Q4>
+__device__ void select_eval_step(const float* __restrict__ hp_row, const float* __restrict__ unary_row, const int32_t* __restrict__ tok_row,
+                                 const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank,
+                                 int ptok, float* __restrict__ vp, float* __restrict__ sc) {
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    if (Q4) vp[tid] = q4row_at(reinterpret_cast<const uint8_t*>(pred_cb) + (size_t) ptok * (rank / 32 * 18), tid) * hp_row[tid];
+    else vp[tid] = bf16f(pred_cb[(size_t) ptok * rank + tid]) * hp_row[tid];
+    __syncthreads();
+    float v_loc[8];
+#pragma unroll
+    for (int e = 0; e < 8; ++e) v_loc[e] = vp[lane * 8 + e];
+    for (int j = w * 2; j < w * 2 + 2; ++j) {
+        const int t = tok_row[j];
+        float acc = 0.0f;
+        if (Q4) {
+            const uint8_t* row = reinterpret_cast<const uint8_t*>(succ_cb) + (size_t) t * (rank / 32 * 18);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) acc = fmaf(q4row_at(row, lane * 8 + e), v_loc[e], acc);
+        } else {
+            const uint4 raw = *reinterpret_cast<const uint4*>(succ_cb + (size_t) t * rank + lane * 8);
+            const uint32_t u[4] = {raw.x, raw.y, raw.z, raw.w};
+#pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                acc = fmaf(__uint_as_float(u[e] << 16), v_loc[e * 2], acc);
+                acc = fmaf(__uint_as_float(u[e] & 0xffff0000u), v_loc[e * 2 + 1], acc);
+            }
+        }
+        for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+        if (lane == 0) sc[j] = unary_row[j] + acc;
+    }
+    __syncthreads();
+}
+
+template <bool Q4, int BEAM>
 __device__ void select_slot_walk(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
                                  const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
                                  int prev0, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+    if (rows <= 0) return;
     __shared__ float vp[256];
     __shared__ float sc[kDf2TopK];
-    __shared__ int prev;
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
-    if (tid == 0) prev = prev0;
-    __syncthreads();
-    for (int i = 0; i < rows; ++i) {
-        if (Q4) vp[tid] = q4row_at(reinterpret_cast<const uint8_t*>(pred_cb) + (size_t) prev * (rank / 32 * 18), tid) * hp[(size_t) i * rank + tid];
-        else vp[tid] = bf16f(pred_cb[(size_t) prev * rank + tid]) * hp[(size_t) i * rank + tid];
+    if constexpr (BEAM <= 1) {
+        __shared__ int prev;
+        if (tid == 0) prev = prev0;
         __syncthreads();
-        float v_loc[8];
+        for (int i = 0; i < rows; ++i) {
+            select_eval_step<Q4>(hp + (size_t) i * rank, unary + i * kDf2TopK, tok + i * kDf2TopK, pred_cb, succ_cb, rank, prev, vp, sc);
+            if (w == 0) {
+                const float sj = (lane < kDf2TopK) ? sc[lane] : -INFINITY;
+                float bv = sj;
+                int bj = lane;
 #pragma unroll
-        for (int e = 0; e < 8; ++e) v_loc[e] = vp[lane * 8 + e];
-        for (int j = w * 2; j < w * 2 + 2; ++j) {
-            const int t = tok[i * kDf2TopK + j];
-            float acc = 0.0f;
-            if (Q4) {
-                const uint8_t* row = reinterpret_cast<const uint8_t*>(succ_cb) + (size_t) t * (rank / 32 * 18);
+                for (int o = 8; o > 0; o >>= 1) {
+                    const float obv = __shfl_xor_sync(0xffffffffu, bv, o);
+                    const int obj = __shfl_xor_sync(0xffffffffu, bj, o);
+                    if (obv > bv || (obv == bv && obj < bj)) {
+                        bv = obv;
+                        bj = obj;
+                    }
+                }
+                bv = __shfl_sync(0xffffffffu, bv, 0);
+                bj = __shfl_sync(0xffffffffu, bj, 0);
+                const float ej = (lane < kDf2TopK) ? __expf(sj - bv) : 0.0f;
+                float z = 0.0f;
 #pragma unroll
-                for (int e = 0; e < 8; ++e) acc = fmaf(q4row_at(row, lane * 8 + e), v_loc[e], acc);
-            } else {
-                const uint4 raw = *reinterpret_cast<const uint4*>(succ_cb + (size_t) t * rank + lane * 8);
-                const uint32_t u[4] = {raw.x, raw.y, raw.z, raw.w};
-#pragma unroll
-                for (int e = 0; e < 4; ++e) {
-                    acc = fmaf(__uint_as_float(u[e] << 16), v_loc[e * 2], acc);
-                    acc = fmaf(__uint_as_float(u[e] & 0xffff0000u), v_loc[e * 2 + 1], acc);
+                for (int j = 0; j < kDf2TopK; ++j) z += __shfl_sync(0xffffffffu, ej, j);
+                if (lane == 0) {
+                    const int32_t picked = tok[i * kDf2TopK + bj];
+                    out_prob[i] = 1.0f / z;
+                    prev = picked;
+                    if (i + 1 == rows) __threadfence_system();
+                    out_tok[i] = picked;
                 }
             }
-            for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
-            if (lane == 0) sc[j] = unary[i * kDf2TopK + j] + acc;
+            __syncthreads();
+        }
+        return;
+    }
+    __shared__ int32_t beam_tok[BEAM];
+    __shared__ float beam_score[BEAM];
+    __shared__ int32_t beam_path[BEAM][kDf2Rows];
+    __shared__ float beam_prob[BEAM][kDf2Rows];
+    __shared__ float cand_logp[BEAM * kDf2TopK];
+    __shared__ float cand_prob[BEAM * kDf2TopK];
+    __shared__ int32_t next_tok[BEAM];
+    __shared__ float next_score[BEAM];
+    __shared__ int32_t next_path[BEAM][kDf2Rows];
+    __shared__ float next_prob[BEAM][kDf2Rows];
+    for (int i = 0; i < rows; ++i) {
+        const int n_prev = (i == 0) ? 1 : BEAM;
+        for (int b = 0; b < n_prev; ++b) {
+            const int ptok = (i == 0) ? prev0 : beam_tok[b];
+            select_eval_step<Q4>(hp + (size_t) i * rank, unary + i * kDf2TopK, tok + i * kDf2TopK, pred_cb, succ_cb, rank, ptok, vp, sc);
+            if (w == 0) {
+                const float sj = (lane < kDf2TopK) ? sc[lane] : -INFINITY;
+                float bv = sj;
+#pragma unroll
+                for (int o = 8; o > 0; o >>= 1) bv = fmaxf(bv, __shfl_xor_sync(0xffffffffu, bv, o));
+                bv = __shfl_sync(0xffffffffu, bv, 0);
+                const float ej = (lane < kDf2TopK) ? __expf(sj - bv) : 0.0f;
+                float z = 0.0f;
+#pragma unroll
+                for (int j = 0; j < kDf2TopK; ++j) z += __shfl_sync(0xffffffffu, ej, j);
+                if (lane < kDf2TopK) {
+                    const float base = (i == 0) ? 0.0f : beam_score[b];
+                    const float p = ej / z;
+                    cand_logp[b * kDf2TopK + lane] = base + ((sj - bv) - logf(z));
+                    cand_prob[b * kDf2TopK + lane] = p;
+                }
+            }
+            __syncthreads();
+        }
+        if (w == 0) {
+            // Viterbi deduplication per candidate token j = 0..kDf2TopK-1 (Markov-1 state depends only on tok[i][j])
+            float v_logp = -INFINITY;
+            float v_p = 0.0f;
+            int v_b = 0;
+            if (lane < kDf2TopK) {
+                for (int b = 0; b < n_prev; ++b) {
+                    const float lp = cand_logp[b * kDf2TopK + lane];
+                    if (lp > v_logp) {
+                        v_logp = lp;
+                        v_b = b;
+                        v_p = cand_prob[b * kDf2TopK + lane];
+                    }
+                }
+            }
+            for (int k = 0; k < BEAM; ++k) {
+                float bv = v_logp;
+                int bj = lane;
+#pragma unroll
+                for (int o = 8; o > 0; o >>= 1) {
+                    const float obv = __shfl_xor_sync(0xffffffffu, bv, o);
+                    const int obj = __shfl_xor_sync(0xffffffffu, bj, o);
+                    if (obv > bv || (obv == bv && obj < bj)) {
+                        bv = obv;
+                        bj = obj;
+                    }
+                }
+                const int win_j = __shfl_sync(0xffffffffu, bj, 0);
+                if (lane == win_j) {
+                    const int32_t t = tok[i * kDf2TopK + win_j];
+                    next_tok[k] = t;
+                    next_score[k] = v_logp;
+                    for (int r = 0; r < i; ++r) {
+                        next_path[k][r] = beam_path[v_b][r];
+                        next_prob[k][r] = beam_prob[v_b][r];
+                    }
+                    next_path[k][i] = t;
+                    next_prob[k][i] = v_p;
+                    v_logp = -INFINITY;
+                }
+            }
         }
         __syncthreads();
-        if (w == 0) {
-            const float sj = (lane < kDf2TopK) ? sc[lane] : -INFINITY;
-            float bv = sj;
-            int bj = lane;
-#pragma unroll
-            for (int o = 8; o > 0; o >>= 1) {
-                const float obv = __shfl_xor_sync(0xffffffffu, bv, o);
-                const int obj = __shfl_xor_sync(0xffffffffu, bj, o);
-                if (obv > bv || (obv == bv && obj < bj)) {
-                    bv = obv;
-                    bj = obj;
-                }
-            }
-            bv = __shfl_sync(0xffffffffu, bv, 0);
-            bj = __shfl_sync(0xffffffffu, bj, 0);
-            const float ej = (lane < kDf2TopK) ? __expf(sj - bv) : 0.0f;
-            float z = 0.0f;
-#pragma unroll
-            for (int j = 0; j < kDf2TopK; ++j) z += __shfl_sync(0xffffffffu, ej, j);
-            if (lane == 0) {
-                const int32_t picked = tok[i * kDf2TopK + bj];
-                out_prob[i] = 1.0f / z;
-                prev = picked;
-                if (i + 1 == rows) __threadfence_system();
-                out_tok[i] = picked;
+        if (tid < BEAM) {
+            beam_tok[tid] = next_tok[tid];
+            beam_score[tid] = next_score[tid];
+            for (int r = 0; r <= i; ++r) {
+                beam_path[tid][r] = next_path[tid][r];
+                beam_prob[tid][r] = next_prob[tid][r];
             }
         }
         __syncthreads();
     }
+    if (tid < rows) {
+        out_prob[tid] = beam_prob[0][tid];
+        if (tid + 1 < rows) out_tok[tid] = beam_path[0][tid];
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence_system();
+        out_tok[rows - 1] = beam_path[0][rows - 1];
+    }
 }
 
-template <bool Q4>
+template <bool Q4, int BEAM>
 __global__ void select_kernel(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
                               const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
                               const int32_t* __restrict__ anchor_tok, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
-    select_slot_walk<Q4>(hp, unary, tok, pred_cb, succ_cb, rank, rows, *anchor_tok, out_tok, out_prob);
+    select_slot_walk<Q4, BEAM>(hp, unary, tok, pred_cb, succ_cb, rank, rows, *anchor_tok, out_tok, out_prob);
 }
 
-template <bool Q4>
+template <bool Q4, int BEAM>
 __global__ void select_multi_kernel(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
                                     const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank,
                                     const int32_t* __restrict__ batch_meta, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
@@ -1302,8 +1410,8 @@ __global__ void select_multi_kernel(const float* __restrict__ hp, const float* _
     const int row_off = batch_meta[s * 4 + 0];
     const int rows = batch_meta[s * 4 + 1];
     const int prev0 = batch_meta[s * 4 + 2];
-    select_slot_walk<Q4>(hp + (size_t) row_off * rank, unary + (size_t) row_off * kDf2TopK, tok + (size_t) row_off * kDf2TopK,
-                         pred_cb, succ_cb, rank, rows, prev0, out_tok + s * 8, out_prob + s * 8);
+    select_slot_walk<Q4, BEAM>(hp + (size_t) row_off * rank, unary + (size_t) row_off * kDf2TopK, tok + (size_t) row_off * kDf2TopK,
+                               pred_cb, succ_cb, rank, rows, prev0, out_tok + s * 8, out_prob + s * 8);
 }
 
 __global__ void pack_head_rows_kernel(const float* __restrict__ fn_in, const float* __restrict__ hsel_in,
@@ -1676,19 +1784,29 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 }
 
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4) {
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4, int beam) {
     if (rank != 256) throw std::invalid_argument("df2_select: the selector rank must be 256");
-    if (cb_q4) select_kernel<true><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
-    else select_kernel<false><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+    if (beam <= 1) {
+        if (cb_q4) select_kernel<true, 1><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+        else select_kernel<false, 1><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+    } else {
+        if (cb_q4) select_kernel<true, 4><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+        else select_kernel<false, 4><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
+    }
     check("select");
 }
 
 void df2_select_multi(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank,
-                      const int32_t* batch_meta, int n_items, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4) {
+                      const int32_t* batch_meta, int n_items, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4, int beam) {
     if (rank != 256) throw std::invalid_argument("df2_select_multi: the selector rank must be 256");
     if (n_items <= 0) return;
-    if (cb_q4) select_multi_kernel<true><<<n_items, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, batch_meta, out_tok, out_prob);
-    else select_multi_kernel<false><<<n_items, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, batch_meta, out_tok, out_prob);
+    if (beam <= 1) {
+        if (cb_q4) select_multi_kernel<true, 1><<<n_items, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, batch_meta, out_tok, out_prob);
+        else select_multi_kernel<false, 1><<<n_items, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, batch_meta, out_tok, out_prob);
+    } else {
+        if (cb_q4) select_multi_kernel<true, 4><<<n_items, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, batch_meta, out_tok, out_prob);
+        else select_multi_kernel<false, 4><<<n_items, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, batch_meta, out_tok, out_prob);
+    }
     check("select_multi");
 }
 

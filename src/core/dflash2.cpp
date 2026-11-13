@@ -38,6 +38,15 @@ bool mapped(size_t bytes, void** h, void** d) {
 
 constexpr int GGML_Q8_0 = 8;
 
+int df2_beam() {
+    static const int b = [] {
+        const char* e = std::getenv("STRATA_DF2_BEAM");
+        if (e && (e[0] == '0' || e[0] == '1')) return 1;
+        return 4;
+    }();
+    return b;
+}
+
 }  // namespace
 
 Dflash2Drafter::~Dflash2Drafter() {
@@ -740,7 +749,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, out_tok_,
-                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0");
+                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0", df2_beam());
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -2015,7 +2024,7 @@ bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t
                          reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                          reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off),
                          rank_, m_bmeta_, n_items, out_btok_, out_bprob_, cs,
-                         find("candidate_selector.predecessor_codebook").dtype == "q4_0");
+                         find("candidate_selector.predecessor_codebook").dtype == "q4_0", df2_beam());
     } catch (const std::exception& e) {
         err = e.what();
         return false;

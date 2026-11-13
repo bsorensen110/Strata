@@ -112,13 +112,13 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 /// `cb_q4`: the codebooks are ggml Q4_0 rows in block order (rank / 32 blocks of 18 bytes a row: fp16 d, 16 bytes, value i in the low nibble of byte i,
 /// value i + 16 in the high nibble; NOT tiled like the matrices), dequantized to fp32 ((q - 8) * d) before the same dot; default: bf16 rows.
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false);
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false, int beam = 4);
 
 /// Multi-slot candidate selector walk: one threadblock per item (`0 <= s < n_items`).  Item `s` reads
 /// `row_off = batch_meta[s * 4 + 0]`, `rows = batch_meta[s * 4 + 1]`, and `prev0 = batch_meta[s * 4 + 2]`, walks
 /// `rows` rows starting at `row_off` of `hp` / `unary` / `tok`, and writes `out_tok[s * 8 + i]` and `out_prob[s * 8 + i]`.
 void df2_select_multi(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank,
-                      const int32_t* batch_meta, int n_items, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false);
+                      const int32_t* batch_meta, int n_items, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false, int beam = 4);
 
 /// Packs `rows` rows of `fn_in` ([rows][N]) and `hsel_in` ([rows][rank]) into `fn_out` and `hsel_out` in one launch.
 void df2_pack_head_rows(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out, int rows, int N, int rank, void* stream);
