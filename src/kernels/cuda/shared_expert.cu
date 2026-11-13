@@ -226,7 +226,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens (16 in a wide build), native weights, scratch and a stream");
     cudaStream_t cs = (cudaStream_t) stream;
     const auto il_ok = [&](int type, int n_in, int n_out) {
-        return nw.q8_il != nullptr && n_tok >= 2 && n_tok <= 8 &&
+        return nw.q8_il != nullptr && n_tok >= 2 && n_tok <= kVerifyMaxT &&
                native_mmvq_il_supported(type, n_tok, n_out) &&
                ((type != 18 && type != 21) || n_in <= 4096);
     };

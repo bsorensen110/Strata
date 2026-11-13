@@ -3162,8 +3162,14 @@ static bool gr_gfx906_split_on(const FusedGrArgs& a0) {
 #endif
 
 // One multi-token read of up to kMultiMaxT tokens (1..8 standard, or 9..16 single-pass when STRATA_FUSED_GR_16 is ON).
+bool gr_il_16_on() {
+    const char* v = std::getenv("STRATA_MMVQ_IL_16");
+    return v == nullptr || v[0] != '0';
+}
+
 static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
-                                      unsigned long long* stamp_buf, int stamp_i0) {
+                                      unsigned long long* stamp_buf, int stamp_i0,
+                                      bool* q8_il_written = nullptr) {
     if (n_tok < 1 || n_tok > kMultiMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
@@ -3191,7 +3197,7 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
     for (int t = 0; t < n_tok; ++t) q8 = q8 && a[t].q8_mixed != nullptr;
     if (!q8) {
         for (int t = 0; t < n_tok; ++t) m.a[t].q8_mixed = nullptr;
-    } else if (n_tok >= 2 && n_tok <= kFusedGrMaxT && a[0].q8_il != nullptr) {
+    } else if (n_tok >= 2 && (n_tok <= kFusedGrMaxT || (n_tok <= kFusedGrWideT && gr_il_16_on())) && a[0].q8_il != nullptr) {
         const int cp = native_q8_1_il_cp(n_tok);
         const size_t words = size_t(N / 32) * 8 * size_t(cp);
         m.q8_il_bm = static_cast<int*>(a[0].q8_il);
@@ -3209,6 +3215,7 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
             std::fprintf(stderr, "fused_gr_read_multi q8: %s\n", cudaGetErrorString(eq));
             std::exit(1);
         }
+        if (q8_il_written != nullptr) *q8_il_written = m.q8_il_bm != nullptr;
         return q8;
     }
     const int split = n_tok <= kFusedGrMaxT ? gr_v3_split(a[0]) : 0;
@@ -3290,6 +3297,7 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
         std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
+    if (q8_il_written != nullptr) *q8_il_written = m.q8_il_bm != nullptr;
     return q8;
 }
 
@@ -3330,20 +3338,24 @@ void fused_gr_v3_print_resources() {
 #endif
 }
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
-                         int stamp_i0) {
-    if (n_tok <= kFusedGrMaxT) return fused_gr_read_multi_slice(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
+                         int stamp_i0, bool* q8_il_written) {
+    if (q8_il_written != nullptr) *q8_il_written = false;
+    if (n_tok <= kFusedGrMaxT) {
+        return fused_gr_read_multi_slice(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0, q8_il_written);
+    }
     if (n_tok > kFusedGrWideT || a == nullptr || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments (%d tokens)\n", n_tok);
         std::exit(1);
     }
 #if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
     // Single-pass 9..16 execution (STRATA_FUSED_GR_16, default ON): norm + down + up each run in 1 launch,
-    // reading w_down and w_up once across the full window instead of across 8-column slices.
-    // Falls back to the 8-column slice loop when STRATA_FUSED_GR_16=0, when q8_il is set (q8_1_il has CP <= 8),
+    // reading w_down and w_up once across the full window instead of across 8-column slices.  Writes q8_il (CP=16)
+    // alongside q8_mixed when a[0].q8_il is set and STRATA_MMVQ_IL_16 != 0.
+    // Falls back to the 8-column slice loop when STRATA_FUSED_GR_16=0,
     // when Q8_0 / V3 / gfx906-split paths are active, or when device LDS cannot stage all tokens in 1 down launch.
-    if (fused_gr_16_on() && a[0].q8_il == nullptr && a[0].q8_down == nullptr && a[0].q8_up == nullptr &&
+    if (fused_gr_16_on() && a[0].q8_down == nullptr && a[0].q8_up == nullptr &&
         gr_v3_split(a[0]) == 0 && !gr_gfx906_split_on(a[0]) && down_wide_tile(n_tok) > 0) {
-        return fused_gr_read_multi_slice(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
+        return fused_gr_read_multi_slice(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0, q8_il_written);
     }
 #endif
     bool q8 = false;

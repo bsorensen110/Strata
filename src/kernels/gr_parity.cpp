@@ -925,9 +925,10 @@ int fused_wide_lds_parity(const float* d_norm, const uint16_t* d_down, const uin
 
         float *d_r = nullptr, *d_r_out = nullptr, *d_bo = nullptr, *d_inj = nullptr;
         float *d_lo = nullptr, *d_rs = nullptr, *d_inj_out = nullptr, *d_mixed = nullptr, *d_xn = nullptr;
-        uint8_t *d_q = nullptr, *d_qref = nullptr;
+        uint8_t *d_q = nullptr, *d_qref = nullptr, *d_il = nullptr, *d_il_ref = nullptr;
         unsigned* d_cnt = nullptr;
         const size_t qbytes = (size_t) W * (N / 32) * 36;
+        const size_t ilbytes = native_q8_1_il_bytes(N, W);
         check(cudaMalloc(&d_r, r.size() * sizeof(float)), "wide R");
         check(cudaMalloc(&d_r_out, r.size() * sizeof(float)), "wide R_out");
         check(cudaMalloc(&d_bo, bo.size() * sizeof(float)), "wide bo");
@@ -939,6 +940,8 @@ int fused_wide_lds_parity(const float* d_norm, const uint16_t* d_down, const uin
         check(cudaMalloc(&d_xn, (size_t) W * D * sizeof(float)), "wide xn");
         check(cudaMalloc(&d_q, qbytes), "wide q8");
         check(cudaMalloc(&d_qref, qbytes), "wide q8 ref");
+        check(cudaMalloc(&d_il, ilbytes), "wide q8 il");
+        check(cudaMalloc(&d_il_ref, ilbytes), "wide q8 il ref");
         check(cudaMalloc(&d_cnt, (N / 32) * sizeof(unsigned)), "wide q8 cnt");
         check(cudaMemset(d_cnt, 0, (N / 32) * sizeof(unsigned)), "wide q8 cnt zero");
         check(cudaMemcpy(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice), "wide copy R");
@@ -1018,20 +1021,24 @@ int fused_wide_lds_parity(const float* d_norm, const uint16_t* d_down, const uin
 
         for (int T = kFusedGrMaxT + 1; T <= W; ++T) check_direct(T, "single-pass");
 
-        auto check_qfuse = [&](int T, bool use_graph) {
+        auto check_qfuse = [&](int T, bool use_graph, bool expect_il_written = true) {
             std::vector<FusedGrArgs> qa(args.begin(), args.begin() + T);
             const size_t tqb = (size_t) T * (N / 32) * 36;
+            const size_t tib = native_q8_1_il_bytes(N, T);
             for (int t = 0; t < T; ++t) {
                 qa[t].q8_mixed = d_q + (size_t) t * (N / 32) * 36;
                 qa[t].q8_cnt = d_cnt;
             }
+            qa[0].q8_il = d_il;
             check(cudaMemsetAsync(d_q, 0x5a, tqb, stream), "wide q8 poison");
-            bool wrote = false;
+            check(cudaMemsetAsync(d_il, 0, tib, stream), "wide q8 il zero");
+            check(cudaMemsetAsync(d_il_ref, 0, tib, stream), "wide q8 il ref zero");
+            bool wrote = false, wrote_il = false;
             cudaGraph_t qg = nullptr;
             cudaGraphExec_t qx = nullptr;
             if (use_graph) {
                 check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "wide q8 graph begin");
-                wrote = fused_gr_read_multi(qa.data(), T, d_xn, stream);
+                wrote = fused_gr_read_multi(qa.data(), T, d_xn, stream, nullptr, 0, &wrote_il);
                 check(cudaStreamEndCapture(stream, &qg), "wide q8 graph end");
                 check(cudaGraphInstantiate(&qx, qg, nullptr, nullptr, 0), "wide q8 graph inst");
                 check(cudaGraphLaunch(qx, stream), "wide q8 graph launch");
@@ -1039,11 +1046,12 @@ int fused_wide_lds_parity(const float* d_norm, const uint16_t* d_down, const uin
                 for (size_t i = 0; i < (size_t) T * D; ++i) r[i] = -0.6f * r[i] + 0.002f * (float) (i % 19);
                 check(cudaMemcpyAsync(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice, stream), "wide replay R");
                 check(cudaMemsetAsync(d_q, 0x5a, tqb, stream), "wide q8 replay poison");
+                check(cudaMemsetAsync(d_il, 0, tib, stream), "wide q8 il replay zero");
                 check(cudaGraphLaunch(qx, stream), "wide q8 graph replay");
             } else {
-                wrote = fused_gr_read_multi(qa.data(), T, d_xn, stream);
+                wrote = fused_gr_read_multi(qa.data(), T, d_xn, stream, nullptr, 0, &wrote_il);
             }
-            strata::kernels::native_quantize_q8_1(d_mixed, d_qref, N, T, stream);
+            strata::kernels::native_quantize_q8_1_il(d_mixed, d_qref, d_il_ref, N, T, stream);
             check(cudaStreamSynchronize(stream), "wide q8 sync");
             if (qx) { check(cudaGraphExecDestroy(qx), "wide q8 graph exec destroy"); check(cudaGraphDestroy(qg), "wide q8 graph destroy"); }
             if (!wrote) {
@@ -1051,7 +1059,12 @@ int fused_wide_lds_parity(const float* d_norm, const uint16_t* d_down, const uin
                 ++bad;
                 return;
             }
-            std::vector<uint8_t> hq(tqb), href(tqb);
+            if (wrote_il != expect_il_written) {
+                std::printf("  fused GR wide q8_1 T=%d q8_il_written=%d expected %d\n",
+                            T, (int) wrote_il, (int) expect_il_written);
+                ++bad;
+            }
+            std::vector<uint8_t> hq(tqb), href(tqb), hil(tib), hil_ref(tib);
             std::vector<unsigned> hcnt(N / 32);
             check(cudaMemcpy(hq.data(), d_q, tqb, cudaMemcpyDeviceToHost), "wide q8 read");
             check(cudaMemcpy(href.data(), d_qref, tqb, cudaMemcpyDeviceToHost), "wide q8 ref");
@@ -1060,6 +1073,15 @@ int fused_wide_lds_parity(const float* d_norm, const uint16_t* d_down, const uin
                 std::printf("  fused GR wide q8_1 T=%d (%s) differs from native_quantize_q8_1\n",
                             T, use_graph ? "graph" : "direct");
                 ++bad;
+            }
+            if (expect_il_written && wrote_il) {
+                check(cudaMemcpy(hil.data(), d_il, tib, cudaMemcpyDeviceToHost), "wide q8 il read");
+                check(cudaMemcpy(hil_ref.data(), d_il_ref, tib, cudaMemcpyDeviceToHost), "wide q8 il ref");
+                if (std::memcmp(hil.data(), hil_ref.data(), tib) != 0) {
+                    std::printf("  fused GR wide q8_1_il T=%d (%s) differs from native_quantize_q8_1_il\n",
+                                T, use_graph ? "graph" : "direct");
+                    ++bad;
+                }
             }
             for (size_t i = 0; i < hcnt.size(); ++i) {
                 if (hcnt[i] != 0) {
@@ -1070,21 +1092,27 @@ int fused_wide_lds_parity(const float* d_norm, const uint16_t* d_down, const uin
             }
         };
 
-        for (int T = kFusedGrMaxT + 1; T <= W; ++T) check_qfuse(T, T == W);
+        const char* gr16_env = std::getenv("STRATA_FUSED_GR_16");
+        const char* il16_env = std::getenv("STRATA_MMVQ_IL_16");
+        const bool expect_wide_il = (gr16_env == nullptr || gr16_env[0] != '0') &&
+                                    (il16_env == nullptr || il16_env[0] != '0');
+        for (int T = kFusedGrMaxT + 1; T <= W; ++T) check_qfuse(T, T == W, expect_wide_il);
 
 #if !defined(_WIN32)
         if (std::getenv("STRATA_FUSED_GR_16") == nullptr) {
             setenv("STRATA_FUSED_GR_16", "0", 1);
             check_direct(W, "slice-fallback");
-            check_qfuse(W, false);
+            check_qfuse(W, false, false);
             unsetenv("STRATA_FUSED_GR_16");
         }
 #endif
 
-        std::printf("  fused GR wide T=9..%d single-pass + q8_1 + graph replay %s\n",
+        std::printf("  fused GR wide T=9..%d single-pass + q8_1 + q8_1_il + graph replay %s\n",
                     W, bad == 0 ? "pass" : "FAIL");
         check(cudaStreamDestroy(stream), "wide stream destroy");
         check(cudaFree(d_cnt), "free wide cnt");
+        check(cudaFree(d_il_ref), "free wide il ref");
+        check(cudaFree(d_il), "free wide il");
         check(cudaFree(d_qref), "free wide qref");
         check(cudaFree(d_q), "free wide q");
         check(cudaFree(d_xn), "free wide xn");

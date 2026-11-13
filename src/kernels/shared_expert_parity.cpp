@@ -20,6 +20,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/shared_expert.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <cuda_runtime.h>
 
@@ -514,6 +515,115 @@ int main(int argc, char** argv) {
                     "a null `shared` is observable", differs ? "yes" : "*** NO ***", rel_no_shared * 100);
         if (!differs) ++bad;
         cudaFree(d_p); cudaFree(d_w); cudaFree(d_s); cudaFree(d_y);
+    }
+
+    // ================= shared_expert_multi Q8_1_IL parity (4..16 tokens, CP=16) =================
+    {
+        using namespace strata::kernels;
+        cudaStream_t sm_stream = nullptr;
+        check(cudaStreamCreateWithFlags(&sm_stream, cudaStreamNonBlocking), "sm stream");
+        constexpr int MT = kVerifyMaxT;
+        const int64_t m_embd = 256, m_ff = 256;
+        const int tp = 12;   // Q4_K (supported by native_mmvq_il across 2..16 cols on gfx12)
+        const size_t wg_b = native_mmvq_weight_bytes(tp, (int) m_embd, (int) m_ff);
+        const size_t wd_b = native_mmvq_weight_bytes(tp, (int) m_ff, (int) m_embd);
+        std::mt19937 srng(91);
+        auto make_q4k = [&](size_t bytes) {
+            std::vector<uint8_t> buf(bytes);
+            for (size_t i = 0; i < bytes; ++i) buf[i] = (uint8_t) (srng() & 0xffu);
+            for (size_t off = 0; off + 144 <= bytes; off += 144) {
+                auto sane = [&]() -> uint16_t {
+                    const uint32_t r = srng();
+                    return (uint16_t) (((r >> 31) << 15) | ((5u + (r >> 10) % 5u) << 10) | (r & 0x3ffu));
+                };
+                const uint16_t d = sane(), dm = sane();
+                std::memcpy(buf.data() + off, &d, 2);
+                std::memcpy(buf.data() + off + 2, &dm, 2);
+            }
+            return buf;
+        };
+        const std::vector<uint8_t> hwg = make_q4k(wg_b), hwu = make_q4k(wg_b), hwd = make_q4k(wd_b);
+        std::vector<float> hx((size_t) MT * m_embd);
+        std::vector<uint16_t> hxb((size_t) MT * m_embd), hgi((size_t) MT * m_embd);
+        std::normal_distribution<float> snd(0.f, 0.5f);
+        for (size_t i = 0; i < hx.size(); ++i) {
+            hx[i] = snd(srng);
+            hxb[i] = bf16_from_f32(hx[i]);
+            hgi[i] = bf16_from_f32(snd(srng));
+        }
+        uint8_t *d_wg = nullptr, *d_wu = nullptr, *d_wd = nullptr;
+        uint8_t *d_q8 = nullptr, *d_il = nullptr, *d_pre_q8 = nullptr, *d_pre_il = nullptr;
+        float *d_x = nullptr, *d_gate = nullptr, *d_up = nullptr, *d_g = nullptr, *d_o0 = nullptr, *d_o1 = nullptr;
+        uint16_t *d_xb = nullptr, *d_gi = nullptr;
+        const size_t q8_max_b = native_q8_1_bytes((int) std::max(m_embd, m_ff), MT);
+        const size_t il_max_b = native_q8_1_il_bytes((int) std::max(m_embd, m_ff), MT);
+        check(cudaMalloc(&d_wg, wg_b), "sm wg");
+        check(cudaMalloc(&d_wu, wg_b), "sm wu");
+        check(cudaMalloc(&d_wd, wd_b), "sm wd");
+        check(cudaMalloc(&d_q8, q8_max_b), "sm q8");
+        check(cudaMalloc(&d_il, il_max_b), "sm il");
+        check(cudaMalloc(&d_pre_q8, q8_max_b), "sm pre q8");
+        check(cudaMalloc(&d_pre_il, il_max_b), "sm pre il");
+        check(cudaMalloc(&d_x, hx.size() * sizeof(float)), "sm x");
+        check(cudaMalloc(&d_xb, hxb.size() * sizeof(uint16_t)), "sm xb");
+        check(cudaMalloc(&d_gi, hgi.size() * sizeof(uint16_t)), "sm gi");
+        check(cudaMalloc(&d_gate, (size_t) MT * m_ff * sizeof(float)), "sm gate");
+        check(cudaMalloc(&d_up, (size_t) MT * m_ff * sizeof(float)), "sm up");
+        check(cudaMalloc(&d_g, (size_t) MT * sizeof(float)), "sm g");
+        check(cudaMalloc(&d_o0, (size_t) MT * m_embd * sizeof(float)), "sm o0");
+        check(cudaMalloc(&d_o1, (size_t) MT * m_embd * sizeof(float)), "sm o1");
+        check(cudaMemcpy(d_wg, hwg.data(), wg_b, cudaMemcpyHostToDevice), "sm cp wg");
+        check(cudaMemcpy(d_wu, hwu.data(), wg_b, cudaMemcpyHostToDevice), "sm cp wu");
+        check(cudaMemcpy(d_wd, hwd.data(), wd_b, cudaMemcpyHostToDevice), "sm cp wd");
+        check(cudaMemcpy(d_x, hx.data(), hx.size() * sizeof(float), cudaMemcpyHostToDevice), "sm cp x");
+        check(cudaMemcpy(d_xb, hxb.data(), hxb.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "sm cp xb");
+        check(cudaMemcpy(d_gi, hgi.data(), hgi.size() * sizeof(uint16_t), cudaMemcpyHostToDevice), "sm cp gi");
+
+        const int cases[] = {4, 8, 9, 12, 16};
+        for (int nt : cases) {
+            if (nt > kVerifyMaxT) continue;
+            NativeSharedWeights nw_ref{}, nw_il{};
+            nw_ref.gate_type = nw_ref.up_type = nw_ref.down_type = tp;
+            nw_ref.gate_data = d_wg; nw_ref.up_data = d_wu; nw_ref.down_data = d_wd;
+            nw_ref.q8_1 = d_q8; nw_ref.q8_il = nullptr;
+            nw_il = nw_ref;
+            nw_il.q8_il = d_il;
+
+            check(cudaMemsetAsync(d_il, 0, il_max_b, sm_stream), "sm il zero");
+            shared_expert_multi(nt, d_x, d_xb, nw_ref, d_gi, d_gate, d_up, d_g, d_o0, m_embd, m_ff, sm_stream);
+            shared_expert_multi(nt, d_x, d_xb, nw_il, d_gi, d_gate, d_up, d_g, d_o1, m_embd, m_ff, sm_stream);
+            check(cudaStreamSynchronize(sm_stream), "sm sync 1");
+            std::vector<float> o0((size_t) nt * m_embd), o1((size_t) nt * m_embd);
+            check(cudaMemcpy(o0.data(), d_o0, o0.size() * sizeof(float), cudaMemcpyDeviceToHost), "sm rd o0");
+            check(cudaMemcpy(o1.data(), d_o1, o1.size() * sizeof(float), cudaMemcpyDeviceToHost), "sm rd o1");
+            const bool direct_ok = std::memcmp(o0.data(), o1.data(), o0.size() * sizeof(float)) == 0;
+
+            check(cudaMemsetAsync(d_pre_il, 0, il_max_b, sm_stream), "sm pre il zero");
+            native_quantize_q8_1_il(d_x, d_pre_q8, d_pre_il, (int) m_embd, nt, sm_stream);
+            nw_il.q8_il = d_pre_il;
+            shared_expert_multi(nt, d_x, d_xb, nw_il, d_gi, d_gate, d_up, d_g, d_o1, m_embd, m_ff, sm_stream, d_pre_q8, 8);
+            check(cudaStreamSynchronize(sm_stream), "sm sync 2");
+            check(cudaMemcpy(o1.data(), d_o1, o1.size() * sizeof(float), cudaMemcpyDeviceToHost), "sm rd o1 pre");
+            const bool pre_il_ok = std::memcmp(o0.data(), o1.data(), o0.size() * sizeof(float)) == 0;
+
+            nw_il.q8_il = d_il;
+            check(cudaMemsetAsync(d_il, 0x5a, il_max_b, sm_stream), "sm il poison");
+            shared_expert_multi(nt, d_x, d_xb, nw_il, d_gi, d_gate, d_up, d_g, d_o1, m_embd, m_ff, sm_stream, d_pre_q8, 0);
+            check(cudaStreamSynchronize(sm_stream), "sm sync 3");
+            check(cudaMemcpy(o1.data(), d_o1, o1.size() * sizeof(float), cudaMemcpyDeviceToHost), "sm rd o1 fallback");
+            const bool fallback_ok = std::memcmp(o0.data(), o1.data(), o0.size() * sizeof(float)) == 0;
+
+            const bool ok = direct_ok && pre_il_ok && fallback_ok;
+            std::printf("  shared_expert_multi Q4_K T=%d il=%d (direct=%d pre_il=%d interleave=%d): %s\n",
+                        nt, (int) native_mmvq_il_supported(tp, nt, (int) m_ff),
+                        (int) direct_ok, (int) pre_il_ok, (int) fallback_ok, ok ? "bitwise" : "*** FAIL ***");
+            if (!ok) ++bad;
+        }
+        (void) cudaStreamDestroy(sm_stream);
+        (void) cudaFree(d_wg); (void) cudaFree(d_wu); (void) cudaFree(d_wd);
+        (void) cudaFree(d_q8); (void) cudaFree(d_il); (void) cudaFree(d_pre_q8); (void) cudaFree(d_pre_il);
+        (void) cudaFree(d_x); (void) cudaFree(d_xb); (void) cudaFree(d_gi);
+        (void) cudaFree(d_gate); (void) cudaFree(d_up); (void) cudaFree(d_g); (void) cudaFree(d_o0); (void) cudaFree(d_o1);
     }
 
     std::printf("\nshared_expert: %d failures\n", bad);

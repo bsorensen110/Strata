@@ -329,7 +329,7 @@ struct GdnQ81Il {
     int nb = 0;
 };
 inline GdnQ81Il make_gdn_q81_il(void* xq_il_out, int value_dim, int out_tok) {
-    if (!xq_il_out || out_tok < 2 || out_tok > 8) return {};
+    if (!xq_il_out || out_tok < 2 || out_tok > kVerifyMaxT) return {};
     const int cp = native_q8_1_il_cp(out_tok);
     const int nb = value_dim / 32;
     const size_t words = (size_t) nb * 8 * (size_t) cp;

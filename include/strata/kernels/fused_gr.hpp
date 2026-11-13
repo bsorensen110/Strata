@@ -48,7 +48,8 @@ struct FusedGrArgs {
     uint8_t* q8_mixed = nullptr;
     unsigned* q8_cnt = nullptr;
     /// Optional interleaved q8_1 destination (native_q8_1_il_bytes(n_embd, n_tok)) written alongside q8_mixed when
-    /// 2 <= n_tok <= kFusedGrMaxT and token 0 sets q8_il.
+    /// 2 <= n_tok <= kFusedGrMaxT (or up to kFusedGrWideT in a single-pass wide call with STRATA_MMVQ_IL_16 != 0)
+    /// and token 0 sets q8_il.
     void* q8_il = nullptr;
     /// STRATA_HC_Q8: non-null when w_down / w_up hold int8 codes (same [row][col] layout) with one fp32 scale per
     /// 32 contiguous values here ([row][col / 32]).  w_inject stays bf16.
@@ -73,13 +74,15 @@ void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks
 /// weight pointers and eps must be the same for every t); `xn_scratch` is n_tok * hc * n_embd floats.  Every
 /// token's outputs are bitwise `fused_gr_read(a[t])`.
 constexpr int kFusedGrMaxT = 8;
-/// A window of more than kFusedGrMaxT tokens executes in a single wide launch when STRATA_FUSED_GR_16 is enabled (default ON)
-/// and q8_il is null, or in slices of at most kFusedGrMaxT otherwise (bitwise the one read); `a` and `xn_scratch` hold up to
-/// kFusedGrWideT tokens.
+/// A window of more than kFusedGrMaxT tokens executes in a single wide launch when STRATA_FUSED_GR_16 is enabled
+/// (default ON), or in slices of at most kFusedGrMaxT otherwise (bitwise the one read); `a` and `xn_scratch` hold up to
+/// kFusedGrWideT tokens.  The 8-column slice fallback clears `q8_il`, so callers passing `q8_il` can observe `*q8_il_written`.
 constexpr int kFusedGrWideT = kWindowMaxT;
 /// Returns true when it also wrote the q8_1 images (every token's q8_mixed set and this read supports it).
+/// When non-null, `*q8_il_written` is set to true iff this call also wrote `a[0].q8_il`.
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
-                         unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
+                         unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0,
+                         bool* q8_il_written = nullptr);
 
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);

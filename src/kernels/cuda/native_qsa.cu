@@ -23,8 +23,10 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #define STRATA_Q81_FASTMATH_DIV 1
 #include "strata/kernels/q8_1_finite.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <atomic>
@@ -295,9 +297,9 @@ void native_qsa_gate_quantize_q8_1(const float* attn, const float* q_full, void*
     int *bm = nullptr, *pm = nullptr;
     float* dl = nullptr;
     int n_in = 0, cp = 0;
-    if (x_il != nullptr && ncols >= 2 && ncols <= 8 && (n_head % ncols) == 0) {
+    if (x_il != nullptr && ncols >= 2 && ncols <= kWindowMaxT && (n_head % ncols) == 0) {
         n_in = (n_head / ncols) * head_dim;
-        cp = ncols <= 2 ? 2 : (ncols <= 4 ? 4 : 8);
+        cp = native_q8_1_il_cp(ncols);
         const std::size_t words = std::size_t(n_in / 32) * 8 * std::size_t(cp);
         bm = static_cast<int*>(x_il);
         pm = bm + words;

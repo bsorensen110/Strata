@@ -189,6 +189,7 @@ inline bool g_qdedup(bool q8_ffn_ready = false) {
 // fork F4 (Eddoursul): 2-4 token dense projections read an interleaved copy of the q8_1 activations (bitwise the same
 // outputs); STRATA_MMVQ_IL=0 keeps native_mmvq's multi-column kernels
 inline bool g_mmvq_il() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL"); return v == nullptr || v[0] != '0'; }(); return on; }
+inline bool g_mmvq_il_16() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL_16"); return v == nullptr || v[0] != '0'; }(); return on; }
 // STRATA_SELECT_LONG=1 (opt-in): a window graph past select_long_at() cells takes the long-context QSA select
 // (qsa_block_topk_long's multi-CTA top-k through topk_scratch_, qsa_block_scores_long's shuffle-free decode scorer;
 // both compute capability 6.x by default, the same ids and score bits).  Each costs ~6 more kernels a call, which only
@@ -1664,8 +1665,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             pending = false;
         }
-        const bool want_attn_il = n >= 2 && n <= kFusedGrMaxT && qil_on() && g_mmvq_il();
-        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out, bool write_ffn_il = false) {
+        const bool want_attn_il = n >= 2 && n <= kVerifyMaxT && qil_on() && g_mmvq_il() &&
+                                  (n <= kFusedGrMaxT || g_mmvq_il_16());
+        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out, bool write_ffn_il = false,
+                                 bool* il_out = nullptr) {
+            if (il_out != nullptr) *il_out = false;
             strata::dispatch::notef("hc read: weights Q8_0 copies=%ld (0 = bf16 rows), half=%ld, qfuse=%ld", (long) (wd[half]->hc_q8 != nullptr), (long) half, (long) (qcnt_ != nullptr));
             FusedGrArgs fa[kFusedGrWideT];
             for (int t = tb; t < te; ++t) {
@@ -1693,9 +1697,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
-                                (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+                                (int) (l * kProfPer + (half == 0 ? 27 : 30)), il_out);
         };
-        const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
+        bool il_attn_wrote = false;
+        const bool q8_attn = gr_read_group(0, pending, inj2_, inj_, false, &il_attn_wrote);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
             for (int d = 0; d < dummy; ++d) gpu_noop(cs);
@@ -1706,7 +1711,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
-        bool il_ready = q8_attn && want_attn_il;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
+        bool il_ready = q8_attn && want_attn_il && il_attn_wrote;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
         // a projection input's q8_1 blocks and their interleaved copy in one launch (native_quantize_q8_1_il, the same
         // bytes): Turing default (+0.5..+1 % decode, two launches fewer per GDN layer and per QSA layer); STRATA_QIL=0 / 1
         // forces it off / on
@@ -1901,7 +1906,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const char* e = std::getenv("STRATA_GDN_GROUPS_QFUSE");
                     return !e || e[0] != '0';
                 }();
-                const bool use_quant_il_wout = n >= 2 && n <= 8 && qil_on() && g_mmvq_il() &&
+                const bool use_quant_il_wout = n >= 2 && n <= kVerifyMaxT && qil_on() && g_mmvq_il() &&
                                                strata::kernels::native_mmvq_il_supported(wout->native_type, n, (int) N);
                 bool gdn_q_done = false;
                 if (batch_rec_ && gdn_groups_on && n_gdn_groups >= 1 && n_gdn_groups <= 8) {
@@ -2464,7 +2469,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const char* e = std::getenv("STRATA_QSA_GATE_QFUSE");
                     return !e || e[0] != '0';
                 }();
-                const bool use_quant_il_wo = n >= 2 && n <= 8 && qil_on() && g_mmvq_il() &&
+                const bool use_quant_il_wo = n >= 2 && n <= kVerifyMaxT && qil_on() && g_mmvq_il() &&
                                              strata::kernels::native_mmvq_il_supported(wo->native_type, n, (int) N);
                 const bool fuse_gate_q8 = qb && qsa_gate_qfuse && (HD % 32) == 0;
                 const bool rot_kv = st.kv_rot || st.kv_hybrid;
@@ -2507,10 +2512,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                    ((t != 18 && t != 21) || N <= 4096);
         };
         const bool want_ffn_il_wide = !sh_fork && n >= 2 && n <= kVerifyMaxT && g_mmvq_il() && qil_on() &&
+                                      (n <= kFusedGrMaxT || g_mmvq_il_16()) &&
                                       strata::kernels::cpu::expert_layout().native &&
                                       (shexp_il_needed(wsg) || shexp_il_needed(wsu));
-        const bool want_ffn_il = want_ffn_il_wide && n <= kFusedGrMaxT;
-        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_, want_ffn_il);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
+        const bool want_ffn_il = want_ffn_il_wide;
+        bool il_ffn_wrote = false;
+        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_, want_ffn_il, &il_ffn_wrote);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
@@ -2623,7 +2630,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // shared expert runs on the same stream): the shared expert's gate/up reuse nat_xq_ directly instead of
             // launching a second native_quantize_q8_1(xm) pass per layer (quantize_q8_1_rows and native_quantize_q8_1
             // write the same bytes)
-            bool ffn_il_ready = q8_ffn && want_ffn_il;
+            bool ffn_il_ready = q8_ffn && want_ffn_il && il_ffn_wrote;
             qdedup = g_qdedup(q8_ffn) && !sh_fork && strata::kernels::cpu::expert_layout().native;
             if (qdedup && !q8_ffn) {
                 if (want_ffn_il_wide) {

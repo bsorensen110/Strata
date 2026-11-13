@@ -164,9 +164,10 @@ void qsa_gate_q8(cudaStream_t s) {
     const int NH = 16, HD = 256;
     std::mt19937 rng(17);
     std::normal_distribution<float> nd(0.f, 1.f);
-    for (int n : {1, 4, 8, 16}) {
+    for (int n : {1, 4, 8, 9, 12, 16}) {
         const size_t elems = (size_t) n * NH * HD;
         const size_t q8_bytes = (elems / 32) * 36;
+        const size_t il_bytes = n >= 2 ? k::native_q8_1_il_bytes(NH * HD, n) : 0;
         std::vector<float> attn(elems), qfull(elems * 2);
         for (auto& x : attn) x = nd(rng);
         for (auto& x : qfull) x = 2.f * nd(rng);
@@ -175,14 +176,38 @@ void qsa_gate_q8(cudaStream_t s) {
         float* d_out = dalloc<float>(elems);
         uint8_t* xq0 = dalloc<uint8_t>(q8_bytes);
         uint8_t* xq1 = dalloc<uint8_t>(q8_bytes);
+        uint8_t* xil0 = n >= 2 ? dalloc<uint8_t>(il_bytes) : nullptr;
+        uint8_t* xil1 = n >= 2 ? dalloc<uint8_t>(il_bytes) : nullptr;
+        if (n >= 2) {
+            ck(cudaMemsetAsync(xil0, 0, il_bytes, s), "qsa il0 zero");
+            ck(cudaMemsetAsync(xil1, 0, il_bytes, s), "qsa il1 zero");
+        }
         k::native_qsa_gate_apply(d_attn, d_qfull, d_out, n * NH, HD, s);
-        k::native_quantize_q8_1(d_out, xq0, NH * HD, n, s);
-        k::native_qsa_gate_quantize_q8_1(d_attn, d_qfull, xq1, n * NH, HD, s);
+        if (n >= 2) k::native_quantize_q8_1_il(d_out, xq0, xil0, NH * HD, n, s);
+        else k::native_quantize_q8_1(d_out, xq0, NH * HD, n, s);
+        k::native_qsa_gate_quantize_q8_1(d_attn, d_qfull, xq1, n * NH, HD, s, xil1, n >= 2 ? n : 0, false);
         ck(cudaStreamSynchronize(s), "qsa_gate_q8");
         char what[128];
         std::snprintf(what, sizeof what, "native_qsa_gate_quantize_q8_1, %d tokens", n);
-        report(what, read(xq0, q8_bytes) == read(xq1, q8_bytes));
+        bool ok = read(xq0, q8_bytes) == read(xq1, q8_bytes);
+        if (n >= 2) ok = ok && (read(xil0, il_bytes) == read(xil1, il_bytes));
+        report(what, ok);
+        if (n >= 2) {
+            ck(cudaMemsetAsync(xil0, 0, il_bytes, s), "qsa fwht il0 zero");
+            ck(cudaMemsetAsync(xil1, 0, il_bytes, s), "qsa fwht il1 zero");
+            float* d_rot = dalloc<float>(elems);
+            ck(cudaMemcpyAsync(d_rot, d_attn, elems * sizeof(float), cudaMemcpyDeviceToDevice, s), "qsa rot copy");
+            k::fwht256_inplace_cuda(d_rot, (int64_t) n * NH, s);
+            k::native_qsa_gate_apply(d_rot, d_qfull, d_out, n * NH, HD, s);
+            k::native_quantize_q8_1_il(d_out, xq0, xil0, NH * HD, n, s);
+            k::native_qsa_gate_quantize_q8_1(d_attn, d_qfull, xq1, n * NH, HD, s, xil1, n, true);
+            ck(cudaStreamSynchronize(s), "qsa_gate_q8_fwht");
+            std::snprintf(what, sizeof what, "native_qsa_gate_quantize_q8_1 fwht+il, %d tokens", n);
+            report(what, read(xq0, q8_bytes) == read(xq1, q8_bytes) && read(xil0, il_bytes) == read(xil1, il_bytes));
+            cudaFree(d_rot);
+        }
         cudaFree(d_attn); cudaFree(d_qfull); cudaFree(d_out); cudaFree(xq0); cudaFree(xq1);
+        cudaFree(xil0); cudaFree(xil1);
     }
 }
 
@@ -191,10 +216,11 @@ void gdn_groups_q8(cudaStream_t s) {
     const int HK = 16, HV = 32, S = 128, ZV = HV * S, C = (2 * HK + HV) * S;
     std::mt19937 rng(23);
     std::normal_distribution<float> nd(0.f, 0.5f);
-    for (int n : {8, 16}) {
+    for (int n : {8, 9, 12, 16}) {
         const int n0 = n / 2, n1 = n - n0;
         const size_t st_floats = (size_t) HV * S * S;
         const size_t q8_bytes = ((size_t) n * ZV / 32) * 36;
+        const size_t il_bytes = k::native_q8_1_il_bytes(ZV, n);
         std::vector<float> st0(st_floats), st1(st_floats), h((size_t) n * C), gate((size_t) n * HV), beta((size_t) n * HV),
             z((size_t) n * ZV), gam(S);
         for (auto* v : {&st0, &st1, &h, &gate, &beta, &z})
@@ -204,18 +230,21 @@ void gdn_groups_q8(cudaStream_t s) {
         float *dh = upload(h), *dg = upload(gate), *db = upload(beta), *dz = upload(z), *dgam = upload(gam);
         float *ya = dalloc<float>((size_t) n * ZV), *yb = dalloc<float>((size_t) n * ZV);
         uint8_t *xqa = dalloc<uint8_t>(q8_bytes), *xqb = dalloc<uint8_t>(q8_bytes);
+        uint8_t *xila = dalloc<uint8_t>(il_bytes), *xilb = dalloc<uint8_t>(il_bytes);
+        ck(cudaMemsetAsync(xila, 0, il_bytes, s), "gdn il_a zero");
+        ck(cudaMemsetAsync(xilb, 0, il_bytes, s), "gdn il_b zero");
         k::GdnGroups gga{}, ggb{};
         gga.n = 2; gga.state[0] = s0a; gga.first[0] = 0; gga.ntok[0] = n0; gga.state[1] = s1a; gga.first[1] = n0; gga.ntok[1] = n1;
         ggb.n = 2; ggb.state[0] = s0b; ggb.first[0] = 0; ggb.ntok[0] = n0; ggb.state[1] = s1b; ggb.first[1] = n0; ggb.ntok[1] = n1;
         k::gdn_step_norm_groups(gga, dh, C, dg, db, dz, dgam, 1e-6f, ya, HK, HV, false, s, 0, nullptr);
-        k::native_quantize_q8_1(ya, xqa, ZV, n, s);
-        k::gdn_step_norm_groups(ggb, dh, C, dg, db, dz, dgam, 1e-6f, yb, HK, HV, false, s, 0, xqb);
+        k::native_quantize_q8_1_il(ya, xqa, xila, ZV, n, s);
+        k::gdn_step_norm_groups(ggb, dh, C, dg, db, dz, dgam, 1e-6f, yb, HK, HV, false, s, 0, xqb, xilb);
         ck(cudaStreamSynchronize(s), "gdn_groups_q8");
         char what[128];
-        std::snprintf(what, sizeof what, "gdn_step_norm_groups fused q8_1, %d tokens (2 groups)", n);
-        report(what, read(xqa, q8_bytes) == read(xqb, q8_bytes));
+        std::snprintf(what, sizeof what, "gdn_step_norm_groups fused q8_1+il, %d tokens (2 groups)", n);
+        report(what, read(xqa, q8_bytes) == read(xqb, q8_bytes) && read(xila, il_bytes) == read(xilb, il_bytes));
         for (float* p : {s0a, s1a, s0b, s1b, dh, dg, db, dz, dgam, ya, yb}) cudaFree(p);
-        cudaFree(xqa); cudaFree(xqb);
+        cudaFree(xqa); cudaFree(xqb); cudaFree(xila); cudaFree(xilb);
     }
 }
 
