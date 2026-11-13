@@ -158,6 +158,18 @@ bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void*
 bool native_mmvq_pair_swiglu(int ggml_type, const void* w_gate, const void* w_up, const void* x_q8_1, float* y_swiglu,
                              int n_in, int n_out, int ncols, void* stream);
 
+struct NativeMmvqSeg {
+    const void* weights = nullptr;
+    float* y = nullptr;
+    int n_out = 0;
+};
+/// Runs 2 or 3 projections of the same ggml_type and n_in reading the same input in ONE launch.
+/// Prefers the interleaved kernel when use_il is true and all segments qualify; falls back to
+/// multi-segment plain MMVQ where exact layout applies. Returns false (nothing launched) otherwise.
+bool native_mmvq_multi_segs(int ggml_type, const NativeMmvqSeg* segs, int n_segs,
+                            const void* x_q8_1, const void* x_il,
+                            int n_in, int ncols, void* stream, bool use_il = true);
+
 // Fork F4 (Eddoursul): 2..4 columns also INTERLEAVED, so one 16-byte load reads a position of every column: CP = 2 (2
 // columns) or 4 (3-4), zero-padded; nb = n_in / 32 blocks; int32 bm[nb][8][CP] (block-major), int32 pm[8][nb][CP]
 // (position-major), float d[nb][CP] (each block's scale as the dots read it, __low2float of ds).
