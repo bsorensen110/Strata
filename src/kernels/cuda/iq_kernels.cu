@@ -3986,6 +3986,109 @@ __global__ void __launch_bounds__(256) s27_gu_kernel(const unsigned long long* _
     }
 }
 
+__device__ __forceinline__ void s27_swiglu_q8_1_warp(float g, float u, block_q8_1* y, int lane) {
+#pragma clang fp contract(off)
+    const float xi = (g / (1.0f + __expf(-g))) * u;
+    float amax = fabsf(xi), sum = xi;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+        sum += __shfl_xor_sync(0xffffffffu, sum, o);
+    }
+    const float d = q8_1_finite(amax / 127.0f);   // #606: as native_quantize_q8_1_kernel - finite blocks bit for bit
+    const int8_t q = q8_1_quant(xi, d, amax);
+    y->qs[lane] = q;
+    if (lane == 0) y->ds = q8_1_ds(d, sum);
+}
+
+// Fused Q4_K / Q5_K gate+up + SwiGLU + q8_1 quantize for V2K shapes where n_ff % 32 == 0 and n_embd <= 2560 (q36geo):
+// each block computes matching 32-row slices of gate and up while sharing the chunk's LDS activations, then quantizes
+// directly to hq without writing intermediate gate/up/h buffers.
+template<int TG, bool TS = false>
+__global__ void __launch_bounds__(256) s27_gu_swiglu_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                            const int32_t* __restrict__ grp_start,
+                                                            const int32_t* __restrict__ n_groups,
+                                                            const int32_t* __restrict__ ent_tok,
+                                                            const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                            block_q8_1* __restrict__ hq) {
+    using F = Fmt<TG>;
+    using S = S27<TG>;
+    constexpr int RPW = 4;
+    __shared__ block_q8_1 s_x[GRP_NC * S26_XMAX];
+    __shared__ float s_gu[GRP_NC][64];
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int r0 = blockIdx.x * 32;
+    const int nb = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 32), hb = (int) (L.n_ff / 32);
+    const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int e = e0; e < e1; e += GRP_NC) {
+        const int n = min(GRP_NC, e1 - e);
+        int off[GRP_NC];
+        __syncthreads();   // previous chunk is done with s_x and s_gu
+        for (int i = threadIdx.x; i < n * xb; i += 256) {
+            const int c = i / xb, j = i - c * xb;
+            memcpy(&s_x[c * S26_XMAX + j], &xq[(size_t) ent_tok[e + c] * xb + j], sizeof(s_x[0]));
+        }
+#pragma unroll
+        for (int c = 0; c < GRP_NC; ++c) off[c] = min(c, n - 1) * S26_XMAX;
+        __syncthreads();
+        for (int half = 0; half < 2; ++half) {   // 0: gate rows [r0, r0+32), 1: up rows [r0, r0+32)
+            const size_t base_off = half ? (size_t) L.up_off : 0;
+            const uint8_t* wr[RPW];
+#pragma unroll
+            for (int q = 0; q < RPW; ++q)
+                wr[q] = blob + base_off + (size_t) (r0 + warp + q * GU_ROWS) * L.gu_row;
+            float s[RPW][GRP_NC];
+#pragma unroll
+            for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                for (int c = 0; c < GRP_NC; ++c) s[q][c] = 0.0f;
+            for (int k = lane; k < nb * F::ipb; k += 32) {
+                const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+                typename S::W w[RPW];
+#pragma unroll
+                for (int q = 0; q < RPW; ++q) w[q] = S::load(wr[q], kbx, iqs);
+#pragma unroll
+                for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                    for (int c = 0; c < GRP_NC; ++c)
+                        if (c < n) s[q][c] += S::apply(w[q], s_x + off[c] + kbx * (F::qk / 32), iqs);
+            }
+            if constexpr (TS) {
+                constexpr int P = s26ts::pow2_ceil(RPW * GRP_NC);
+                float v[P];
+#pragma unroll
+                for (int j = 0; j < P; ++j) v[j] = j < RPW * GRP_NC ? s[j / GRP_NC][j % GRP_NC] : 0.0f;
+                const float sum = s26ts::tsum<P>(v, lane);
+                const int j = s26ts::tsum_token<P>(lane);
+                if (lane == s26ts::tsum_lane<P>(j) && j < RPW * GRP_NC) {
+                    const int c = j % GRP_NC;
+#pragma unroll
+                    for (int q = 0; q < RPW; ++q)
+                        if (j / GRP_NC == q && c < n) s_gu[c][half * 32 + q * GU_ROWS + warp] = sum;
+                }
+            } else {
+#pragma unroll
+                for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                    for (int c = 0; c < GRP_NC; ++c)
+                        if (c < n) s[q][c] = warp_sum(s[q][c]);
+#pragma unroll
+                for (int q = 0; q < RPW; ++q)
+#pragma unroll
+                    for (int c = 0; c < GRP_NC; ++c)
+                        if (c < n && lane == c) s_gu[c][half * 32 + q * GU_ROWS + warp] = s[q][c];
+            }
+        }
+        __syncthreads();
+        if (warp < n)
+            s27_swiglu_q8_1_warp(s_gu[warp][lane], s_gu[warp][32 + lane],
+                                 hq + (size_t) (e + warp) * hb + blockIdx.x, lane);
+    }
+}
+
 template<int TD, bool LX, int RPW, bool TS>
 __global__ void __launch_bounds__(256) s27_down_kernel(const unsigned long long* __restrict__ grp_ptr,
                                                        const int32_t* __restrict__ grp_start,
@@ -6382,12 +6485,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         const long long nh = (long long) cap_entries * L.n_ff;
 #define STRATA_V2K(G, D) s27_launch_ts<G, D>(ts, L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh)
         if (q36geo) {
-            // the gate/up of the V2K path (4 rows per warp, the chunk's activations in LDS) + SwiGLU/q8_1, and the old down kernel:
-            // for n_ff 512 the new down kernel measured slower (15.1 vs 13.4 us per layer on gfx1201, R9700)
-            const dim3 ggu((unsigned) (2 * L.n_ff / (GU_ROWS * 4)), (unsigned) cap_groups);
-            if (L.gu_type == 12) s27_gu_kernel<12, true, 4, false><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-            else s27_gu_kernel<13, true, 4, false><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up);
-            s26_swiglu_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, hq, nh);
+            // the gate/up of the V2K path (4 rows per warp, the chunk's activations in LDS) fused with SwiGLU/q8_1,
+            // and the old down kernel: for n_ff 512 the new down kernel measured slower (15.1 vs 13.4 us per layer on gfx1201, R9700)
+            const dim3 ggu((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
+            if (L.gu_type == 12) s27_gu_swiglu_kernel<12><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+            else s27_gu_swiglu_kernel<13><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
             const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
             launch_down<13>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         }
