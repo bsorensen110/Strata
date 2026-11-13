@@ -1,0 +1,105 @@
+{
+ "arm": "ctl_newbuild_mt16_vs_old16",
+ "round": "_r2",
+ "ts": "2026-11-13T14:03:28",
+ "exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "commit": "7a7deac9e",
+ "engine_pid": 26766,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-17-win16/results/ctl_newbuild_mt16_vs_old16.manifest.json",
+  "STRATA_BATCH_DF2_MAX_T": "16"
+ },
+ "parallel": 2,
+ "smoke": {
+  "prompt_tokens": 40,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.349,
+  "wall_tok_s": 8.6
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 5.846,
+  "wall_tok_s": 43.79
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.369,
+   "wall_tok_s": 117.19,
+   "hash": "35cfee67ce98c066f3b3fe932e12ab58d31a51593f94879b892f7ee64ed8fda8"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.855,
+   "wall_tok_s": 132.8,
+   "hash": "35cfee67ce98c066f3b3fe932e12ab58d31a51593f94879b892f7ee64ed8fda8"
+  }
+ ],
+ "burst": {
+  "wall_s": 3.91,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 130.96,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.627,
+    "wall_tok_s": 70.58,
+    "hash": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.909,
+    "wall_tok_s": 65.5,
+    "hash": "8ce0dbce8b7d40c66b56c6d325330ccb8b9ffdbb2736f30501c8e5a5456b0732"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "35cfee67ce98c066f3b3fe932e12ab58d31a51593f94879b892f7ee64ed8fda8",
+  "greedy_warm": "35cfee67ce98c066f3b3fe932e12ab58d31a51593f94879b892f7ee64ed8fda8",
+  "burst_a": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574",
+  "burst_b": "8ce0dbce8b7d40c66b56c6d325330ccb8b9ffdbb2736f30501c8e5a5456b0732"
+ },
+ "engine_decode_512": [
+  "123.2",
+  "134.7"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 68 ms (43.9 tok/s), drafts accepted 1 of 6, 1 checkpoints",
+   "generated in 3025 ms (84.6 tok/s), drafts accepted 162 of 294, 1 checkpoints",
+   "generated in 4157 ms (123.2 tok/s), drafts accepted 413 of 575, 1 checkpoints",
+   "generated in 3802 ms (134.7 tok/s), drafts accepted 412 of 577, 1 checkpoints",
+   "generated in 28 ms (35.3 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 16 ms (63.1 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 231 ms (185.8 tok/s), drafts accepted 37 of 42, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 40 tokens = 0 reused + 40 read in 278 ms (143.9 tok/s), 3 generated in 68 ms (43.9 tok/s), drafts accepted 1 of 6, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 2817 ms (1400.9 tok/s), 256 generated in 3025 ms (84.6 tok/s), drafts accepted 162 of 294, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 210 ms (166.9 tok/s), 512 generated in 4157 ms (123.2 tok/s), drafts accepted 413 of 575, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 52 ms (135.7 tok/s), 512 generated in 3802 ms (134.7 tok/s), drafts accepted 412 of 577, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 209 ms (167.3 tok/s), 1 generated in 28 ms (35.3 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 188 ms (186.3 tok/s), 1 generated in 16 ms (63.1 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 248 tokens = 247 reused + 1 read in 2 ms (642.8 tok/s), 43 generated in 231 ms (185.8 tok/s), drafts accepted 37 of 42, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 6",
+   "drafts accepted 162 of 294",
+   "drafts accepted 413 of 575",
+   "drafts accepted 412 of 577",
+   "drafts accepted 0 of 0",
+   "drafts accepted 0 of 0",
+   "drafts accepted 37 of 42"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 9504 slots, 21.75 GiB of VRAM; policy is"
+ ]
+}

@@ -1,0 +1,105 @@
+{
+ "arm": "ctl_newbuild_mt16_vs_old16",
+ "round": "_r3",
+ "ts": "2026-11-13T14:05:33",
+ "exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "commit": "7a7deac9e",
+ "engine_pid": 27522,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-17-win16/results/ctl_newbuild_mt16_vs_old16.manifest.json",
+  "STRATA_BATCH_DF2_MAX_T": "16"
+ },
+ "parallel": 2,
+ "smoke": {
+  "prompt_tokens": 40,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.356,
+  "wall_tok_s": 8.43
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 5.98,
+  "wall_tok_s": 42.81
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.157,
+   "wall_tok_s": 123.16,
+   "hash": "88164a4a62adb42738457ecf179fe2a43b737da1522af199444cc881e9e8a12c"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.504,
+   "wall_tok_s": 146.11,
+   "hash": "f25fb555a300a69af3a8b1de759d243b533d3f5f2191e7c877f498f3ec64fdca"
+  }
+ ],
+ "burst": {
+  "wall_s": 4.071,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 125.78,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.676,
+    "wall_tok_s": 69.64,
+    "hash": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 4.07,
+    "wall_tok_s": 62.9,
+    "hash": "4b35927e470e1c16de4138828e987018dccbd7d60eb6ca54066e754b7381b26a"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "88164a4a62adb42738457ecf179fe2a43b737da1522af199444cc881e9e8a12c",
+  "greedy_warm": "f25fb555a300a69af3a8b1de759d243b533d3f5f2191e7c877f498f3ec64fdca",
+  "burst_a": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574",
+  "burst_b": "4b35927e470e1c16de4138828e987018dccbd7d60eb6ca54066e754b7381b26a"
+ },
+ "engine_decode_512": [
+  "129.4",
+  "148.9"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 68 ms (44.0 tok/s), drafts accepted 1 of 6, 1 checkpoints",
+   "generated in 3222 ms (79.5 tok/s), drafts accepted 152 of 292, 1 checkpoints",
+   "generated in 3956 ms (129.4 tok/s), drafts accepted 426 of 514, 1 checkpoints",
+   "generated in 3439 ms (148.9 tok/s), drafts accepted 421 of 533, 1 checkpoints",
+   "generated in 28 ms (35.6 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 16 ms (62.5 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 346 ms (112.7 tok/s), drafts accepted 30 of 61, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 40 tokens = 0 reused + 40 read in 285 ms (140.3 tok/s), 3 generated in 68 ms (44.0 tok/s), drafts accepted 1 of 6, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 2755 ms (1432.7 tok/s), 256 generated in 3222 ms (79.5 tok/s), drafts accepted 152 of 292, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 199 ms (176.0 tok/s), 512 generated in 3956 ms (129.4 tok/s), drafts accepted 426 of 514, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 63 ms (111.2 tok/s), 512 generated in 3439 ms (148.9 tok/s), drafts accepted 421 of 533, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 217 ms (161.3 tok/s), 1 generated in 28 ms (35.6 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 185 ms (188.7 tok/s), 1 generated in 16 ms (62.5 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 252 tokens = 251 reused + 1 read in 2 ms (649.2 tok/s), 39 generated in 346 ms (112.7 tok/s), drafts accepted 30 of 61, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 6",
+   "drafts accepted 152 of 292",
+   "drafts accepted 426 of 514",
+   "drafts accepted 421 of 533",
+   "drafts accepted 0 of 0",
+   "drafts accepted 0 of 0",
+   "drafts accepted 30 of 61"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 9504 slots, 21.75 GiB of VRAM; policy is"
+ ]
+}

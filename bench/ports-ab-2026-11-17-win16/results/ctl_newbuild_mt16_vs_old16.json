@@ -1,0 +1,105 @@
+{
+ "arm": "ctl_newbuild_mt16_vs_old16",
+ "round": "r1",
+ "ts": "2026-11-13T14:01:20",
+ "exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "commit": "7a7deac9e",
+ "engine_pid": 26030,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-17-win16/results/ctl_newbuild_mt16_vs_old16.manifest.json",
+  "STRATA_BATCH_DF2_MAX_T": "16"
+ },
+ "parallel": 2,
+ "smoke": {
+  "prompt_tokens": 40,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.367,
+  "wall_tok_s": 8.17
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 6.049,
+  "wall_tok_s": 42.32
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.498,
+   "wall_tok_s": 113.83,
+   "hash": "5ad7ecaba7c74e67bb3883a64e10df863b012b09b9a5dd734a090c9a0e90276b"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.534,
+   "wall_tok_s": 144.86,
+   "hash": "c2e24da117eb8ce472460a5e5bb739850483701d926e3c9e4536b75ab66ee9c5"
+  }
+ ],
+ "burst": {
+  "wall_s": 3.895,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 131.45,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.55,
+    "wall_tok_s": 72.11,
+    "hash": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.894,
+    "wall_tok_s": 65.74,
+    "hash": "44bd47f49b2cbc2d5de94d22b4b8dd591a97cfa48bb6bfff1bc4d4c86f44ed94"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "5ad7ecaba7c74e67bb3883a64e10df863b012b09b9a5dd734a090c9a0e90276b",
+  "greedy_warm": "c2e24da117eb8ce472460a5e5bb739850483701d926e3c9e4536b75ab66ee9c5",
+  "burst_a": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574",
+  "burst_b": "44bd47f49b2cbc2d5de94d22b4b8dd591a97cfa48bb6bfff1bc4d4c86f44ed94"
+ },
+ "engine_decode_512": [
+  "118.9",
+  "146.9"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 69 ms (43.3 tok/s), drafts accepted 1 of 6, 1 checkpoints",
+   "generated in 3148 ms (81.3 tok/s), drafts accepted 159 of 303, 1 checkpoints",
+   "generated in 4305 ms (118.9 tok/s), drafts accepted 410 of 525, 1 checkpoints",
+   "generated in 3486 ms (146.9 tok/s), drafts accepted 421 of 517, 1 checkpoints",
+   "generated in 16 ms (60.8 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 16 ms (60.7 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 284 ms (144.6 tok/s), drafts accepted 34 of 46, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 40 tokens = 0 reused + 40 read in 295 ms (135.6 tok/s), 3 generated in 69 ms (43.3 tok/s), drafts accepted 1 of 6, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 2897 ms (1362.5 tok/s), 256 generated in 3148 ms (81.3 tok/s), drafts accepted 159 of 303, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 191 ms (183.4 tok/s), 512 generated in 4305 ms (118.9 tok/s), drafts accepted 410 of 525, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 47 ms (148.7 tok/s), 512 generated in 3486 ms (146.9 tok/s), drafts accepted 421 of 517, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 227 ms (154.5 tok/s), 1 generated in 16 ms (60.8 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 192 ms (181.9 tok/s), 1 generated in 16 ms (60.7 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 250 tokens = 249 reused + 1 read in 2 ms (631.0 tok/s), 41 generated in 284 ms (144.6 tok/s), drafts accepted 34 of 46, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 6",
+   "drafts accepted 159 of 303",
+   "drafts accepted 410 of 525",
+   "drafts accepted 421 of 517",
+   "drafts accepted 0 of 0",
+   "drafts accepted 0 of 0",
+   "drafts accepted 34 of 46"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 9504 slots, 21.75 GiB of VRAM; policy is"
+ ]
+}

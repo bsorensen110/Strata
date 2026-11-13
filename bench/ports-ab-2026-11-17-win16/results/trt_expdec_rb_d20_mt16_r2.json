@@ -1,0 +1,108 @@
+{
+ "arm": "trt_expdec_rb_d20_mt16",
+ "round": "_r2",
+ "ts": "2026-11-13T13:58:12",
+ "exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "commit": "7a7deac9e",
+ "engine_pid": 24932,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-17-win16/results/trt_expdec_rb_d20_mt16.manifest.json",
+  "STRATA_BATCH_DF2_MAX_T": "16",
+  "STRATA_EXPDEC_RB": "128",
+  "STRATA_EXPDEC_DRB": "256",
+  "STRATA_EXPDEC_D20": "1"
+ },
+ "parallel": 2,
+ "smoke": {
+  "prompt_tokens": 41,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.351,
+  "wall_tok_s": 8.56
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 5.963,
+  "wall_tok_s": 42.93
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.215,
+   "wall_tok_s": 121.46,
+   "hash": "c8e3f6e55e82ff9af2f148e7755b4b169fdf10cf22e0af4f21544b690afff1b7"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.685,
+   "wall_tok_s": 138.93,
+   "hash": "5bfa72b66d286c85762bf17806c2d9b7dc04cc2a8d985bf0fa84aa69dae1498f"
+  }
+ ],
+ "burst": {
+  "wall_s": 3.851,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 132.95,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.547,
+    "wall_tok_s": 72.18,
+    "hash": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.85,
+    "wall_tok_s": 66.5,
+    "hash": "67dd34987071ae963b40e110ef4251052f3b07fe93684a155c43ba58f1f2c83a"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "c8e3f6e55e82ff9af2f148e7755b4b169fdf10cf22e0af4f21544b690afff1b7",
+  "greedy_warm": "5bfa72b66d286c85762bf17806c2d9b7dc04cc2a8d985bf0fa84aa69dae1498f",
+  "burst_a": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574",
+  "burst_b": "67dd34987071ae963b40e110ef4251052f3b07fe93684a155c43ba58f1f2c83a"
+ },
+ "engine_decode_512": [
+  "127.4",
+  "141.0"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 68 ms (44.2 tok/s), drafts accepted 1 of 4, 1 checkpoints",
+   "generated in 3122 ms (82.0 tok/s), drafts accepted 160 of 301, 1 checkpoints",
+   "generated in 4020 ms (127.4 tok/s), drafts accepted 419 of 528, 1 checkpoints",
+   "generated in 3632 ms (141.0 tok/s), drafts accepted 413 of 525, 1 checkpoints",
+   "generated in 17 ms (59.0 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 29 ms (34.8 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 274 ms (124.0 tok/s), drafts accepted 26 of 41, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 41 tokens = 0 reused + 41 read in 280 ms (146.4 tok/s), 3 generated in 68 ms (44.2 tok/s), drafts accepted 1 of 4, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 2837 ms (1391.5 tok/s), 256 generated in 3122 ms (82.0 tok/s), drafts accepted 160 of 301, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 193 ms (181.4 tok/s), 512 generated in 4020 ms (127.4 tok/s), drafts accepted 419 of 528, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 52 ms (135.4 tok/s), 512 generated in 3632 ms (141.0 tok/s), drafts accepted 413 of 525, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 217 ms (161.0 tok/s), 1 generated in 17 ms (59.0 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 195 ms (179.1 tok/s), 1 generated in 29 ms (34.8 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 257 tokens = 256 reused + 1 read in 2 ms (634.5 tok/s), 34 generated in 274 ms (124.0 tok/s), drafts accepted 26 of 41, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 4",
+   "drafts accepted 160 of 301",
+   "drafts accepted 419 of 528",
+   "drafts accepted 413 of 525",
+   "drafts accepted 0 of 0",
+   "drafts accepted 0 of 0",
+   "drafts accepted 26 of 41"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 9504 slots, 21.75 GiB of VRAM; policy is"
+ ]
+}

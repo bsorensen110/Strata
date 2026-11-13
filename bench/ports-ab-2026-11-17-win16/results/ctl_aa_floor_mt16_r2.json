@@ -1,0 +1,105 @@
+{
+ "arm": "ctl_aa_floor_mt16",
+ "round": "_r2",
+ "ts": "2026-11-13T13:50:49",
+ "exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "commit": "7a7deac9e",
+ "engine_pid": 22361,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-17-win16/results/ctl_aa_floor_mt16.manifest.json",
+  "STRATA_BATCH_DF2_MAX_T": "16"
+ },
+ "parallel": 2,
+ "smoke": {
+  "prompt_tokens": 36,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.328,
+  "wall_tok_s": 9.14
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 5.868,
+  "wall_tok_s": 43.63
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.727,
+   "wall_tok_s": 108.32,
+   "hash": "9f4f9ca3cc2c2d8f10135c4eb5bf16ea5f5038a372c6435254233dad414c965c"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.604,
+   "wall_tok_s": 142.05,
+   "hash": "4b5ce7df7d14ad16b142885dcf6591bf23f49fbf12a32ed0ab6c8ff89ca4ee41"
+  }
+ ],
+ "burst": {
+  "wall_s": 3.971,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 128.95,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.598,
+    "wall_tok_s": 71.14,
+    "hash": "ea13422a759d2166567db62b2a5e8f2c9319b536ca1e01a1ffa6c30b48fd4037"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.969,
+    "wall_tok_s": 64.49,
+    "hash": "a7705e916638527a5c1bfb73147a1bce93c654bc86f1c1e89d5c475fffc9d082"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "9f4f9ca3cc2c2d8f10135c4eb5bf16ea5f5038a372c6435254233dad414c965c",
+  "greedy_warm": "4b5ce7df7d14ad16b142885dcf6591bf23f49fbf12a32ed0ab6c8ff89ca4ee41",
+  "burst_a": "ea13422a759d2166567db62b2a5e8f2c9319b536ca1e01a1ffa6c30b48fd4037",
+  "burst_b": "a7705e916638527a5c1bfb73147a1bce93c654bc86f1c1e89d5c475fffc9d082"
+ },
+ "engine_decode_512": [
+  "113.0",
+  "144.9"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 66 ms (45.3 tok/s), drafts accepted 1 of 3, 1 checkpoints",
+   "generated in 2954 ms (86.7 tok/s), drafts accepted 168 of 305, 1 checkpoints",
+   "generated in 4533 ms (113.0 tok/s), drafts accepted 402 of 559, 1 checkpoints",
+   "generated in 3533 ms (144.9 tok/s), drafts accepted 419 of 536, 1 checkpoints",
+   "generated in 17 ms (60.2 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 17 ms (59.9 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 287 ms (157.0 tok/s), drafts accepted 38 of 49, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 36 tokens = 0 reused + 36 read in 259 ms (138.8 tok/s), 3 generated in 66 ms (45.3 tok/s), drafts accepted 1 of 3, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 2909 ms (1356.7 tok/s), 256 generated in 2954 ms (86.7 tok/s), drafts accepted 168 of 305, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 192 ms (182.1 tok/s), 512 generated in 4533 ms (113.0 tok/s), drafts accepted 402 of 559, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 70 ms (100.4 tok/s), 512 generated in 3533 ms (144.9 tok/s), drafts accepted 419 of 536, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 213 ms (164.6 tok/s), 1 generated in 17 ms (60.2 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 199 ms (176.3 tok/s), 1 generated in 17 ms (59.9 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 246 tokens = 245 reused + 1 read in 2 ms (633.1 tok/s), 45 generated in 287 ms (157.0 tok/s), drafts accepted 38 of 49, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 3",
+   "drafts accepted 168 of 305",
+   "drafts accepted 402 of 559",
+   "drafts accepted 419 of 536",
+   "drafts accepted 0 of 0",
+   "drafts accepted 0 of 0",
+   "drafts accepted 38 of 49"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 9504 slots, 21.75 GiB of VRAM; policy is"
+ ]
+}
