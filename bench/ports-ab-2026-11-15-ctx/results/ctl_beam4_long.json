@@ -1,0 +1,51 @@
+{
+ "arm": "ctl_beam4",
+ "round": "r1",
+ "ts": "2026-11-13T07:38:17",
+ "exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-15-ctx/results/ctl_beam4.manifest.json",
+  "STRATA_DF2_BEAM": "1"
+ },
+ "resident_budget_arg": [
+  "--kv-resident",
+  "--resident-cpu-experts"
+ ],
+ "contexts": [
+  {
+   "label": "64k",
+   "target": 65536,
+   "prompt_tokens": 65502,
+   "prompt_wall_s": 11.462,
+   "prompt_tokens_per_s": 5714.7,
+   "cached_tokens_probe": 49152,
+   "decode64": {
+    "completion_tokens": 64,
+    "finish": "length",
+    "wall_s": 1.202,
+    "hash": "a3dd825a3b21018d54571545b25c15b8d98dbd443714b4af52c3aab469c24167",
+    "cached_tokens": 65495
+   },
+   "decode_tok_s": 53.24,
+   "calibration_attempts": 2
+  },
+  {
+   "label": "128k",
+   "target": 131072,
+   "prompt_tokens": 131053,
+   "prompt_wall_s": 34.836,
+   "prompt_tokens_per_s": 3762.0,
+   "cached_tokens_probe": 81920,
+   "decode64": {
+    "completion_tokens": 64,
+    "finish": "length",
+    "wall_s": 1.282,
+    "hash": "a3dd825a3b21018d54571545b25c15b8d98dbd443714b4af52c3aab469c24167",
+    "cached_tokens": 131046
+   },
+   "decode_tok_s": 49.92,
+   "calibration_attempts": 2
+  }
+ ]
+}

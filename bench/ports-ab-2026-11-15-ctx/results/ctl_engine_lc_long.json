@@ -1,0 +1,51 @@
+{
+ "arm": "ctl_engine_lc",
+ "round": "r1",
+ "ts": "2026-11-13T07:29:22",
+ "exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-df8ee1a30/strata",
+ "binary_sha256": "4109831f3870be794b60a9ba5b99229f310e5d8520d57a4db18194018bbcd62b",
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-15-ctx/results/ctl_engine_lc.manifest.json",
+  "STRATA_DF2_BEAM": ""
+ },
+ "resident_budget_arg": [
+  "--kv-resident",
+  "--resident-cpu-experts"
+ ],
+ "contexts": [
+  {
+   "label": "64k",
+   "target": 65536,
+   "prompt_tokens": 65520,
+   "prompt_wall_s": 11.524,
+   "prompt_tokens_per_s": 5685.5,
+   "cached_tokens_probe": 49152,
+   "decode64": {
+    "completion_tokens": 2,
+    "finish": "stop",
+    "wall_s": 0.317,
+    "hash": "2689367b205c16ce32ed4200942b8b8b1e262dfc70d9bc9fbc77c49699a4f1df",
+    "cached_tokens": 65513
+   },
+   "decode_tok_s": 6.31,
+   "calibration_attempts": 2
+  },
+  {
+   "label": "128k",
+   "target": 131072,
+   "prompt_tokens": 131041,
+   "prompt_wall_s": 35.079,
+   "prompt_tokens_per_s": 3735.6,
+   "cached_tokens_probe": 81920,
+   "decode64": {
+    "completion_tokens": 2,
+    "finish": "stop",
+    "wall_s": 0.517,
+    "hash": "2689367b205c16ce32ed4200942b8b8b1e262dfc70d9bc9fbc77c49699a4f1df",
+    "cached_tokens": 131034
+   },
+   "decode_tok_s": 3.87,
+   "calibration_attempts": 2
+  }
+ ]
+}

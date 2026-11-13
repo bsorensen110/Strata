@@ -1,0 +1,54 @@
+{
+ "arm": "trt_arena34",
+ "round": "_r2",
+ "ts": "2026-11-13T07:51:34",
+ "exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-15-ctx/results/trt_arena34.manifest.json",
+  "STRATA_RESIDENT_PIN": "1"
+ },
+ "resident_budget_arg": [
+  "--kv-resident",
+  "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-15-ctx/configs/trt_arena34/profile-learned.bin",
+  "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-15-ctx/configs/trt_arena34/conversation-cache",
+  "--resident-cpu-experts",
+  "--resident-budget-gib"
+ ],
+ "contexts": [
+  {
+   "label": "64k",
+   "target": 65536,
+   "prompt_tokens": 65502,
+   "prompt_wall_s": 7.73,
+   "prompt_tokens_per_s": 8473.7,
+   "cached_tokens_probe": 49152,
+   "decode64": {
+    "completion_tokens": 64,
+    "finish": "length",
+    "wall_s": 1.189,
+    "hash": "a3dd825a3b21018d54571545b25c15b8d98dbd443714b4af52c3aab469c24167",
+    "cached_tokens": 65495
+   },
+   "decode_tok_s": 53.83,
+   "calibration_attempts": 2
+  },
+  {
+   "label": "128k",
+   "target": 131072,
+   "prompt_tokens": 131053,
+   "prompt_wall_s": 23.388,
+   "prompt_tokens_per_s": 5603.4,
+   "cached_tokens_probe": 81920,
+   "decode64": {
+    "completion_tokens": 64,
+    "finish": "length",
+    "wall_s": 1.31,
+    "hash": "a3dd825a3b21018d54571545b25c15b8d98dbd443714b4af52c3aab469c24167",
+    "cached_tokens": 131046
+   },
+   "decode_tok_s": 48.85,
+   "calibration_attempts": 2
+  }
+ ]
+}

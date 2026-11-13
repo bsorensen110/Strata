@@ -1,0 +1,41 @@
+{
+  "campaign": "pinned 34 GiB resident arena + lend, and 64k/128k context, vs production 2026-11-13",
+  "arms": [
+    {
+      "id": "arena34",
+      "switch": "STRATA_RESIDENT_PIN",
+      "baseline": "",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "long": true,
+      "args_arm": [
+        "--resident-budget-gib",
+        "34"
+      ],
+      "why": "production's RAM mode sized implicitly (--mmap-experts --resident-cpu-experts, no budget); this arm pins a 34 GiB resident arena explicitly and keeps the lend slots (STRATA_LEND_RAM_BACKUP=1, STRATA_LEND_PCIE_PINNED=1) as production sets them"
+    },
+    {
+      "id": "engine_lc",
+      "switch": "STRATA_DF2_BEAM",
+      "baseline": "",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "long": true,
+      "exe_ctl": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-df8ee1a30/strata",
+      "exe_arm": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+      "why": "the previous production engine (fork-df8ee1a30, old env) against the promoted one (fork-68872b2d1 + STRATA_DF2_BEAM=1), at 64k and 128k context and on the standard short-prompt workload"
+    },
+    {
+      "id": "beam4",
+      "switch": "STRATA_DF2_BEAM",
+      "baseline": "1",
+      "arm": "4",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "long": true,
+      "why": "the new optimization itself: order-1 Viterbi beam search (=4, the build default) against the previous greedy select (=1). =1 is the revert, not the new path \u2014 this is the polarity that matters"
+    }
+  ]
+}
