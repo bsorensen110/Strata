@@ -1926,8 +1926,8 @@ void df2_pack_head_rows_batch(const float* fn_in, const float* hsel_in, float* f
     int *bm = nullptr, *pm = nullptr;
     float* dl = nullptr;
     int cp = 0;
-    if (xq_q81_out != nullptr && xil_q81_out != nullptr && il_rows >= 2 && il_rows <= 8) {
-        cp = il_rows <= 2 ? 2 : (il_rows <= 4 ? 4 : 8);
+    if (xq_q81_out != nullptr && xil_q81_out != nullptr && il_rows >= 2 && il_rows <= 16) {
+        cp = il_rows <= 2 ? 2 : (il_rows <= 4 ? 4 : (il_rows <= 8 ? 8 : 16));
         const std::size_t words = std::size_t(N / 32) * 8 * std::size_t(cp);
         bm = reinterpret_cast<int*>(xil_q81_out);
         pm = bm + words;

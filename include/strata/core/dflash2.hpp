@@ -186,7 +186,7 @@ public:
     bool draft_batch_slots_finish(const BatchSlotItem* items, int n_items, std::string& err);
 
     /// Precomputes the context projections (rope table, tap quantize, fc.weight, hidden_norm, and all layers' K/V
-    /// projections) on cs_ for `n_rows` verify rows while the target model finishes layers 46..47.
+    /// projections) on cs_pre_ for `n_rows` verify rows while the target model finishes layers 44..47.
     void precompute_batch_context(const float* taps_dev, int n_rows, const int64_t* pos) noexcept;
     bool has_precomputed_context(const float* taps, int n_rows, int64_t pos0, int* out_off = nullptr) const noexcept;
     void clear_precomputed_context() noexcept { precomp_taps_ = nullptr; precomp_rows_ = 0; }
@@ -257,6 +257,10 @@ private:
     float* dpend_ = nullptr;        ///< pinned host: deferred taps, row = position % kRing2048
     int64_t dpend_lo_ = 0, dpend_hi_ = 0;
     bool make_streams(std::string& err);
+    void destroy_streams();
+    bool wait_precomp_on_cs(cudaStream_t cs);
+    void record_precompute_batch_context(const float* taps, int n_rows, bool want_log, cudaStream_t cs);
+    bool capture_precompute_batch_context(const float* taps, int n_rows, bool want_log, cudaStream_t cs);
     uint64_t vram_ = 0;
     bool q4_ = false;   // the pack's matrices are Q4_0 (tools/dflash2_pack.py --q4_0)
     int N_ = 2560, L_ = 5, NH_ = 32, NKV_ = 8, HD_ = 128, I_ = 7680, window_ = 2048, group_ = 16, rank_ = 256, mask_token_ = 0;
@@ -293,7 +297,8 @@ private:
     uint8_t* xqc_ = nullptr;        ///< the same for the context update, which runs beside the block
     float* xdc_ = nullptr;
     cudaStream_t cs2_ = nullptr;    ///< the context update's branch of the round graph
-    cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr, ev_ctx_[8] = {};
+    cudaStream_t cs_pre_ = nullptr; ///< low-priority non-blocking stream for overlap during verifier layers 44..47
+    cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr, ev_pre_ = nullptr, ev_ctx_[8] = {};
     bool fork_ = false;             ///< recording the forked graph: layer l's attention waits for ev_ctx_[l]
     float *fcy_ = nullptr, *hctx_ = nullptr, *kc_ = nullptr, *vc_ = nullptr;
     float *h_ = nullptr, *xn_ = nullptr, *xc_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *qn_ = nullptr, *k_ = nullptr, *v_ = nullptr, *kblk_ = nullptr;
@@ -330,6 +335,12 @@ private:
     std::vector<BatchBodyGraphEntry> batch_body_graphs_;
     std::vector<BatchFullGraphEntry> batch_full_graphs_;
     uint64_t batch_graph_tick_ = 0;
+    static constexpr int kPrecompGraphMax = 16;
+    cudaGraphExec_t precomp_exec_[kPrecompGraphMax + 1] = {};
+    const float* precomp_exec_taps_[kPrecompGraphMax + 1] = {};
+    bool precomp_exec_log_[kPrecompGraphMax + 1] = {};
+    bool precomp_graph_failed_[kPrecompGraphMax + 1] = {};
+    bool precomp_pending_ = false;
     const float* precomp_taps_ = nullptr;
     int precomp_rows_ = 0;
     int32_t precomp_pos_[kBatchMaxSlots * kRows] = {};
