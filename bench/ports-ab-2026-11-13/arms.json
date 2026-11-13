@@ -1,0 +1,107 @@
+{
+  "campaign": "new optimizations (fork-main edc2956c7 -> df8ee1a30), 2026-11-13",
+  "note": "control = the engine/env production runs today; treatment = the new engine, or the new engine with one switch moved",
+  "arms": [
+    {
+      "id": "engine_delta",
+      "switch": null,
+      "baseline": "prod engine",
+      "arm": "new engine",
+      "exe_ctl": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-edc2956c7/strata",
+      "exe_arm": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "the whole 11-commit engine delta (8 unconditional fusions + 3 new default-on tunings) at identical argv and environment"
+    },
+    {
+      "id": "attn_v4",
+      "switch": "STRATA_ATTN_V4",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "opt-in uint32 value vectorization inside the QSA decode-attention chunk kernels (`attn_v4_on()`, off unless =1)"
+    },
+    {
+      "id": "df2_gemm",
+      "switch": "STRATA_DF2_GEMM",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "new default-ON tuning in the DFlash2 verify GEMM (rows-a-warp by matrix size); ablation restores the fixed 8-row mapping"
+    },
+    {
+      "id": "mmvq_segs",
+      "switch": "STRATA_MMVQ_SEGS",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "new default-ON gate for `native_mmvq_multi_segs`: fuses shared-input QSA and GDN projections into one launch; ablation uses the per-projection path"
+    },
+    {
+      "id": "rows2_off",
+      "switch": "STRATA_NO_MMVQ_ROWS2",
+      "baseline": "",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "ablation of the ROWS2 exact-layout path (default auto per device class); =1 forces the single-row default layout"
+    },
+    {
+      "id": "mmvf_rpb1",
+      "switch": "STRATA_MMVF_RPB",
+      "baseline": "",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "new HIP rows-per-block tuning defaults to auto by n_out (<=256:1, <=512:2, else 4); this pins 1"
+    },
+    {
+      "id": "mmvf_rpb2",
+      "switch": "STRATA_MMVF_RPB",
+      "baseline": "",
+      "arm": "2",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "same tuning, forced to 2 rows per block"
+    },
+    {
+      "id": "mmvf_rpb4",
+      "switch": "STRATA_MMVF_RPB",
+      "baseline": "",
+      "arm": "4",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "same tuning, forced to 4 rows per block"
+    },
+    {
+      "id": "bf16_tsum_off",
+      "switch": "STRATA_BF16_TSUM",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "the new code lets STRATA_BF16_TSUM fall back to STRATA_TSUM when unset; production sets it to 1, so this ablates the split-sum path in the bf16 GEMM"
+    },
+    {
+      "id": "aa_floor_1",
+      "switch": "STRATA_ATTN_V4",
+      "baseline": "0",
+      "arm": "0",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "A/A floor: identical configuration launched twice, to measure launch-to-launch noise in this window"
+    },
+    {
+      "id": "aa_floor_2",
+      "switch": "STRATA_ATTN_V4",
+      "baseline": "0",
+      "arm": "0",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "A/A floor: identical configuration launched twice, to measure launch-to-launch noise in this window"
+    }
+  ]
+}
