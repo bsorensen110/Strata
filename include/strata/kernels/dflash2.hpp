@@ -124,23 +124,23 @@ void df2_select_multi(const float* hp, const float* unary, const int32_t* tok, c
 void df2_pack_head_rows(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out, int rows, int N, int rank, void* stream);
 
 struct Df2BatchKvRing {
-    void* kring[4];
-    void* vring[4];
-    int64_t* tag[4];
-    uint8_t row_slot[32];
+    void* kring[8];
+    void* vring[8];
+    int64_t* tag[8];
+    uint8_t row_slot[64];
 };
 
 struct Df2BatchKvRingPrecomp {
-    void* kring[4][8];
-    void* vring[4][8];
+    void* kring[8][8];
+    void* vring[8][8];
     const float* gk[8];
-    int64_t* tag[4];
+    int64_t* tag[8];
 };
 
 struct Df2BatchAttn {
-    const void* kring[4];
-    const void* vring[4];
-    const int64_t* tag[4];
+    const void* kring[8];
+    const void* vring[8];
+    const int64_t* tag[8];
 };
 
 void df2_kv_ring_batch(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table,

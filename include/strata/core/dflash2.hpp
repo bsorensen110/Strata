@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -237,8 +238,8 @@ private:
     bool record_batch_head(int n_items, int total_rows, cudaStream_t cs, std::string& err, bool q81_prepacked = false);
     bool capture(int n, const float* taps, std::string& err);
     bool capture_body(int n, const float* taps, std::string& err);
-    bool capture_batch_body(const BatchSlotItem* items, int n_items, std::string& err);
-    bool capture_batch_full(const BatchSlotItem* items, int n_items, int total_rows, std::string& err);
+    bool capture_batch_body(const BatchSlotItem* items, int n_items, cudaGraphExec_t& exec_out, std::string& err);
+    bool capture_batch_full(const BatchSlotItem* items, int n_items, int total_rows, cudaGraphExec_t& exec_out, std::string& err);
     bool alloc(std::string& err);
     struct Prof;
     Prof* prof_ = nullptr;
@@ -282,7 +283,7 @@ private:
     float* hp_out_ = nullptr;
     float *kring_[8] = {}, *vring_[8] = {};
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;   ///< rope tables of the context rows and of the block rows: one allocation, rt_blk_ = rt_ctx_ + 8 * 128
-    float *rt_bctx_ = nullptr, *rt_bblk_ = nullptr; ///< multi-slot batch rope tables: rt_bblk_ = rt_bctx_ + 32 * 128
+    float *rt_bctx_ = nullptr, *rt_bblk_ = nullptr; ///< multi-slot batch rope tables: rt_bblk_ = rt_bctx_ + (kBatchMaxSlots * kRows) * 128
     double* rope_inv_ = nullptr;   ///< theta^(-2 i / 128), once
     cudaEvent_t ev_hs_[2] = {};     ///< the selector's projection runs beside the head
     uint8_t* xq_ = nullptr;         ///< the head's q8_1 activations
@@ -306,15 +307,34 @@ private:
     uint32_t* topscratch_ = nullptr;
     cudaGraphExec_t exec_[kRows + 1] = {};
     cudaGraphExec_t body_exec_[kRows + 1] = {};
-    cudaGraphExec_t batch_body_exec_[kRows + 1][kRows + 1] = {};
-    cudaGraphExec_t batch_full_exec_[2 * kDrafts + 1] = {};
-    cudaGraphExec_t batch_full_1_exec_[2][kDrafts + 1] = {};
-    Dflash2Drafter* batch_slots_[2] = {};
-    Dflash2Drafter* batch_full_1_slots_[2] = {};
-    const float* batch_taps_[2] = {};
+    struct BatchBodyGraphKey {
+        int n_items = 0;
+        std::array<Dflash2Drafter*, kBatchMaxSlots> slots = {};
+        std::array<const float*, kBatchMaxSlots> taps = {};
+        std::array<int, kBatchMaxSlots> n_new = {};
+        bool operator==(const BatchBodyGraphKey& o) const {
+            return n_items == o.n_items && slots == o.slots && taps == o.taps && n_new == o.n_new;
+        }
+    };
+    struct BatchFullGraphKey {
+        int n_items = 0;
+        int total_rows = 0;
+        std::array<Dflash2Drafter*, kBatchMaxSlots> slots = {};
+        bool operator==(const BatchFullGraphKey& o) const {
+            return n_items == o.n_items && total_rows == o.total_rows && slots == o.slots;
+        }
+    };
+    struct BatchBodyGraphEntry { BatchBodyGraphKey key; cudaGraphExec_t exec = nullptr; uint64_t last_use = 0; };
+    struct BatchFullGraphEntry { BatchFullGraphKey key; cudaGraphExec_t exec = nullptr; uint64_t last_use = 0; };
+    static constexpr size_t kBatchGraphCacheMax = 64;
+    std::vector<BatchBodyGraphEntry> batch_body_graphs_;
+    std::vector<BatchFullGraphEntry> batch_full_graphs_;
+    uint64_t batch_graph_tick_ = 0;
     const float* precomp_taps_ = nullptr;
     int precomp_rows_ = 0;
-    int32_t precomp_pos_[4 * kRows] = {};
+    int32_t precomp_pos_[kBatchMaxSlots * kRows] = {};
+    struct PendingPrecompLog { Dflash2Drafter* slot = nullptr; int64_t pos0 = 0; int n = 0; int off = 0; };
+    std::vector<PendingPrecompLog> pend_precomp_logs_;
     const float* graph_taps_ = nullptr;
     int ndraft_ = kDrafts;          ///< drafts a window can use (set_max_drafts)
     int64_t have_ctx_ = 0;
@@ -343,7 +363,7 @@ private:
     int32_t* rb_pos_ = nullptr;
     uint64_t rb_bytes_ = 0;
     void log_stage(int64_t pos0, int n);       ///< an update of rows [pos0, pos0 + n) is queued: remember where its h_log* rows go, mark the slots
-    void log_flush();                          ///< after the stream sync: move the staged rows into the lineage's log
+    void log_flush(int row_off = 0, const int8_t* q_src = nullptr, const float* d_src = nullptr);   ///< after the stream sync: move the staged rows into the lineage's log
     bool log_row(int64_t pos, const int8_t** q, const float** d) const;
     bool rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* missing, std::string& err);
     void stash_push(Lineage&& l);
