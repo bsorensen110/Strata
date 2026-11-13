@@ -1,4 +1,4 @@
-// src/kernels/cuda/q8_1_il.cuh - the interleaved copy of 2..8 q8_1 activation columns (native_mmvq.hpp) as the
+// src/kernels/cuda/q8_1_il.cuh - the interleaved copy of 2..16 q8_1 activation columns (native_mmvq.hpp) as the
 // multi-column dot products read it, for native_mmvq.cu and iq_kernels.cu.
 #pragma once
 
@@ -13,6 +13,40 @@
 namespace strata::kernels {
 namespace {
 
+template <typename T> struct IlVec;
+template <> struct IlVec<int>   { using V2 = int2;   using V4 = int4; };
+template <> struct IlVec<float> { using V2 = float2; using V4 = float4; };
+
+template <bool Ldg, typename V>
+__device__ __forceinline__ V il_load(const V* p) {
+    if constexpr (Ldg) return __ldg(p);
+    else return *p;
+}
+
+template <int NC, int Base, typename T, typename V4>
+__device__ __forceinline__ void il_unpack4(const V4& v, T (&o)[NC]) {
+    o[Base] = v.x;
+    if constexpr (NC > Base + 1) o[Base + 1] = v.y;
+    if constexpr (NC > Base + 2) o[Base + 2] = v.z;
+    if constexpr (NC > Base + 3) o[Base + 3] = v.w;
+}
+
+template <int NC, int CP, bool Ldg, typename T>
+__device__ __forceinline__ void il_read(const T* s, T (&o)[NC]) {
+    using V2 = typename IlVec<T>::V2;
+    using V4 = typename IlVec<T>::V4;
+    if constexpr (CP == 2) {
+        const V2 a = il_load<Ldg>(reinterpret_cast<const V2*>(s));
+        o[0] = a.x;
+        o[1] = a.y;
+    } else {
+        il_unpack4<NC, 0>(il_load<Ldg>(reinterpret_cast<const V4*>(s)), o);
+        if constexpr (NC > 4) il_unpack4<NC, 4>(il_load<Ldg>(reinterpret_cast<const V4*>(s + 4)), o);
+        if constexpr (NC > 8) il_unpack4<NC, 8>(il_load<Ldg>(reinterpret_cast<const V4*>(s + 8)), o);
+        if constexpr (NC > 12) il_unpack4<NC, 12>(il_load<Ldg>(reinterpret_cast<const V4*>(s + 12)), o);
+    }
+}
+
 // NC columns of the block-major (PM false) or position-major copy: u(b, p, o) = int p of q8_1 block b of every column,
 // scales(b, o) = their scales
 template <int NC, bool PM> struct Q81Il {
@@ -22,24 +56,7 @@ template <int NC, bool PM> struct Q81Il {
     int nb;   // blocks a column
     __device__ __forceinline__ void u(int b, int p, int (&o)[NC]) const {
         const int* s = q + std::size_t(PM ? p * nb + b : b * 8 + p) * CP;
-        if constexpr (CP == 2) {
-            const int2 a = *reinterpret_cast<const int2*>(s);
-            o[0] = a.x;
-            o[1] = a.y;
-        } else {
-            const int4 a = *reinterpret_cast<const int4*>(s);
-            o[0] = a.x;
-            if constexpr (NC > 1) o[1] = a.y;
-            if constexpr (NC > 2) o[2] = a.z;
-            if constexpr (NC > 3) o[3] = a.w;
-            if constexpr (NC > 4) {
-                const int4 e = *reinterpret_cast<const int4*>(s + 4);
-                o[4] = e.x;
-                if constexpr (NC > 5) o[5] = e.y;
-                if constexpr (NC > 6) o[6] = e.z;
-                if constexpr (NC > 7) o[7] = e.w;
-            }
-        }
+        il_read<NC, CP, false>(s, o);
     }
     // P1 (native_mmvq_il_pf_kernel): the same loads from a pointer the caller strength-reduces - qat(qbase(b, p) + k * QB)
     // is u(b + k, p), dat(dbase(b) + k * DB) is scales(b + k)
@@ -48,65 +65,14 @@ template <int NC, bool PM> struct Q81Il {
     __device__ __forceinline__ const int* qbase(int b, int p) const { return q + std::size_t(PM ? p * nb + b : b * 8 + p) * CP; }
     __device__ __forceinline__ const float* dbase(int b) const { return d + std::size_t(b) * CP; }
     __device__ __forceinline__ void qat(const int* s, int (&o)[NC]) const {   // __ldg: s comes from an asm (madw), so the
-        if constexpr (CP == 2) {                                                // front end no longer knows it is global
-            const int2 a = __ldg(reinterpret_cast<const int2*>(s));
-            o[0] = a.x;
-            o[1] = a.y;
-        } else {
-            const int4 a = __ldg(reinterpret_cast<const int4*>(s));
-            o[0] = a.x;
-            if constexpr (NC > 1) o[1] = a.y;
-            if constexpr (NC > 2) o[2] = a.z;
-            if constexpr (NC > 3) o[3] = a.w;
-            if constexpr (NC > 4) {
-                const int4 e = __ldg(reinterpret_cast<const int4*>(s + 4));
-                o[4] = e.x;
-                if constexpr (NC > 5) o[5] = e.y;
-                if constexpr (NC > 6) o[6] = e.z;
-                if constexpr (NC > 7) o[7] = e.w;
-            }
-        }
+        il_read<NC, CP, true>(s, o);                                            // front end no longer knows it is global
     }
     __device__ __forceinline__ void dat(const float* s, float (&o)[NC]) const {
-        if constexpr (CP == 2) {
-            const float2 a = __ldg(reinterpret_cast<const float2*>(s));
-            o[0] = a.x;
-            o[1] = a.y;
-        } else {
-            const float4 a = __ldg(reinterpret_cast<const float4*>(s));
-            o[0] = a.x;
-            if constexpr (NC > 1) o[1] = a.y;
-            if constexpr (NC > 2) o[2] = a.z;
-            if constexpr (NC > 3) o[3] = a.w;
-            if constexpr (NC > 4) {
-                const float4 e = __ldg(reinterpret_cast<const float4*>(s + 4));
-                o[4] = e.x;
-                if constexpr (NC > 5) o[5] = e.y;
-                if constexpr (NC > 6) o[6] = e.z;
-                if constexpr (NC > 7) o[7] = e.w;
-            }
-        }
+        il_read<NC, CP, true>(s, o);
     }
     __device__ __forceinline__ void scales(int b, float (&o)[NC]) const {
         const float* s = d + std::size_t(b) * CP;
-        if constexpr (CP == 2) {
-            const float2 a = *reinterpret_cast<const float2*>(s);
-            o[0] = a.x;
-            o[1] = a.y;
-        } else {
-            const float4 a = *reinterpret_cast<const float4*>(s);
-            o[0] = a.x;
-            if constexpr (NC > 1) o[1] = a.y;
-            if constexpr (NC > 2) o[2] = a.z;
-            if constexpr (NC > 3) o[3] = a.w;
-            if constexpr (NC > 4) {
-                const float4 e = *reinterpret_cast<const float4*>(s + 4);
-                o[4] = e.x;
-                if constexpr (NC > 5) o[5] = e.y;
-                if constexpr (NC > 6) o[6] = e.z;
-                if constexpr (NC > 7) o[7] = e.w;
-            }
-        }
+        il_read<NC, CP, false>(s, o);
     }
 };
 

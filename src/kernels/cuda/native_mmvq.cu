@@ -2658,7 +2658,15 @@ void launch_il(const void* weights, const void* x_il, float* y, int n_in, int n_
             launch_il_one<I, 5, R>(blocks, w, xq, xd, y, n_in, n_out, s, pf);
         }
         break;
-        default: throw std::invalid_argument("native_mmvq_il requires 1 <= ncols <= 8");
+#if STRATA_VERIFY_MAX_T > 8
+#define STRATA_IL_CASE16(N) case N: if constexpr (R == 1) launch_il_one<I, N, R>(blocks, w, xq, xd, y, n_in, n_out, s, pf); break;
+        STRATA_IL_CASE16(9) STRATA_IL_CASE16(10) STRATA_IL_CASE16(11) STRATA_IL_CASE16(12)
+#if STRATA_VERIFY_MAX_T > 12
+        STRATA_IL_CASE16(13) STRATA_IL_CASE16(14) STRATA_IL_CASE16(15) STRATA_IL_CASE16(16)
+#endif
+#undef STRATA_IL_CASE16
+#endif
+        default: throw std::invalid_argument("native_mmvq_il requires 1 <= ncols <= MAX_NCOLS");
     }
 }
 
@@ -2667,7 +2675,8 @@ void launch_il_rows(int r, const void* weights, const void* x_il, float* y, int 
     int pf_rows = 0;
     const int pf = il_pf_for(I::F::TYPE, ncols, n_out, &pf_rows);
     if (pf_rows != 0) r = pf_rows;   // the pf table measured its rows with its kernel
-    if (ncols > 4 && r == 4) r = 2;   // 5..8 columns: 1 or 2 rows a warp
+    if (ncols > 8) r = 1;            // 9..16 columns (cp = 16): 1 row a warp to bound register pressure
+    else if (ncols > 4 && r == 4) r = 2;   // 5..8 columns: 1 or 2 rows a warp
     switch (r) {
     case 1: launch_il<I, 1>(weights, x_il, y, n_in, n_out, ncols, s, pf); break;
     case 4: launch_il<I, 4>(weights, x_il, y, n_in, n_out, ncols, s, pf); break;
@@ -4070,7 +4079,7 @@ std::size_t native_q8_1_il_bytes(int n_in, int ncols) {
 
 void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in, int ncols, void* stream) {
     validate_shape(n_in, ncols);
-    if (ncols < 2 || ncols > 8) throw std::invalid_argument("native_quantize_q8_1_il requires 2 <= ncols <= 8");
+    if (ncols < 2 || ncols > MAX_NCOLS) throw std::invalid_argument("native_quantize_q8_1_il requires 2 <= ncols <= MAX_NCOLS");
     validate_pointer(x);
     validate_pointer(x_q8_1);
     validate_pointer(x_il);
@@ -4088,7 +4097,7 @@ void native_quantize_q8_1_il(const float* x, void* x_q8_1, void* x_il, int n_in,
 void native_swiglu_quantize_q8_1_il(const float* gate, const float* up, void* x_q8_1, void* x_il,
                                     int n_in, int ncols, void* stream) {
     validate_shape(n_in, ncols);
-    if (ncols < 2 || ncols > 8) throw std::invalid_argument("native_swiglu_quantize_q8_1_il requires 2 <= ncols <= 8");
+    if (ncols < 2 || ncols > MAX_NCOLS) throw std::invalid_argument("native_swiglu_quantize_q8_1_il requires 2 <= ncols <= MAX_NCOLS");
     validate_pointer(gate);
     validate_pointer(up);
     validate_pointer(x_q8_1);
@@ -4106,7 +4115,7 @@ void native_swiglu_quantize_q8_1_il(const float* gate, const float* up, void* x_
 
 void native_q8_1_interleave(const void* x_q8_1, void* x_il, int n_in, int ncols, void* stream) {
     validate_shape(n_in, ncols);
-    if (ncols < 2 || ncols > 8) throw std::invalid_argument("native_q8_1_interleave requires 2 <= ncols <= 8");
+    if (ncols < 2 || ncols > MAX_NCOLS) throw std::invalid_argument("native_q8_1_interleave requires 2 <= ncols <= MAX_NCOLS");
     validate_pointer(x_q8_1);
     validate_pointer(x_il);
     validate_stream(stream);
@@ -4325,6 +4334,7 @@ bool il_env_on(const char* name) {
 }
 bool il_t1_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_T1"); return on; }
 bool il_q3k_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_Q3K"); return on; }
+bool il_16_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_16"); return on; }
 // #3453: sm_89's own tables (kIlRows_89 / kIl1Rows_89) are ON by default on compute capability 8.9 only (owner decision, 0.2.7; no sm_89 card
 // has run mmvq_il_parity or an end-to-end A/B for us, the reporter tests and reports back).  STRATA_MMVQ_IL_89=0 gives an Ada card what it
 // answered before (the shared table, no one-column row) and so does STRATA_DEFAULTS=026; STRATA_MMVQ_IL_89=1 wins over that master switch
@@ -4384,8 +4394,15 @@ const std::vector<IlEnvRow>& il_env_rows() {
 // The rows a warp for a card of compute capability `cc` (major * 10 + minor); 0: native_mmvq's kernels.  Pure, so a test
 // can check every architecture's table without that card.
 int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
-    if (ncols < 1 || ncols > 8) return 0;
+    if (ncols < 1 || ncols > 16) return 0;
     const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
+    if (ncols > 8) {   // RDNA4 (gfx12, cc == 1202): 9..16 columns (cp = 16) use R = 1 row/warp across supported IL types
+        static const bool wide = il_env_on("STRATA_MMVQ_IL_WIDE");
+        if (!wide) return 0;
+        if (type == 11 && !il_q3k_on()) return 0;
+        if (cc != 1202) return 0;
+        return (type == 23 || type == 12 || type == 13 || type == 14 || type == 11 || type == 21 || type == 18) ? 1 : 0;
+    }
     if (ncols > 4) {   // 147-verify: 5..8 columns, only where a card measured its table
         static const bool wide = il_env_on("STRATA_MMVQ_IL_WIDE");
         if (!wide) return 0;
@@ -4490,7 +4507,8 @@ bool il_arch_ok() {
 }  // namespace
 
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
-    if (ncols < 1 || ncols > 8 || !g_multi_exact || !il_arch_ok()) return false;
+    if (ncols < 1 || ncols > MAX_NCOLS || !g_multi_exact || !il_arch_ok()) return false;
+    if (ncols > 8 && !il_16_on()) return false;
     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
            (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 11 ||
             ggml_type == 21 || ggml_type == 18);
@@ -4565,13 +4583,22 @@ void launch_il_segs_r(const NativeMmvqSeg* in_segs, int n_segs, const void* x_il
             native_mmvq_il_segs_kernel<I, 5, R><<<blocks, 4 * WARP, 0, s>>>(sa, xq, xd, n_in);
         }
         break;
+#if STRATA_VERIFY_MAX_T > 8
+#define STRATA_IL_SEG_CASE16(N) case N: if constexpr (R == 1) native_mmvq_il_segs_kernel<I, N, R><<<blocks, 4 * WARP, 0, s>>>(sa, xq, xd, n_in); break;
+        STRATA_IL_SEG_CASE16(9) STRATA_IL_SEG_CASE16(10) STRATA_IL_SEG_CASE16(11) STRATA_IL_SEG_CASE16(12)
+#if STRATA_VERIFY_MAX_T > 12
+        STRATA_IL_SEG_CASE16(13) STRATA_IL_SEG_CASE16(14) STRATA_IL_SEG_CASE16(15) STRATA_IL_SEG_CASE16(16)
+#endif
+#undef STRATA_IL_SEG_CASE16
+#endif
     default: break;
     }
 }
 
 template <typename I>
 void launch_il_segs(int r, const NativeMmvqSeg* segs, int n_segs, const void* x_il, int n_in, int ncols, cudaStream_t s) {
-    if (ncols > 4 && r == 4) r = 2;
+    if (ncols > 8) r = 1;
+    else if (ncols > 4 && r == 4) r = 2;
     switch (r) {
     case 1: launch_il_segs_r<I, 1>(segs, n_segs, x_il, n_in, ncols, s); break;
     case 4: launch_il_segs_r<I, 4>(segs, n_segs, x_il, n_in, ncols, s); break;
@@ -4655,7 +4682,7 @@ bool native_mmvq_multi_segs(int ggml_type, const NativeMmvqSeg* segs, int n_segs
     }
     const auto s = static_cast<cudaStream_t>(stream);
     const bool iq3 = ggml_type == 18 || ggml_type == 21;
-    if (use_il && ncols <= 8 && n_in % QK == 0 && !(iq3 && n_in > kIq3IlMaxNIn) && (ncols == 1 || x_il != nullptr)) {
+    if (use_il && ncols <= MAX_NCOLS && n_in % QK == 0 && !(iq3 && n_in > kIq3IlMaxNIn) && (ncols == 1 || x_il != nullptr)) {
         bool all_il = true;
         for (int i = 0; i < n_segs && all_il; ++i) {
             if (!native_mmvq_il_supported(ggml_type, ncols, segs[i].n_out)) all_il = false;

@@ -8,6 +8,7 @@
 // scale path (d = amax / 127, q8_1_finite) and the zero-amax path are both exercised. Shapes cover the window's
 // projection inputs (N, the GDN value width, NH*HD). Exit status 1 on any byte difference.
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -90,9 +91,11 @@ int main() {
     if (!check(cudaStreamCreate(&s), "stream")) return 1;
     bool all = true;
     const int shapes[] = {32, 2560, 4096, 8192, 10240};   // N, the GDN value width, NH*HD class widths
+    const int cols[] = {2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16};
     for (int n_in : shapes)
-        for (int ncols = 2; ncols <= 8; ++ncols)
-            for (unsigned seed : {1u, 2u, 3u}) all = run_case(n_in, ncols, seed, s) && all;
+        for (int ncols : cols)
+            if (ncols <= strata::kernels::kWindowMaxT)
+                for (unsigned seed : {1u, 2u, 3u}) all = run_case(n_in, ncols, seed, s) && all;
     (void) cudaStreamDestroy(s);
     std::printf("%s\n", all ? "ALL PASS" : "FAILURES");
     return all ? 0 : 1;
