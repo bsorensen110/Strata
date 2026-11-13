@@ -1256,6 +1256,145 @@ __global__ void __launch_bounds__(256) topk_merge_kernel(const float* __restrict
     }
 }
 
+// The same top-16 with no serial loop.  The order (value desc, key asc) is total, so the 16th best of the 256 threads' own bests is a bound no
+// better than the block's 16th best: only the values at or above it can be in the top 16, and each one's place is the count of those better than it.
+// A value above the bound belongs to one of the 15 threads whose best beats it, so there are at most 15 * PER + 1 of them.
+constexpr int TK_CAND = 256;
+struct TopRankSmem {
+    unsigned long long wk[8][kDf2TopK];   // each warp's 16 best thread bests, best first
+    unsigned long long ck[TK_CAND];
+    float cv[TK_CAND];
+    unsigned long long bound;
+    int cnt;
+};
+
+// (value, key) as one number that orders like better(): the value's bits made monotone (-0 as +0, since better() has them equal), then the key
+// reversed.  0 is below every value that is not -inf or NaN.
+__device__ __forceinline__ unsigned long long top_key(float v, int k) {
+    uint32_t b = v == 0.0f ? 0u : __float_as_uint(v);
+    b ^= (b & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    return ((unsigned long long) b << 32) | (uint32_t) (0x7fffffff - k);
+}
+
+// rv/ri: the thread's PER values and keys (ri < 0: none; a value with a key is never -inf or NaN).  Gathers the candidates into s.cv/s.ck; returns their count.
+template <int PER>
+__device__ __forceinline__ int top16_candidates(const float (&rv)[PER], const int (&ri)[PER], TopRankSmem& s) {
+    static_assert((kDf2TopK - 1) * PER + 1 <= TK_CAND, "top16_candidates: the candidates must fit");
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    unsigned long long mk = 0;
+#pragma unroll
+    for (int j = 0; j < PER; ++j)
+        if (ri[j] >= 0) {
+            const unsigned long long k = top_key(rv[j], ri[j]);
+            mk = k > mk ? k : mk;
+        }
+#pragma unroll
+    for (int k = 2; k <= 32; k <<= 1) {   // the warp's 32 thread bests, sorted best first (bitonic)
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const unsigned long long o = __shfl_xor_sync(0xffffffffu, mk, j);
+            mk = (((lane & j) == 0) == ((lane & k) == 0)) == (o > mk) ? o : mk;   // the lower lane of a pair keeps the larger in a descending run
+        }
+    }
+    if (lane < kDf2TopK) s.wk[warp][lane] = mk;
+    if (tid == 0) { s.bound = 0; s.cnt = 0; }
+    __syncthreads();
+    if (tid < 8 * kDf2TopK) {   // the 16th best of all 256 thread bests is in some warp's 16: its place = its place in its warp + the better ones in the others
+        const int w = tid >> 4, p = tid & 15;
+        const unsigned long long me = s.wk[w][p];
+        if (me != 0) {
+            int place = p;
+            for (int w2 = 0; w2 < 8; ++w2) {
+                if (w2 == w) continue;
+                int lo = 0, hi = kDf2TopK;   // the count of s.wk[w2][*] > me (they are sorted best first)
+                while (lo < hi) {
+                    const int mid = (lo + hi) >> 1;
+                    if (s.wk[w2][mid] > me) lo = mid + 1; else hi = mid;
+                }
+                place += lo;
+            }
+            if (place == kDf2TopK - 1) s.bound = me;   // fewer than 16 thread bests: bound 0, every value is a candidate
+        }
+    }
+    __syncthreads();
+    const unsigned long long bound = s.bound;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        if (ri[j] >= 0) {
+            const unsigned long long k = top_key(rv[j], ri[j]);
+            if (k >= bound) {
+                const int p = atomicAdd(&s.cnt, 1);
+                s.ck[p] = k;
+                s.cv[p] = rv[j];
+            }
+        }
+    }
+    __syncthreads();
+    return s.cnt;
+}
+
+// the place of candidate p among the c (0 = best)
+__device__ __forceinline__ int top16_place(const TopRankSmem& s, int c, int p) {
+    const unsigned long long k = s.ck[p];
+    int r = 0;
+    for (int q = 0; q < c; ++q) r += s.ck[q] > k;
+    return r;
+}
+
+__device__ __forceinline__ int top_key_index(unsigned long long k) { return 0x7fffffff - (int) (uint32_t) k; }
+template <int MAX_PER_THR>
+__global__ void __launch_bounds__(256) topk_part_rank_kernel(const float* __restrict__ logits, int n, float* __restrict__ cval, int32_t* __restrict__ cidx) {
+    __shared__ TopRankSmem s;
+    const int row = blockIdx.x, blk = blockIdx.y, tid = threadIdx.x;
+    const int cs = (n + kDf2TopBlocks - 1) / kDf2TopBlocks;
+    const int c0 = blk * cs, c1 = min(c0 + cs, n);
+    float rv[MAX_PER_THR];
+    int ri[MAX_PER_THR];
+#pragma unroll
+    for (int j = 0; j < MAX_PER_THR; ++j) {
+        const int i = tid + j * 256;
+        const bool in = i < cs && c0 + i < c1;
+        rv[j] = in ? logits[(size_t) row * n + c0 + i] : -INFINITY;
+        ri[j] = in && rv[j] > -INFINITY ? i : -1;   // the serial loop never picks -inf (it ends the list) or NaN
+    }
+    const int c = top16_candidates<MAX_PER_THR>(rv, ri, s);
+    const size_t o = ((size_t) row * kDf2TopBlocks + blk) * kDf2TopK;
+    if (tid < c) {
+        const int r = top16_place(s, c, tid);
+        if (r < kDf2TopK) { cval[o + r] = s.cv[tid]; cidx[o + r] = c0 + top_key_index(s.ck[tid]); }
+    } else if (tid < kDf2TopK) {
+        cval[o + tid] = -INFINITY;
+        cidx[o + tid] = -1;
+    }
+}
+
+__global__ void __launch_bounds__(256) topk_merge_rank_kernel(const float* __restrict__ cval, const int32_t* __restrict__ cidx, const int32_t* __restrict__ idx_map,
+                                                              float* __restrict__ val, int32_t* __restrict__ tok) {
+    constexpr int NC = kDf2TopBlocks * kDf2TopK;
+    constexpr int PER = NC / 256;
+    __shared__ TopRankSmem s;
+    const int row = blockIdx.x, tid = threadIdx.x;
+    float rv[PER];
+    int ri[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        rv[j] = cval[(size_t) row * NC + tid + j * 256];
+        ri[j] = cidx[(size_t) row * NC + tid + j * 256];
+    }
+    const int c = top16_candidates<PER>(rv, ri, s);
+    if (tid < c) {
+        const int r = top16_place(s, c, tid);
+        if (r < kDf2TopK) {
+            const int ix = top_key_index(s.ck[tid]);
+            val[row * kDf2TopK + r] = s.cv[tid];
+            tok[row * kDf2TopK + r] = idx_map ? idx_map[ix] : ix;
+        }
+    } else if (tid < kDf2TopK) {
+        val[row * kDf2TopK + tid] = -INFINITY;
+        tok[row * kDf2TopK + tid] = 0;
+    }
+}
+
 // one value / eight values of a ggml Q4_0 row of 256 (8 blocks of 18 bytes: fp16 d, then 16 bytes with value i in the low nibble of byte i and value i + 16 in the high one)
 __device__ __forceinline__ float q4row_at(const uint8_t* row, int i) {
     const uint8_t* blk = row + (size_t) (i >> 5) * 18;
@@ -1997,17 +2136,31 @@ void df2_q8_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t coun
     check("q8_tile");
 }
 
+static int g_topk_variant = 0;
+void df2_topk_variant(int v) { g_topk_variant = v; }
+static bool df2_topk_rank() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DF2_TOPK_RANK"); return !(e && e[0] == '0'); }();
+    return g_topk_variant != 0 ? g_topk_variant == 2 : on;
+}
+
 void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint32_t* scratch, float* val, int32_t* tok, void* stream) {
     const int cs = (n + kDf2TopBlocks - 1) / kDf2TopBlocks;
     if (cs > TK_CHUNK_MAX) throw std::invalid_argument("df2_topk: too many logits per row");
     float* cval = reinterpret_cast<float*>(scratch);
     int32_t* cidx = reinterpret_cast<int32_t*>(scratch + (size_t) rows * kDf2TopBlocks * kDf2TopK);
-    if (cs <= 8 * 256)
-        topk_part_kernel<8><<<dim3(rows, kDf2TopBlocks), 256, 0, (cudaStream_t) stream>>>(logits, n, cval, cidx);
-    else
-        topk_part_kernel<TK_PER_THR><<<dim3(rows, kDf2TopBlocks), 256, 0, (cudaStream_t) stream>>>(logits, n, cval, cidx);
-    check("topk_part");
-    topk_merge_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>(cval, cidx, idx_map, val, tok);
+    cudaStream_t st = (cudaStream_t) stream;
+    const dim3 grid(rows, kDf2TopBlocks);
+    if (df2_topk_rank()) {
+        if (cs <= 8 * 256) topk_part_rank_kernel<8><<<grid, 256, 0, st>>>(logits, n, cval, cidx);
+        else               topk_part_rank_kernel<TK_PER_THR><<<grid, 256, 0, st>>>(logits, n, cval, cidx);
+        check("topk_part");
+        topk_merge_rank_kernel<<<rows, 256, 0, st>>>(cval, cidx, idx_map, val, tok);
+    } else {
+        if (cs <= 8 * 256) topk_part_kernel<8><<<grid, 256, 0, st>>>(logits, n, cval, cidx);
+        else               topk_part_kernel<TK_PER_THR><<<grid, 256, 0, st>>>(logits, n, cval, cidx);
+        check("topk_part");
+        topk_merge_kernel<<<rows, 256, 0, st>>>(cval, cidx, idx_map, val, tok);
+    }
     check("topk_merge");
 }
 

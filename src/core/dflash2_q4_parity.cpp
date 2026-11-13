@@ -227,6 +227,64 @@ int main() {
         }
         cudaFree(tiled_q8); cudaFree(dx); cudaFree(dxq); cudaFree(dxd); cudaFree(dy);
 
+        // 3a. the ranked top-16 vs the serial one: bitwise the same values and tokens (ties, -inf, short and empty chunks)
+        {
+            bool tk_ok = true;
+            std::vector<int32_t> h_map(4096);
+            for (int i = 0; i < 4096; ++i) h_map[i] = (i * 13) % 4096;
+            int32_t* d_map;
+            cudaMalloc((void**) &d_map, 4096 * 4);
+            cudaMemcpy(d_map, h_map.data(), 4096 * 4, cudaMemcpyHostToDevice);
+            const int tk_n[5] = {248320, 4096, 500, 70000, 131072};
+            for (int t = 0; t < 5; ++t) {
+                const int n = tk_n[t], rows = 7;
+                std::vector<float> lg((size_t) rows * n);
+                for (size_t i = 0; i < lg.size(); ++i) {
+                    const float v = std::round(nd(rng) * (t == 3 ? 2.0f : 50.0f)) / 4.0f;   // coarse: many ties
+                    lg[i] = (i % 97 == 5) ? -INFINITY : v;
+                }
+                if (t == 2) for (int i = 0; i < n; ++i) lg[(size_t) 3 * n + i] = -INFINITY;   // a row with no candidate
+                if (t == 4) for (int i = 0; i < n; ++i) lg[(size_t) 1 * n + i] = (i % 1000 == 0) ? 1.0f : -INFINITY;   // fewer than 16 in most chunks
+                if (t == 3) for (int i = 0; i < n; ++i) {   // +0 and -0 tie (better() has them equal); denormals are values of their own
+                    const float z = (i * 2654435761u) & 64 ? -0.0f : 0.0f;
+                    lg[(size_t) 5 * n + i] = i % 9001 == 7 ? ((i & 1) ? 1e-40f : -1e-40f) : z;
+                }
+                if (t == 0) {   // each chunk's best values all in one thread: the most candidates the bound lets through
+                    const int cs = (n + strata::kernels::kDf2TopBlocks - 1) / strata::kernels::kDf2TopBlocks;
+                    for (int i = 0; i < n; ++i) if ((i % cs) % 256 == 0) lg[(size_t) 2 * n + i] = 1000.0f + (float) (i % 7);
+                }
+                float *dl, *dv[2];
+                int32_t* dt[2];
+                uint32_t* dsc;
+                cudaMalloc((void**) &dl, lg.size() * 4);
+                cudaMalloc((void**) &dsc, (size_t) rows * strata::kernels::kDf2TopBlocks * 16 * 2 * 4);
+                cudaMemcpy(dl, lg.data(), lg.size() * 4, cudaMemcpyHostToDevice);
+                std::vector<float> hv[2];
+                std::vector<int32_t> ht[2];
+                for (int k = 0; k < 2; ++k) {
+                    cudaMalloc((void**) &dv[k], rows * 16 * 4);
+                    cudaMalloc((void**) &dt[k], rows * 16 * 4);
+                    strata::kernels::df2_topk_variant(k + 1);
+                    strata::kernels::df2_topk(dl, n, t == 1 ? d_map : nullptr, rows, dsc, dv[k], dt[k], nullptr);
+                    hv[k].resize(rows * 16);
+                    ht[k].resize(rows * 16);
+                    cudaMemcpy(hv[k].data(), dv[k], rows * 16 * 4, cudaMemcpyDeviceToHost);
+                    cudaMemcpy(ht[k].data(), dt[k], rows * 16 * 4, cudaMemcpyDeviceToHost);
+                    cudaFree(dv[k]);
+                    cudaFree(dt[k]);
+                }
+                strata::kernels::df2_topk_variant(0);
+                const bool same = std::memcmp(hv[0].data(), hv[1].data(), hv[0].size() * 4) == 0 && ht[0] == ht[1];
+                std::printf("top-16 ranked vs serial, n %6d: %s\n", n, same ? "ok" : "MISMATCH");
+                tk_ok = tk_ok && same;
+                cudaFree(dl);
+                cudaFree(dsc);
+            }
+            cudaFree(d_map);
+            ++total;
+            if (!tk_ok) ++bad;
+        }
+
         // 3. df2_topk + df2_pack_head_rows + df2_select_multi vs per-slot df2_select
         const int n_vocab = 4096, rank = 256, n_slots = 4;
         const int kw[4] = {4, 7, 2, 5};

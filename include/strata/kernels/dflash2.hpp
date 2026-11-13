@@ -63,6 +63,8 @@ void df2_rope_table_inv(const int32_t* pos, int rows, const double* inv, float* 
 /// The same table computed on the host (double precision, bitwise the CUDA kernel up to sincosf): table [rows][2][64].  The SYCL port uses this one: a kernel with FP64 operations on an Arc Alchemist (IGC DP emulation) slows every later kernel of the process by 2x or more, so the drafter has no device FP64.
 void df2_rope_table_cpu(const int32_t* pos, int rows, float theta, float* table);
 void df2_gemm_variant(int v);
+/// Tests only: 1 = the one-block top-16, 2 = the ranked one (the same results), 0 = the default (STRATA_DF2_TOPK_RANK).
+void df2_topk_variant(int v);
 /// Bench only: attention variants (bit 0 skips Q K^T, bit 1 skips P V).
 void df2_attention_variant(int v);
 /// Bench only (SYCL): keys per attention work-group, 64 or 128 (0 = the default).
