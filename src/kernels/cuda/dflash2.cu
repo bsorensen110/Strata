@@ -1631,39 +1631,42 @@ void df2_attention_variant(int v) { g_attn_variant = v; }
 // 110 SMs) for every matrix, within 0-2 us of the best on a 188-SM RTX PRO 6000.  gfx12 (R9700, gfx1201, p620, 8 columns, cold weights, two bench runs): the same shape with unroll 1
 // (26) is 25-45% faster on every matrix of 1000 rows and more (gate+up 56 -> 44.5 us, down 39 -> 23.4, qkv 26.8 -> 21.4, o 23.6 -> 14.9, fc 61.5 -> 35.2, kv 15.2 -> 10.0), and one
 // warp a row with unroll 1 (31) is 2x faster on the 256 and 640 row matrices (akp / mkp 12.1 -> 6.3 us, selector 11.1 -> 5.2); all bitwise the same results.
-static int df2_q8_auto(int rows) {
+static bool df2_hip_wave32_u1() {
 #if defined(STRATA_USE_HIP)
-    static const bool gfx12 = [] {
+    static const bool on = [] {
         int dev = 0;
         cudaDeviceProp p;
         return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
-               strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+               (strata::kernels::gfx_arch_is_gfx12(p.gcnArchName) || strata::kernels::gfx_arch_is_gfx11_wmma(p.gcnArchName));
     }();
-    if (gfx12) return rows <= 640 ? 31 : 26;
+    return on;
+#else
+    return false;
 #endif
+}
+
+static int df2_q8_auto(int rows) {
+    if (df2_hip_wave32_u1()) return rows <= 640 ? 31 : 26;
     return rows <= 1024 ? 20 : rows <= 3072 ? 13 : rows >= 15000 ? 10 : (rows % 32 == 0 ? 1 : 2);
 }
 
 static int df2_q4_auto(int rows) {
-#if defined(STRATA_USE_HIP)
-    static const bool gfx12 = [] {
-        int dev = 0;
-        cudaDeviceProp p;
-        return cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
-    }();
-    if (gfx12) return rows <= 640 ? 31 : 26;
-#endif
-    (void) rows;
+    if (df2_hip_wave32_u1()) return rows <= 640 ? 31 : 26;
     return 17;
 }
 #ifndef DF2_Q4_AUTO
 #define DF2_Q4_AUTO(rows) df2_q4_auto(rows)
 #endif
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream) {
-    if (n < 1 || n > kDf2MaxSegs || n_in % 512 != 0 || ncols < 1 || ncols > 32) throw std::invalid_argument("df2_gemm: unsupported shape");
-    if (ncols > 16) {
-        for (int c0 = 0; c0 < ncols; c0 += 16) {
-            const int nc = std::min(16, ncols - c0);
+    if (n < 1 || n > kDf2MaxSegs || n_in % 512 != 0 || ncols < 1 || ncols > 64) throw std::invalid_argument("df2_gemm: unsupported shape");
+    static const bool single_pass_32 = [] { const char* e = std::getenv("STRATA_DF2_GEMM_32"); return !(e && e[0] == '0'); }();
+    static const int tune4 = [] { const char* e = std::getenv("STRATA_DF2_GEMM4"); return e ? std::atoi(e) : 0; }();
+    static const int tune = [] { const char* e = std::getenv("STRATA_DF2_GEMM"); return e ? std::atoi(e) : 1; }();
+    const bool allow_sp32 = single_pass_32 && g_gemm_variant == 0 && (mats[0].q4 ? tune4 == 0 : tune == 1);
+    if (ncols > 32 || (ncols > 16 && !allow_sp32)) {
+        const int step = (ncols > 32 && allow_sp32) ? 32 : 16;
+        for (int c0 = 0; c0 < ncols; c0 += step) {
+            const int nc = std::min(step, ncols - c0);
             Df2Mat sub[kDf2MaxSegs];
             for (int i = 0; i < n; ++i) {
                 sub[i] = Df2Mat{mats[i].w, mats[i].y + (size_t) c0 * mats[i].n_out, mats[i].n_out, mats[i].q4};
@@ -1672,6 +1675,7 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
         }
         return;
     }
+    const bool use_sp32 = ncols > 16 && allow_sp32;
     Df2Segs segs;
     int rows = 0;
     for (int i = 0; i < n; ++i) {
@@ -1684,8 +1688,21 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
     segs.n = n;
     const int8_t* xqp = static_cast<const int8_t*>(xq);
     cudaStream_t st = (cudaStream_t) stream;
+    if (use_sp32) {
+        // 17..32 columns in 1 pass (R=1 row/warp keeps 32 float accumulators/thread, reading weights once for 3-4 slots).
+        const unsigned grid = (unsigned) (rows / 2), blk = 64;
+        if (mats[0].q4) {
+            if (ncols == 32) gemm4_rows_kernel<2, 1, 1, 32, true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 32);
+            else             gemm4_rows_kernel<2, 1, 1, 32, false><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, ncols);
+            check("gemm4_32");
+        } else {
+            if (ncols == 32) gemm_rows_kernel<2, 1, 1, 32, true><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, 32);
+            else             gemm_rows_kernel<2, 1, 1, 32, false><<<grid, blk, 0, st>>>(segs, xqp, xd, n_in, ncols);
+            check("gemm8_32");
+        }
+        return;
+    }
     if (mats[0].q4) {   // the Q4_0 pack: 4 warps a block when the rows allow, else 2; the rows-a-warp variants (bitwise the same results) by matrix size
-        static const int tune4 = [] { const char* e = std::getenv("STRATA_DF2_GEMM4"); return e ? std::atoi(e) : 0; }();   // 0: the table; 1: 8 rows a warp as before; 10 and up: that variant for every matrix (bench / A/B)
         int v4 = g_gemm_variant != 0 ? g_gemm_variant : tune4 >= 10 ? tune4 : tune4 != 0 ? 1 : DF2_Q4_AUTO(rows);
 #define DF2_ROWS4_CASE(V, W, R, U) case V: if (ncols <= 8) gemm4_rows_kernel<W, R, U, 8><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); else gemm4_rows_kernel<W, R, U, 16><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         switch (v4) {
@@ -1734,7 +1751,6 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
         check("gemm4");
         return;
     }
-    static const int tune = [] { const char* e = std::getenv("STRATA_DF2_GEMM"); return e ? std::atoi(e) : 1; }();   // 1 (default): rows a warp by matrix size, bitwise the same results; 0: 8 rows a warp as before; 10+: variant override
     const int variant = g_gemm_variant != 0 ? g_gemm_variant
                         : tune >= 10        ? tune
                         : tune == 0         ? (rows % 32 == 0 ? 1 : 2)
