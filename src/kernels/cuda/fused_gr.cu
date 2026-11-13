@@ -301,8 +301,9 @@ __global__ void __launch_bounds__(THREADS) gr_up_kernel(FusedGrArgs a) {
 }
 
 // ================================ plan v0.3 P6: T tokens, one weight read ================================
+constexpr int kMultiMaxT = kFusedGrWideT;
 struct GrMulti {
-    FusedGrArgs a[kFusedGrMaxT];
+    FusedGrArgs a[kMultiMaxT];
     float* xn;
     int* q8_il_bm = nullptr;
     int* q8_il_pm = nullptr;
@@ -355,11 +356,11 @@ __device__ __forceinline__ void gr_q8_tail(const GrMulti& m, int d0) {
     __syncthreads();
     if (!last) return;
     __threadfence();
-    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    if (warp >= m.T) return;
-    const int c0 = (d0 / 32) * 32;
-    const float xi = *reinterpret_cast<const volatile float*>(m.a[warp].mixed + c0 + lane);
-    gr_q8_write(m, warp, c0 / 32, lane, xi);
+    const int lane = threadIdx.x & 31, c0 = (d0 / 32) * 32;
+    for (int warp = threadIdx.x >> 5; warp < m.T; warp += WARPS) {
+        const float xi = *reinterpret_cast<const volatile float*>(m.a[warp].mixed + c0 + lane);
+        gr_q8_write(m, warp, c0 / 32, lane, xi);
+    }
 }
 // Step 1 of `gr_down_kernel`, one block per token, same threads and reduction order: rs[t] and xn[t] to global.
 __global__ void __launch_bounds__(THREADS) gr_norm_multi_kernel(GrMulti m) {
@@ -1719,6 +1720,99 @@ static int gr_r2() {
     static const int v = [] { const char* e = std::getenv("STRATA_GR_R2"); return e != nullptr ? std::atoi(e) : 2; }();
     return v == 1 || v == 2 || v == 4 ? v : 0;
 }
+#if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
+// STRATA_FUSED_GR_16 (opt-out, default ON): single-pass norm/down/up for 9..16 tokens when q8_il is null.
+// LDS budgets per CTA on gfx1201 (64 KiB LDS):
+//   gr_down_multi_kernel (0 static LDS): T=9..12 @ TILEV=1280 uses 45..60 KiB (<= 64 KiB, 1 CTA/CU on 41-CTA grid);
+//     T=13..16 @ TILEV=1024 uses 52..64 KiB (<= 64 KiB, 1 CTA/CU), or @ TILEV=512 uses 26..32 KiB if usable < 64 KiB.
+//   gr_up_q32_kernel (default QFUSE on HIP): T=12 uses 21 KiB (15 KiB lo + 6 KiB g), T=16 uses 28 KiB (20 KiB + 8 KiB) -> 2 CTAs/CU.
+//   gr_up_multi_kernel (non-QFUSE / fallback): T=12 uses 18 KiB, T=16 uses 24 KiB -> 2 CTAs/CU.
+inline bool fused_gr_16_on() {
+    const char* v = std::getenv("STRATA_FUSED_GR_16");
+    return v == nullptr || v[0] != '0';
+}
+#endif
+
+int down_wide_tile(int n_tok) {
+#if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
+    if (n_tok <= kFusedGrMaxT) return 0;
+    struct DevWide {
+        bool init = false;
+        int max_half = 0;      // TILEV = N / 2 (1280): 5120 B/tok -> <= 12 tok in 64 KiB
+        int max_1024_12 = 0;   // TILEV = 1024: 4096 B/tok -> <= 12 tok in 48 KiB
+        int max_1024_16 = 0;   // TILEV = 1024: 4096 B/tok -> <= 16 tok in 64 KiB
+        int max_512 = 0;       // TILEV = 512: 2048 B/tok -> <= 16 tok in 32 KiB
+    };
+    static DevWide per_dev[64];
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return 0;
+    DevWide& d = per_dev[dev];
+    if (!d.init) {
+        int optin = 0;
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        optin = strata::smem_optin_of(optin);
+#if defined(__HIPCC__)
+        const int usable = optin > 0 ? optin : 48 * 1024;
+#else
+        int cc = 0, per_block = 0;
+        cudaDeviceGetAttribute(&cc, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&per_block, cudaDevAttrMaxSharedMemoryPerBlock, dev);
+        cc = strata::cc_major_of(cc);
+        const int usable = (cc >= 7 && optin > 0) ? optin : per_block;
+#endif
+        auto allow = [&](auto kernel, int tv, int max_tok) -> int {
+            if (tv < 256 || (tv % 256) != 0 || (D % tv) != 0) return 0;
+            int cap = usable / (tv * (int) sizeof(float));
+            if (cap > max_tok) cap = max_tok;
+            if (cap <= kFusedGrMaxT) return 0;
+            const int need = cap * tv * (int) sizeof(float);
+            if (need > 48 * 1024 &&
+                cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, need) != cudaSuccess) {
+                cudaGetLastError();
+                cap = (48 * 1024) / (tv * (int) sizeof(float));
+                if (cap <= kFusedGrMaxT) return 0;
+            }
+            return cap;
+        };
+        auto allow_both = [&](auto k_bf16, auto k_q8, int tv, int max_tok) -> int {
+            const int c1 = allow(k_bf16, tv, max_tok);
+            const int c2 = allow(k_q8, tv, max_tok);
+            return c1 < c2 ? c1 : c2;
+        };
+        if constexpr ((N / 2) >= 256 && ((N / 2) % 256) == 0 && (D % (N / 2)) == 0) {
+            d.max_half = allow_both(gr_down_multi_kernel<(N / 2), 12, false>,
+                                    gr_down_multi_kernel<(N / 2), 12, true>, N / 2, 12);
+        }
+        if constexpr ((D % 1024) == 0) {
+            d.max_1024_12 = allow_both(gr_down_multi_kernel<1024, 12, false>,
+                                       gr_down_multi_kernel<1024, 12, true>, 1024, 12);
+#if STRATA_VERIFY_MAX_T > 12
+            d.max_1024_16 = allow_both(gr_down_multi_kernel<1024, 16, false>,
+                                       gr_down_multi_kernel<1024, 16, true>, 1024, 16);
+#endif
+        }
+        if constexpr ((D % 512) == 0) {
+            int cap = usable / (512 * (int) sizeof(float));
+            if (cap > kFusedGrWideT) cap = kFusedGrWideT;
+            d.max_512 = cap > kFusedGrMaxT ? cap : 0;
+        }
+        cudaGetLastError();
+        d.init = true;
+    }
+    if (n_tok <= 12 && n_tok <= d.max_half) return N / 2;
+    if (n_tok <= 12 && n_tok <= d.max_1024_12) return 1024;
+#if STRATA_VERIFY_MAX_T > 12
+    if (n_tok > 12 && n_tok <= d.max_1024_16) return 1024;
+#endif
+    if (n_tok <= d.max_512) return 512;
+    return 0;
+#else
+    (void) n_tok;
+    return 0;
+#endif
+}
+
 void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
     const int n_tok = m.T;
     const bool q8w = m.a[0].s_down != nullptr;   // STRATA_HC_REQ8: w_down / w_up hold int8 codes
@@ -1739,9 +1833,11 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
 #endif
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     // STRATA_HC_Q8: the staged down kernel reads bf16 only, so Q8 weights take split's down kernel (the plain one)
-    const bool staged = variant >= kHcStaged && m.a[0].s_down == nullptr;
+    const int wide_tv = n_tok > kFusedGrMaxT ? down_wide_tile(n_tok) : 0;
+    const bool staged = wide_tv == 0 && variant >= kHcStaged && m.a[0].s_down == nullptr;
     int tv = N;
-    const int chunk_tok = down_chunk(staged, &tv);
+    const int chunk_tok = wide_tv > 0 ? n_tok : down_chunk(staged, &tv);
+    if (wide_tv > 0) tv = wide_tv;
     // BW-MEASURE: the hyper-connection read's form: var = layout variant (0 plain, 1 split, 2 staged), type = 1 for Q8 weights, n_in = down tile,
     // n_out = tokens a down launch, ncols = tokens
     strata::dispatch::kernel(strata::dispatch::kHc, variant, m.a[0].s_down != nullptr ? 1 : 0, tv, chunk_tok, n_tok);
@@ -1766,7 +1862,38 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         // kFusedGrMaxT - the same tile, block size, accumulation order and plain/split/staged path, so the same bits
         // (decided once per device: this runs per layer when decode is not captured)
         const bool max4 = ct <= 4 && gr_down_max4();
-        if (staged) {
+        if (wide_tv > 0) {
+#if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
+            if (ct <= 12) {
+                if (tv == (N / 2)) {
+                    if constexpr ((N / 2) >= 256 && ((N / 2) % 256) == 0 && (D % (N / 2)) == 0) {
+                        if (q8w) gr_down_multi_kernel<(N / 2), 12, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                        else gr_down_multi_kernel<(N / 2), 12><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                    }
+                } else if (tv == 1024) {
+                    if constexpr ((D % 1024) == 0) {
+                        if (q8w) gr_down_multi_kernel<1024, 12, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                        else gr_down_multi_kernel<1024, 12><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                    }
+                } else if constexpr ((D % 512) == 0) {
+                    if (q8w) gr_down_multi_kernel<512, 12, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                    else gr_down_multi_kernel<512, 12><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                }
+            } else {
+#if STRATA_VERIFY_MAX_T > 12
+                if (tv == 1024) {
+                    if constexpr ((D % 1024) == 0) {
+                        if (q8w) gr_down_multi_kernel<1024, 16, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                        else gr_down_multi_kernel<1024, 16><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                    }
+                } else if constexpr ((D % 512) == 0) {
+                    if (q8w) gr_down_multi_kernel<512, 16, true><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                    else gr_down_multi_kernel<512, 16><<<DOWN_BLOCKS + 1, THREADS, smem, st>>>(c);
+                }
+#endif
+            }
+#endif
+        } else if (staged) {
             // #783 PR-g (stuchapin909): a launch of exactly ct <= 6 tokens is its own instantiation, the loop bounds
             // are compile-time (the same sums in the same order); STRATA_NO_MULTI_GR=1 keeps the generic kernels
             const int tg = down_tg(ct);
@@ -1800,79 +1927,72 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+    const int up_t = no_multi_gr ? (n_tok > kFusedGrMaxT ? (n_tok <= 12 ? 12 : 16) : kFusedGrMaxT) : n_tok;
+#if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 12
+#define STRATA_UP_WIDE(CALL) \
+    case 9: case 10: case 11: case 12: CALL(12, false); break; \
+    case 13: case 14: case 15: case 16: CALL(16, false); break;
+#elif defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
+#define STRATA_UP_WIDE(CALL) \
+    case 9: case 10: case 11: case 12: CALL(12, false); break;
+#else
+#define STRATA_UP_WIDE(CALL)
+#endif
+#define STRATA_UP_SWITCH(CALL) \
+    switch (up_t) { \
+        case 1: CALL(1, true); break; \
+        case 2: CALL(2, true); break; \
+        case 3: CALL(3, true); break; \
+        case 4: CALL(4, true); break; \
+        case 5: CALL(5, true); break; \
+        case 6: CALL(6, true); break; \
+        STRATA_UP_WIDE(CALL) \
+        default: CALL(kFusedGrMaxT, false); break; \
+    }
     // 149-cuda: the wide up read (test arm; STRATA_GR_UP_WIDE=1).  The q8_1 tail of S26 needs the 16-column
     // blocks, so the wide kernel is only used when no q8_1 image is written.
     if (!q8w && m.a[0].q8_mixed == nullptr && gr_up_wide_on()) {
-        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
-            case 1: gr_up_wide_kernel<1, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 2: gr_up_wide_kernel<2, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 3: gr_up_wide_kernel<3, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 4: gr_up_wide_kernel<4, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 5: gr_up_wide_kernel<5, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 6: gr_up_wide_kernel<6, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
-            default: gr_up_wide_kernel<kFusedGrMaxT, false><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
-        }
+#define STRATA_UP_CALL(MT, EX) gr_up_wide_kernel<MT, EX><<<UPW_BLOCKS, THREADS, 0, st>>>(m)
+        STRATA_UP_SWITCH(STRATA_UP_CALL);
+#undef STRATA_UP_CALL
     } else
 #if STRATA_GR_FAST_BUILD
-    if (fast && !q8w) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    if (fast && !q8w && n_tok <= kFusedGrMaxT) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
 #endif
 #if !STRATA_GR_FAST_BUILD
     if (!q8w && m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {
         if (gr_tsum_on()) {
-            switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
-                case 1: gr_up_q32_kernel<1, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                case 2: gr_up_q32_kernel<2, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                case 3: gr_up_q32_kernel<3, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                case 4: gr_up_q32_kernel<4, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                case 5: gr_up_q32_kernel<5, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                case 6: gr_up_q32_kernel<6, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                default: gr_up_q32_kernel<kFusedGrMaxT, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-            }
+#define STRATA_UP_CALL(MT, EX) gr_up_q32_kernel<MT, EX, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m)
+            STRATA_UP_SWITCH(STRATA_UP_CALL);
+#undef STRATA_UP_CALL
         } else {
-            switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
-                case 1: gr_up_q32_kernel<1, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                case 2: gr_up_q32_kernel<2, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                case 3: gr_up_q32_kernel<3, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                case 4: gr_up_q32_kernel<4, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                case 5: gr_up_q32_kernel<5, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                case 6: gr_up_q32_kernel<6, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-                default: gr_up_q32_kernel<kFusedGrMaxT, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m); break;
-            }
+#define STRATA_UP_CALL(MT, EX) gr_up_q32_kernel<MT, EX, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m)
+            STRATA_UP_SWITCH(STRATA_UP_CALL);
+#undef STRATA_UP_CALL
         }
         return;
     }
 #endif
     if (q8w) {   // STRATA_HC_REQ8: the up kernel on int8 rows
-        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
-            case 1: gr_up_multi_kernel<1, true, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 2: gr_up_multi_kernel<2, true, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 3: gr_up_multi_kernel<3, true, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 4: gr_up_multi_kernel<4, true, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 5: gr_up_multi_kernel<5, true, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 6: gr_up_multi_kernel<6, true, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            default: gr_up_multi_kernel<kFusedGrMaxT, false, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-        }
+#define STRATA_UP_CALL(MT, EX) gr_up_multi_kernel<MT, EX, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m)
+        STRATA_UP_SWITCH(STRATA_UP_CALL);
+#undef STRATA_UP_CALL
     } else if (n_tok >= 3 && up75_on()) {   // T 1-2: gr_up_multi_kernel is as fast or faster (fused_gr_bench, cold)
-        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
-            case 1: gr_up75_kernel<1, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 2: gr_up75_kernel<2, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 3: gr_up75_kernel<3, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 4: gr_up75_kernel<4, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 5: gr_up75_kernel<5, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            case 6: gr_up75_kernel<6, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-            default: gr_up75_kernel<kFusedGrMaxT, false><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-        }
-    } else
-    switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
-        case 1: gr_up_multi_kernel<1, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-        case 2: gr_up_multi_kernel<2, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-        case 3: gr_up_multi_kernel<3, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-        case 4: gr_up_multi_kernel<4, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-        case 5: gr_up_multi_kernel<5, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-        case 6: gr_up_multi_kernel<6, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
-        default: gr_up_multi_kernel<kFusedGrMaxT, false><<<UPM_BLOCKS, THREADS, 0, st>>>(m); break;
+#define STRATA_UP_CALL(MT, EX) gr_up75_kernel<MT, EX><<<UPM_BLOCKS, THREADS, 0, st>>>(m)
+        STRATA_UP_SWITCH(STRATA_UP_CALL);
+#undef STRATA_UP_CALL
+    } else {
+#define STRATA_UP_CALL(MT, EX) gr_up_multi_kernel<MT, EX><<<UPM_BLOCKS, THREADS, 0, st>>>(m)
+        STRATA_UP_SWITCH(STRATA_UP_CALL);
+#undef STRATA_UP_CALL
     }
+#ifdef STRATA_UP_SWITCH
+#undef STRATA_UP_SWITCH
+#endif
+#ifdef STRATA_UP_WIDE
+#undef STRATA_UP_WIDE
+#endif
 }
 
 /// STRATA_HC_SPLIT: unset or 2 = the newest the check accepts (staged), 1 = at most split, 0 = the plain read
@@ -2978,15 +3098,77 @@ static bool gr_up_pf_dispatch(int pf, int n_tok, const GrMulti& m, const float* 
     }
 }
 
-// One read of at most kFusedGrMaxT tokens: the kernels below are built for that many (the instantiations, the shared
-// memory, the by-value launch argument), whatever the window is.
+static int gr_v3_split(const FusedGrArgs& a0) {
+    if (a0.s_down != nullptr || a0.s_up != nullptr) return 0;
+    // the two-kernel read above (another summation order): STRATA_GR_V3=0 / 1, unset = gr_v3_default_on (a 12.0 card with > 13 GiB)
+    static const int v3_env = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
+    static int split3[64] = {};   // per device: 0 = not decided yet, 1 / 2 = column halves S, -1 = does not fit
+    int dev3 = 0;
+    cudaGetDevice(&dev3);
+    const bool v3 = v3_env >= 0 ? v3_env == 1 : gr_v3_default_on(dev3);
+    if (v3 && dev3 >= 0 && dev3 < 64 && split3[dev3] == 0) {
+        int optin = 0;
+        cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev3);
+        const int limit = optin > 0 ? optin : 48 * 1024;
+        const int need1 = (int) (kFusedGrMaxT * N * sizeof(float)), need6 = (int) (6 * N * sizeof(float)),
+                  need5 = (int) (5 * N * sizeof(float)), need2 = need1 / 2;
+        int split = -1;
+        if (need1 <= limit &&
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, kFusedGrMaxT, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, need1) == cudaSuccess &&
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, 6, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, need6) == cudaSuccess &&
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, 5, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, need5) == cudaSuccess) {
+            if (kFusedGrMaxT >= 8) {   // the exact 7- and 8-token instantiations (STRATA_GR_R2: rows per warp 1 / 2 / 4)
+                const int need7 = (int) (7 * N * sizeof(float)), need8 = (int) (8 * N * sizeof(float));
+                cudaFuncSetAttribute(gr_down_v3_kernel<1, 5, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, need5);
+                cudaFuncSetAttribute(gr_down_v3_kernel<1, 6, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, need6);
+                cudaFuncSetAttribute(gr_down_v3_kernel<1, 7, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, need7);
+                cudaFuncSetAttribute(gr_down_v3_kernel<1, 7, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, need7);
+                cudaFuncSetAttribute(gr_down_v3_kernel<1, 7, true, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, need7);
+                cudaFuncSetAttribute(gr_down_v3_kernel<1, 8, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, need8);
+                cudaFuncSetAttribute(gr_down_v3_kernel<1, 8, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, need8);
+                cudaFuncSetAttribute(gr_down_v3_kernel<1, 8, true, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, need8);
+            }
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, 1, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, 2, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, 3, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, 4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, 5, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, 6, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, 4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            cudaFuncSetAttribute(gr_down_v3_kernel<1, kFusedGrMaxT, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+            split = 1;
+        } else if (need2 <= limit)
+            // #375 (kenh0u): the S = 2 split (a 64 KB opt-in card: Turing) disagrees with itself in gr_parity
+            // (graph replay vs direct call) - such a card keeps the default read until that split is fixed
+            std::fprintf(stderr, "strata: STRATA_GR_V3=1 needs the two-half split on this card, which fails its "
+                                 "checks (#375): the default read is used\n");
+        cudaGetLastError();   // drop any error the attempts left behind
+        split3[dev3] = split;
+    }
+    const int s = v3 && dev3 >= 0 && dev3 < 64 ? split3[dev3] : -1;
+    return s > 0 ? s : 0;
+}
+
+#if defined(STRATA_HIP_GFX906) || (defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8)
+static bool gr_gfx906_split_on(const FusedGrArgs& a0) {
+#if defined(STRATA_HIP_GFX906)
+    static const bool split_on = std::getenv("STRATA_GR_SPLIT") && std::string(std::getenv("STRATA_GR_SPLIT")) == "1";
+    return split_on && a0.s_down == nullptr;
+#else
+    (void) a0;
+    return false;
+#endif
+}
+#endif
+
+// One multi-token read of up to kMultiMaxT tokens (1..8 standard, or 9..16 single-pass when STRATA_FUSED_GR_16 is ON).
 static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                                       unsigned long long* stamp_buf, int stamp_i0) {
-    if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
+    if (n_tok < 1 || n_tok > kMultiMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
     }
-    GrMulti m;
+    GrMulti m{};
     for (int t = 0; t < n_tok; ++t) {
         m.a[t] = a[t];
         const FusedGrArgs& x = a[t];
@@ -3009,7 +3191,7 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
     for (int t = 0; t < n_tok; ++t) q8 = q8 && a[t].q8_mixed != nullptr;
     if (!q8) {
         for (int t = 0; t < n_tok; ++t) m.a[t].q8_mixed = nullptr;
-    } else if (n_tok >= 2 && a[0].q8_il != nullptr) {
+    } else if (n_tok >= 2 && n_tok <= kFusedGrMaxT && a[0].q8_il != nullptr) {
         const int cp = native_q8_1_il_cp(n_tok);
         const size_t words = size_t(N / 32) * 8 * size_t(cp);
         m.q8_il_bm = static_cast<int*>(a[0].q8_il);
@@ -3029,54 +3211,7 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
         }
         return q8;
     }
-    // the two-kernel read above (another summation order): STRATA_GR_V3=0 / 1, unset = gr_v3_default_on (a 12.0 card with > 13 GiB)
-    static const int v3_env = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
-    static int split3[64] = {};   // per device: 0 = not decided yet, 1 / 2 = column halves S, -1 = does not fit
-    int dev3 = 0;
-    cudaGetDevice(&dev3);
-    const bool v3 = v3_env >= 0 ? v3_env == 1 : gr_v3_default_on(dev3);
-    if (v3) {
-        if (dev3 >= 0 && dev3 < 64 && split3[dev3] == 0) {
-            int optin = 0;
-            cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev3);
-            const int limit = optin > 0 ? optin : 48 * 1024;
-            const int need1 = (int) (kFusedGrMaxT * N * sizeof(float)), need6 = (int) (6 * N * sizeof(float)),
-                      need5 = (int) (5 * N * sizeof(float)), need2 = need1 / 2;
-            int split = -1;
-            if (need1 <= limit &&
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, kFusedGrMaxT, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, need1) == cudaSuccess &&
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 6, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, need6) == cudaSuccess &&
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 5, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, need5) == cudaSuccess) {
-                if (kFusedGrMaxT >= 8) {   // the exact 7- and 8-token instantiations (STRATA_GR_R2: rows per warp 1 / 2 / 4)
-                    const int need7 = (int) (7 * N * sizeof(float)), need8 = (int) (8 * N * sizeof(float));
-                    cudaFuncSetAttribute(gr_down_v3_kernel<1, 5, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, need5);
-                    cudaFuncSetAttribute(gr_down_v3_kernel<1, 6, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, need6);
-                    cudaFuncSetAttribute(gr_down_v3_kernel<1, 7, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, need7);
-                    cudaFuncSetAttribute(gr_down_v3_kernel<1, 7, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, need7);
-                    cudaFuncSetAttribute(gr_down_v3_kernel<1, 7, true, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, need7);
-                    cudaFuncSetAttribute(gr_down_v3_kernel<1, 8, true, 1>, cudaFuncAttributeMaxDynamicSharedMemorySize, need8);
-                    cudaFuncSetAttribute(gr_down_v3_kernel<1, 8, true, 2>, cudaFuncAttributeMaxDynamicSharedMemorySize, need8);
-                    cudaFuncSetAttribute(gr_down_v3_kernel<1, 8, true, 4>, cudaFuncAttributeMaxDynamicSharedMemorySize, need8);
-                }
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 1, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 2, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 3, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 5, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 6, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-                cudaFuncSetAttribute(gr_down_v3_kernel<1, kFusedGrMaxT, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-                split = 1;
-            } else if (need2 <= limit)
-                // #375 (kenh0u): the S = 2 split (a 64 KB opt-in card: Turing) disagrees with itself in gr_parity
-                // (graph replay vs direct call) - such a card keeps the default read until that split is fixed
-                std::fprintf(stderr, "strata: STRATA_GR_V3=1 needs the two-half split on this card, which fails its "
-                                     "checks (#375): the default read is used\n");
-            cudaGetLastError();   // drop any error the attempts left behind
-            split3[dev3] = split;
-        }
-    }
-    const int split = v3 && dev3 >= 0 && dev3 < 64 && a[0].s_down == nullptr && a[0].s_up == nullptr ? split3[dev3] : -1;
+    const int split = n_tok <= kFusedGrMaxT ? gr_v3_split(a[0]) : 0;
     if (split > 0) {   // 2 kernels; scratch = partials + sums of squares
         float* part = xn_scratch;
         float* ssg = xn_scratch + (size_t) n_tok * HC * 2 * PR;   // room for S = 2
@@ -3129,8 +3264,7 @@ static bool fused_gr_read_multi_slice(const FusedGrArgs* a, int n_tok, float* xn
     // per verify window).  Its fixed-order finish sums the K slices in another order than the single-token
     // fused_gr_read, so the multi-token read is then no longer bitwise equal to T single-token calls (gr_parity's
     // contract); off by default for that reason.
-    static const bool split_on = std::getenv("STRATA_GR_SPLIT") && std::string(std::getenv("STRATA_GR_SPLIT")) == "1";
-    if (split_on && a[0].s_down == nullptr) {   // its K-split down reads bf16 rows (not STRATA_HC_REQ8)
+    if (gr_gfx906_split_on(a[0])) {   // its K-split down reads bf16 rows (not STRATA_HC_REQ8)
         const bool fast = gr_fast();
         if (fast) gr_norm_fast_kernel<<<n_tok, THREADS, 0, st>>>(m);
         else gr_norm_multi_kernel<<<n_tok, THREADS, 0, st>>>(m);
@@ -3202,6 +3336,16 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments (%d tokens)\n", n_tok);
         std::exit(1);
     }
+#if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
+    // Single-pass 9..16 execution (STRATA_FUSED_GR_16, default ON): norm + down + up each run in 1 launch,
+    // reading w_down and w_up once across the full window instead of across 8-column slices.
+    // Falls back to the 8-column slice loop when STRATA_FUSED_GR_16=0, when q8_il is set (q8_1_il has CP <= 8),
+    // when Q8_0 / V3 / gfx906-split paths are active, or when device LDS cannot stage all tokens in 1 down launch.
+    if (fused_gr_16_on() && a[0].q8_il == nullptr && a[0].q8_down == nullptr && a[0].q8_up == nullptr &&
+        gr_v3_split(a[0]) == 0 && !gr_gfx906_split_on(a[0]) && down_wide_tile(n_tok) > 0) {
+        return fused_gr_read_multi_slice(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0);
+    }
+#endif
     bool q8 = false;
     for (int c0 = 0; c0 < n_tok; c0 += kFusedGrMaxT) {
         const int ct = n_tok - c0 < kFusedGrMaxT ? n_tok - c0 : kFusedGrMaxT;
@@ -3209,7 +3353,8 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         for (int k = 0; k < ct; ++k) s[k] = a[c0 + k];
         s[0].q8_cnt = a[0].q8_cnt;
         s[0].q8_il = nullptr;
-        q8 = fused_gr_read_multi_slice(s, ct, xn_scratch + (size_t) c0 * D, stream, c0 == 0 ? stamp_buf : nullptr, stamp_i0);
+        const bool w = fused_gr_read_multi_slice(s, ct, xn_scratch + (size_t) c0 * D, stream, c0 == 0 ? stamp_buf : nullptr, stamp_i0);
+        q8 = (c0 == 0) ? w : (q8 && w);
     }
     return q8;
 }

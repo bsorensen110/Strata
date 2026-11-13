@@ -73,8 +73,9 @@ void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks
 /// weight pointers and eps must be the same for every t); `xn_scratch` is n_tok * hc * n_embd floats.  Every
 /// token's outputs are bitwise `fused_gr_read(a[t])`.
 constexpr int kFusedGrMaxT = 8;
-/// A window of more than kFusedGrMaxT tokens is read in slices of at most kFusedGrMaxT (every token's outputs are
-/// strictly its own, so the slices are bitwise the one read); `a` and `xn_scratch` hold up to kFusedGrWideT tokens.
+/// A window of more than kFusedGrMaxT tokens executes in a single wide launch when STRATA_FUSED_GR_16 is enabled (default ON)
+/// and q8_il is null, or in slices of at most kFusedGrMaxT otherwise (bitwise the one read); `a` and `xn_scratch` hold up to
+/// kFusedGrWideT tokens.
 constexpr int kFusedGrWideT = kWindowMaxT;
 /// Returns true when it also wrote the q8_1 images (every token's q8_mixed set and this read supports it).
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
