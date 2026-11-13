@@ -196,6 +196,9 @@ public:
     /// Pre-captures the 1-slot (`batch_full_1_exec_`) precomputed batch graphs on the parent drafter
     /// for `slots[0..n_slots-1]` so the first BGEN admission does not stall in `capture_batch_full`.
     bool prewarm_batch_slots(Dflash2Drafter* const* slots, int n_slots, std::string& err);
+    /// Pre-captures `precomp_exec_[1..min(max_rows, kPrecompGraphMax)]` at startup so runtime
+    /// `taps_ready_cb_` precompute never triggers lazy graph capture during timed bursts.
+    void prewarm_precompute(const float* taps, int max_rows);
 
     /// The most drafts a window will use (the engine's widest window - 1, 1..kDrafts; default kDrafts).  The head, the top-k and the selector's walk run for that
     /// many rows only: the first `n` drafts and probabilities are bitwise the ones a full block makes (every row is its own column, the walk goes left to right);
@@ -259,6 +262,7 @@ private:
     bool make_streams(std::string& err);
     void destroy_streams();
     bool wait_precomp_on_cs(cudaStream_t cs);
+    void reset_precomp_graph(int n_rows, cudaStream_t cs, bool mark_failed) noexcept;
     void record_precompute_batch_context(const float* taps, int n_rows, bool want_log, cudaStream_t cs);
     bool capture_precompute_batch_context(const float* taps, int n_rows, bool want_log, cudaStream_t cs);
     uint64_t vram_ = 0;

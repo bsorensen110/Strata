@@ -57,6 +57,14 @@ int df2_beam() {
     return b;
 }
 
+bool df2_precomp_graph_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_DF2_PRECOMP_GRAPH");
+        return !e || !e[0] || e[0] != '0';
+    }();
+    return on;
+}
+
 int df2_head_il_mode() {
     static const int mode = [] {
         const char* e = std::getenv("STRATA_DF2_HEAD_IL");
@@ -1823,10 +1831,24 @@ void Dflash2Drafter::record_precompute_batch_context(const float* taps, int n_ro
     }
 }
 
+void Dflash2Drafter::reset_precomp_graph(int n_rows, cudaStream_t cs, bool mark_failed) noexcept {
+    if (n_rows < 1 || n_rows > kPrecompGraphMax) return;
+    if (precomp_exec_[n_rows] != nullptr) {
+        if (cs != nullptr) (void) cudaStreamSynchronize(cs);
+        (void) cudaGraphExecDestroy(precomp_exec_[n_rows]);
+        precomp_exec_[n_rows] = nullptr;
+    }
+    precomp_exec_taps_[n_rows] = nullptr;
+    precomp_exec_log_[n_rows] = false;
+    precomp_graph_failed_[n_rows] = mark_failed;
+}
+
 bool Dflash2Drafter::capture_precompute_batch_context(const float* taps, int n_rows, bool want_log, cudaStream_t cs) {
     if (n_rows < 1 || n_rows > kPrecompGraphMax || cs == nullptr) return false;
-    if (precomp_exec_[n_rows] != nullptr) return true;
-    (void) cudaStreamSynchronize(cs);
+    if (precomp_exec_[n_rows] != nullptr) {
+        if (precomp_exec_taps_[n_rows] == taps && precomp_exec_log_[n_rows] == want_log) return true;
+        reset_precomp_graph(n_rows, cs, false);
+    }
     if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
@@ -1853,12 +1875,36 @@ bool Dflash2Drafter::capture_precompute_batch_context(const float* taps, int n_r
         (void) cudaGetLastError();
         return false;
     }
-    (void) cudaGraphUpload(new_exec, cs);
-    (void) cudaStreamSynchronize(cs);
     precomp_exec_[n_rows] = new_exec;
     precomp_exec_taps_[n_rows] = taps;
     precomp_exec_log_[n_rows] = want_log;
     return true;
+}
+
+void Dflash2Drafter::prewarm_precompute(const float* taps, int max_rows) {
+    if (!df2_precomp_graph_on() || prof_ != nullptr || !bound_ || blob_shared_ || rt_bctx_ == nullptr ||
+        taps == nullptr || max_rows < 1 || skip_part("ctx")) return;
+    const OnDevice on_device(device_);
+    if (precomp_pending_ && ev_pre_ != nullptr) {
+        (void) cudaEventSynchronize(ev_pre_);
+        precomp_pending_ = false;
+    }
+    cudaStream_t pre_cs = cs_pre_ ? cs_pre_ : cs_;
+    if (pre_cs == nullptr) return;
+    const int lim = std::min(max_rows, (int) kPrecompGraphMax);
+    const bool want_log = log_on_ && h_logq_ != nullptr && h_logd_ != nullptr;
+    if (h_meta_ != nullptr) std::memset(h_meta_ + kMetaPrecompPos, 0, (size_t) lim * sizeof(int32_t));
+    const Clock::time_point t0 = Clock::now();
+    for (int r = 1; r <= lim; ++r) {
+        if (!precomp_graph_failed_[r] && precomp_exec_[r] == nullptr &&
+            !capture_precompute_batch_context(taps, r, want_log, pre_cs)) {
+            precomp_graph_failed_[r] = true;
+        }
+    }
+    (void) cudaStreamSynchronize(pre_cs);
+    clear_precomputed_context();
+    precomp_pending_ = false;
+    ms_capture += ms_since(t0);
 }
 
 void Dflash2Drafter::precompute_batch_context(const float* taps, int n_rows, const int64_t* pos) noexcept {
@@ -1877,19 +1923,11 @@ void Dflash2Drafter::precompute_batch_context(const float* taps, int n_rows, con
         }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         const bool want_log = log_on_ && h_logq_ != nullptr && h_logd_ != nullptr;
-        static const bool precomp_graph_on = [] {
-            const char* e = std::getenv("STRATA_DF2_PRECOMP_GRAPH");
-            return !e || !e[0] || e[0] != '0';
-        }();
         bool launched_graph = false;
-        if (precomp_graph_on && prof_ == nullptr && n_rows <= kPrecompGraphMax) {
+        if (df2_precomp_graph_on() && prof_ == nullptr && n_rows <= kPrecompGraphMax) {
             if (precomp_exec_[n_rows] != nullptr &&
                 (precomp_exec_taps_[n_rows] != taps || precomp_exec_log_[n_rows] != want_log)) {
-                (void) cudaStreamSynchronize(pre_cs);
-                (void) cudaGraphExecDestroy(precomp_exec_[n_rows]);
-                precomp_exec_[n_rows] = nullptr;
-                precomp_exec_taps_[n_rows] = nullptr;
-                precomp_graph_failed_[n_rows] = false;
+                reset_precomp_graph(n_rows, pre_cs, false);
             }
             if (!precomp_graph_failed_[n_rows]) {
                 if (precomp_exec_[n_rows] == nullptr &&
@@ -1901,11 +1939,7 @@ void Dflash2Drafter::precompute_batch_context(const float* taps, int n_rows, con
                         launched_graph = true;
                     } else {
                         (void) cudaGetLastError();
-                        (void) cudaStreamSynchronize(pre_cs);
-                        (void) cudaGraphExecDestroy(precomp_exec_[n_rows]);
-                        precomp_exec_[n_rows] = nullptr;
-                        precomp_exec_taps_[n_rows] = nullptr;
-                        precomp_graph_failed_[n_rows] = true;
+                        reset_precomp_graph(n_rows, pre_cs, true);
                     }
                 }
             }

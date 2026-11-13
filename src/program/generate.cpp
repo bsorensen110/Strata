@@ -12100,6 +12100,15 @@ int main(int argc, char** argv) {
             batch_df2 = false;
             batch_mtp = false;
         }
+        if (use_df2 && stages.empty() && ver.tap_dev() != nullptr) {
+            static const bool df2_tap_overlap_cfg = [] {
+                const char* e = std::getenv("STRATA_DF2_TAP_OVERLAP");
+                return !e || !e[0] || e[0] != '0';
+            }();
+            if (df2_tap_overlap_cfg) {
+                df2.prewarm_precompute(ver.tap_dev(), ver.max_t());
+            }
+        }
 #endif
         const bool draft_on = use_mtp || use_df2;   // some drafter proposes (--draft-fallback none: DFlash2 alone, use_mtp false)
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)

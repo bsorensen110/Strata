@@ -3839,14 +3839,17 @@ bool FileExpertSource::pin_cache_complement(
         arena = nullptr;
     };
 #if defined(__linux__)
-    // #1250: the cached pages of the model files this source maps (the engine read them itself), given back
-    auto drop_file_cache = [&]() {
+    auto drop_mapped_shards = [&]() {
         auto drop = [](const uint8_t* at, uint64_t len, int fd) {
             if (at != nullptr && len > 0) (void) madvise((void*) at, (size_t) len, MADV_DONTNEED);
             if (fd >= 0) (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
         };
         if (maps_.empty()) drop(base_, mapped_bytes_, fd_);
         else for (const Map& m : maps_) drop(m.closed ? nullptr : m.base, m.bytes, m.fd);
+    };
+    // #1250: the cached pages of the model files this source maps (the engine read them itself), given back
+    auto drop_file_cache = [&]() {
+        drop_mapped_shards();
         // the files read at start outside this source (set_extra_drop_files): their pages are already copied to VRAM
         // or RAM, and they sat on whichever node read them (~2.2 GiB on node 0 measured on the 3090 box)
         // CBA: whole files by path; a file read at start but not listed stays cached (the per-node free line shows
@@ -4228,6 +4231,26 @@ bool FileExpertSource::pin_cache_complement(
         release();
         return false;
     }
+#if defined(__linux__)
+    if (!role_ptr_.empty()) {
+        static const bool drop_complement_cache = [] {
+            const char* v = std::getenv("STRATA_COMPLEMENT_DROP_CACHE");
+            return v == nullptr || v[0] == '\0' || v[0] != '0';
+        }();
+        if (drop_complement_cache) {
+            uint64_t before_free = 0, after_free = 0;
+            const bool have_before = free_memory_bytes(before_free);
+            drop_mapped_shards();
+            if (have_before && free_memory_bytes(after_free)) {
+                std::fprintf(stderr, "FileExpertSource: released mapped GGUF shard cache after complement copy "
+                                     "(%.2f -> %.2f GiB really free)\n",
+                             (double) before_free / 1073741824.0, (double) after_free / 1073741824.0);
+            } else {
+                std::fprintf(stderr, "FileExpertSource: released mapped GGUF shard cache after complement copy\n");
+            }
+        }
+    }
+#endif
 #if defined(_WIN32)
     // The mapped pages this process touched (the GPU cache's fill and this copy) leave its working set for the
     // standby list: VirtualUnlock on pages that are not locked does exactly that (it then reports ERROR_NOT_LOCKED).
