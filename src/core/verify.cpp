@@ -2410,8 +2410,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
                 }
-                stamp(l, 13, grp);
-                if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
                 static const bool qsa_gate_qfuse = [] {
                     const char* e = std::getenv("STRATA_QSA_GATE_QFUSE");
                     return !e || e[0] != '0';
@@ -2419,10 +2417,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool use_quant_il_wo = n >= 2 && n <= 8 && qil_on() && g_mmvq_il() &&
                                              strata::kernels::native_mmvq_il_supported(wo->native_type, n, (int) N);
                 const bool fuse_gate_q8 = qb && qsa_gate_qfuse && (HD % 32) == 0;
+                const bool rot_kv = st.kv_rot || st.kv_hybrid;
+                const bool fuse_fwht_gate = fuse_gate_q8 && rot_kv && HD == 256;
+                if (rot_kv && !fuse_fwht_gate) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
+                stamp(l, 13, grp);
                 if (fuse_gate_q8) {
                     native_qsa_gate_quantize_q8_1(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, xq_,
                                                   (int) (n * NH), (int) HD, cs,
-                                                  use_quant_il_wo ? (void*) xil_ : nullptr, use_quant_il_wo ? n : 0);
+                                                  use_quant_il_wo ? (void*) xil_ : nullptr, use_quant_il_wo ? n : 0,
+                                                  fuse_fwht_gate);
                     il_ready = use_quant_il_wo;
                 } else if (qb) {
                     native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,

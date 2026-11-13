@@ -143,6 +143,85 @@ __global__ void gate_quantize_q8_1_kernel(const float* __restrict__ attn, const 
         }
     }
 }
+
+__global__ void fwht256_gate_quantize_q8_1_kernel(const float* __restrict__ attn, const float* __restrict__ q_full,
+                                                  QsaQ81Block* __restrict__ xq, int n_head,
+                                                  int* __restrict__ bm, int* __restrict__ pm, float* __restrict__ dl,
+                                                  int n_in, int cp) {
+#pragma clang fp contract(off)
+    const int r = int(blockIdx.x) * int(blockDim.y) + int(threadIdx.y);
+    if (r >= n_head) return;
+
+    constexpr int warp_size = 32;
+    constexpr int N = 256;
+    constexpr int el_w = N / warp_size;   // 8
+    constexpr float scale = 1.0f / 16.0f;
+
+    const float* row_src = attn + std::size_t(r) * N;
+    const float* row_gate = q_full + std::size_t(r) * (2 * N) + N;
+    const int lane = int(threadIdx.x);
+
+    float reg[el_w];
+#pragma unroll
+    for (int i = 0; i < el_w; ++i) reg[i] = row_src[i * warp_size + lane] * scale;
+
+#pragma unroll
+    for (int h = 1; h < warp_size; h *= 2) {
+#pragma unroll
+        for (int j = 0; j < el_w; ++j) {
+            const float val = reg[j];
+            const float val2 = __shfl_xor_sync(0xffffffffu, val, h, warp_size);
+            reg[j] = (lane & h) == 0 ? val + val2 : val2 - val;
+        }
+    }
+#pragma unroll
+    for (int h = warp_size; h < N; h *= 2) {
+        const int step = h / warp_size;
+#pragma unroll
+        for (int j = 0; j < el_w; j += 2 * step) {
+#pragma unroll
+            for (int k = 0; k < step; ++k) {
+                const float x = reg[j + k];
+                const float y = reg[j + k + step];
+                reg[j + k] = x + y;
+                reg[j + k + step] = x - y;
+            }
+        }
+    }
+
+    const int nb = bm != nullptr ? n_in / 32 : 0;
+#pragma unroll
+    for (int b_h = 0; b_h < el_w; ++b_h) {
+        const int col = b_h * warp_size + lane;
+        const float raw = row_gate[col];
+        const float sigmoid = 1.0f / (1.0f + expf(-raw));
+        const float xi = reg[b_h] * sigmoid;
+
+        float amax = fabsf(xi), sum = xi;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);
+
+        const std::size_t blk = std::size_t(r) * el_w + std::size_t(b_h);
+        const float d = q8_1_finite(q81_div(amax, 127.0f));
+        const int8_t q = q8_1_quant(xi, d, amax);
+        xq[blk].qs[lane] = q;
+        const auto ds = q8_1_ds(d, sum);
+        if (lane == 0) xq[blk].ds = ds;
+        if (bm != nullptr) {
+            unsigned v = unsigned(uint8_t(q)) << (8 * (lane & 3));
+            v |= __shfl_xor_sync(0xffffffffu, v, 1);
+            v |= __shfl_xor_sync(0xffffffffu, v, 2);
+            const int c = int(blk / std::size_t(nb)), b = int(blk % std::size_t(nb)), pp = lane >> 2;
+            if ((lane & 3) == 0) {
+                bm[(std::size_t(b) * 8 + pp) * cp + c] = int(v);
+                pm[(std::size_t(pp) * nb + b) * cp + c] = int(v);
+            }
+            if (lane == 0) dl[std::size_t(b) * cp + c] = __low2float(ds);
+        }
+    }
+}
 std::size_t elements(int cols, int rows) {
     if (cols <= 0 || rows <= 0 || std::uint64_t(cols) * rows > std::uint64_t(std::numeric_limits<int>::max()))
         throw std::invalid_argument("native QSA requires positive bounded dimensions");
@@ -208,9 +287,10 @@ void native_qsa_gate_apply(const float* attn, const float* q_full, float* output
     check_launch();
 }
 void native_qsa_gate_quantize_q8_1(const float* attn, const float* q_full, void* x_q8_1,
-                                   int n_head, int head_dim, void* stream, void* x_il, int ncols) {
+                                   int n_head, int head_dim, void* stream, void* x_il, int ncols, bool fwht256) {
     const auto count = elements(head_dim, n_head);
-    if (head_dim % 32 != 0 || !stream || !valid(attn, count * 4) || !valid(q_full, count * 8) || !x_q8_1)
+    if (head_dim % 32 != 0 || (fwht256 && head_dim != 256) || !stream || !valid(attn, count * 4) ||
+        !valid(q_full, count * 8) || !x_q8_1)
         throw std::invalid_argument("native_qsa_gate_quantize_q8_1 requires head_dim % 32 == 0 and valid buffers");
     int *bm = nullptr, *pm = nullptr;
     float* dl = nullptr;
@@ -223,8 +303,16 @@ void native_qsa_gate_quantize_q8_1(const float* attn, const float* q_full, void*
         pm = bm + words;
         dl = reinterpret_cast<float*>(bm + 2 * words);
     }
-    gate_quantize_q8_1_kernel<<<unsigned((count + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
-        attn, q_full, static_cast<QsaQ81Block*>(x_q8_1), n_head, head_dim, bm, pm, dl, n_in, cp);
+    if (fwht256) {
+        constexpr int rows_per_block = 4;
+        const dim3 grid(unsigned((n_head + rows_per_block - 1) / rows_per_block));
+        const dim3 block(32, rows_per_block);
+        fwht256_gate_quantize_q8_1_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+            attn, q_full, static_cast<QsaQ81Block*>(x_q8_1), n_head, bm, pm, dl, n_in, cp);
+    } else {
+        gate_quantize_q8_1_kernel<<<unsigned((count + 255) / 256), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+            attn, q_full, static_cast<QsaQ81Block*>(x_q8_1), n_head, head_dim, bm, pm, dl, n_in, cp);
+    }
     check_launch();
 }
 } // namespace strata::kernels

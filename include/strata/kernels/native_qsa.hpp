@@ -33,7 +33,9 @@ void native_qsa_gate_apply(const float* attn, const float* q_full, float* output
                            int n_head, int head_dim, void* stream);
 
 // Fused gate_apply + Q8_1 quantization directly into x_q8_1 (requires head_dim % 32 == 0), plus optional x_il interleaved copy.
+// When fwht256 is true (requires head_dim == 256), applies orthonormal FWHT256 to attn in registers before gating.
 void native_qsa_gate_quantize_q8_1(const float* attn, const float* q_full, void* x_q8_1,
-                                   int n_head, int head_dim, void* stream, void* x_il = nullptr, int ncols = 0);
+                                   int n_head, int head_dim, void* stream, void* x_il = nullptr, int ncols = 0,
+                                   bool fwht256 = false);
 
 } // namespace strata::kernels
