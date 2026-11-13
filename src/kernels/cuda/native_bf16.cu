@@ -365,10 +365,9 @@ __global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t l
                     if (EXACT_T || k < n_tok) y[(size_t) k * ldy + o0 + r] = acc[r][k];
 }
 
-template <int B, bool TSV, bool AUX>
+template <int B, int RPB, bool TSV, bool AUX>
 void launch_rows_dispatch(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out,
                           int n_tok, unsigned grid, cudaStream_t st, const uint16_t* w_aux, float* y_aux, int64_t ldy_aux) {
-    constexpr int RPB = 4;
     while (n_tok > 8) {
         bf16_f32_mmvf_rows_kernel<B, 8, RPB, TSV, AUX, true><<<grid, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, 8, w_aux, y_aux, ldy_aux);
         x += (size_t) 8 * ldx;
@@ -388,23 +387,43 @@ void launch_rows_dispatch(const float* x, int64_t ldx, const uint16_t* w, float*
     }
 }
 
+template <int B, int RPB>
+void launch_rows_rpb(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out,
+                     int n_tok, unsigned grid, bool ts, cudaStream_t st, const uint16_t* w_aux, float* y_aux,
+                     int64_t ldy_aux) {
+    if (w_aux != nullptr) {   // S26 STRATA_LFUSE: + one aux row block
+        if (ts) launch_rows_dispatch<B, RPB, true, true>(x, ldx, w, y, ldy, n_in, n_out, n_tok, grid, st, w_aux, y_aux, ldy_aux);
+        else launch_rows_dispatch<B, RPB, false, true>(x, ldx, w, y, ldy, n_in, n_out, n_tok, grid, st, w_aux, y_aux, ldy_aux);
+        return;
+    }
+    if (ts) launch_rows_dispatch<B, RPB, true, false>(x, ldx, w, y, ldy, n_in, n_out, n_tok, grid, st, nullptr, nullptr, 0);
+    else launch_rows_dispatch<B, RPB, false, false>(x, ldx, w, y, ldy, n_in, n_out, n_tok, grid, st, nullptr, nullptr, 0);
+}
+
 template <int B>
 void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out, int n_tok,
                  cudaStream_t st, const uint16_t* w_aux = nullptr, float* y_aux = nullptr, int64_t ldy_aux = 0) {
-    constexpr int RPB = 4;
-    const unsigned nb = (unsigned) ((n_out + RPB - 1) / RPB);
+    static const int env_rpb = [] {
+        const char* v = std::getenv("STRATA_MMVF_RPB");
+        if (!v || !*v) return 0;
+        const int r = std::atoi(v);
+        return (r == 1 || r == 2 || r == 4) ? r : 0;
+    }();
 #if defined(__HIPCC__)
-    static const bool ts = [] { const char* v = std::getenv("STRATA_BF16_TSUM"); return v && v[0] == '1'; }();
+    const int rpb = env_rpb > 0 ? env_rpb : (n_out <= 256 ? 1 : (n_out <= 512 ? 2 : 4));
+    static const bool ts = [] {
+        const char* v = std::getenv("STRATA_BF16_TSUM");
+        if (!v || !*v) v = std::getenv("STRATA_TSUM");
+        return v && v[0] == '1';
+    }();
 #else
+    const int rpb = env_rpb > 0 ? env_rpb : 4;
     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
 #endif
-    if (w_aux != nullptr) {   // S26 STRATA_LFUSE: + one aux row block
-        if (ts) launch_rows_dispatch<B, true, true>(x, ldx, w, y, ldy, n_in, n_out, n_tok, nb + 1, st, w_aux, y_aux, ldy_aux);
-        else launch_rows_dispatch<B, false, true>(x, ldx, w, y, ldy, n_in, n_out, n_tok, nb + 1, st, w_aux, y_aux, ldy_aux);
-        return;
-    }
-    if (ts) launch_rows_dispatch<B, true, false>(x, ldx, w, y, ldy, n_in, n_out, n_tok, nb, st, nullptr, nullptr, 0);
-    else launch_rows_dispatch<B, false, false>(x, ldx, w, y, ldy, n_in, n_out, n_tok, nb, st, nullptr, nullptr, 0);
+    const unsigned grid = (unsigned) ((n_out + rpb - 1) / rpb) + (w_aux != nullptr ? 1u : 0u);
+    if (rpb == 1) launch_rows_rpb<B, 1>(x, ldx, w, y, ldy, n_in, n_out, n_tok, grid, ts, st, w_aux, y_aux, ldy_aux);
+    else if (rpb == 2) launch_rows_rpb<B, 2>(x, ldx, w, y, ldy, n_in, n_out, n_tok, grid, ts, st, w_aux, y_aux, ldy_aux);
+    else launch_rows_rpb<B, 4>(x, ldx, w, y, ldy, n_in, n_out, n_tok, grid, ts, st, w_aux, y_aux, ldy_aux);
 }
 
 void mmvf_chk_report() {
