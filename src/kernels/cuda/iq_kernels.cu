@@ -4250,16 +4250,23 @@ bool expdec_down_ok(const NativeExpertLayout& L) {
     return expdec_down_on() && ((L.d_type == 20 && g_expdec_d20) || L.d_type == 42) && L.n_ff == 32 * ED_HB && L.n_embd % 128 == 0 &&
            L.n_embd > 0;
 }
+bool expdec_cap80_on() {
+    const char* v = std::getenv("STRATA_EXPDEC_CAP80");
+    return v == nullptr || v[0] != '0';
+}
 // rows per block: `knob` rounded up to the rows per pass, or (0) doubled from one pass while ceil(nrow / rb) x
-// cap_groups blocks stay >= g_expdec_minblk (cap_groups: the launch's group rows; every block row g >= n_groups returns)
+// cap_groups blocks stay >= g_expdec_minblk (cap_groups: the launch's group rows; every block row g >= n_groups returns).
+// With STRATA_EXPDEC_CAP80 (default ON), clamp the heuristic's group count to 80 so wide windows (cap_groups = 120/160)
+// do not over-coarsen rb and halve grid.x across every window graph, while preserving grid.y = cap_groups at launch.
 int expdec_rows_per_block(int nrow, int rpp, int64_t cap_groups, int knob) {
     if (knob > 0) {
         int rb = (knob + rpp - 1) / rpp * rpp;
         return rb > nrow ? nrow : rb;
     }
     int rb = rpp;
-    const int64_t cap = cap_groups > 0 ? cap_groups : 1;
-    while (rb * 2 <= nrow && ((int64_t) ((nrow + 2 * rb - 1) / (2 * rb))) * cap >= g_expdec_minblk) rb *= 2;
+    const int64_t raw_cap = cap_groups > 0 ? cap_groups : 1;
+    const int64_t eff_groups = expdec_cap80_on() ? std::min<int64_t>(raw_cap, 80) : raw_cap;
+    while (rb * 2 <= nrow && ((int64_t) ((nrow + 2 * rb - 1) / (2 * rb))) * eff_groups >= g_expdec_minblk) rb *= 2;
     return rb;
 }
 

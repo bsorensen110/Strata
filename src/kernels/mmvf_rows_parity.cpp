@@ -1,6 +1,7 @@
 // Exact multi-row BF16/F32 GEMV checks against independent single-row calls.
 // Run with STRATA_MMVF_ROWS=1; synthetic data, no model or private prompts.
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <cstdio>
@@ -23,9 +24,8 @@ int main() {
     const int shapes[][2] = {{64,64},{192,67},{512,65},{640,128},{2560,48},
                              {2560,128},{2560,512},{2560,2560},{10240,320}};
     size_t cases = 0, values = 0, mismatches = 0;
-    for (const auto& shape : shapes) for (int nt = 1; nt <= 8; ++nt)
-    for (int pad : {0,2}) for (int range : {0,1,2}) {
-        const int ni = shape[0], no = shape[1], ldx = ni + pad, ldy = no + pad + 1;
+    auto run_case = [&](int ni, int no, int nt, int pad, int range) {
+        const int ldx = ni + pad, ldy = no + pad + 1;
         std::mt19937 rng(1234 + nt * 17 + pad * 31 + range * 53 + ni + no);
         std::uniform_real_distribution<float> d(-1.f, 1.f);
         const float xs = range == 0 ? 1.f : range == 1 ? 1.e-12f : 1.e12f;
@@ -69,7 +69,17 @@ int main() {
         ck(cudaGraphExecDestroy(exec)); ck(cudaGraphDestroy(graph));
         ck(cudaFree(dx)); ck(cudaFree(dw)); ck(cudaFree(ref)); ck(cudaFree(got)); ck(cudaFree(aux)); ck(cudaFree(aref));
         ++cases;
+    };
+    for (const auto& shape : shapes) for (int nt = 1; nt <= k::kWindowMaxT; ++nt)
+    for (int pad : {0,2}) for (int range : {0,1,2}) run_case(shape[0], shape[1], nt, pad, range);
+#if !defined(_WIN32)
+    if (k::kWindowMaxT > 8 && std::getenv("STRATA_MMVF_ROWS_16") == nullptr) {
+        setenv("STRATA_MMVF_ROWS_16", "0", 1);
+        const int fb_shapes[][2] = {{2560,512},{2560,2560},{10240,320}};
+        for (const auto& shape : fb_shapes) for (int nt = 9; nt <= k::kWindowMaxT; ++nt) run_case(shape[0], shape[1], nt, 0, 0);
+        unsetenv("STRATA_MMVF_ROWS_16");
     }
+#endif
     ck(cudaStreamDestroy(s));
     std::printf("mmvf_rows_parity: %zu cases, %zu values, %zu mismatches\n",cases,values,mismatches);
     return mismatches ? 1 : 0;
