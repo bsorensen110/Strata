@@ -2880,16 +2880,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
+        uint32_t* const nf = nan_guard_on() ? m_nf_ : nullptr;
         if (argmax_rows_wanted()) {   // sm_80 to sm_89 (sm_7x opt-in): the pick over many blocks a row (bitwise the one-block kernel's)
-            argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
+            argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs, nf);
         } else {
             SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
             sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
+            // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
+            if (nf) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, nf, cs);
         }
-        // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
-        if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
     stamp(g.n_layers, 1, 0);
     if (tap_on_ && !batch_rec_ && tap_file_ != nullptr) copy_from_mapped(m_tap_, tap_dev_, (int64_t) T * (int64_t) tap_layers_.size() * N, cs);

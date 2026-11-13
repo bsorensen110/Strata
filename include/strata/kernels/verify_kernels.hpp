@@ -198,10 +198,13 @@ void map_ids(int32_t* ids, const int32_t* table, int n, void* stream);
 void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* stream);
 /// out[t] = the argmax of row t (n floats a row; ties to the lowest index, NaN never picked, 0 when no value is above
 /// -inf): bitwise sample_tokens' greedy pick.  Up to 128 blocks a row scan slices of it, the row's last block merges
-/// their picks.  `scratch`: argmax_rows_scratch_bytes(n_rows), zero before the first launch (each launch leaves it
-/// so).  Graph-capturable.
+/// their picks.  When `nf_flags` is non-null, the same scan also writes the row's kNonfiniteBlocks non-finite guard
+/// words (`nf_flags[t * kNonfiniteBlocks + 0] = 1` on any NaN/Inf, `0` otherwise, and `0` in `[1..kNonfiniteBlocks)`),
+/// saving a separate logits_nonfinite_rows launch.  `scratch`: argmax_rows_scratch_bytes(n_rows), zero before the first
+/// launch (each launch leaves it so).  Graph-capturable.
 uint64_t argmax_rows_scratch_bytes(int n_rows);
-void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream);
+void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream,
+                 uint32_t* nf_flags = nullptr);
 /// row_top_prob over 8 blocks a row, each computing 4 of its 32 warps' sums, the row's last block adding the 32 in
 /// order: bitwise row_top_prob.  `scratch`: row_top_prob_scratch_bytes(n_rows), zero before the first launch.
 uint64_t row_top_prob_scratch_bytes(int n_rows);

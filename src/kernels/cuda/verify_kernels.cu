@@ -1003,11 +1003,12 @@ struct ArgRow {
     unsigned pad[3];
     float v[kArgMaxBlocks];
     int i[kArgMaxBlocks];
+    uint32_t nf[kArgMaxBlocks];
 };
 
 // grid (blocks, rows): block b scans [b * per_block, +per_block) of its row
 __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int per_block, ArgRow* __restrict__ rows,
-                                   int32_t* out) {
+                                   int32_t* out, uint32_t* __restrict__ nf_flags) {
     const int row = (int) blockIdx.y, b = (int) blockIdx.x, nb = (int) gridDim.x;
     unsigned* counter = &rows[row].counter;
     float* pv = rows[row].v;
@@ -1016,15 +1017,19 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int 
     const int lo = b * per_block, hi = min(n, lo + per_block);
     float bv = __int_as_float(0xff800000);   // -inf
     int bi = n;
+    int bad = 0;
     for (int v = lo + (int) threadIdx.x; v < hi; v += (int) blockDim.x) {
         const float s = l[v];
+        if (nf_flags) bad |= (__float_as_uint(s) & 0x7f800000u) == 0x7f800000u;
         if (s > bv) { bv = s; bi = v; }
     }
     arg_block(bv, bi, n);
+    if (nf_flags) bad = __syncthreads_or(bad);
     __shared__ bool last;
     if (threadIdx.x == 0) {
         pv[b] = bv;
         pi[b] = bi;
+        if (nf_flags) rows[row].nf[b] = bad ? 1u : 0u;
         __threadfence();
         last = atomicAdd(counter, 1u) == (unsigned) (nb - 1);
     }
@@ -1038,6 +1043,12 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int 
         bi = ((volatile const int*) pi)[threadIdx.x];
     }
     arg_block(bv, bi, n);
+    if (nf_flags) {
+        const uint32_t bnf = (int) threadIdx.x < nb ? ((volatile const uint32_t*) rows[row].nf)[threadIdx.x] : 0u;
+        const int any_bad = __syncthreads_or(bnf != 0u);
+        if ((int) threadIdx.x < kNonfiniteBlocks)
+            nf_flags[row * kNonfiniteBlocks + (int) threadIdx.x] = (threadIdx.x == 0 && any_bad) ? 1u : 0u;
+    }
     if (threadIdx.x == 0) {
         out[row] = bi < n ? bi : 0;   // no value above -inf: 0, as the one-block kernel
         *counter = 0;
@@ -1081,12 +1092,13 @@ __global__ void row_top_prob_split_kernel(const float* __restrict__ logits, int 
 
 uint64_t argmax_rows_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(ArgRow); }
 
-void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream) {
+void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream,
+                 uint32_t* nf_flags) {
     if (n_rows <= 0) return;
     const int nb = std::min(kArgMaxBlocks, std::max(1, (n + 4095) / 4096));
     const int per_block = (n + nb - 1) / nb;
     argmax_rows_kernel<<<dim3((unsigned) nb, (unsigned) n_rows), kArgThreads, 0, (cudaStream_t) stream>>>(
-        logits, n, per_block, (ArgRow*) scratch, out);
+        logits, n, per_block, (ArgRow*) scratch, out, nf_flags);
     check("argmax_rows");
 }
 
@@ -1101,7 +1113,7 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
 }
 #else
 uint64_t argmax_rows_scratch_bytes(int) { return 0; }
-void argmax_rows(const float*, int, int, void*, int32_t*, void*) {
+void argmax_rows(const float*, int, int, void*, int32_t*, void*, uint32_t*) {
     std::fprintf(stderr, "argmax_rows: not built for this backend\n");
     std::exit(1);
 }
