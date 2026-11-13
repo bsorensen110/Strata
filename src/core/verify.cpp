@@ -1665,7 +1665,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             pending = false;
         }
         const bool want_attn_il = n >= 2 && n <= kFusedGrMaxT && qil_on() && g_mmvq_il();
-        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out, bool write_ffn_il = false) {
             strata::dispatch::notef("hc read: weights Q8_0 copies=%ld (0 = bf16 rows), half=%ld, qfuse=%ld", (long) (wd[half]->hc_q8 != nullptr), (long) half, (long) (qcnt_ != nullptr));
             FusedGrArgs fa[kFusedGrWideT];
             for (int t = tb; t < te; ++t) {
@@ -1685,7 +1685,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         a.q8_mixed = xq_ + (size_t) (t - tb) * (N / 32) * 36;
                         if (t == tb && want_attn_il) a.q8_il = xil_;
                     }
-                    else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
+                    else if (strata::kernels::cpu::expert_layout().native) {
+                        a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
+                        if (t == tb && write_ffn_il) a.q8_il = xil_;
+                    }
                 }
             }
             if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
@@ -2441,7 +2444,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
-        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
+        const bool sh_fork = sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
+        const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
+                        *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
+        if (!wgi || !wsg || !wsu || !wsd) return false;
+        const auto shexp_il_needed = [&](const WeightRef* w) {
+            const int t = w->native_type;
+            return w->native_data != nullptr && strata::kernels::native_mmvq_il_supported(t, n, (int) g.n_ff) &&
+                   ((t != 18 && t != 21) || N <= 4096);
+        };
+        const bool want_ffn_il = !sh_fork && n >= 2 && n <= 8 && g_mmvq_il() && qil_on() &&
+                                 strata::kernels::cpu::expert_layout().native &&
+                                 (shexp_il_needed(wsg) || shexp_il_needed(wsu));
+        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_, want_ffn_il);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
@@ -2449,7 +2464,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const char* e = std::getenv("STRATA_SH_FORK_LATE");
             return !e || e[0] != '0';
         }();
-        const bool sh_fork = sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
         const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork && !sh_fork_late) {
@@ -2542,9 +2556,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 17, grp);
         bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
         {
-            const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
-                            *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
-            if (!wgi || !wsg || !wsu || !wsd) return false;
             if (!native_of(wsg, v.name("ffn_gate_shexp.weight"), err) || !native_of(wsu, v.name("ffn_up_shexp.weight"), err) ||
                 !native_of(wsd, v.name("ffn_down_shexp.weight"), err))
                 return false;
@@ -2558,8 +2569,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             // shared expert runs on the same stream): the shared expert's gate/up reuse nat_xq_ directly instead of
             // launching a second native_quantize_q8_1(xm) pass per layer (quantize_q8_1_rows and native_quantize_q8_1
             // write the same bytes)
+            bool ffn_il_ready = q8_ffn && want_ffn_il;
             qdedup = g_qdedup(q8_ffn) && !sh_fork && strata::kernels::cpu::expert_layout().native;
-            if (qdedup && !q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            if (qdedup && !q8_ffn) {
+                if (want_ffn_il) {
+                    strata::kernels::native_quantize_q8_1_il(xm, nat_xq_ + (size_t) tb * (N / 32) * 36, xil_, (int) N, n, cs);
+                    ffn_il_ready = true;
+                } else {
+                    quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                }
+            }
             if (!shared_expert_native_bf16_enabled()) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);
@@ -2572,7 +2591,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
-                                    (sg_ready ? 1 : 0) | (g_lfuse_pair() ? 2 : 0) | (sg_aux ? 4 : 0));
+                                    (sg_ready ? 1 : 0) | (g_lfuse_pair() ? 2 : 0) | (sg_aux ? 4 : 0) |
+                                        (qdedup && ffn_il_ready ? 8 : 0));
                 sg_gated_[grp] = sg_ready;
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();

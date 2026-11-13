@@ -216,7 +216,8 @@ bool fused_swiglu_q81_enabled() {
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, const void* x_q8_1_ready, int lfuse) {
-    const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0, gate_precomputed = (lfuse & 4) != 0;
+    const bool gate_deferred = (lfuse & 1) != 0, pair = (lfuse & 2) != 0, gate_precomputed = (lfuse & 4) != 0,
+               q8_il_ready = (lfuse & 8) != 0;
     static const bool default_pair = [] {
         const char* v = std::getenv("STRATA_LFUSE_PAIR");
         return v == nullptr || v[0] != '0';
@@ -238,7 +239,7 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
         if (gate_il || up_il) native_quantize_q8_1_il(x, nw.q8_1, nw.q8_il, (int) n_embd, n_tok, stream);
         else native_quantize_q8_1(x, nw.q8_1, (int) n_embd, n_tok, stream);
         x_q8_1 = nw.q8_1;
-    } else if (gate_il || up_il) {
+    } else if ((gate_il || up_il) && !q8_il_ready) {
         native_q8_1_interleave(x_q8_1, nw.q8_il, (int) n_embd, n_tok, stream);
     }
     // gate and up in one launch where the pair applies (bitwise identical to the two calls)
