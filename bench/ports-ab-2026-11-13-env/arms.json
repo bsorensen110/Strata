@@ -1,0 +1,41 @@
+{
+  "campaign": "env-switch audit vs the promoted engine (fork-df8ee1a30) and the live production env, 2026-11-13",
+  "arms": [
+    {
+      "id": "verify_async",
+      "switch": "STRATA_VERIFY_ASYNC_LAUNCH",
+      "baseline": "",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "production sets STRATA_VERIFY_SAMPLE_ASYNC, which no source reads; the engine's actual gate for the async verify launch is STRATA_VERIFY_ASYNC_LAUNCH (3 read sites), unset in production"
+    },
+    {
+      "id": "cpu_share_maxt",
+      "switch": "STRATA_PREFILL_CPU_SHARE_MAXT",
+      "baseline": "",
+      "arm": "32",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "production sets STRATA_PREFILL_CPU_SHARE_MAX_T=32, which no source reads; the engine reads STRATA_PREFILL_CPU_SHARE_MAXT, so this arm applies the value production intended"
+    },
+    {
+      "id": "aa_floor_1",
+      "switch": "STRATA_VERIFY_ASYNC_LAUNCH",
+      "baseline": "",
+      "arm": "",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "A/A floor: identical configuration launched twice"
+    },
+    {
+      "id": "aa_floor_2",
+      "switch": "STRATA_VERIFY_ASYNC_LAUNCH",
+      "baseline": "",
+      "arm": "",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "A/A floor: identical configuration launched twice"
+    }
+  ]
+}
