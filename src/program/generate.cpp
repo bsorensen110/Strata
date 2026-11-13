@@ -7443,7 +7443,7 @@ int main(int argc, char** argv) {
     };
     auto df2_head_bytes = [&]() -> int64_t {
         if (df2_expect_share) return 0;   // (its logits are in the 48 MiB the callers add)
-        if (strata::core::Dflash2Drafter::head_native()) return (int64_t) 7 * n_vocab * (int64_t) sizeof(float);   // STRATA_DF2_HEAD=native: no pruned copy, the logits of every row
+        if (strata::core::Dflash2Drafter::head_native()) return (int64_t) (batch_df2_wanted ? 14 : 7) * n_vocab * (int64_t) sizeof(float);   // STRATA_DF2_HEAD=native: no pruned copy, the logits of every row
         if (!df2_solo) return (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab);
         int64_t bytes = (int64_t) std::min(o.spec, (int) strata::kernels::kVerifyNarrowT) * n_vocab * (int64_t) sizeof(float);
         if (FILE* f = std::fopen(df2_vocab_path().c_str(), "rb")) {
