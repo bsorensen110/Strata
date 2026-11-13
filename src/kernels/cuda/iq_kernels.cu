@@ -4225,7 +4225,18 @@ int expdec_mode() {
 int g_expdec_r = env_int_or("STRATA_EXPDEC_R", 1);          // gate/up rows per lane: 1, 2 (bench: R=1 wins on the 2080 Ti)
 int g_expdec_dr = env_int_or("STRATA_EXPDEC_DR", 4);        // down rows per lane: 1, 2, 4 (Q2_0: R=4 wins on both cards)
 int g_expdec_minb = env_int_or("STRATA_EXPDEC_MINB", STRATA_EXPDEC_MINB);   // gate/up __launch_bounds__ min blocks: 2 (<= 128 regs) or 4 (<= 64)
-int g_expdec_d20 = env_int_or("STRATA_EXPDEC_D20", 0);      // 1: EXPDEC also for the IQ4_NL down (bench: no gain, default kernel)
+int g_expdec_d20 = -1;
+int expdec_d20_on() {
+    if (g_expdec_d20 >= 0) return g_expdec_d20;
+    const char* v = std::getenv("STRATA_EXPDEC_D20");
+    if (v != nullptr && v[0] != '\0') return std::atoi(v) != 0 ? 1 : 0;
+    return expdec_default_gfx12() ? 1 : 0;
+}
+bool gu_fused_23_on() {
+    const char* v = std::getenv("STRATA_GU_FUSED_23");
+    if (v != nullptr && v[0] != '\0') return v[0] != '0';
+    return expdec_default_gfx12();
+}
 // 1: EXPDEC for the down too (Q2_0; IQ4_NL with _D20).  Default 0 on CUDA (on a 2080 Ti at 131k decode the Q2_0 down
 // with EXPDEC was ~10% slower than the default kernel); default 1 on gfx12 (RDNA4, R9700: Q2_0 down is 24-27% faster in
 // expdec_bench and faster end-to-end in decode).
@@ -4247,7 +4258,7 @@ bool expdec_gu_ok(const NativeExpertLayout& L) {
     return fmt && L.n_embd == 32 * ED_XB && L.n_ff % 64 == 0 && L.n_ff > 0;
 }
 bool expdec_down_ok(const NativeExpertLayout& L) {
-    return expdec_down_on() && ((L.d_type == 20 && g_expdec_d20) || L.d_type == 42) && L.n_ff == 32 * ED_HB && L.n_embd % 128 == 0 &&
+    return expdec_down_on() && ((L.d_type == 20 && expdec_d20_on()) || L.d_type == 42) && L.n_ff == 32 * ED_HB && L.n_embd % 128 == 0 &&
            L.n_embd > 0;
 }
 bool expdec_cap80_on() {
@@ -6411,7 +6422,7 @@ NativeExpertExpdecParams native_expert_expdec_params() {
     p.gu_rows_per_lane = expdec_r();
     p.down_rows_per_lane = expdec_dr();
     p.gu_min_blocks_per_sm = g_expdec_minb >= 4 ? 4 : 2;
-    p.down_iq4_nl = g_expdec_d20 ? 1 : 0;
+    p.down_iq4_nl = expdec_d20_on() ? 1 : 0;
     p.down = expdec_down_on() ? 1 : 0;
     p.gu_rows_per_block = g_expdec_rb;
     p.down_rows_per_block = g_expdec_drb;
@@ -6523,8 +6534,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = !nib_layout(L) && em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
-                          L.n_ff % 32 == 0;
+    const bool fused_gu_23 = !g_old_kernels && !g_no_sub16_gu && em0 == 0 && L.gu_type == 23 && gu_fused_23_on() &&
+                             !expdec_gu_ok(L) && L.n_embd > 0 && L.n_embd % 32 == 0 &&
+                             (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1) <= 49152;
+    const bool fused_gu = !nib_layout(L) && L.n_ff % 32 == 0 &&
+                          (fused_gu_23 ||
+                           (em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23)));
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
