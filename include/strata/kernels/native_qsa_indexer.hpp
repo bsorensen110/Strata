@@ -66,4 +66,22 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
                                             const QsaIndexerLayers& layers, int n_layers, const QsaShapes& shapes,
                                             int64_t max_cells, const RopeScaling& scaling, void* stream);
 
+/// Batch-decode slot descriptor for `native_qsa_indexer_append_steps_slots`: appends distinct slots of one QSA layer
+/// in one launch (`blockIdx.x` = slot index).  Each slot has its own raw keys slice, step positions pointer, step count,
+/// state buffers, and capacity.  Bitwise identical to one `native_qsa_indexer_append_steps` launch per slot.
+struct QsaIndexerSlots {
+    static constexpr int kMax = 8;
+    const float* raw[kMax] = {};
+    const int32_t* pos_dev[kMax] = {};
+    int n_steps[kMax] = {};
+    float* tail[kMax] = {};
+    float* dead[kMax] = {};
+    float* pooled[kMax] = {};
+    int32_t* block_pos[kMax] = {};
+    int64_t max_cells[kMax] = {};
+};
+void native_qsa_indexer_append_steps_slots(int pos_stride, int32_t pos_base, const float* gamma, float epsilon,
+                                           const QsaIndexerSlots& slots, int n_slots, const QsaShapes& shapes,
+                                           const RopeScaling& scaling, void* stream);
+
 } // namespace strata::kernels

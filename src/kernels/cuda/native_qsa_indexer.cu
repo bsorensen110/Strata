@@ -145,6 +145,17 @@ __global__ void append_layers(const float* __restrict__ raw0, long long raw_stri
                      L.dead[i], L.pooled[i], L.block_pos[i], max_cells, theta_scale, freq_scale, corr_low, corr_high,
                      ext_factor, mscale, mtab, rt);
 }
+template <bool TAB>
+__global__ void append_slots(int pos_stride, int pos_base, const float* __restrict__ gamma, float epsilon,
+                             QsaIndexerSlots S, float theta_scale, float freq_scale, float corr_low,
+                             float corr_high, float ext_factor, float mscale,
+                             const int32_t* __restrict__ mtab, RopeTab rt) {
+    const int i = blockIdx.x;
+    if (S.n_steps[i] <= 0) return;
+    append_body<TAB>(S.raw[i], S.pos_dev[i], pos_stride, S.n_steps[i], pos_base, gamma, epsilon, S.tail[i], S.dead[i],
+                     S.pooled[i], S.block_pos[i], (int) S.max_cells[i], theta_scale, freq_scale, corr_low, corr_high,
+                     ext_factor, mscale, mtab, rt);
+}
 // ---- C-2: the batched append.  The pooled key of a completed block b (its last cell pos = 4b+3), computed with
 // the single append's arithmetic: keys rounded through F16, summed tail[0]+tail[1]+tail[2]+incoming in that order,
 // the RMS norm, gamma, the rotation at pos_base + 4b.  `k(j)` is the key of the block's cell j: a row of this batch
@@ -262,6 +273,16 @@ bool overlaps(Span a, Span b) {
     const auto x = reinterpret_cast<std::uintptr_t>(a.p), y = reinterpret_cast<std::uintptr_t>(b.p);
     return x < y + b.n && y < x + a.n;
 }
+void validate_step_spans(const float* raw, const int32_t* pos_dev, int pos_stride, int n_steps, const float* gamma,
+                         float* tail, float* dead, float* pooled, int32_t* block_pos, int64_t max_cells) {
+    const std::size_t pos_span = (n_steps == 1 || pos_stride <= 0) ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
+    const Span spans[] = {{raw, std::size_t(n_steps) * D * 4}, {pos_dev, pos_span}, {gamma, D * 4},
+                          {tail, (R - 1) * D * 4}, {dead, D * 4}, {pooled, std::size_t(max_cells / R + 1) * D * 4},
+                          {block_pos, 4}};
+    for (const auto& span : spans) validate(span);
+    for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
+        if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
+}
 } // namespace
 
 void native_qsa_indexer_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
@@ -276,12 +297,8 @@ void native_qsa_indexer_append_steps(const float* raw, const int32_t* relative_p
         int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
         rope_scaling_invalid(scaling) != nullptr)
         throw std::invalid_argument("native QSA indexer requires fixed geometry, aligned position base, positive capacity/epsilon, valid frequency/scaling and explicit stream");
-    const std::size_t pos_span = (n_steps == 1 || pos_stride <= 0) ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
-    const Span spans[] = {{raw,std::size_t(n_steps)*D*4},{relative_pos_device,pos_span},{gamma,D*4},{b.tail,(R-1)*D*4},
-        {b.dead,D*4},{b.pooled,std::size_t(max_cells/R+1)*D*4},{b.block_pos,4}};
-    for (const auto& span : spans) validate(span);
-    for (int i = 0; i < 7; ++i) for (int j = i + 1; j < 7; ++j)
-        if (overlaps(spans[i], spans[j])) throw std::invalid_argument("native QSA indexer buffers overlap");
+    validate_step_spans(raw, relative_pos_device, pos_stride, n_steps, gamma, b.tail, b.dead, b.pooled, b.block_pos,
+                        max_cells);
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
     const RopeKernelArgs k = scaling.kernel_args(ROT);   // none: the identity constants
     const RopeTab rt = rope_table_for(scaling);
@@ -307,15 +324,10 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
         int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
         rope_scaling_invalid(scaling) != nullptr)
         throw std::invalid_argument("native QSA indexer (layers): bad geometry, layer count or parameters");
-    for (int i = 0; i < n_layers; ++i) {   // the per-layer append's span checks, layer by layer
-        const std::size_t pos_span = (n_steps == 1 || pos_stride <= 0) ? 4 : (std::size_t(n_steps - 1) * pos_stride + 1) * 4;
-        const Span spans[] = {{raw0 + (std::size_t) i * (std::size_t) raw_stride, std::size_t(n_steps)*D*4},
-            {relative_pos_device,pos_span},{layers.gamma[i],D*4},{layers.tail[i],(R-1)*D*4},{layers.dead[i],D*4},
-            {layers.pooled[i],std::size_t(max_cells/R+1)*D*4},{layers.block_pos[i],4}};
-        for (const auto& span : spans) validate(span);
-        for (int a = 0; a < 7; ++a) for (int b = a + 1; b < 7; ++b)
-            if (overlaps(spans[a], spans[b])) throw std::invalid_argument("native QSA indexer buffers overlap");
-    }
+    for (int i = 0; i < n_layers; ++i)   // the per-layer append's span checks, layer by layer
+        validate_step_spans(raw0 + (std::size_t) i * (std::size_t) raw_stride, relative_pos_device, pos_stride, n_steps,
+                            layers.gamma[i], layers.tail[i], layers.dead[i], layers.pooled[i], layers.block_pos[i],
+                            max_cells);
     const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
     const RopeKernelArgs k = scaling.kernel_args(ROT);
     const RopeTab rt = rope_table_for(scaling);
@@ -328,6 +340,36 @@ void native_qsa_indexer_append_steps_layers(const float* raw0, int64_t raw_strid
         append_layers<false><<<n_layers, THREADS, 0, st>>>(raw0, (long long) raw_stride, relative_pos_device, pos_stride, n_steps,
             pos_base, epsilon, layers, int(max_cells), theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor,
             k.attn_factor, mrope_table(), rt);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void native_qsa_indexer_append_steps_slots(int pos_stride, int32_t pos_base, const float* gamma, float epsilon,
+                                           const QsaIndexerSlots& slots, int n_slots, const QsaShapes& s,
+                                           const RopeScaling& scaling, void* stream) {
+    if (n_slots <= 0) return;
+    if (!stream || n_slots > QsaIndexerSlots::kMax || s.idx_dim != D || s.idx_block != R || s.n_rot != ROT ||
+        pos_base < 0 || pos_base % R || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr)
+        throw std::invalid_argument("native QSA indexer (slots): bad geometry, slot count or parameters");
+    for (int i = 0; i < n_slots; ++i) {
+        if (slots.n_steps[i] <= 0) continue;
+        if (slots.max_cells[i] < 1 || slots.max_cells[i] > INT32_MAX ||
+            int64_t(pos_base) + slots.max_cells[i] > INT32_MAX)
+            throw std::invalid_argument("native QSA indexer (slots): bad capacity");
+        validate_step_spans(slots.raw[i], slots.pos_dev[i], pos_stride, slots.n_steps[i], gamma, slots.tail[i],
+                            slots.dead[i], slots.pooled[i], slots.block_pos[i], slots.max_cells[i]);
+    }
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);
+    const RopeTab rt = rope_table_for(scaling);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (rt.cos != nullptr)
+        append_slots<true><<<n_slots, THREADS, 0, st>>>(pos_stride, pos_base, gamma, epsilon, slots, theta_scale,
+            k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, mrope_table(), rt);
+    else
+        append_slots<false><<<n_slots, THREADS, 0, st>>>(pos_stride, pos_base, gamma, epsilon, slots, theta_scale,
+            k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, mrope_table(), rt);
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

@@ -1999,23 +1999,56 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 };
                 auto idx_snap = [&](cudaStream_t ns) {
                     if (batch_rec_) {   // snapshot each slot's indexer tail before its first proposed row
-                        for (int t = tb; t < te && !keep_rows; ++t)
-                            if (t == tb || brow_[t] != brow_[t - 1])
-                                copy_from_mapped(tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
-                                                 slot_ss(t).qsa_states[qi].idx_tail, TS, ns);
+                        strata::kernels::MappedCopy mc[8];
+                        int k = 0;
+                        for (int t = tb; t < te && !keep_rows; ++t) {
+                            if (t != tb && brow_[t] == brow_[t - 1]) continue;
+                            mc[k++] = {tail_snap_b_ + ((size_t) brow_[t] * nQall + qi) * TS,
+                                       slot_ss(t).qsa_states[qi].idx_tail, (int64_t) TS};
+                            if (k == 8) { copy_from_mapped_multi(mc, k, ns); k = 0; }
+                        }
+                        if (k > 0) copy_from_mapped_multi(mc, k, ns);
                     } else
                     if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, ns);
                 };
                 auto idx_append = [&](cudaStream_t ns) {
                     if (dec_batch && !g_no_batch_kv) {
-                        for (int t = tb; t < te;) {
-                            const int first = t;
-                            while (t < te && (!batch_rec_ || brow_[t] == brow_[first])) ++t;
-                            const QsaState& sx = slot_ss(first).qsa_states[qi];
-                            const QsaIndexerBuffers ib{sx.idx_tail, sx.idx_dead, sx.idx_pooled, sx.idx_block_pos};
-                            native_qsa_indexer_append_steps(idx_raw + first * ID, step_ + first * kStepCount + kStepPos,
-                                                            kStepCount, t - first, 0, (const float*) wikn->data, EPS, ib,
-                                                            s, sx.max_cells, rope_scaling(), ns);
+                        if (!batch_rec_) {
+                            native_qsa_indexer_append_steps(idx_raw + tb * ID, step_ + tb * kStepCount + kStepPos,
+                                                            kStepCount, te - tb, 0, (const float*) wikn->data, EPS,
+                                                            {st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos},
+                                                            s, st.max_cells, rope_scaling(), ns);
+                        } else {
+                            strata::kernels::QsaIndexerSlots slots;
+                            int k = 0;
+                            auto flush = [&] {
+                                if (k == 1) {
+                                    native_qsa_indexer_append_steps(
+                                        slots.raw[0], slots.pos_dev[0], kStepCount, slots.n_steps[0], 0,
+                                        (const float*) wikn->data, EPS,
+                                        {slots.tail[0], slots.dead[0], slots.pooled[0], slots.block_pos[0]}, s,
+                                        slots.max_cells[0], rope_scaling(), ns);
+                                } else if (k > 1) {
+                                    native_qsa_indexer_append_steps_slots(kStepCount, 0, (const float*) wikn->data, EPS,
+                                                                          slots, k, s, rope_scaling(), ns);
+                                }
+                                k = 0;
+                            };
+                            for (int t = tb; t < te;) {
+                                const int first = t;
+                                while (t < te && brow_[t] == brow_[first]) ++t;
+                                const QsaState& sx = slot_ss(first).qsa_states[qi];
+                                slots.raw[k] = idx_raw + first * ID;
+                                slots.pos_dev[k] = step_ + first * kStepCount + kStepPos;
+                                slots.n_steps[k] = t - first;
+                                slots.tail[k] = sx.idx_tail;
+                                slots.dead[k] = sx.idx_dead;
+                                slots.pooled[k] = sx.idx_pooled;
+                                slots.block_pos[k] = sx.idx_block_pos;
+                                slots.max_cells[k] = sx.max_cells;
+                                if (++k == strata::kernels::QsaIndexerSlots::kMax) flush();
+                            }
+                            flush();
                         }
                     } else {
                         for (int t = tb; t < te; ++t) {
