@@ -1381,6 +1381,89 @@ void extra_sources_append(const int32_t* t, size_t n) {
     for (auto& src : strata::spec::extra_draft_sources()) src->append(t, n);
 }
 
+#if defined(STRATA_HAVE_DFLASH2)
+// Feeds `rows` committed verifier tap rows (starting at `pos0`) into `df2.context()` in <= kRows chunks.
+// On single GPU reads directly from `ver.tap_dev()`; on layer splits gathers <= kRows slices via `df2.landing()`.
+bool df2_context_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& ver, int n_stages,
+                      int rows, int64_t pos0, size_t tap_stride, std::string& err) {
+    if (rows <= 0) return true;
+    const int kR = (int) strata::core::Dflash2Drafter::kRows;
+    if (n_stages > 1) {
+        for (int r0 = 0; r0 < rows; r0 += kR) {
+            const int chunk = std::min(kR, rows - r0);
+            if (!ver.gather_taps(df2.landing(), df2.device(), r0, chunk, 0, df2.stream(), err)) return false;
+            if (!df2.context(df2.landing(), chunk, pos0 + r0, err)) return false;
+        }
+        return true;
+    }
+    const float* tp = ver.tap_dev();
+    if (tp == nullptr) {
+        err = "dflash2: verifier tap buffer is null";
+        return false;
+    }
+    for (int r0 = 0; r0 < rows; r0 += kR) {
+        const int chunk = std::min(kR, rows - r0);
+        if (!df2.context(tp + (size_t) r0 * tap_stride, chunk, pos0 + r0, err)) return false;
+    }
+    return true;
+}
+
+// Consumes `rows` committed verifier tap rows (1..16, e.g. with --lookup-max-t 16 / --lookup-chain):
+// feeds any excess prefix rows through `df2_context_rows`, shifts the trailing <= kRows rows safely to row 0
+// on `ver.tap_dev()` (or gathers them to `df2.landing()` on layer splits), and runs `df2.draft()`.
+bool df2_draft_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& ver, int n_stages,
+                    int rows, int64_t pos0, int32_t anchor, size_t tap_stride,
+                    int32_t* dd, float* pp, std::string& err) {
+    const int kR = (int) strata::core::Dflash2Drafter::kRows;
+    const auto plan = strata::core::dflash2_plan_tap_rows(rows, kR);
+    if (plan.tail_m <= 0) {
+        err = "dflash2: draft rows out of range";
+        return false;
+    }
+    if (!df2_context_rows(df2, ver, n_stages, plan.head_n, pos0, tap_stride, err)) return false;
+    if (n_stages > 1) {
+        if (!ver.gather_taps(df2.landing(), df2.device(), plan.head_n, plan.tail_m, 0, df2.stream(), err)) return false;
+        return df2.draft(df2.landing(), plan.tail_m, pos0 + plan.head_n, anchor, dd, pp, err);
+    }
+    const float* tp = ver.tap_dev();
+    if (tp == nullptr) {
+        err = "dflash2: verifier tap buffer is null";
+        return false;
+    }
+    if (plan.head_n > 0) {
+        const strata::core::OnDevice on_df2(df2.device());
+        auto copy_d2d = [&](void* dst, const void* src, size_t bytes) -> bool {
+            const cudaError_t ce = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, df2.stream());
+            if (ce != cudaSuccess) {
+                err = std::string("dflash2: tail tap shift: ") + cudaGetErrorString(ce);
+                return false;
+            }
+            return true;
+        };
+        if (plan.overlap_shift) {
+            if (tp != df2.landing() && df2.landing() != nullptr) {
+                const size_t bytes = (size_t) plan.tail_m * tap_stride * sizeof(float);
+                if (!copy_d2d(df2.landing(), tp + (size_t) plan.head_n * tap_stride, bytes) ||
+                    !copy_d2d(const_cast<float*>(tp), df2.landing(), bytes))
+                    return false;
+            } else {
+                for (int r = 0; r < plan.tail_m; ++r) {
+                    if (!copy_d2d(const_cast<float*>(tp) + (size_t) r * tap_stride,
+                                  tp + (size_t) (plan.head_n + r) * tap_stride,
+                                  tap_stride * sizeof(float)))
+                        return false;
+                }
+            }
+        } else {
+            if (!copy_d2d(const_cast<float*>(tp), tp + (size_t) plan.head_n * tap_stride,
+                          (size_t) plan.tail_m * tap_stride * sizeof(float)))
+                return false;
+        }
+    }
+    return df2.draft(tp, plan.tail_m, pos0 + plan.head_n, anchor, dd, pp, err);
+}
+#endif
+
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
     out.clear();
     std::string text(s);
@@ -20333,40 +20416,8 @@ int main(int argc, char** argv) {
             auto draft_df2 = [&](int a_) -> bool {
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
-                const int adm_rows = a_ + 1;
-                const float* tp = df2_win_taps(adm_rows, err);
-                if (tp == nullptr) return false;
-                const int kR = (int) strata::core::Dflash2Drafter::kRows;
-                const int tail_m = std::min(adm_rows, kR);
-                const int head_n = adm_rows - tail_m;
                 const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
-                for (int r0 = 0; r0 < head_n; r0 += kR) {
-                    const int chunk = std::min(kR, head_n - r0);
-                    if (!df2.context(tp + (size_t) r0 * tap_stride, chunk, p + r0, err)) return false;
-                }
-                if (head_n > 0) {
-                    if (strata::core::dflash2_tail_shift_overlaps(head_n, tail_m)) {
-                        if (tp != df2.landing() && df2.landing() != nullptr) {
-                            const size_t bytes = (size_t) tail_m * tap_stride * sizeof(float);
-                            (void) cudaMemcpyAsync(df2.landing(), tp + (size_t) head_n * tap_stride,
-                                                   bytes, cudaMemcpyDeviceToDevice, df2.stream());
-                            (void) cudaMemcpyAsync(const_cast<float*>(tp), df2.landing(),
-                                                   bytes, cudaMemcpyDeviceToDevice, df2.stream());
-                        } else {
-                            for (int r = 0; r < tail_m; ++r) {
-                                (void) cudaMemcpyAsync(const_cast<float*>(tp) + (size_t) r * tap_stride,
-                                                       tp + (size_t) (head_n + r) * tap_stride,
-                                                       tap_stride * sizeof(float),
-                                                       cudaMemcpyDeviceToDevice, df2.stream());
-                            }
-                        }
-                    } else {
-                        (void) cudaMemcpyAsync(const_cast<float*>(tp), tp + (size_t) head_n * tap_stride,
-                                               (size_t) tail_m * tap_stride * sizeof(float),
-                                               cudaMemcpyDeviceToDevice, df2.stream());
-                    }
-                }
-                if (!df2.draft(tp, tail_m, p + head_n, outv[(size_t) a_], dd, pp, err)) return false;
+                if (!df2_draft_rows(df2, ver, n_stages, a_ + 1, p, outv[(size_t) a_], tap_stride, dd, pp, err)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 if (ss.ple.ready() && ss.ple.table != nullptr) {   // the PLE rows of the next window's tokens, read ahead (as the MTP's draft does)
                     int n_pf = 0;
@@ -20403,13 +20454,14 @@ int main(int argc, char** argv) {
                     const int kd = sfx.propose(S_look - 1, sbuf.data());
                     const int md = sfx.last_match();
                     const strata::spec::DraftPolicy::Pick pk = kd > 0 ? policy.choose(S_mtp, kd, md) : strata::spec::DraftPolicy::Pick{};
+                    const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
                     if (kd > 0 && pk.lookup) {
                         dfr_lookup = true; dfr_T = pk.t; dfr_match = md;
-                        if (!df2.context(ver.tap_dev(), dfr_n, dfr_pos, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                        if (!df2_context_rows(df2, ver, n_stages, dfr_n, dfr_pos, tap_stride, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                     } else {
                         int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                         float pp[strata::core::Dflash2Drafter::kDrafts];
-                        if (!df2.draft(ver.tap_dev(), dfr_n, dfr_pos, dfr_anchor, dd, pp, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                        if (!df2_draft_rows(df2, ver, n_stages, dfr_n, dfr_pos, dfr_anchor, tap_stride, dd, pp, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                         for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                     }
                 }
@@ -20853,8 +20905,8 @@ int main(int argc, char** argv) {
                 static const bool df2_end_update = std::getenv("STRATA_DF2_END_UPDATE") == nullptr || std::getenv("STRATA_DF2_END_UPDATE")[0] != '0';   // =0: the pre-fix behaviour (diagnostics)
                 const bool will_admit_df2 = admit_slot >= 0 && batch_df2 && !eos && !stop_now && admit_max_new > 1;
                 if (df2_end_update && use_df2 && req_df2 && !will_admit_df2 && (eos || produced_n >= max_new || stop_now)) {
-                    const float* tp_end = df2_win_taps(a + 1, err);   // (on a layer split: every stage's taps gathered onto the drafter's card)
-                    if (tp_end == nullptr || !df2.context(tp_end, a + 1, p, err)) { if (adapt_thr.joinable()) adapt_thr.join(); std::printf("ERR %s\n", err.c_str()); return 1; }
+                    const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
+                    if (!df2_context_rows(df2, ver, n_stages, a + 1, p, tap_stride, err)) { if (adapt_thr.joinable()) adapt_thr.join(); std::printf("ERR %s\n", err.c_str()); return 1; }
                 } else if (will_admit_df2 && use_df2 && req_df2 && (a + 1) > (int) strata::core::Dflash2Drafter::kRows) {
                     const int head_n = (a + 1) - (int) strata::core::Dflash2Drafter::kRows;
                     const float* tp_end = df2_win_taps(a + 1, err);
@@ -22494,7 +22546,8 @@ int main(int argc, char** argv) {
                 if (wait_commit_first && !ver.wait_commit(err)) return false;
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
-                if (!df2.draft(ver.tap_dev(), a_ + 1, p, outv[(size_t) a_], dd, pp, err)) return false;
+                const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
+                if (!df2_draft_rows(df2, ver, 1, a_ + 1, p, outv[(size_t) a_], tap_stride, dd, pp, err)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 // what the MTP does while it drafts: the PLE rows of the tokens the next window will hold are read ahead
                 // (the window's gather would otherwise wait for them: 1.8 ms a round on strix)
@@ -22535,13 +22588,14 @@ int main(int argc, char** argv) {
                 const int kd = sfx.propose(o.spec - 1, sbuf.data());
                 const int md = sfx.last_match();
                 const strata::spec::DraftPolicy::Pick pk = kd > 0 ? policy.choose(S_mtp, kd, md) : strata::spec::DraftPolicy::Pick{};
+                const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
                 if (kd > 0 && pk.lookup) {
                     dfr_lookup = true; dfr_T = pk.t; dfr_match = md;
-                    if (!df2.context(ver.tap_dev(), dfr_n, dfr_pos, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+                    if (!df2_context_rows(df2, ver, 1, dfr_n, dfr_pos, tap_stride, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
                 } else {
                     int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                     float pp[strata::core::Dflash2Drafter::kDrafts];
-                    if (!df2.draft(ver.tap_dev(), dfr_n, dfr_pos, dfr_anchor, dd, pp, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+                    if (!df2_draft_rows(df2, ver, 1, dfr_n, dfr_pos, dfr_anchor, tap_stride, dd, pp, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
                     for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 }
             }

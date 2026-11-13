@@ -108,6 +108,22 @@ inline bool dflash2_tail_shift_overlaps(int head_n, int tail_m) noexcept {
     return head_n > 0 && tail_m > 0 && head_n < tail_m;
 }
 
+/// Plan for feeding `n_rows` committed verifier tap rows into a DFlash2 drafter whose block graph
+/// accepts at most `k_rows` (8) rows per draft call: `head_n` prefix rows go through `context()` in
+/// `<= k_rows` chunks, leaving the trailing `tail_m <= k_rows` rows for `draft()`.
+struct Dflash2TapPlan {
+    int head_n = 0;
+    int tail_m = 0;
+    bool overlap_shift = false;
+};
+
+inline Dflash2TapPlan dflash2_plan_tap_rows(int n_rows, int k_rows) noexcept {
+    if (n_rows <= 0 || k_rows <= 0) return {};
+    const int tail_m = std::min(n_rows, k_rows);
+    const int head_n = n_rows - tail_m;
+    return {head_n, tail_m, dflash2_tail_shift_overlaps(head_n, tail_m)};
+}
+
 /// Returns true when `Dflash2Drafter::prepare` should eagerly capture single-slot `exec_[1..8]` and
 /// `body_exec_[1..8]` CUDA graphs at startup. When `blob_shared && batch_body_on`, batch slots run
 /// through the main drafter's `batch_full_1_exec_` / `batch_full_exec_` graphs, so skipping the 16
