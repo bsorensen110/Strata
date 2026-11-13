@@ -2281,6 +2281,28 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // STRATA_BATCH_ATTN_ROWS=1 (default on HIP): the window's rows in ONE launch per step - scores with each
                 // row's own indexer keys, the top-k over all rows (row-independent), per-slot KV resolve when streamed,
                 // attention with each row's own pools - instead of 3-4 one-row launches per row; the same per-row arithmetic.
+                auto resolve_qsa_slots = [&](int r0, int r1) {
+                    const QsaState* sts[kVerifyMaxT];
+                    const int32_t* ids[kVerifyMaxT];
+                    const int32_t* steps[kVerifyMaxT];
+                    int32_t nq[kVerifyMaxT];
+                    int ns = 0;
+                    auto flush = [&] {
+                        if (ns == 1) qsa_kv_resolve(*sts[0], *g_, ids[0], steps[0], nq[0], cap_, cs);
+                        else if (ns > 1) qsa_kv_resolve_slots(sts, ids, steps, nq, ns, *g_, cap_, cs);
+                        ns = 0;
+                    };
+                    for (int t = r0; t < r1;) {
+                        const int first = t;
+                        while (t < r1 && brow_[t] == brow_[first]) ++t;
+                        sts[ns] = &slot_ss(first).qsa_states[qi];
+                        ids[ns] = sel_ + (size_t) first * cap_;
+                        steps[ns] = step_ + first * kStepCount;
+                        nq[ns] = t - first;
+                        if (++ns == kVerifyMaxT) flush();
+                    }
+                    flush();
+                };
                 const bool attn_rows = g_batch_attn_rows;
                 const bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
                 if (rows_ok) {
@@ -2305,12 +2327,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                     qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n_rows, max_blocks_, cap_,
                                    s, sel_ + (size_t) tb * cap_, cs);
-                    for (int t = tb; t < te;) {
-                        const int first = t;
-                        while (t < te && brow_[t] == brow_[first]) ++t;
-                        const QsaState& sx = slot_ss(first).qsa_states[qi];
-                        qsa_kv_resolve(sx, *g_, sel_ + (size_t) first * cap_, step_ + first * kStepCount, t - first, cap_, cs);
-                    }
+                    resolve_qsa_slots(tb, te);
                     qsa_decode_attn_batch_rows(qcur_ + tb * NH * HD, pr, sel_ + (size_t) tb * cap_, step_ + tb * kStepCount,
                                                cap_, s, attn_scratch_ + (size_t) tb * attn_scratch_floats_,
                                                attn_ + tb * NH * HD, n_rows, cs);
@@ -2338,12 +2355,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                  1, max_blocks_, s, scores_ + (size_t) t * max_blocks_, cs);
                         qsa_block_topk(scores_ + (size_t) t0 * max_blocks_, step_ + t0 * kStepCount, m, max_blocks_,
                                        cap_, s, sel_ + (size_t) t0 * cap_, cs);
-                        for (int t = t0; t < t0 + m;) {
-                            const int first = t;
-                            while (t < t0 + m && brow_[t] == brow_[first]) ++t;
-                            const QsaState& sx = slot_ss(first).qsa_states[qi];
-                            qsa_kv_resolve(sx, *g_, sel_ + (size_t) first * cap_, step_ + first * kStepCount, t - first, cap_, cs);
-                        }
+                        resolve_qsa_slots(t0, t0 + m);
                         if (!qsa_decode_attn_slots(qcur_ + t0 * NH * HD, px, sel_ + (size_t) t0 * cap_,
                                                    step_ + t0 * kStepCount, cap_, s,
                                                    attn_scratch_ + (size_t) t0 * attn_scratch_floats_,

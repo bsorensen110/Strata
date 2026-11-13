@@ -110,8 +110,8 @@ __device__ int block_scan(int v, int* warp_sums, int& total) {
     return excl;
 }
 
-__global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
-                                                     const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
+__device__ __forceinline__ void resolve_body(KvStreamMap m, const int32_t* __restrict__ ids,
+                                             const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
     __shared__ int s_nmiss, s_lookups, s_cut;
     __shared__ int warp_sums[32];
     const int epoch = m.ctl[0] + 1;
@@ -188,8 +188,26 @@ __global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_
     }
 }
 
-// One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
-__global__ void copy_kernel(KvStreamMap m, Runs r) {
+__global__ void __launch_bounds__(RT) resolve_kernel(KvStreamMap m, const int32_t* __restrict__ ids,
+                                                     const int32_t* __restrict__ steps, int n_q, int cap, int page_size) {
+    resolve_body(m, ids, steps, n_q, cap, page_size);
+}
+
+struct KvResolveArg {
+    KvStreamMap map;
+    const int32_t* ids;
+    const int32_t* steps;
+    int32_t n_q;
+};
+struct KvResolveArgs {
+    KvResolveArg s[kKvAppendMaxSlots];
+};
+__global__ void __launch_bounds__(RT) resolve_slots_kernel(KvResolveArgs a, int cap, int page_size) {
+    const KvResolveArg& r = a.s[blockIdx.x];
+    if (r.n_q > 0) resolve_body(r.map, r.ids, r.steps, r.n_q, cap, page_size);
+}
+
+__device__ __forceinline__ void copy_body(KvStreamMap m, Runs r) {
     const int need = m.ctl[2];
     const long long mask = r.block_shift > 0 ? ((1ll << r.block_shift) - 1) : 0;
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
@@ -204,6 +222,23 @@ __global__ void copy_kernel(KvStreamMap m, Runs r) {
             for (int i = threadIdx.x; i < r.len[a] / 16; i += blockDim.x) dst[i] = src[i];
         }
     }
+}
+
+// One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
+__global__ void copy_kernel(KvStreamMap m, Runs r) {
+    copy_body(m, r);
+}
+
+struct KvCopyArg {
+    KvStreamMap map;
+    Runs runs;
+};
+struct KvCopyArgs {
+    KvCopyArg s[kKvAppendMaxSlots];
+};
+__global__ void copy_slots_kernel(KvCopyArgs a) {
+    const KvCopyArg& c = a.s[blockIdx.y];
+    copy_body(c.map, c.runs);
 }
 
 __global__ void reset_kernel(KvStreamMap m) {
@@ -240,14 +275,14 @@ void kv_stream_reset(const KvStreamMap& m, void* stream) {
     check("reset");
 }
 
-void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
-                       const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
-                       void* stream) {
-    if (n_q <= 0) return;
+static void validate_resolve_common(const QsaShapes& s) {
     if (s.n_head_kv * s.page_size * (s.head_dim / KV_Q8_GROUP) * 2 % 16 != 0) {
         std::fprintf(stderr, "kv_stream: a block's scale run must be a multiple of 16 bytes\n");
         std::exit(1);
     }
+}
+
+static void validate_resolve_slots(const KvStreamMap& m) {
     // one sweep step looks at RT consecutive slots `(hand + thread) % n_slots`; with fewer slots than RT two
     // threads see the same slot and may both take it for two different misses.  The engine never streams with fewer
     // than qsa_kv_resident_min() / page_size = 5,120 slots, so this is a guard, not a limit.
@@ -256,10 +291,44 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
                              "slot twice\n", (long long) m.n_slots, RT);
         std::exit(1);
     }
+}
+
+void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const KvHostPools& host, int fmt,
+                       const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
+                       void* stream) {
+    if (n_q <= 0) return;
+    validate_resolve_common(s);
+    validate_resolve_slots(m);
     resolve_kernel<<<1, RT, 0, (cudaStream_t) stream>>>(m, ids, steps, (int) n_q, (int) cap, (int) s.page_size);
     check("resolve");
     copy_kernel<<<96, 128, 0, (cudaStream_t) stream>>>(m, runs_of(slots, host, fmt, s));
     check("copy");
+}
+
+void kv_stream_resolve_slots(const KvResolveSlots& slots, int64_t cap, const QsaShapes& s, void* stream) {
+    if (slots.n <= 0) return;
+    if (slots.n == 1) {
+        const auto& r = slots.s[0];
+        kv_stream_resolve(r.map, r.slots, r.host, r.fmt, r.ids, r.steps, r.n_q, cap, s, stream);
+        return;
+    }
+    if (slots.n > kKvAppendMaxSlots) {
+        std::fprintf(stderr, "kv_stream: at most %d slots in kv_stream_resolve_slots\n", kKvAppendMaxSlots);
+        std::exit(1);
+    }
+    validate_resolve_common(s);
+    KvResolveArgs rargs{};
+    KvCopyArgs cargs{};
+    for (int i = 0; i < slots.n; ++i) {
+        const auto& src = slots.s[i];
+        validate_resolve_slots(src.map);
+        rargs.s[i] = {src.map, src.ids, src.steps, src.n_q};
+        cargs.s[i] = {src.map, runs_of(src.slots, src.host, src.fmt, s)};
+    }
+    resolve_slots_kernel<<<(unsigned) slots.n, RT, 0, (cudaStream_t) stream>>>(rargs, (int) cap, (int) s.page_size);
+    check("resolve_slots");
+    copy_slots_kernel<<<dim3(96, (unsigned) slots.n), 128, 0, (cudaStream_t) stream>>>(cargs);
+    check("copy_slots");
 }
 
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {

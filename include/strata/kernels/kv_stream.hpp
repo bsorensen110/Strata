@@ -146,6 +146,23 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
                        const int32_t* ids, const int32_t* steps, int64_t n_q, int64_t cap, const QsaShapes& s,
                        void* stream);
 
+/// Multi-slot descriptor for `kv_stream_resolve_slots`: resolves up to `kKvAppendMaxSlots` distinct sequence
+/// slots of one QSA layer in one pair of (resolve, copy) kernel launches (`blockIdx.x` / `blockIdx.y` = slot).
+struct KvResolveSlot {
+    KvStreamMap map{};
+    QsaAttnPools slots{};
+    KvHostPools host{};
+    int fmt = 0;
+    const int32_t* ids = nullptr;
+    const int32_t* steps = nullptr;
+    int32_t n_q = 0;
+};
+struct KvResolveSlots {
+    KvResolveSlot s[kKvAppendMaxSlots]{};
+    int n = 0;
+};
+void kv_stream_resolve_slots(const KvResolveSlots& slots, int64_t cap, const QsaShapes& s, void* stream);
+
 /// The static ring table `block -> block % n_slots`.
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream);
 

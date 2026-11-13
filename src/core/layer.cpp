@@ -1397,6 +1397,34 @@ void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* i
     strata::kernels::kv_stream_resolve(st.map, qsa_attn_pools(st), st.host, qsa_kv_format(st), ids, steps, n_q, cap,
                                        qsa_shapes(g), stream);
 }
+void qsa_kv_resolve_slots(const QsaState* const* sts, const int32_t* const* ids, const int32_t* const* steps,
+                          const int32_t* n_q, int n_slots, const ModelGeometry& g, int64_t cap, void* stream) {
+    if (n_slots <= 0) return;
+    const strata::kernels::QsaShapes s = qsa_shapes(g);
+    for (int base = 0; base < n_slots;) {
+        strata::kernels::KvResolveSlots batch;
+        while (base < n_slots && batch.n < strata::kernels::kKvAppendMaxSlots) {
+            const QsaState& st = *sts[base];
+            if (st.kv_mode == 1 && n_q[base] > 0) {
+                auto& dst = batch.s[batch.n++];
+                dst.map = st.map;
+                dst.slots = qsa_attn_pools(st);
+                dst.host = st.host;
+                dst.fmt = qsa_kv_format(st);
+                dst.ids = ids[base];
+                dst.steps = steps[base];
+                dst.n_q = n_q[base];
+            }
+            ++base;
+        }
+        if (batch.n == 1) {
+            const auto& r = batch.s[0];
+            strata::kernels::kv_stream_resolve(r.map, r.slots, r.host, r.fmt, r.ids, r.steps, r.n_q, cap, s, stream);
+        } else if (batch.n > 1) {
+            strata::kernels::kv_stream_resolve_slots(batch, cap, s, stream);
+        }
+    }
+}
 
 uint64_t qsa_buffers_bytes(const ModelGeometry& g, int64_t max_cells) {    const QsaShapes s = qsa_shapes(g);    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);    uint64_t n = 0;    n += (uint64_t) q8k_bytes(g.n_embd);    n += (uint64_t) (g.n_embd / 32) * 34;
 // block_q8_0

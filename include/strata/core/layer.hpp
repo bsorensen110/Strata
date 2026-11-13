@@ -344,6 +344,9 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,
                     int64_t cap, void* stream);
+/// Batch-decode helper: resolve K/V residency for multiple streamed slots of the same QSA layer in batched launches.
+void qsa_kv_resolve_slots(const QsaState* const* sts, const int32_t* const* ids, const int32_t* const* steps,
+                          const int32_t* n_q, int n_slots, const ModelGeometry& g, int64_t cap, void* stream);
 /// Zeroes the pools AND the indexer, so a fresh sequence matches the reference's own `zeros()`.  The KV pool
 /// matters even for cells that are never attended, because `kv_gather` reads whatever the selection names.
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream);
