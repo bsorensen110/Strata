@@ -1,0 +1,49 @@
+{
+  "manifest_version": 1,
+  "stage": "ready",
+  "engine": {
+    "drafter": "none-or-lookup",
+    "engine": "native-single-gpu",
+    "expert_cache_request": "9504",
+    "kv_format": "int8",
+    "pipeline_windows": "0",
+    "ple_io": "direct",
+    "spec_window": "8",
+    "stages": "1",
+    "version": "0.1.59.1"
+  },
+  "budgets": {
+    "batch_slots": 2,
+    "conversation_cache_mib": 8192,
+    "expert_cache_all_mib": 22270,
+    "expert_cache_primary_mib": 22270,
+    "expert_slots_all": 9504,
+    "expert_slots_primary": 9504,
+    "kv_resident_cells": 32768,
+    "max_context": 196608,
+    "memory_limit_mib": -1,
+    "pool_workers": 15,
+    "prefill_chunk_cap": 2048,
+    "prefill_stages": 1,
+    "resident_budget_bytes": 0,
+    "vram_reserve_mib": 700
+  },
+  "paths": [
+    {"area": "decode", "name": "route-tail-skip", "selected": true, "reason": "STRATA_ROUTE_TAIL_SKIP not set: the engine default applies (it skips tails only where the configuration allows)", "detail": ""},
+    {"area": "dense", "name": "hc_q8", "selected": true, "reason": "architecture default (gfx12 / gfx1151 HIP)", "detail": ""},
+    {"area": "head", "name": "output.weight", "selected": true, "reason": "held in VRAM", "detail": "type Q6_K"},
+    {"area": "prefill", "name": "experts: gate_up IQ2_S, down IQ4_NL", "selected": true, "reason": "an MMQ tile exists for both products on every visible GPU", "detail": "mmq, 1 layers"},
+    {"area": "prefill", "name": "experts: gate_up IQ2_S, down Q2_0", "selected": true, "reason": "an MMQ tile exists for both products on every visible GPU", "detail": "mmq, 2 layers"},
+    {"area": "prefill", "name": "experts: gate_up IQ3_XXS, down IQ4_NL", "selected": true, "reason": "an MMQ tile exists for both products on every visible GPU", "detail": "mmq, 8 layers"},
+    {"area": "prefill", "name": "experts: gate_up IQ3_XXS, down Q5_0", "selected": true, "reason": "an MMQ tile exists for both products on every visible GPU", "detail": "mmq, 20 layers"},
+    {"area": "prefill", "name": "experts: gate_up IQ4_XS, down IQ4_NL", "selected": true, "reason": "an MMQ tile exists for both products on every visible GPU", "detail": "mmq, 4 layers"},
+    {"area": "prefill", "name": "experts: gate_up IQ4_XS, down Q5_0", "selected": true, "reason": "an MMQ tile exists for both products on every visible GPU", "detail": "mmq, 13 layers"},
+    {"area": "prefill", "name": "mmq-group-sort", "selected": true, "reason": "STRATA_MMQ_STAGED_SORT=3", "detail": "48 of 48 layers"},
+    {"area": "transfer", "name": "dma-batch", "selected": false, "reason": "mode 0: one copy per expert (the default loop)", "detail": "mode 0"}
+  ],
+  "tensors": {
+    "dense": {"Q6_K": {"count": 212, "bytes": 1820851200}, "Q8_0": {"count": 89, "bytes": 761077760}},
+    "dense_hc_q8_copy": {"Q8_0": {"count": 194, "bytes": 675430400}},
+    "head": {"Q6_K": {"count": 1, "bytes": 521472000}}
+  }
+}

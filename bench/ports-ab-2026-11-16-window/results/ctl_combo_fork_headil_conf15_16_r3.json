@@ -1,0 +1,106 @@
+{
+ "arm": "ctl_combo_fork_headil_conf15_16",
+ "round": "_r3",
+ "ts": "2026-11-13T09:02:32",
+ "exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "commit": "d63d36a9f",
+ "engine_pid": 372176,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-16-window/results/ctl_combo_fork_headil_conf15_16.manifest.json",
+  "STRATA_BATCH_DF2_MAX_T": "16",
+  "STRATA_DF2_FORK": "0"
+ },
+ "parallel": 2,
+ "smoke": {
+  "prompt_tokens": 42,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.363,
+  "wall_tok_s": 8.26
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 6.052,
+  "wall_tok_s": 42.3
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.587,
+   "wall_tok_s": 111.62,
+   "hash": "4521e198787228d30fd4f84e80186461a9234ea1f2244573957eb11352c09bde"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.922,
+   "wall_tok_s": 130.53,
+   "hash": "bf62fdef9da2e2818ee896c579d53424c16c695d2a935ae24f0f24eed566efd2"
+  }
+ ],
+ "burst": {
+  "wall_s": 3.894,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 131.49,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.49,
+    "wall_tok_s": 73.36,
+    "hash": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.892,
+    "wall_tok_s": 65.77,
+    "hash": "012c6589a3fb818295ea4db1b3db8c51ccfd679d2c11c3376388b09447adc3a3"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "4521e198787228d30fd4f84e80186461a9234ea1f2244573957eb11352c09bde",
+  "greedy_warm": "bf62fdef9da2e2818ee896c579d53424c16c695d2a935ae24f0f24eed566efd2",
+  "burst_a": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574",
+  "burst_b": "012c6589a3fb818295ea4db1b3db8c51ccfd679d2c11c3376388b09447adc3a3"
+ },
+ "engine_decode_512": [
+  "116.8",
+  "132.8"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 67 ms (44.9 tok/s), drafts accepted 1 of 3, 1 checkpoints",
+   "generated in 3097 ms (82.7 tok/s), drafts accepted 161 of 303, 1 checkpoints",
+   "generated in 4382 ms (116.8 tok/s), drafts accepted 409 of 580, 1 checkpoints",
+   "generated in 3855 ms (132.8 tok/s), drafts accepted 412 of 576, 1 checkpoints",
+   "generated in 16 ms (60.8 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 16 ms (61.4 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 323 ms (154.7 tok/s), drafts accepted 41 of 50, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 42 tokens = 0 reused + 42 read in 293 ms (143.2 tok/s), 3 generated in 67 ms (44.9 tok/s), drafts accepted 1 of 3, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 2951 ms (1337.5 tok/s), 256 generated in 3097 ms (82.7 tok/s), drafts accepted 161 of 303, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 203 ms (172.4 tok/s), 512 generated in 4382 ms (116.8 tok/s), drafts accepted 409 of 580, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 65 ms (107.0 tok/s), 512 generated in 3855 ms (132.8 tok/s), drafts accepted 412 of 576, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 228 ms (153.4 tok/s), 1 generated in 16 ms (60.8 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 191 ms (183.6 tok/s), 1 generated in 16 ms (61.4 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 241 tokens = 240 reused + 1 read in 2 ms (630.5 tok/s), 50 generated in 323 ms (154.7 tok/s), drafts accepted 41 of 50, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 3",
+   "drafts accepted 161 of 303",
+   "drafts accepted 409 of 580",
+   "drafts accepted 412 of 576",
+   "drafts accepted 0 of 0",
+   "drafts accepted 0 of 0",
+   "drafts accepted 41 of 50"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 9504 slots, 21.75 GiB of VRAM; policy is"
+ ]
+}

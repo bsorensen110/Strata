@@ -1,0 +1,106 @@
+{
+ "arm": "trt_conf025_mt12",
+ "round": "_r3",
+ "ts": "2026-11-13T09:16:53",
+ "exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "commit": "d63d36a9f",
+ "engine_pid": 377170,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-16-window/results/trt_conf025_mt12.manifest.json",
+  "STRATA_BATCH_DF2_MAX_T": "12",
+  "STRATA_BATCH_DF2_CONF": "0.25"
+ },
+ "parallel": 2,
+ "smoke": {
+  "prompt_tokens": 39,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.375,
+  "wall_tok_s": 8.0
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 6.073,
+  "wall_tok_s": 42.16
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.529,
+   "wall_tok_s": 113.06,
+   "hash": "dfef57f256d6e34ed148e9b6a57c36f24f663d7c310f33b3a73c941b8598c05f"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.083,
+   "wall_tok_s": 125.41,
+   "hash": "6b55cd6130f0950471d4453e49b331f929ea77414fdaa26219c8f3a8cefa4f02"
+  }
+ ],
+ "burst": {
+  "wall_s": 3.92,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 130.61,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.918,
+    "wall_tok_s": 65.33,
+    "hash": "97b2c0fb47235acf3633ddf9324ac652bf58b553252643f6e14eb45822384c50"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.66,
+    "wall_tok_s": 69.95,
+    "hash": "0807101b206327beb0e8cb7a7ae95b74042f9256dabf2151f7d0e908935494f1"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "dfef57f256d6e34ed148e9b6a57c36f24f663d7c310f33b3a73c941b8598c05f",
+  "greedy_warm": "6b55cd6130f0950471d4453e49b331f929ea77414fdaa26219c8f3a8cefa4f02",
+  "burst_a": "97b2c0fb47235acf3633ddf9324ac652bf58b553252643f6e14eb45822384c50",
+  "burst_b": "0807101b206327beb0e8cb7a7ae95b74042f9256dabf2151f7d0e908935494f1"
+ },
+ "engine_decode_512": [
+  "118.4",
+  "127.9"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 73 ms (41.3 tok/s), drafts accepted 1 of 4, 1 checkpoints",
+   "generated in 3153 ms (81.2 tok/s), drafts accepted 159 of 308, 1 checkpoints",
+   "generated in 4324 ms (118.4 tok/s), drafts accepted 403 of 567, 1 checkpoints",
+   "generated in 4002 ms (127.9 tok/s), drafts accepted 402 of 567, 1 checkpoints",
+   "generated in 17 ms (60.1 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 28 ms (35.8 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 190 ms (168.9 tok/s), drafts accepted 27 of 30, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 39 tokens = 0 reused + 39 read in 299 ms (130.3 tok/s), 3 generated in 73 ms (41.3 tok/s), drafts accepted 1 of 4, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 2916 ms (1353.7 tok/s), 256 generated in 3153 ms (81.2 tok/s), drafts accepted 159 of 308, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 202 ms (172.9 tok/s), 512 generated in 4324 ms (118.4 tok/s), drafts accepted 403 of 567, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 78 ms (89.4 tok/s), 512 generated in 4002 ms (127.9 tok/s), drafts accepted 402 of 567, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 224 ms (156.4 tok/s), 1 generated in 17 ms (60.1 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 204 ms (172.0 tok/s), 1 generated in 28 ms (35.8 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 259 tokens = 258 reused + 1 read in 2 ms (639.2 tok/s), 32 generated in 190 ms (168.9 tok/s), drafts accepted 27 of 30, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 4",
+   "drafts accepted 159 of 308",
+   "drafts accepted 403 of 567",
+   "drafts accepted 402 of 567",
+   "drafts accepted 0 of 0",
+   "drafts accepted 0 of 0",
+   "drafts accepted 27 of 30"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 9504 slots, 21.75 GiB of VRAM; policy is"
+ ]
+}

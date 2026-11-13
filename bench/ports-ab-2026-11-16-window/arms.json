@@ -1,0 +1,162 @@
+{
+  "campaign": "DFlash2 batch window width (MAX_T 12/16) vs production's 8, and the switches that offset its cost, plus the verify-width confidence sweep, 2026-11-13",
+  "arms": [
+    {
+      "id": "mt12_vs_prod",
+      "switch": "STRATA_BATCH_DF2_MAX_T",
+      "baseline": "8",
+      "arm": "12",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "the base cost itself: production's 8-row verify window against 12, same build and env"
+    },
+    {
+      "id": "mt16_vs_prod",
+      "switch": "STRATA_BATCH_DF2_MAX_T",
+      "baseline": "8",
+      "arm": "16",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "and against 16, the width whose draft cost the offset switches are meant to absorb"
+    },
+    {
+      "id": "aa_floor",
+      "bits": "unknown",
+      "src": "none",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "12"
+      },
+      "why": "A/A floor at MAX_T=12: the same window pinned on both sides, so every verdict below is judged against this noise",
+      "baseline": "12",
+      "arm": "12",
+      "switch": "STRATA_BATCH_DF2_MAX_T"
+    },
+    {
+      "id": "fork_mt12",
+      "switch": "STRATA_DF2_FORK",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "12"
+      },
+      "why": "two-stream split of the context update and the block front run (HIP default off: +0.0..0.7 ms a round on gfx1151), at 12 rows"
+    },
+    {
+      "id": "fork_mt16",
+      "switch": "STRATA_DF2_FORK",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "why": "same fork at 16 rows, where there is more per-window work to overlap"
+    },
+    {
+      "id": "headil_mt12",
+      "switch": "STRATA_DF2_HEAD_IL",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "12"
+      },
+      "why": "drop the IL head quantisation path (HIP default on) at 12 rows"
+    },
+    {
+      "id": "headil_mt16",
+      "switch": "STRATA_DF2_HEAD_IL",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "why": "the same ablation at 16 rows"
+    },
+    {
+      "id": "chunk14_mt12",
+      "switch": "STRATA_DF2_HEAD_CHUNK",
+      "baseline": "8",
+      "arm": "14",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "12"
+      },
+      "why": "head chunk 8 (HIP default) to 14, the clamp ceiling, so the head consumes the whole 12-14 row window in one chunk"
+    },
+    {
+      "id": "chunk14_mt16",
+      "switch": "STRATA_DF2_HEAD_CHUNK",
+      "baseline": "8",
+      "arm": "14",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "why": "14-chunk head at 16 rows"
+    },
+    {
+      "id": "conf015_mt12",
+      "switch": "STRATA_BATCH_DF2_CONF",
+      "baseline": "0.35",
+      "arm": "0.15",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "12"
+      },
+      "why": "verify width vs accepted tokens a round: a slot's draft rows stop where the selector probability product drops below P, so 0.15 drafts wider"
+    },
+    {
+      "id": "conf025_mt12",
+      "switch": "STRATA_BATCH_DF2_CONF",
+      "baseline": "0.35",
+      "arm": "0.25",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "12"
+      },
+      "why": "the middle of the confidence sweep at 12 rows"
+    },
+    {
+      "id": "combo_fork_headil16",
+      "switch": "STRATA_DF2_FORK",
+      "baseline": "0",
+      "arm": "1",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "pin_arm": {
+        "STRATA_DF2_HEAD_IL": "0"
+      },
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "the two round-1 winners stacked at 16 rows: the fork (+23.9% solo) and the IL ablation (+10.7% burst)"
+    },
+    {
+      "id": "combo_fork_headil_conf15_16",
+      "switch": "STRATA_DF2_FORK",
+      "baseline": "0",
+      "arm": "1",
+      "pin": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "pin_arm": {
+        "STRATA_DF2_HEAD_IL": "0",
+        "STRATA_BATCH_DF2_CONF": "0.15"
+      },
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "and with the wider draft depth that won at 12 rows, to see whether the three stack or fight"
+    }
+  ]
+}
