@@ -305,6 +305,7 @@ private:
     int32_t *h_bout_ = nullptr, *out_btok_ = nullptr;
     float *out_bprob_ = nullptr;
     uint32_t* topscratch_ = nullptr;
+    float* seltab_ = nullptr;   // the selector's step scores, [kRows][16][16] (df2_select's table)
     cudaGraphExec_t exec_[kRows + 1] = {};
     cudaGraphExec_t body_exec_[kRows + 1] = {};
     struct BatchBodyGraphKey {

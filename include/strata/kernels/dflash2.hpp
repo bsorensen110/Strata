@@ -111,8 +111,10 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 /// out_tok[i] and out_prob[i] (the softmax probability of the pick among the 16).  `prev0` is read from *anchor_tok on the device.
 /// `cb_q4`: the codebooks are ggml Q4_0 rows in block order (rank / 32 blocks of 18 bytes a row: fp16 d, 16 bytes, value i in the low nibble of byte i,
 /// value i + 16 in the high nibble; NOT tiled like the matrices), dequantized to fp32 ((q - 8) * d) before the same dot; default: bf16 rows.
+/// `table` (optional, rows * 16 * 16 floats, rows <= 8): score every reachable step in one parallel launch first, then walk the table (bitwise the same picks
+/// and probabilities as without it).
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false, int beam = 4);
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false, int beam = 4, float* table = nullptr);
 
 /// Multi-slot candidate selector walk: one threadblock per item (`0 <= s < n_items`).  Item `s` reads
 /// `row_off = batch_meta[s * 4 + 0]`, `rows = batch_meta[s * 4 + 1]`, and `prev0 = batch_meta[s * 4 + 2]`, walks

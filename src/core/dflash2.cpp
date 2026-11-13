@@ -57,6 +57,12 @@ int df2_beam() {
     return b;
 }
 
+// STRATA_DF2_SELECT_TABLE=0: the selector walks with its one-block steps (the walk's scores computed in one parallel launch first is the default: bitwise the same drafts)
+bool df2_select_table() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DF2_SELECT_TABLE"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
 int df2_head_il_mode() {
     static const int mode = [] {
         const char* e = std::getenv("STRATA_DF2_HEAD_IL");
@@ -132,7 +138,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     fr(landing_); if (dpend_) cudaFreeHost(dpend_); fr(tag_); fr(d_meta_); fr(xq_); fr(xil_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rt_bctx_); fr(rope_inv_);
     for (int l = 0; l < 8; ++l) { fr(kring_[l]); fr(vring_[l]); }
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
-    fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(fn_batch_); fr(hsel_batch_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
+    fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(fn_batch_); fr(hsel_batch_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_); fr(seltab_);
     if (!dhead_shared_ && !blob_shared_) {
         if (dhead_ != nullptr && head_type_ == 14) kernels::native_q6_k_unpack(dhead_);
         fr(dvocab_);
@@ -347,7 +353,8 @@ bool Dflash2Drafter::alloc(std::string& err) {
               dev(&part_, (B / kRows) * (size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) && dev(&fn_, B * N_) &&
               dev(&topval_, (size_t) (blob_shared_ ? kDrafts : kBatchMaxRows) * 16) &&
               dev(&toptok_, (size_t) (blob_shared_ ? kDrafts : kBatchMaxRows) * 16) &&
-              dev(&hsel_, B * rank_) && dev(&topscratch_, HMax * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
+              dev(&hsel_, B * rank_) && dev(&topscratch_, HMax * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2) &&
+              dev(&seltab_, (size_t) kRows * kernels::kDf2TopK * kernels::kDf2TopK);
     if (!blob_shared_) {
         ok = ok && dev(&fn_batch_, (size_t) kBatchMaxRows * N_) && dev(&hsel_batch_, (size_t) kBatchMaxRows * rank_);
     }
@@ -797,7 +804,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, out_tok_,
-                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0", df2_beam());
+                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0", df2_beam(), df2_select_table() ? seltab_ : nullptr);
     } catch (const std::exception& e) {
         err = e.what();
         return false;

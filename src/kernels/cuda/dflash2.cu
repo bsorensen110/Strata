@@ -1298,20 +1298,50 @@ __device__ void select_eval_step(const float* __restrict__ hp_row, const float* 
     __syncthreads();
 }
 
-template <bool Q4, int BEAM>
+// Every predecessor the walk can reach is the anchor (row 0) or one of row i - 1's 16 candidates, so the scores of all the walk's steps form a table
+// T[i][jp][j] (row 0: jp = 0 only) that does not depend on the walk's choices.  One block per (jp, i) fills a row of it with select_eval_step, the very
+// arithmetic of the walk's own step, so a walk that reads T picks the same tokens with the same probabilities, bitwise; the 16-25 dependent codebook
+// steps of the one-block walk become one parallel launch.
+template <bool Q4>
+__global__ void __launch_bounds__(256) select_table_kernel(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
+                                                           const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank,
+                                                           const int32_t* __restrict__ anchor_tok, float* __restrict__ table) {
+    __shared__ float vp[256];
+    __shared__ float sc[kDf2TopK];
+    const int jp = blockIdx.x, i = blockIdx.y;
+    if (i == 0 && jp > 0) return;
+    const int ptok = i == 0 ? *anchor_tok : tok[(i - 1) * kDf2TopK + jp];
+    select_eval_step<Q4>(hp + (size_t) i * rank, unary + i * kDf2TopK, tok + i * kDf2TopK, pred_cb, succ_cb, rank, ptok, vp, sc);
+    if (threadIdx.x < kDf2TopK) table[((size_t) i * kDf2TopK + jp) * kDf2TopK + threadIdx.x] = sc[threadIdx.x];
+}
+
+// TABLE: the step's scores come from select_table_kernel's T (indexed by the predecessor's candidate slot) instead of select_eval_step
+template <bool Q4, int BEAM, bool TABLE = false>
 __device__ void select_slot_walk(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
                                  const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
-                                 int prev0, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+                                 int prev0, int32_t* __restrict__ out_tok, float* __restrict__ out_prob, const float* __restrict__ table = nullptr) {
     if (rows <= 0) return;
     __shared__ float vp[256];
     __shared__ float sc[kDf2TopK];
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    __shared__ float tab_s[TABLE ? kDf2Rows * kDf2TopK * kDf2TopK : 1];   // the whole table and the candidates up front: the walk's steps then wait on no memory
+    __shared__ int32_t tok_s[TABLE ? kDf2Rows * kDf2TopK : 1];
+    if constexpr (TABLE) {
+        for (int k = tid; k < rows * kDf2TopK * kDf2TopK; k += blockDim.x) tab_s[k] = table[k];
+        for (int k = tid; k < rows * kDf2TopK; k += blockDim.x) tok_s[k] = tok[k];
+        __syncthreads();
+        tok = tok_s;
+    }
     if constexpr (BEAM <= 1) {
-        __shared__ int prev;
-        if (tid == 0) prev = prev0;
+        __shared__ int prev, prev_j;
+        if (tid == 0) { prev = prev0; prev_j = 0; }
         __syncthreads();
         for (int i = 0; i < rows; ++i) {
-            select_eval_step<Q4>(hp + (size_t) i * rank, unary + i * kDf2TopK, tok + i * kDf2TopK, pred_cb, succ_cb, rank, prev, vp, sc);
+            if constexpr (TABLE) {
+                if (tid < kDf2TopK) sc[tid] = tab_s[(i * kDf2TopK + prev_j) * kDf2TopK + tid];
+                __syncthreads();
+            } else
+                select_eval_step<Q4>(hp + (size_t) i * rank, unary + i * kDf2TopK, tok + i * kDf2TopK, pred_cb, succ_cb, rank, prev, vp, sc);
             if (w == 0) {
                 const float sj = (lane < kDf2TopK) ? sc[lane] : -INFINITY;
                 float bv = sj;
@@ -1335,6 +1365,7 @@ __device__ void select_slot_walk(const float* __restrict__ hp, const float* __re
                     const int32_t picked = tok[i * kDf2TopK + bj];
                     out_prob[i] = 1.0f / z;
                     prev = picked;
+                    prev_j = bj;
                     if (i + 1 == rows) __threadfence_system();
                     out_tok[i] = picked;
                 }
@@ -1446,6 +1477,104 @@ __global__ void select_kernel(const float* __restrict__ hp, const float* __restr
                               const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
                               const int32_t* __restrict__ anchor_tok, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
     select_slot_walk<Q4, BEAM>(hp, unary, tok, pred_cb, succ_cb, rank, rows, *anchor_tok, out_tok, out_prob);
+}
+
+// greedy (BEAM = 1) over the table
+template <int BEAM>
+__global__ void select_walk_table_kernel(const float* __restrict__ table, const int32_t* __restrict__ tok, int rows, int32_t* __restrict__ out_tok,
+                                         float* __restrict__ out_prob) {
+    select_slot_walk<false, BEAM, true>(nullptr, nullptr, tok, nullptr, nullptr, 0, rows, 0, out_tok, out_prob, table);
+}
+
+// The beam walk (BEAM > 1) over select_table_kernel's T, with select_slot_walk's arithmetic per value: warp b scores beam b (the beams of a row at once
+// instead of one after another), warp 0 keeps the Viterbi pick, and each kept beam stores a back-pointer instead of copying its path (the path is
+// read back once at the end).  Two barriers a row.
+template <int BEAM>
+__global__ void __launch_bounds__(BEAM * 32) select_walk_beam_table_kernel(const float* __restrict__ table, const int32_t* __restrict__ tok, int rows,
+                                                                           int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+    if (rows <= 0) return;
+    __shared__ float tab_s[kDf2Rows * kDf2TopK * kDf2TopK];
+    __shared__ int32_t tok_s[kDf2Rows * kDf2TopK];
+    __shared__ float beam_score[BEAM];
+    __shared__ int beam_j[BEAM];
+    __shared__ float cand_logp[BEAM * kDf2TopK], cand_prob[BEAM * kDf2TopK];
+    __shared__ int8_t parent[kDf2Rows][BEAM], keep_j[kDf2Rows][BEAM];
+    __shared__ float keep_p[kDf2Rows][BEAM];
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    for (int k = tid; k < rows * kDf2TopK * kDf2TopK; k += blockDim.x) tab_s[k] = table[k];
+    for (int k = tid; k < rows * kDf2TopK; k += blockDim.x) tok_s[k] = tok[k];
+    __syncthreads();
+    for (int i = 0; i < rows; ++i) {
+        const int n_prev = (i == 0) ? 1 : BEAM;
+        if (w < n_prev) {
+            const int b = w;
+            const float sj = (lane < kDf2TopK) ? tab_s[(i * kDf2TopK + (i == 0 ? 0 : beam_j[b])) * kDf2TopK + lane] : -INFINITY;
+            float bv = sj;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) bv = fmaxf(bv, __shfl_xor_sync(0xffffffffu, bv, o));
+            bv = __shfl_sync(0xffffffffu, bv, 0);
+            const float ej = (lane < kDf2TopK) ? __expf(sj - bv) : 0.0f;
+            float z = 0.0f;
+#pragma unroll
+            for (int j = 0; j < kDf2TopK; ++j) z += __shfl_sync(0xffffffffu, ej, j);
+            if (lane < kDf2TopK) {
+                const float base = (i == 0) ? 0.0f : beam_score[b];
+                cand_logp[b * kDf2TopK + lane] = base + ((sj - bv) - logf(z));
+                cand_prob[b * kDf2TopK + lane] = ej / z;
+            }
+        }
+        __syncthreads();
+        if (w == 0) {
+            float v_logp = -INFINITY, v_p = 0.0f;
+            int v_b = 0;
+            if (lane < kDf2TopK) {
+                for (int b = 0; b < n_prev; ++b) {
+                    const float lp = cand_logp[b * kDf2TopK + lane];
+                    if (lp > v_logp) {
+                        v_logp = lp;
+                        v_b = b;
+                        v_p = cand_prob[b * kDf2TopK + lane];
+                    }
+                }
+            }
+            for (int k = 0; k < BEAM; ++k) {
+                float bv = v_logp;
+                int bj = lane;
+#pragma unroll
+                for (int o = 8; o > 0; o >>= 1) {
+                    const float obv = __shfl_xor_sync(0xffffffffu, bv, o);
+                    const int obj = __shfl_xor_sync(0xffffffffu, bj, o);
+                    if (obv > bv || (obv == bv && obj < bj)) {
+                        bv = obv;
+                        bj = obj;
+                    }
+                }
+                const int win_j = __shfl_sync(0xffffffffu, bj, 0);
+                if (lane == win_j) {
+                    beam_j[k] = win_j;   // the beams' scores of this row are all read (the barrier above): the next row's state is written in place
+                    beam_score[k] = v_logp;
+                    parent[i][k] = (int8_t) v_b;
+                    keep_j[i][k] = (int8_t) win_j;
+                    keep_p[i][k] = v_p;
+                    v_logp = -INFINITY;
+                }
+                __syncwarp();
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {   // the best beam's path, back to front
+        int b = 0, last = 0;
+        for (int r = rows - 1; r >= 0; --r) {
+            const int32_t t = tok_s[r * kDf2TopK + keep_j[r][b]];
+            out_prob[r] = keep_p[r][b];
+            if (r + 1 < rows) out_tok[r] = t;
+            else last = t;
+            b = parent[r][b];
+        }
+        __threadfence_system();   // the last token is the host's sentinel: written after everything else
+        out_tok[rows - 1] = last;
+    }
 }
 
 template <bool Q4, int BEAM>
@@ -1883,8 +2012,19 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 }
 
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4, int beam) {
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4, int beam, float* table) {
     if (rank != 256) throw std::invalid_argument("df2_select: the selector rank must be 256");
+    cudaStream_t st = (cudaStream_t) stream;
+    if (table != nullptr && rows >= 1 && rows <= kDf2Rows) {
+        const dim3 grid(kDf2TopK, rows);
+        if (cb_q4) select_table_kernel<true><<<grid, 256, 0, st>>>(hp, unary, tok, pred_cb, succ_cb, rank, anchor_tok, table);
+        else select_table_kernel<false><<<grid, 256, 0, st>>>(hp, unary, tok, pred_cb, succ_cb, rank, anchor_tok, table);
+        check("select_table");
+        if (beam <= 1) select_walk_table_kernel<1><<<1, 256, 0, st>>>(table, tok, rows, out_tok, out_prob);
+        else select_walk_beam_table_kernel<4><<<1, 4 * 32, 0, st>>>(table, tok, rows, out_tok, out_prob);
+        check("select_walk_table");
+        return;
+    }
     if (beam <= 1) {
         if (cb_q4) select_kernel<true, 1><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
         else select_kernel<false, 1><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);

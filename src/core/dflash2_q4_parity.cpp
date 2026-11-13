@@ -293,7 +293,9 @@ int main() {
         std::vector<float> bprob(n_slots * 8);
         cudaMemcpy(btok.data(), d_btok, btok.size() * 4, cudaMemcpyDeviceToHost);
         cudaMemcpy(bprob.data(), d_bprob, bprob.size() * 4, cudaMemcpyDeviceToHost);
-        bool sel_ok = true;
+        bool sel_ok = true, tab_ok = true;
+        float* d_tab;
+        cudaMalloc((void**) &d_tab, (size_t) 8 * 16 * 16 * 4);
         off = 0;
         for (int s = 0; s < n_slots; ++s) {
             cudaMemcpy(d_anchor, &prev0[s], 4, cudaMemcpyHostToDevice);
@@ -306,12 +308,32 @@ int main() {
             cudaMemcpy(sprob, d_sprob, 8 * 4, cudaMemcpyDeviceToHost);
             for (int i = 0; i < kw[s]; ++i)
                 if (stok[i] != btok[s * 8 + i] || std::memcmp(&sprob[i], &bprob[s * 8 + i], 4) != 0) sel_ok = false;
+            // the walk over the precomputed step table (df2_select's `table`) against the one-block walk: beam and greedy, bf16 and Q4_0 codebooks
+            for (int beam : {4, 1})
+                for (int q4 = 0; q4 < 2; ++q4) {
+                    int32_t rt[2][8] = {};
+                    float rp[2][8] = {};
+                    for (int use = 0; use < 2; ++use) {
+                        cudaMemset(d_stok, 0, 8 * 4);
+                        cudaMemset(d_sprob, 0, 8 * 4);
+                        strata::kernels::df2_select(slot_hsel[s], d_tv + (size_t) off * 16, d_ti + (size_t) off * 16, d_pcb, d_scb, rank, kw[s], d_anchor, d_stok,
+                                                    d_sprob, nullptr, q4 != 0, beam, use ? d_tab : nullptr);
+                        cudaDeviceSynchronize();
+                        cudaMemcpy(rt[use], d_stok, 8 * 4, cudaMemcpyDeviceToHost);
+                        cudaMemcpy(rp[use], d_sprob, 8 * 4, cudaMemcpyDeviceToHost);
+                    }
+                    if (std::memcmp(rt[0], rt[1], sizeof(rt[0])) != 0 || std::memcmp(rp[0], rp[1], sizeof(rp[0])) != 0) tab_ok = false;
+                }
             off += kw[s];
             cudaFree(slot_fn[s]); cudaFree(slot_hsel[s]);
         }
         ++total;
         if (!sel_ok) ++bad;
         std::printf("df2_pack_head_rows + df2_select_multi (4 slots, 18 total rows): %s\n", sel_ok ? "bitwise equal" : "MISMATCH");
+        ++total;
+        if (!tab_ok) ++bad;
+        std::printf("df2_select over the step table vs the one-block walk (4 slots, beam 4 and 1, bf16 and q4_0): %s\n", tab_ok ? "bitwise equal" : "MISMATCH");
+        cudaFree(d_tab);
         cudaFree(d_logits); cudaFree(d_tv); cudaFree(d_ti); cudaFree(d_scratch);
         cudaFree(d_pcb); cudaFree(d_scb); cudaFree(d_dv); cudaFree(fn_batch); cudaFree(hsel_batch);
         cudaFree(d_bmeta); cudaFree(d_btok); cudaFree(d_bprob); cudaFree(d_stok); cudaFree(d_sprob); cudaFree(d_anchor);
