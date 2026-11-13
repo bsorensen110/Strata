@@ -337,7 +337,10 @@ bool Dflash2Drafter::alloc(std::string& err) {
     };
     const size_t B = blob_shared_ ? (size_t) kRows : (size_t) (kBatchMaxSlots * kRows);
     const size_t HMax = blob_shared_ ? (size_t) kDrafts : (size_t) (2 * kDrafts);
-    bool ok = dev(&d_meta_, kMetaInts) && dev(&xq_, kernels::native_q8_1_bytes(N_, blob_shared_ ? kRows : 16) + 4096) && dev(&xil_, kernels::native_q8_1_il_bytes(N_, blob_shared_ ? kRows : 16) + 4096) && dev(&xqp_, (size_t) 5 * N_ * B + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * B + 64) && dev(&xqc_, (size_t) 5 * N_ * B + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * B + 64) && dev(&rt_ctx_, 2 * kRows * 128) && (blob_shared_ || dev(&rt_bctx_, 2 * kBatchMaxSlots * kRows * 128)) && dev(&rope_inv_, 64) &&
+    // 16 head columns for the batch path, sized from 8-column calls: the helpers validate ncols against the build's window (8 on default CUDA builds)
+    const size_t xq_bytes = kernels::native_q8_1_bytes(N_, kRows) * (blob_shared_ ? 1 : 2);
+    const size_t xil_bytes = kernels::native_q8_1_il_bytes(N_, kRows);   // the interleaved layout holds at most 8 columns
+    bool ok = dev(&d_meta_, kMetaInts) && dev(&xq_, xq_bytes + 4096) && dev(&xil_, xil_bytes + 4096) && dev(&xqp_, (size_t) 5 * N_ * B + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * B + 64) && dev(&xqc_, (size_t) 5 * N_ * B + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * B + 64) && dev(&rt_ctx_, 2 * kRows * 128) && (blob_shared_ || dev(&rt_bctx_, 2 * kBatchMaxSlots * kRows * 128)) && dev(&rope_inv_, 64) &&
               dev(&fcy_, B * N_) && dev(&hctx_, B * N_) && dev(&kc_, (size_t) L_ * B * NKV_ * HD_) && dev(&vc_, (size_t) L_ * B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
               dev(&xc_, B * N_) && dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
