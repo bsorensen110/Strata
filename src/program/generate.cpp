@@ -1240,9 +1240,12 @@ void usage() {
                  "  --expert-profile P   R4.2e: pre-load the VRAM tier from a `profile.bin` (see\n"
                  "                       tools/make_profile.py) instead of admitting on first use.\n"
                  "  --expert-profile-save P  --serve, #477: save what the adaptive tier learned (the experts in\n"
-                 "                       VRAM, then the routing counted since the start) as a profile at P and heat at P.heat, on\n"
-                 "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
-                 "                       0 = on QUIT only) between requests; start from it with --expert-profile P\n"
+                 "                       VRAM, then the routing counted since the start) as a profile at P and heat at P.heat\n"
+                 "                       (with provenance in P.heat.meta), on QUIT and every --expert-profile-save-every MIN\n"
+                 "                       minutes (default 10; 0 = on QUIT only) between requests. If P.heat is missing at\n"
+                 "                       startup, bootstraps a deterministic profile-rank prior from P (else --expert-profile)\n"
+                 "                       without overwriting valid measured heat or malformed sidecars; later replaced once\n"
+                 "                       positive runtime routing counts are saved. Start from P with --expert-profile P\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
                  "                       launch so the GPU starts while the CPU pool runs; without it the work\n"
                  "                       waits for the next driver entry and does not overlap at all.\n"
@@ -1272,8 +1275,9 @@ void usage() {
                  "                       and measured **2.97%%**.  Per-layer, the same routing gives 21.4%% at 8\n"
                  "                       slots/layer and 70.4%% at 64.  On a native pack, N is still the budget of N\n"
                  "                       largest blobs; each layer's slots are that layer's own blob.\n"
-                 "  --expert-cache-quota auto  startup-only learned quotas from <expert-profile>.heat; no heat file uses uniform quotas\n"
-                 "                       within the same byte budget; never rebalances at runtime.\n"
+                 "  --expert-cache-quota auto  startup-only quotas from <expert-profile-save>.heat or <expert-profile>.heat\n"
+                 "                       (measured/legacy heat wins over profile-rank priors; missing heat falls back to\n"
+                 "                       uniform quotas; malformed heat fails closed; never rebalances at runtime).\n"
                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
@@ -8421,6 +8425,7 @@ int main(int argc, char** argv) {
     uint64_t quota_byte_budget = 0;
     bool quota_heat_loaded = false;
     bool quota_use_learned_heat = false;
+    auto quota_heat_provenance = strata::core::ExpertHeatProvenance::None;
     // plan v0.3 P6: a native pack's blobs differ per layer, so the same VRAM holds more experts than slots of
     // the largest blob would. The shared cache below sizes slots in profile order.
     // #369: that list does not match --expert-cache-per-layer. A range is layer * quota + n, so a size cut for
@@ -8433,6 +8438,34 @@ int main(int argc, char** argv) {
     }();
     std::vector<int64_t> sized_slots;
     uint64_t per_layer_bytes = 0;
+    if (!o.expert_profile_save.empty()) {
+        const strata::core::ExpertHeatBootstrapResult boot = strata::core::bootstrap_expert_profile_heat(
+            o.expert_profile_save, o.expert_profile, profile_loaded, g.n_layers, g.n_expert);
+        using BootAction = strata::core::ExpertHeatBootstrapResult::Action;
+        if (boot.action == BootAction::DerivedPrior) {
+            std::fprintf(stderr,
+                         "strata generate: bootstrapped %s heat sidecar %s from %s (%s, %lldx%lld, %zu ranked pairs)%s%s\n",
+                         strata::core::expert_heat_provenance_name(boot.provenance), boot.heat_path.c_str(),
+                         boot.source_profile.c_str(), boot.source_kind.c_str(), (long long) g.n_layers,
+                         (long long) g.n_expert, boot.ranked_pairs,
+                         boot.detail.empty() ? "" : "; fallback note: ",
+                         boot.detail.empty() ? "" : boot.detail.c_str());
+        } else if (boot.action == BootAction::RetainedValid) {
+            std::fprintf(stderr, "strata generate: retaining existing %s heat sidecar %s (%lldx%lld)\n",
+                         strata::core::expert_heat_provenance_name(boot.provenance), boot.heat_path.c_str(),
+                         (long long) g.n_layers, (long long) g.n_expert);
+        } else if (boot.action == BootAction::MalformedLeftUntouched) {
+            if (!o.expert_cache_quota_auto || o.expert_cache <= 0) {
+                std::fprintf(stderr,
+                             "strata generate: warning: existing expert heat sidecar %s is malformed/incompatible "
+                             "and left untouched (%s)\n",
+                             boot.heat_path.c_str(), boot.detail.c_str());
+            }
+        } else if (boot.action == BootAction::Failed) {
+            std::fprintf(stderr, "strata generate: warning: failed to bootstrap heat sidecar %s (%s)\n",
+                         boot.heat_path.c_str(), boot.detail.c_str());
+        }
+    }
     if (o.expert_cache_quota_auto && o.expert_cache > 0) {
         const int asked = o.expert_cache;
         const uint64_t budget = (uint64_t) asked * nibble_max_slot_bytes();
@@ -8445,22 +8478,28 @@ int main(int argc, char** argv) {
             const int64_t blob = native_pack ? (int64_t) nib::slot_bytes(l) : (int64_t) lay.max_blob;
             quota_slot_bytes.push_back(strata::core::ExpertCache::slot_stride(blob, slot_guard));
         }
-        if (!o.expert_profile.empty()) {
-            const std::string heat_path = o.expert_profile + ".heat";
-            std::error_code ec;
-            const bool have_heat = std::filesystem::exists(heat_path, ec);
-            if (ec) {
-                std::fprintf(stderr, "strata generate: cannot check expert heat file %s: %s\n", heat_path.c_str(),
-                             ec.message().c_str());
+        if (!o.expert_profile_save.empty() || !o.expert_profile.empty()) {
+            strata::core::ExpertHeatResolution resolved = strata::core::resolve_expert_profile_heat(
+                o.expert_profile_save, o.expert_profile, g.n_layers, g.n_expert);
+            if (resolved.found && !resolved.valid) {
+                const std::string msg =
+                    resolved.detail.empty() ? ("invalid expert heat file " + resolved.path) : resolved.detail;
+                std::fprintf(stderr, "strata generate: %s\n", msg.c_str());
                 return 2;
             }
-            if (have_heat) {
-                if (!strata::core::read_expert_profile_heat(heat_path, g.n_layers, g.n_expert, quota_heat, err)) {
-                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
-                    return 2;
-                }
+            if (resolved.valid) {
+                quota_heat = std::move(resolved.heat);
                 quota_heat_loaded = true;
-                quota_use_learned_heat = std::any_of(quota_heat.begin(), quota_heat.end(), [](double v) { return v > 0.0; });
+                quota_heat_provenance = resolved.provenance;
+                quota_use_learned_heat =
+                    std::any_of(quota_heat.begin(), quota_heat.end(), [](double v) { return v > 0.0; });
+                if (quota_use_learned_heat &&
+                    quota_heat_provenance == strata::core::ExpertHeatProvenance::ProfileRankPrior) {
+                    std::fprintf(stderr,
+                                 "strata generate: --expert-cache-quota auto using profile-rank prior from %s "
+                                 "(not measured routing counts; will switch once runtime heat is saved)\n",
+                                 resolved.path.c_str());
+                }
             }
         }
         layer_quotas = quota_use_learned_heat
@@ -8789,9 +8828,13 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 return 1;
             }
-            const char* quota_source = quota_use_learned_heat ? "learned"
-                                      : quota_heat_loaded ? "uniform zero-heat fallback"
-                                                          : "uniform no-heat fallback";
+            const char* quota_source =
+                quota_use_learned_heat
+                    ? (quota_heat_provenance == strata::core::ExpertHeatProvenance::ProfileRankPrior
+                           ? "profile-rank prior"
+                           : "learned")
+                    : quota_heat_loaded ? "uniform zero-heat fallback"
+                                        : "uniform no-heat fallback";
             std::fprintf(stderr, "strata generate: expert-cache quota %s=[", quota_source);
             for (size_t l = 0; l < layer_quotas.size(); ++l)
                 std::fprintf(stderr, "%s%lld", l == 0 ? "" : ",", (long long) layer_quotas[l]);
@@ -14586,11 +14629,18 @@ int main(int argc, char** argv) {
             else
                 std::fprintf(stderr, "strata serve: the expert profile was not saved: %s\n", e.c_str());
             std::string heat_err;
+            bool skipped_zero_heat = false;
             const std::string heat_path = o.expert_profile_save + ".heat";
-            if (!strata::core::write_expert_profile_heat(heat_path, g.n_layers, g.n_expert, heat, heat_err))
+            if (!strata::core::save_runtime_expert_profile_heat(o.expert_profile_save, g.n_layers, g.n_expert, heat,
+                                                                 (int64_t) ranked.size(), skipped_zero_heat, heat_err))
                 std::fprintf(stderr, "strata serve: expert heat was not saved: %s\n", heat_err.c_str());
+            else if (skipped_zero_heat)
+                std::fprintf(stderr,
+                             "strata serve: expert heat unchanged at %s (%s: zero runtime routing counts observed)\n",
+                             heat_path.c_str(), why);
             else
-                std::fprintf(stderr, "strata serve: expert heat saved to %s (%s)\n", heat_path.c_str(), why);
+                std::fprintf(stderr, "strata serve: runtime expert heat saved to %s (%s; provenance=runtime)\n",
+                             heat_path.c_str(), why);
             profile_saved_at = Clock::now();
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
