@@ -19,6 +19,9 @@
 #include <cstdlib>
 #include <utility>
 #include <cstring>
+#include <cmath>
+#include <functional>
+#include <limits>
 
 // (not in a SYCL build: its CUDA names are a compatibility layer without the PCI ids NVML is matched by)
 #if defined(_WIN32) && !defined(STRATA_EC_NO_VMM) && !defined(SYCL_LANGUAGE_VERSION)
@@ -306,6 +309,71 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
     if (!ok || ec) {
         std::filesystem::remove(tmp, ec);
         err = "write_expert_profile: cannot write " + path;
+        return false;
+    }
+    return true;
+}
+
+bool read_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t n_expert,
+                              std::vector<double>& heat, std::string& err) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        err = "read_expert_profile_heat: cannot open " + path;
+        return false;
+    }
+    char magic[4] = {};
+    uint32_t hdr[3] = {};
+    if (std::fread(magic, 1, 4, f) != 4 || std::fread(hdr, 4, 3, f) != 3 ||
+        std::memcmp(magic, "STRH", 4) != 0 || hdr[0] != 1 ||
+        (int64_t) hdr[1] != n_layers || (int64_t) hdr[2] != n_expert ||
+        n_layers <= 0 || n_expert <= 0 || n_layers > 65535 || n_expert > 65535 ||
+        (size_t) n_layers > std::numeric_limits<size_t>::max() / (size_t) n_expert ||
+        (size_t) n_layers * (size_t) n_expert > std::numeric_limits<size_t>::max() / sizeof(double)) {
+        std::fclose(f);
+        err = "read_expert_profile_heat: invalid header or model dimensions in " + path;
+        return false;
+    }
+    const size_t count = (size_t) n_layers * (size_t) n_expert;
+    std::vector<double> values(count);
+    if (std::fread(values.data(), sizeof(double), count, f) != count || std::fgetc(f) != EOF || std::ferror(f)) {
+        std::fclose(f);
+        err = "read_expert_profile_heat: truncated or oversized heat file " + path;
+        return false;
+    }
+    std::fclose(f);
+    if (std::any_of(values.begin(), values.end(), [](double v) { return !std::isfinite(v) || v < 0.0; })) {
+        err = "read_expert_profile_heat: invalid heat value in " + path;
+        return false;
+    }
+    heat = std::move(values);
+    return true;
+}
+
+bool write_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t n_expert,
+                               const std::vector<double>& heat, std::string& err) {
+    if (n_layers <= 0 || n_expert <= 0 || n_layers > 65535 || n_expert > 65535 ||
+        (size_t) n_layers > std::numeric_limits<size_t>::max() / (size_t) n_expert ||
+        (size_t) n_layers * (size_t) n_expert > std::numeric_limits<size_t>::max() / sizeof(double) ||
+        heat.size() != (size_t) n_layers * (size_t) n_expert ||
+        std::any_of(heat.begin(), heat.end(), [](double v) { return !std::isfinite(v) || v < 0.0; })) {
+        err = "write_expert_profile_heat: invalid model dimensions or heat";
+        return false;
+    }
+    const uint32_t hdr[3] = {1u, (uint32_t) n_layers, (uint32_t) n_expert};
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+        err = "write_expert_profile_heat: cannot create " + tmp;
+        return false;
+    }
+    bool ok = std::fwrite("STRH", 1, 4, f) == 4 && std::fwrite(hdr, 4, 3, f) == 3 &&
+              std::fwrite(heat.data(), sizeof(double), heat.size(), f) == heat.size();
+    ok = (std::fclose(f) == 0) && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        err = "write_expert_profile_heat: cannot write " + path;
         return false;
     }
     return true;
