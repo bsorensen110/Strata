@@ -48,6 +48,19 @@ The following assertions remain pending for an approved live gfx1201 A/B window;
 
 ## Phase 3 — Startup-Only Quotas
 
-`--expert-cache-quota auto` is opt-in and reads per-expert miss counts from the `.heat` sidecar written alongside `--expert-profile-save`.  It uses each layer's actual `sized_slots` stride for native packs and greedily assigns integer slots by next-expert heat per byte, while preserving the uniform plan's total slot count and staying within the same byte budget.  It keeps at least one slot per layer; with no sidecar or all-zero heat it uses uniform per-layer quotas.  Startup reports the full quota vector.  A checked byte sum and assertion guard both initial planning and cache-allocation retries.  Existing behavior is unchanged unless the new option is used.
+`--expert-cache-quota auto` is opt-in and reads per-expert weights from a `.heat` (`STRH` v1) sidecar paired with `--expert-profile-save` or `--expert-profile`.  It uses each layer's actual `sized_slots` stride for native packs and greedily assigns integer slots by next-expert weight per byte, while preserving the uniform plan's total slot count and staying within the same byte budget.  It keeps at least one slot per layer; with no sidecar or all-zero heat it uses uniform per-layer quotas.  Startup reports the full quota vector.  A checked byte sum and assertion guard both initial planning and cache-allocation retries.  Existing behavior is unchanged unless the new option is used.
 
 Runtime rebalancing is out of scope: it would require stopping routing and graph submissions, draining all consumer streams, evicting and refilling slots across different layer ranges, publishing a new residency table, and preserving the byte cap while accounting for unequal slot strides.  That is a separate state transition and needs its own ordering proof and live A/B validation.
+
+### Heat Sidecar Bootstrap, Precedence, and Provenance
+
+When `--expert-profile-save P` is enabled at startup and no valid `.heat` sidecar is selected yet, the engine bootstraps a deterministic **profile-rank prior** atomically to `P.heat` and `P.heat.meta` (still opt-in for quota selection: only `--expert-cache-quota auto` consumes it).
+
+- **Prior derivation order**: read ranking from `P` (`--expert-profile-save`) if it exists and validates for the current `(n_layers, n_expert)`; otherwise fall back to the loaded `--expert-profile` ranking.  Each first-seen `(layer, expert)` at rank `r` gets finite weight `R - r`; unranked experts get `0.0`.
+- **Lookup precedence**:
+  1. `<expert-profile-save>.heat` if valid `runtime` or legacy unmarked (`STRH` v1 without `.meta`).  If `<expert-profile-save>.heat` exists and is malformed/incompatible, leave it untouched (warn at startup; fail closed under `--expert-cache-quota auto`).
+  2. `<expert-profile>.heat` if valid `runtime` or legacy unmarked.  If `<expert-profile>.heat` exists and is malformed/incompatible, leave it untouched and do not shadow it with a prior (fail closed under `--expert-cache-quota auto`).
+  3. `<expert-profile-save>.heat` if valid `profile-rank prior`.
+  4. `<expert-profile>.heat` if valid `profile-rank prior`.
+- **Provenance and crash safety**: `.heat.meta` records `provenance=profile-rank-prior` vs `provenance=runtime`, the source profile, dimensions, and `heat_fnv1a64`.  Existing valid `.heat` files without `.meta` remain accepted as legacy unmarked measured heat.  Bootstrapping stages `.meta` before `.heat`; runtime saving stages both `.tmp` files first and skips overwrites when zero runtime routing counts were observed, then renames `.heat` before `.meta` so a failure or crash never silently upgrades a prior's provenance to `runtime`.  `--expert-cache-quota auto` logs `profile-rank prior` (never `learned`) when allocating from a prior.
+- **Developer note**: Profile-rank priors are synthetic monotonic ordering weights derived from profile rank, **not** true observed route counts.  Actual live traffic and periodic/`QUIT` saves under `--expert-profile-save` overwrite both `P.heat` and `P.heat.meta` with real routing counts and upgrade provenance to `runtime`.
