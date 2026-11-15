@@ -369,6 +369,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME expert_profile_version_test COMMAND expert_profile_version_test)
     set_tests_properties(expert_profile_version_test PROPERTIES TIMEOUT 60)
   endif()
+  add_executable(expert_cache_live_slot_test tests/core/expert_cache_live_slot_test.cpp)
+  target_include_directories(expert_cache_live_slot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME expert_cache_live_slot_test COMMAND expert_cache_live_slot_test)
+  set_tests_properties(expert_cache_live_slot_test PROPERTIES TIMEOUT 60)
   if(STRATA_BUILD_TESTS AND STRATA_NATIVE_EXPERTS)
     # native_experts.txt v2-v4 (the real packs' copies and the per-role shard column) and the arena filled from
     # synthetic GGUF shards at the real expert dimensions

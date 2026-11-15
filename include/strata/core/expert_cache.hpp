@@ -103,6 +103,8 @@ public:
     void close();
 
     bool valid() const { return base_ != nullptr; }
+    /// True only for a slot wholly inside the currently mapped prefix.
+    static constexpr bool is_live_slot(int64_t slot, int64_t live_slots) { return slot >= 0 && slot < live_slots; }
     /// The slots usable now: all of them, unless `shrink` gave the tail's VRAM back (#533) - then the ones wholly
     /// inside the VRAM still backed, always a prefix.  The prompt path's loan (the last slots) and every report
     /// follow this; `full_slots()` is what `open` allocated.
@@ -243,7 +245,7 @@ public:
     /// STRATA_MMQ_DIRECT: the address `blob` bytes into slot `s` when the slot has room for `need` more bytes there
     /// (null otherwise, or for a bad slot).  Uniform slots too: their stride is the largest blob.
     uint8_t* slot_tail(int32_t s, uint64_t blob, uint64_t need) const {
-        if (s < 0 || s >= slots_ || base_ == nullptr) return nullptr;
+        if (!is_live_slot(s, live_slots_) || base_ == nullptr) return nullptr;
         return slot_room(s) >= blob + need ? base_ + slot_offset(s) + blob : nullptr;
     }
 

@@ -641,14 +641,16 @@ void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) cons
 
 int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
-    return residency_[(size_t) (layer * n_expert_ + expert)];
+    const int32_t slot = residency_[(size_t) (layer * n_expert_ + expert)];
+    return is_live_slot(slot, live_slots_) ? slot : kNotResident;
 }
 
 int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     if (sealed_) return kNotResident;   // STRATA_EXPERT_NIBBLE: nothing is admitted (and so filled) after the startup fill
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     const size_t at = (size_t) (layer * n_expert_ + expert);
-    if (residency_[at] != kNotResident) return residency_[at];
+    if (residency_[at] != kNotResident)
+        return is_live_slot(residency_[at], live_slots_) ? residency_[at] : kNotResident;
     // R4.2g: THE PER-LAYER PATH.  Same "no eviction" rule, but the ceiling is this layer's own range rather
     // than one counter shared by all 48 - which is what confined the measured hit rate to 2.97%.
     if (per_layer_) {
@@ -664,6 +666,7 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
             } else {
                 return kNotResident;
             }
+            if (!is_live_slot(slot, live_slots_)) return kNotResident;
             ++layer_count_[(size_t) layer];
             residency_[at] = (int32_t) slot;
             ++admitted_;
@@ -673,23 +676,25 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
         int64_t lo = 0, hi = 0;
         layer_slot_range(layer, lo, hi);
         if ((int64_t) layer_next_[(size_t) layer] >= hi) return kNotResident;   // this layer's quota is full
+        const int32_t slot = layer_next_[(size_t) layer];
+        if (!is_live_slot(slot, live_slots_)) return kNotResident;
         residency_[at] = layer_next_[(size_t) layer]++;
         ++admitted_;
         return residency_[at];
     }
-    if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
+    if (next_free_ >= live_slots_) return kNotResident;   // full: no eviction, deliberately - see the header
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
-    if (slot < 0 || slot >= slots_) return nullptr;
+    if (!is_live_slot(slot, live_slots_)) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
-    if (slot < 0 || slot >= slots_) return nullptr;
+    if (!is_live_slot(slot, live_slots_)) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
