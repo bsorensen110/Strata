@@ -697,6 +697,33 @@ bool read_heat_meta_file(const std::string& meta_path, int64_t n_layers, int64_t
 
 }  // namespace
 
+bool profile_rank_prior_heat(int64_t n_layers, int64_t n_expert,
+                             const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                             std::vector<double>& heat, std::string& err) {
+    if (!valid_heat_dimensions(n_layers, n_expert)) {
+        err = "profile_rank_prior_heat: invalid model dimensions";
+        return false;
+    }
+    if (ranked.empty()) {
+        err = "profile_rank_prior_heat: ranked profile list is empty";
+        return false;
+    }
+    const size_t total = (size_t) n_layers * (size_t) n_expert;
+    std::vector<double> weights(total, 0.0);
+    const size_t n_ranked = ranked.size();
+    for (size_t r = 0; r < n_ranked; ++r) {
+        const auto [l, e] = ranked[r];
+        if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
+            err = "profile_rank_prior_heat: ranked pair is out of range for model dimensions";
+            return false;
+        }
+        const size_t idx = (size_t) l * (size_t) n_expert + (size_t) e;
+        if (weights[idx] == 0.0) weights[idx] = (double) (n_ranked - r);
+    }
+    heat = std::move(weights);
+    return true;
+}
+
 bool read_expert_profile_heat_with_provenance(const std::string& heat_path, int64_t n_layers, int64_t n_expert,
                                               std::vector<double>& heat, ExpertHeatProvenance& provenance,
                                               std::string& source_profile, std::string& err) {

@@ -86,6 +86,14 @@ enum class ExpertHeatProvenance {
 
 const char* expert_heat_provenance_name(ExpertHeatProvenance p);
 
+/// Convert ranked `(layer, expert)` pairs to deterministic, finite, nonnegative per-layer/per-expert weights
+/// consumable by `learned_expert_cache_quotas`. Ranked entries get strictly decreasing weight
+/// `ranked.size() - rank` on first occurrence; unranked entries get `0.0`. Rejects invalid dimensions, empty
+/// rankings, or out-of-range pairs.
+bool profile_rank_prior_heat(int64_t n_layers, int64_t n_expert,
+                             const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                             std::vector<double>& heat, std::string& err);
+
 /// Return the `.heat.meta` provenance sidecar path paired with `heat_path`.
 std::string expert_profile_heat_meta_path(const std::string& heat_path);
 
