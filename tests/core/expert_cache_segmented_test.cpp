@@ -1,6 +1,6 @@
 // #533: the segmented expert cache (--vram-elastic).  A shrink gives the last segments' VRAM back to the driver and
 // keeps every slot left exactly as it was (same address, same bytes); a grow maps them again at the same addresses.
-// Uniform and sized slots.  Needs a CUDA device with virtual memory management (exits 77 without one).
+// Uniform and sized slots. Needs a VMM-capable CUDA or HIP device (exits 77 without one).
 #include "strata/core/expert_cache.hpp"
 
 #include <cuda_runtime.h>
@@ -47,7 +47,7 @@ bool check(const strata::core::ExpertCache& c, int64_t to, int64_t blob) {
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
-        std::puts("no CUDA device: skipped");
+        std::puts("no GPU device: skipped");
         return 77;
     }
     constexpr int64_t kBlob = 1 << 20, kSlots = 96, kSeg = 8ll << 20;
@@ -58,9 +58,7 @@ int main() {
         const bool ok = sized ? c.open_sized(std::vector<int64_t>(kSlots, kBlob), 4, 64, err)
                               : c.open(kSlots, 4, 64, kBlob, err);
         if (!ok) {
-            // #1475: a HIP build has no segmented cache ("--vram-elastic ... is CUDA-only for now"): a skip, not a failure
-            if (err.find("virtual memory management") != std::string::npos ||
-                err.find("CUDA-only") != std::string::npos) {
+            if (err.find("virtual memory management") != std::string::npos) {
                 std::printf("%s: skipped\n", err.c_str());
                 return 77;
             }

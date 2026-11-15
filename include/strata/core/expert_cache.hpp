@@ -121,8 +121,8 @@ public:
     /// management) instead of one cudaMalloc, so `shrink` can give the tail's VRAM back to the driver - for another
     /// program - and `grow` can take it again, while every slot keeps its address (the captured graphs, the verify
     /// plan's pointers and the prompt path's loan all hold addresses into it).  0 (the default): one cudaMalloc, as
-    /// always.  CUDA only: a HIP build refuses it at open.  The slots past `slots()` after a shrink must hold no
-    /// resident expert and no loan: the CALLER evicts them first (they become CPU misses).
+    /// always.  CUDA and VMM-capable HIP only: other builds refuse it at open.  The slots past `slots()` after a shrink
+    /// must hold no resident expert and no loan: the CALLER evicts them first (they become CPU misses).
     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
     /// STRATA_MMQ_DIRECT: `open_sized` leaves at least `g` bytes of room after each slot's blob (the prompt MMQ
     /// reads a little past a down matrix when it reads an expert in its slot).  Set before opening, like
@@ -134,7 +134,7 @@ public:
     int64_t slot_guard() const { return guard_; }
     /// A sized slot's arena bytes: the blob plus the guard, 256-byte aligned.
     static int64_t slot_stride(int64_t blob, int64_t guard = 0) { return (blob + guard + 255) / 256 * 256; }
-    bool segmented() const { return !segs_.empty(); }
+    bool segmented() const { return segmented_vmm_ != nullptr; }
     int64_t segment_bytes() const { return seg_; }
     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
     int64_t mapped_bytes() const;
@@ -263,9 +263,7 @@ private:
     int64_t guard_ = 0;                 ///< ...the guard open_sized applied to the open slots (0: none)
     int64_t seg_ = 0;                   ///< #533: the segment size used (a multiple of the driver's granularity)
     uint64_t reserved_ = 0;             ///< #533: the reserved address range's size
-    std::vector<unsigned long long> segs_;   ///< #533: each segment's physical handle (0: unmapped)
-    std::vector<int64_t> seg_size_;     ///< #533: each segment's size (the last one may be shorter)
-    int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed
+    std::unique_ptr<VmmRange> segmented_vmm_;   ///< #533: segmented cache range, eager-mapped on open
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
