@@ -173,6 +173,7 @@ bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 #include <array>
 #include <chrono>
 #include <algorithm>
+#include <cassert>
 #include <memory>
 #include <iostream>
 #include <functional>
@@ -771,6 +772,7 @@ struct Options {
     /// to them.  Measured at 256 slots: **1781 of 60000 = 2.97%**, against **21.4%** for 8 slots per layer and
     /// **70.4%** for 64, from `Memory/cache_allocation.py` on the same run's routing.  Off by default.
     bool expert_cache_per_layer = false;
+    bool expert_cache_quota_auto = false;
     /// Multi-GPU: a second expert tier on CUDA device `peer_device` (-1 = off), `peer_reserve_mib` left free
     /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
     /// (-1 = adapt_swaps).
@@ -814,7 +816,7 @@ struct Options {
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
     int vram_reserve_mib = 700;
     bool vram_reserve_given = false;   ///< --vram-reserve-mib on the command line (#496: no smaller automatic reserve)
-    /// #533 (opt-in): the expert cache in physical segments (CUDA virtual memory management), so the serve loop's
+    /// #533 (opt-in): the expert cache in physical segments (CUDA/HIP virtual memory management), so the serve loop's
     /// `VRAM <reserve_mib>` command can give part of it back to other programs and take it again.  Off: one cudaMalloc.
     bool vram_elastic = false;
     int64_t vram_segment_mib = 512;
@@ -1146,7 +1148,7 @@ void usage() {
                  "                       write a whole snapshot that the next turn drops (default 0 = park every turn)\n"
                  "  --session-min-free-mib N  --serve: disk space a SAVE must leave free (default 4096; 0 = no check)\n"
                  "  --session-save-reclaim  --serve: reclaim unpinned host caches if SAVE needs RAM (opt-in)\n"
-                 "  --vram-elastic       --serve (#533, opt-in, NVIDIA): the expert cache in segments (--vram-segment-mib,\n"
+                 "  --vram-elastic       --serve (#533, opt-in, CUDA/HIP VMM): the expert cache in segments (--vram-segment-mib,\n"
                  "                       default 512), so the command `VRAM <reserve_mib>` (the server's POST /v1/vram) can\n"
                  "                       give VRAM back to other programs between requests and take it back later\n"
                  "  --batch N / --slots N  --serve (opt-in): up to N requests decode together in batch slots (2..8\n"
@@ -1238,7 +1240,7 @@ void usage() {
                  "  --expert-profile P   R4.2e: pre-load the VRAM tier from a `profile.bin` (see\n"
                  "                       tools/make_profile.py) instead of admitting on first use.\n"
                  "  --expert-profile-save P  --serve, #477: save what the adaptive tier learned (the experts in\n"
-                 "                       VRAM, then the routing counted since the start) as a profile at P, on\n"
+                 "                       VRAM, then the routing counted since the start) as a profile at P and heat at P.heat, on\n"
                  "                       QUIT and every --expert-profile-save-every MIN minutes (default 10;\n"
                  "                       0 = on QUIT only) between requests; start from it with --expert-profile P\n"
                  "  --no-hit-poke        R4.2d's A/B arm.  The hit path pokes the driver once right after its\n"
@@ -1270,6 +1272,8 @@ void usage() {
                  "                       and measured **2.97%%**.  Per-layer, the same routing gives 21.4%% at 8\n"
                  "                       slots/layer and 70.4%% at 64.  On a native pack, N is still the budget of N\n"
                  "                       largest blobs; each layer's slots are that layer's own blob.\n"
+                 "  --expert-cache-quota auto  startup-only learned quotas from <expert-profile>.heat; no heat file uses uniform quotas\n"
+                 "                       within the same byte budget; never rebalances at runtime.\n"
                  "  --no-host-worker     R2.2: the A/B arm.  By default the HOST THREAD joins the drain, so the\n"
                  "                       pool is six threads on six cores instead of five plus an idle core;\n"
                  "                       this flag restores the five-worker form for comparison on `pool phases`.\n"
@@ -3878,6 +3882,14 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
+        else if (a == "--expert-cache-quota") {
+            const std::string mode = next("--expert-cache-quota");
+            if (mode != "auto") {
+                std::fprintf(stderr, "--expert-cache-quota: expected auto, got '%s'\n", mode.c_str());
+                return 2;
+            }
+            o.expert_cache_quota_auto = true;
+        }
         else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
@@ -8403,6 +8415,12 @@ int main(int argc, char** argv) {
             o.expert_cache = (int) fit;
         }
     }
+    std::vector<int64_t> layer_quotas;
+    std::vector<int64_t> quota_slot_bytes;
+    std::vector<double> quota_heat;
+    uint64_t quota_byte_budget = 0;
+    bool quota_heat_loaded = false;
+    bool quota_use_learned_heat = false;
     // plan v0.3 P6: a native pack's blobs differ per layer, so the same VRAM holds more experts than slots of
     // the largest blob would. The shared cache below sizes slots in profile order.
     // #369: that list does not match --expert-cache-per-layer. A range is layer * quota + n, so a size cut for
@@ -8415,7 +8433,71 @@ int main(int argc, char** argv) {
     }();
     std::vector<int64_t> sized_slots;
     uint64_t per_layer_bytes = 0;
-    if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
+    if (o.expert_cache_quota_auto && o.expert_cache > 0) {
+        const int asked = o.expert_cache;
+        const uint64_t budget = (uint64_t) asked * nibble_max_slot_bytes();
+        const size_t free_b = strata::core::device_free_bytes();
+        const size_t reserve_b = (size_t) o.vram_reserve_mib << 20;
+        quota_byte_budget = std::min<uint64_t>(budget, free_b > reserve_b ? free_b - reserve_b : 0);
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        quota_slot_bytes.reserve((size_t) g.n_layers);
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const int64_t blob = native_pack ? (int64_t) nib::slot_bytes(l) : (int64_t) lay.max_blob;
+            quota_slot_bytes.push_back(strata::core::ExpertCache::slot_stride(blob, slot_guard));
+        }
+        if (!o.expert_profile.empty()) {
+            const std::string heat_path = o.expert_profile + ".heat";
+            std::error_code ec;
+            const bool have_heat = std::filesystem::exists(heat_path, ec);
+            if (ec) {
+                std::fprintf(stderr, "strata generate: cannot check expert heat file %s: %s\n", heat_path.c_str(),
+                             ec.message().c_str());
+                return 2;
+            }
+            if (have_heat) {
+                if (!strata::core::read_expert_profile_heat(heat_path, g.n_layers, g.n_expert, quota_heat, err)) {
+                    std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                    return 2;
+                }
+                quota_heat_loaded = true;
+                quota_use_learned_heat = std::any_of(quota_heat.begin(), quota_heat.end(), [](double v) { return v > 0.0; });
+            }
+        }
+        layer_quotas = quota_use_learned_heat
+                           ? strata::core::learned_expert_cache_quotas(quota_heat, quota_slot_bytes, g.n_expert,
+                                                                      quota_byte_budget)
+                           : strata::core::uniform_expert_cache_quotas(quota_slot_bytes, g.n_expert,
+                                                                       quota_byte_budget);
+        if (layer_quotas.empty()) {
+            std::fprintf(stderr, "strata generate: --expert-cache-quota auto cannot fit one slot per layer in its "
+                                 "byte budget; disabling the expert cache\n");
+            o.expert_cache = 0;
+        } else {
+            uint64_t planned_bytes = 0;
+            int64_t planned_slots = 0;
+            for (size_t l = 0; l < layer_quotas.size(); ++l) {
+                planned_slots += layer_quotas[l];
+                const uint64_t layer_bytes = (uint64_t) layer_quotas[l] * (uint64_t) quota_slot_bytes[l];
+                if (layer_bytes > std::numeric_limits<uint64_t>::max() - planned_bytes) {
+                    std::fprintf(stderr, "strata generate: learned expert-cache quota byte count overflowed\n");
+                    return 2;
+                }
+                planned_bytes += layer_bytes;
+            }
+            if (planned_bytes > quota_byte_budget) {
+                std::fprintf(stderr, "strata generate: learned expert-cache quotas exceeded their byte budget\n");
+                return 2;
+            }
+            assert(planned_bytes <= quota_byte_budget);
+            o.expert_cache = (int) planned_slots;
+            if (native_pack) {
+                sized_slots.reserve((size_t) planned_slots);
+                for (int64_t l = 0; l < g.n_layers; ++l)
+                    for (int64_t s = 0; s < layer_quotas[(size_t) l]; ++s)
+                        sized_slots.push_back((int64_t) nib::slot_bytes(l));
+            }
+        }
+    } else if (native_pack && o.expert_cache > 0 && o.expert_cache_per_layer) {
         const size_t free_b = strata::core::device_free_bytes();   // the same reading the shared-cache sizing uses
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int asked = o.expert_cache;
@@ -8521,9 +8603,6 @@ int main(int argc, char** argv) {
                         : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                       [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
-#if defined(STRATA_USE_HIP)
-        if (why == nullptr) why = "it is NVIDIA-only for now";
-#endif
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: --vram-elastic is off: %s\n", why);
             o.vram_elastic = false;
@@ -8544,6 +8623,45 @@ int main(int argc, char** argv) {
         // keep the first `keep_bytes` of the cache (the profile's hottest experts first); false when nothing is left
         auto shrink_to = [&](int64_t keep_bytes) -> bool {
             if (keep_bytes <= 0) { o.expert_cache = 0; sized_slots.clear(); return false; }
+            if (o.expert_cache_quota_auto) {
+                const uint64_t budget = std::min<uint64_t>(quota_byte_budget, (uint64_t) keep_bytes);
+                layer_quotas = quota_use_learned_heat
+                                   ? strata::core::learned_expert_cache_quotas(quota_heat, quota_slot_bytes,
+                                                                              g.n_expert, budget)
+                                   : strata::core::uniform_expert_cache_quotas(quota_slot_bytes, g.n_expert, budget);
+                if (layer_quotas.empty()) {
+                    o.expert_cache = 0;
+                    sized_slots.clear();
+                    return false;
+                }
+                int64_t planned_slots = 0;
+                uint64_t planned_bytes = 0;
+                sized_slots.clear();
+                for (int64_t l = 0; l < g.n_layers; ++l) {
+                    planned_slots += layer_quotas[(size_t) l];
+                    const uint64_t layer_bytes =
+                        (uint64_t) layer_quotas[(size_t) l] * (uint64_t) quota_slot_bytes[(size_t) l];
+                    if (layer_bytes > std::numeric_limits<uint64_t>::max() - planned_bytes) {
+                        std::fprintf(stderr, "strata generate: learned expert-cache retry byte count overflowed\n");
+                        o.expert_cache = 0;
+                        sized_slots.clear();
+                        return false;
+                    }
+                    planned_bytes += layer_bytes;
+                    if (native_pack)
+                        for (int64_t s = 0; s < layer_quotas[(size_t) l]; ++s)
+                            sized_slots.push_back((int64_t) nib::slot_bytes(l));
+                }
+                if (planned_bytes > budget) {
+                    std::fprintf(stderr, "strata generate: learned expert-cache retry exceeded its byte budget\n");
+                    o.expert_cache = 0;
+                    sized_slots.clear();
+                    return false;
+                }
+                assert(planned_bytes <= budget);
+                o.expert_cache = (int) planned_slots;
+                return true;
+            }
             if (per_layer_bytes > 0) {
                 // Cutting the list short would put one layer's blob in the next layer's range.
                 const auto& lay = strata::kernels::cpu::expert_layout();
@@ -8662,8 +8780,23 @@ int main(int argc, char** argv) {
                          (long long) xcache.slots_within(xcache.mapped_bytes()), (long long) xcache.slots(),
                          (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20));
         }
-        xcache.set_per_layer_admission(o.expert_cache_per_layer);
-        xcache.set_per_layer_rank_major(o.expert_cache_per_layer && per_layer_rank_major);
+        const bool cache_per_layer = o.expert_cache_per_layer || o.expert_cache_quota_auto;
+        xcache.set_per_layer_admission(cache_per_layer);
+        xcache.set_per_layer_rank_major(o.expert_cache_per_layer && !o.expert_cache_quota_auto &&
+                                        per_layer_rank_major);
+        if (o.expert_cache_quota_auto) {
+            if (!xcache.set_layer_quotas(layer_quotas, err)) {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                return 1;
+            }
+            const char* quota_source = quota_use_learned_heat ? "learned"
+                                      : quota_heat_loaded ? "uniform zero-heat fallback"
+                                                          : "uniform no-heat fallback";
+            std::fprintf(stderr, "strata generate: expert-cache quota %s=[", quota_source);
+            for (size_t l = 0; l < layer_quotas.size(); ++l)
+                std::fprintf(stderr, "%s%lld", l == 0 ? "" : ",", (long long) layer_quotas[l]);
+            std::fprintf(stderr, "] (slots per layer)\n");
+        }
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
         // token 0). That fault was fixed long since (native_expert_parity, expert_parity, the grouped kernels'
         // tests), and the warning outlived it (issue #23). What remains is rounding: a GPU expert and the CPU's
@@ -8674,10 +8807,10 @@ int main(int argc, char** argv) {
                      "strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,\n"
                      "                 so a reply can differ slightly from a run without the cache (same quality:\n"
                      "                 bench/results/2026-09-27-cache-parity).\n");
-        if (o.expert_cache_per_layer) {
+        if (cache_per_layer) {
             int64_t lo = 0, hi = 0;
             xcache.layer_slot_range(0, lo, hi);
-            std::fprintf(stderr, "                 R4.2g PER-LAYER: each layer owns %lld slots (%lld..%lld).\n",
+            std::fprintf(stderr, "                 PER-LAYER: layer 0 owns %lld slots (%lld..%lld).\n",
                          (long long) (hi - lo), (long long) lo, (long long) (hi - 1));
         } else if (profile.empty()) {
             std::fprintf(stderr, "                 compulsory-miss (fills with whatever the run routes first).\n");
@@ -14445,11 +14578,19 @@ int main(int argc, char** argv) {
             std::string e;
             const auto ranked = strata::core::rank_learned_profile(g.n_layers, g.n_expert, resident, heat,
                                                                    profile_loaded);
-            if (strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e))
+            const bool profile_ok =
+                strata::core::write_expert_profile(o.expert_profile_save, g.n_layers, g.n_expert, ranked, e);
+            if (profile_ok)
                 std::fprintf(stderr, "strata serve: expert profile saved to %s (%s)\n", o.expert_profile_save.c_str(),
                              why);
             else
                 std::fprintf(stderr, "strata serve: the expert profile was not saved: %s\n", e.c_str());
+            std::string heat_err;
+            const std::string heat_path = o.expert_profile_save + ".heat";
+            if (!strata::core::write_expert_profile_heat(heat_path, g.n_layers, g.n_expert, heat, heat_err))
+                std::fprintf(stderr, "strata serve: expert heat was not saved: %s\n", heat_err.c_str());
+            else
+                std::fprintf(stderr, "strata serve: expert heat saved to %s (%s)\n", heat_path.c_str(), why);
             profile_saved_at = Clock::now();
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
@@ -14860,7 +15001,7 @@ int main(int argc, char** argv) {
             const long long reserve = bare ? (long long) o.vram_reserve_mib : std::strtoll(cmd.c_str() + 4, &end, 10);
             if (!bare && (end == cmd.c_str() + 4 || reserve < 0)) { e = "expected: VRAM [reserve_mib]"; return false; }
             if (!xcache.segmented()) {
-                e = "VRAM needs an engine started with --vram-elastic (one NVIDIA GPU, --serve)";
+                e = "VRAM needs an engine started with --vram-elastic (one VMM-capable GPU, --serve)";
                 return false;
             }
             if (src.complement_ready()) {
