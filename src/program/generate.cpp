@@ -7527,19 +7527,29 @@ int main(int argc, char** argv) {
         }
 #endif
     };
-    auto df2_head_bytes = [&]() -> int64_t {
-        if (df2_expect_share) return 0;   // (its logits are in the 48 MiB the callers add)
-        if (strata::core::Dflash2Drafter::head_native()) return (int64_t) (batch_df2_wanted ? 14 : 7) * n_vocab * (int64_t) sizeof(float);   // STRATA_DF2_HEAD=native: no pruned copy, the logits of every row
-        if (!df2_solo) return (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab);
-        int64_t bytes = (int64_t) std::min(o.spec, (int) strata::kernels::kVerifyNarrowT) * n_vocab * (int64_t) sizeof(float);
-        if (FILE* f = std::fopen(df2_vocab_path().c_str(), "rb")) {
-            std::fseek(f, 0, SEEK_END);
-            const long size = std::ftell(f);
-            std::fclose(f);
-            if (size >= 4 && size % 4 == 0) bytes += (int64_t) (size / 4) * (int64_t) native_head.row_bytes() + (int64_t) size;
-        }
-        return bytes;
+#if defined(STRATA_HAVE_DFLASH2)
+    struct Df2LateBreakdown {
+        int64_t bind = 0, clones = 0, prompt_taps = 0, ver_taps = 0, ver_arena = 0;
+        int64_t total() const noexcept { return bind + clones + prompt_taps + ver_taps + ver_arena; }
     };
+    auto df2_late_bytes = [&](const strata::core::NativeHead& head_ref, const strata::core::SessionState& ss_ref,
+                              int64_t lb, int64_t le, bool include_stage_prompt_land) -> Df2LateBreakdown {
+        Df2LateBreakdown b;
+        const int tmax = batch_max_t();
+        const bool same_dev = !multi_gpu || !df2_first;
+        b.bind = (int64_t) df2.bind_bytes(head_ref.row_bytes(), n_vocab, df2_vocab_path(), df2_expect_share, same_dev);
+        for (const auto& d : slot_df2) b.clones += (int64_t) d->clone_bind_bytes(n_vocab, df2_vocab_path(), same_dev);
+        if (o.serve) {
+            b.prompt_taps = o.batch > 1 ? (112ll << 20)
+                : (int64_t) strata::prefill::Prefill::tap_bytes(df2.tap_layers(), 2048, g.n_embd);
+            if (o.batch <= 1 && include_stage_prompt_land)
+                b.prompt_taps += (int64_t) strata::prefill::Prefill::tap_bytes(df2.tap_layers(), 2048, g.n_embd, lb, le);
+        }
+        b.ver_taps = (int64_t) strata::core::Verifier::tap_bytes(df2.tap_layers(), tmax, g.n_embd, lb, le, g.n_layers);
+        b.ver_arena = (int64_t) strata::core::Verifier::arena_bytes(g, ss_ref, n_vocab, tmax);
+        return b;
+    };
+#endif
     float* d_logits = nullptr;
     if (cudaMalloc(&d_logits, (size_t) n_vocab * 4) != cudaSuccess) {
         (void) cudaGetLastError();
@@ -7874,8 +7884,7 @@ int main(int argc, char** argv) {
                                             ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
 #if defined(STRATA_HAVE_DFLASH2)
                         if (use_df2 && native_head.loaded())
-                            mtp_b += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0) +
-                                     (((batch_max_t() > 8 ? 24 : 0) + (int64_t) slot_df2.size() * 4) << 20);   // DFlash2's own draft head and logits (serve: and the prompt staging)
+                            mtp_b += df2_late_bytes(native_head, ss, 0, g.n_layers, false).total();
 #endif
                         if (stages.empty())
                             for (const auto& d : slot_mtp) mtp_b += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
@@ -8185,8 +8194,7 @@ int main(int argc, char** argv) {
                 mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2 && native_head.loaded())
-            mtp_bind += df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0) +
-                        (((batch_max_t() > 8 ? 24 : 0) + (int64_t) slot_df2.size() * 4) << 20);   // DFlash2's own draft head and logits (serve: and the prompt staging), bound after this
+            mtp_bind += df2_late_bytes(native_head, ss, 0, g.n_layers, false).total();
 #endif
         const int64_t reserve = (((int64_t) o.vram_reserve_mib + prefill_mib) << 20) + mtp_bind + pipe_first;
         const int64_t blob = (int64_t) nibble_max_slot_bytes();   // max_blob (STRATA_EXPERT_NIBBLE: or a larger 4-bit slot)
@@ -8220,6 +8228,16 @@ int main(int argc, char** argv) {
                              "draft head%s) -> %d slots\n",
                      (double) free_b / 1073741824.0, o.vram_reserve_mib, (long long) (mtp_bind >> 20),
                      auto_slots.late_priced ? ", +256 MiB for what is allocated after the cache" : "", o.expert_cache);
+#if defined(STRATA_HAVE_DFLASH2)
+        if (use_df2 && native_head.loaded()) {
+            const Df2LateBreakdown db = df2_late_bytes(native_head, ss, 0, g.n_layers, false);
+            std::fprintf(stderr, "strata generate: dflash2/verify late bind: %.1f MiB (drafter %.1f + clones %.1f + "
+                                 "prompt taps %.1f + verify taps %.1f + verify arena %.1f)\n",
+                         (double) db.total() / 1048576.0, (double) db.bind / 1048576.0,
+                         (double) db.clones / 1048576.0, (double) db.prompt_taps / 1048576.0,
+                         (double) db.ver_taps / 1048576.0, (double) db.ver_arena / 1048576.0);
+        }
+#endif
 #if defined(STRATA_USE_HIP) && !defined(_WIN32)
         // An APU's "VRAM" is system RAM: the device-free figure above counts the whole GPU-addressable pool and does not
         // subtract ordinary CPU allocations (the host expert arena), so a cache sized from it alone can ask the OOM killer
@@ -8806,7 +8824,7 @@ int main(int argc, char** argv) {
         // DFlash2's own draft head and logits (and, in serve, the prompt staging) are bound on its card AFTER the caches, as the single card prices them (mtp_bind above): without
         // this term the last stage ended its load with 130-400 MiB less than the plan kept (the serve check's LOW at 8 and 12 GB).  Not under STRATA_DEFAULTS=026.
         if (use_df2 && &st == last_st && !df2_first && !strata::qwen_defaults_026()) {
-            const int64_t df2_after = df2_head_bytes() + (48 << 20) + (o.serve ? (112 << 20) : 0);
+            const int64_t df2_after = df2_late_bytes(st.head, st.ss, st.lb, st.le, true).total();
             room = std::max<int64_t>(room - df2_after, 0);
         }
 #endif
