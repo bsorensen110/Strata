@@ -695,6 +695,60 @@ bool read_heat_meta_file(const std::string& meta_path, int64_t n_layers, int64_t
     return true;
 }
 
+bool same_profile_target(const std::string& a, const std::string& b) {
+    if (a.empty() || b.empty()) return false;
+    const std::filesystem::path pa = std::filesystem::path(a).lexically_normal();
+    const std::filesystem::path pb = std::filesystem::path(b).lexically_normal();
+    if (pa == pb) return true;
+    std::error_code ec;
+    const std::filesystem::path ca = std::filesystem::weakly_canonical(pa, ec);
+    if (!ec) {
+        std::error_code ec2;
+        const std::filesystem::path cb = std::filesystem::weakly_canonical(pb, ec2);
+        if (!ec2 && ca == cb) return true;
+    }
+    const std::filesystem::path ha(a + ".heat");
+    const std::filesystem::path hb(b + ".heat");
+    if (std::filesystem::exists(ha, ec) && !ec && std::filesystem::exists(hb, ec) && !ec) {
+        const bool eq = std::filesystem::equivalent(ha, hb, ec);
+        if (!ec && eq) return true;
+    }
+    return false;
+}
+
+ExpertHeatResolution inspect_heat_candidate(const std::string& profile_path, int64_t n_layers, int64_t n_expert) {
+    ExpertHeatResolution res;
+    if (profile_path.empty()) return res;
+    res.path = profile_path + ".heat";
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(res.path, ec);
+    if (ec) {
+        res.found = true;
+        res.valid = false;
+        res.provenance = ExpertHeatProvenance::Malformed;
+        res.detail = "cannot check expert heat file " + res.path + ": " + ec.message();
+        return res;
+    }
+    if (!exists) return res;
+
+    res.found = true;
+    std::string err;
+    if (!read_expert_profile_heat_with_provenance(res.path, n_layers, n_expert, res.heat, res.provenance,
+                                                  res.source_profile, err)) {
+        res.valid = false;
+        res.provenance = ExpertHeatProvenance::Malformed;
+        res.detail = err;
+        res.heat.clear();
+        return res;
+    }
+    res.valid = true;
+    return res;
+}
+
+bool is_measured_provenance(ExpertHeatProvenance p) {
+    return p == ExpertHeatProvenance::Runtime || p == ExpertHeatProvenance::LegacyUnmarked;
+}
+
 }  // namespace
 
 bool profile_rank_prior_heat(int64_t n_layers, int64_t n_expert,
@@ -878,6 +932,31 @@ bool write_expert_profile_heat_with_provenance(const std::string& heat_path, int
         return false;
     }
     return true;
+}
+
+ExpertHeatResolution resolve_expert_profile_heat(const std::string& save_profile_path,
+                                                 const std::string& input_profile_path,
+                                                 int64_t n_layers, int64_t n_expert) {
+    if (!valid_heat_dimensions(n_layers, n_expert)) {
+        ExpertHeatResolution bad;
+        bad.found = false;
+        bad.valid = false;
+        bad.detail = "invalid model dimensions";
+        return bad;
+    }
+    ExpertHeatResolution save = inspect_heat_candidate(save_profile_path, n_layers, n_expert);
+    ExpertHeatResolution input;
+    if (!same_profile_target(save_profile_path, input_profile_path)) {
+        input = inspect_heat_candidate(input_profile_path, n_layers, n_expert);
+    }
+
+    if (save.found && !save.valid) return save;
+    if (save.valid && is_measured_provenance(save.provenance)) return save;
+    if (input.found && !input.valid) return input;
+    if (input.valid && is_measured_provenance(input.provenance)) return input;
+    if (save.valid) return save;
+    if (input.found) return input;
+    return {};
 }
 
 ExpertCache::~ExpertCache() { close(); }

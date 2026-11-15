@@ -86,6 +86,16 @@ enum class ExpertHeatProvenance {
 
 const char* expert_heat_provenance_name(ExpertHeatProvenance p);
 
+struct ExpertHeatResolution {
+    bool found = false;
+    bool valid = false;
+    std::string path;
+    ExpertHeatProvenance provenance = ExpertHeatProvenance::None;
+    std::string source_profile;
+    std::string detail;
+    std::vector<double> heat;
+};
+
 /// Convert ranked `(layer, expert)` pairs to deterministic, finite, nonnegative per-layer/per-expert weights
 /// consumable by `learned_expert_cache_quotas`. Ranked entries get strictly decreasing weight
 /// `ranked.size() - rank` on first occurrence; unranked entries get `0.0`. Rejects invalid dimensions, empty
@@ -110,6 +120,16 @@ bool write_expert_profile_heat_with_provenance(const std::string& heat_path, int
                                                const std::vector<double>& heat, ExpertHeatProvenance provenance,
                                                const std::string& source_profile, const std::string& source_kind,
                                                int64_t ranked_pairs, std::string& err);
+
+/// Read-only resolution of the sidecar expected by `--expert-cache-quota auto`.
+/// Precedence when distinct paths exist:
+/// 1. `<save_profile_path>.heat` if valid `Runtime` or `LegacyUnmarked` (or fail closed if malformed).
+/// 2. `<input_profile_path>.heat` if valid `Runtime` or `LegacyUnmarked`.
+/// 3. `<save_profile_path>.heat` if valid `ProfileRankPrior`.
+/// 4. `<input_profile_path>.heat` if malformed (fail closed) or valid `ProfileRankPrior`.
+ExpertHeatResolution resolve_expert_profile_heat(const std::string& save_profile_path,
+                                                 const std::string& input_profile_path,
+                                                 int64_t n_layers, int64_t n_expert);
 
 std::vector<int64_t> uniform_expert_cache_quotas(const std::vector<int64_t>& slot_bytes, int64_t n_expert,
                                                 uint64_t byte_budget);
