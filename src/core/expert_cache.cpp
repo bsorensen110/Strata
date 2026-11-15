@@ -959,6 +959,158 @@ ExpertHeatResolution resolve_expert_profile_heat(const std::string& save_profile
     return {};
 }
 
+ExpertHeatBootstrapResult bootstrap_expert_profile_heat(
+    const std::string& save_profile_path, const std::string& input_profile_path,
+    const std::vector<std::pair<int32_t, int32_t>>& loaded_input_profile,
+    int64_t n_layers, int64_t n_expert) {
+    ExpertHeatBootstrapResult out;
+    if (save_profile_path.empty()) {
+        out.action = ExpertHeatBootstrapResult::Action::SkippedNoProfile;
+        out.detail = "no --expert-profile-save path configured";
+        return out;
+    }
+    out.heat_path = save_profile_path + ".heat";
+    if (!valid_heat_dimensions(n_layers, n_expert)) {
+        out.action = ExpertHeatBootstrapResult::Action::Failed;
+        out.detail = "invalid model dimensions";
+        return out;
+    }
+
+    const ExpertHeatResolution save = inspect_heat_candidate(save_profile_path, n_layers, n_expert);
+    ExpertHeatResolution input;
+    if (!same_profile_target(save_profile_path, input_profile_path)) {
+        input = inspect_heat_candidate(input_profile_path, n_layers, n_expert);
+    }
+
+    if (save.found && !save.valid) {
+        out.action = ExpertHeatBootstrapResult::Action::MalformedLeftUntouched;
+        out.heat_path = save.path;
+        out.provenance = ExpertHeatProvenance::Malformed;
+        out.detail = save.detail;
+        return out;
+    }
+    if (save.valid && is_measured_provenance(save.provenance)) {
+        out.action = ExpertHeatBootstrapResult::Action::RetainedValid;
+        out.heat_path = save.path;
+        out.provenance = save.provenance;
+        out.source_profile = save.source_profile;
+        return out;
+    }
+    if (input.found && !input.valid) {
+        out.action = ExpertHeatBootstrapResult::Action::MalformedLeftUntouched;
+        out.heat_path = input.path;
+        out.provenance = ExpertHeatProvenance::Malformed;
+        out.detail = input.detail;
+        return out;
+    }
+    if (input.valid && is_measured_provenance(input.provenance)) {
+        out.action = ExpertHeatBootstrapResult::Action::RetainedValid;
+        out.heat_path = input.path;
+        out.provenance = input.provenance;
+        out.source_profile = input.source_profile;
+        return out;
+    }
+    if (save.valid) {
+        out.action = ExpertHeatBootstrapResult::Action::RetainedValid;
+        out.heat_path = save.path;
+        out.provenance = save.provenance;
+        out.source_profile = save.source_profile;
+        return out;
+    }
+
+    std::vector<std::pair<int32_t, int32_t>> chosen_ranked;
+    std::string chosen_source_profile;
+    std::string chosen_source_kind;
+    std::string fallback_note;
+
+    {
+        std::vector<std::pair<int32_t, int32_t>> saved_ranked;
+        int64_t saved_slots = 0;
+        std::string read_err;
+        if (read_expert_profile(save_profile_path, n_layers, n_expert, saved_ranked, saved_slots, read_err) &&
+            !saved_ranked.empty()) {
+            chosen_ranked = std::move(saved_ranked);
+            chosen_source_profile = save_profile_path;
+            chosen_source_kind = "saved-profile";
+        } else {
+            std::error_code ec;
+            if (std::filesystem::exists(save_profile_path, ec)) {
+                fallback_note = read_err.empty() ? "saved profile has empty ranking" : read_err;
+            }
+        }
+    }
+
+    if (chosen_ranked.empty()) {
+        if (!loaded_input_profile.empty()) {
+            chosen_ranked = loaded_input_profile;
+            chosen_source_profile = input_profile_path.empty() ? "<input-profile>" : input_profile_path;
+            chosen_source_kind = "input-profile";
+        } else if (!input_profile_path.empty()) {
+            std::vector<std::pair<int32_t, int32_t>> input_ranked;
+            int64_t input_slots = 0;
+            std::string read_err;
+            if (read_expert_profile(input_profile_path, n_layers, n_expert, input_ranked, input_slots, read_err) &&
+                !input_ranked.empty()) {
+                chosen_ranked = std::move(input_ranked);
+                chosen_source_profile = input_profile_path;
+                chosen_source_kind = "input-profile";
+            }
+        }
+    }
+
+    if (chosen_ranked.empty()) {
+        out.action = ExpertHeatBootstrapResult::Action::SkippedNoProfile;
+        out.detail = fallback_note.empty() ? "no valid saved or input expert profile available for heat prior"
+                                           : fallback_note;
+        return out;
+    }
+
+    std::vector<double> prior_heat;
+    std::string prior_err;
+    if (!profile_rank_prior_heat(n_layers, n_expert, chosen_ranked, prior_heat, prior_err)) {
+        out.action = ExpertHeatBootstrapResult::Action::Failed;
+        out.detail = prior_err;
+        return out;
+    }
+
+    std::string write_err;
+    if (!write_expert_profile_heat_with_provenance(out.heat_path, n_layers, n_expert, prior_heat,
+                                                   ExpertHeatProvenance::ProfileRankPrior,
+                                                   chosen_source_profile, chosen_source_kind,
+                                                   (int64_t) chosen_ranked.size(), write_err)) {
+        out.action = ExpertHeatBootstrapResult::Action::Failed;
+        out.detail = write_err;
+        return out;
+    }
+
+    out.action = ExpertHeatBootstrapResult::Action::DerivedPrior;
+    out.provenance = ExpertHeatProvenance::ProfileRankPrior;
+    out.source_profile = std::move(chosen_source_profile);
+    out.source_kind = std::move(chosen_source_kind);
+    out.ranked_pairs = chosen_ranked.size();
+    out.detail = std::move(fallback_note);
+    return out;
+}
+
+bool save_runtime_expert_profile_heat(const std::string& save_profile_path, int64_t n_layers, int64_t n_expert,
+                                      const std::vector<double>& heat, int64_t ranked_pairs,
+                                      bool& skipped_zero_heat, std::string& err) {
+    skipped_zero_heat = false;
+    if (save_profile_path.empty() || !valid_heat_values(heat, n_layers, n_expert)) {
+        err = "save_runtime_expert_profile_heat: invalid path, dimensions, or heat values";
+        return false;
+    }
+    const bool has_observed_routing = std::any_of(heat.begin(), heat.end(), [](double v) { return v > 0.0; });
+    if (!has_observed_routing) {
+        skipped_zero_heat = true;
+        return true;
+    }
+    const std::string heat_path = save_profile_path + ".heat";
+    return write_expert_profile_heat_with_provenance(heat_path, n_layers, n_expert, heat,
+                                                     ExpertHeatProvenance::Runtime, save_profile_path,
+                                                     "runtime-routing", ranked_pairs, err);
+}
+
 ExpertCache::~ExpertCache() { close(); }
 
 #if !defined(STRATA_EC_NO_VMM)

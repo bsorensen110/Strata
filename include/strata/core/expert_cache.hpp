@@ -96,6 +96,23 @@ struct ExpertHeatResolution {
     std::vector<double> heat;
 };
 
+struct ExpertHeatBootstrapResult {
+    enum class Action {
+        RetainedValid,
+        DerivedPrior,
+        SkippedNoProfile,
+        MalformedLeftUntouched,
+        Failed,
+    };
+    Action action = Action::SkippedNoProfile;
+    std::string heat_path;
+    ExpertHeatProvenance provenance = ExpertHeatProvenance::None;
+    std::string source_profile;
+    std::string source_kind;
+    size_t ranked_pairs = 0;
+    std::string detail;
+};
+
 /// Convert ranked `(layer, expert)` pairs to deterministic, finite, nonnegative per-layer/per-expert weights
 /// consumable by `learned_expert_cache_quotas`. Ranked entries get strictly decreasing weight
 /// `ranked.size() - rank` on first occurrence; unranked entries get `0.0`. Rejects invalid dimensions, empty
@@ -130,6 +147,19 @@ bool write_expert_profile_heat_with_provenance(const std::string& heat_path, int
 ExpertHeatResolution resolve_expert_profile_heat(const std::string& save_profile_path,
                                                  const std::string& input_profile_path,
                                                  int64_t n_layers, int64_t n_expert);
+
+/// Startup bootstrap for `--expert-profile-save`: ensures a valid heat sidecar is available when saving is enabled.
+/// Retains existing valid runtime/legacy/prior heat and leaves malformed/incompatible sidecars untouched.
+ExpertHeatBootstrapResult bootstrap_expert_profile_heat(
+    const std::string& save_profile_path, const std::string& input_profile_path,
+    const std::vector<std::pair<int32_t, int32_t>>& loaded_input_profile,
+    int64_t n_layers, int64_t n_expert);
+
+/// Save measured runtime routing heat atomically with `Runtime` provenance, skipping the overwrite when
+/// no positive routing counts were observed (`heat` all <= 0.0) so existing heat or priors are preserved.
+bool save_runtime_expert_profile_heat(const std::string& save_profile_path, int64_t n_layers, int64_t n_expert,
+                                      const std::vector<double>& heat, int64_t ranked_pairs,
+                                      bool& skipped_zero_heat, std::string& err);
 
 std::vector<int64_t> uniform_expert_cache_quotas(const std::vector<int64_t>& slot_bytes, int64_t n_expert,
                                                 uint64_t byte_budget);
