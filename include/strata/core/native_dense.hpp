@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -10,12 +11,51 @@ class WeightTable;
 struct WeightRef;
 
 // Experimental GDN/QSA/shared-expert projection overrides. Upload unchanged native GGUF
-// blocks once, then attach them to the matching canonical WeightRef. Unsupported
-// types retain their canonical paths. Owns one Q8_1 scratch vector shared by all
-// these projections, so use one ordered session stream and keep this object
-// alive until all graphs that reference it have been destroyed and synchronized.
+// blocks once into one 256B-aligned device arena, then attach them to the matching canonical
+// WeightRef. Unsupported types retain their canonical paths. Owns one Q8_1 scratch vector carved
+// inside the same arena, so use one ordered session stream and keep this object alive until all
+// graphs that reference it have been destroyed and synchronized.
 class NativeDense {
 public:
+    static constexpr uint64_t kArenaAlign = 256;
+    static constexpr uint64_t kAllocGranule = 2ull << 20;
+    static constexpr uint64_t kSmallAlloc = 1ull << 20;
+
+    struct ArenaPlan {
+        std::vector<uint64_t> offsets;
+        uint64_t payload_bytes = 0;
+        uint64_t allocated_bytes = 0;
+    };
+
+    static uint64_t arena_align(uint64_t bytes) noexcept {
+        return (bytes + kArenaAlign - 1) / kArenaAlign * kArenaAlign;
+    }
+    /// Driver backing footprint of one device allocation (`< 1 MiB` unrounded; `>= 1 MiB` rounded up once to 2 MiB granules).
+    static uint64_t alloc_bytes(uint64_t bytes) noexcept {
+        return bytes < kSmallAlloc ? bytes : (bytes + kAllocGranule - 1) / kAllocGranule * kAllocGranule;
+    }
+    static uint64_t arena_payload_bytes(const std::vector<uint64_t>& sizes) noexcept {
+        uint64_t payload = 0;
+        for (uint64_t sz : sizes) payload += arena_align(sz);
+        return payload;
+    }
+    static uint64_t arena_alloc_bytes(uint64_t payload_bytes) noexcept { return alloc_bytes(payload_bytes); }
+    static uint64_t arena_alloc_bytes(const std::vector<uint64_t>& sizes) noexcept {
+        return alloc_bytes(arena_payload_bytes(sizes));
+    }
+    static ArenaPlan plan_arena(const std::vector<uint64_t>& sizes) {
+        ArenaPlan p;
+        p.offsets.reserve(sizes.size());
+        uint64_t cursor = 0;
+        for (uint64_t sz : sizes) {
+            p.offsets.push_back(cursor);
+            cursor += arena_align(sz);
+        }
+        p.payload_bytes = cursor;
+        p.allocated_bytes = alloc_bytes(cursor);
+        return p;
+    }
+
     NativeDense() = default;
     ~NativeDense();
     NativeDense(const NativeDense&) = delete;
@@ -31,11 +71,14 @@ public:
     /// Layer split: load only blocks [lb, le) (every other `blk.N.` projection belongs to another GPU's stage; the
     /// PLE tensors are loaded everywhere).  Process-wide, read by the next `load`; (-1, -1) = all layers.
     static void set_layer_range(int lb, int le);
-    /// Layer split: the device bytes `load` would allocate for the matrices of layers [lb, le) - the same walk and
-    /// filters, each matrix rounded up to the granule cudaMalloc backs it with - reading the GGUF headers and `table`
-    /// only, so it allocates nothing and needs no device (#1238).  `table` must hold every tensor the shards carry.
+    /// Layer split: the device bytes `load` allocates for the matrices of layers [lb, le) - the same walk and filters
+    /// packed at 256B alignment in one contiguous arena, rounded up once to the 2 MiB granule `cudaMalloc` backs it
+    /// with - reading the GGUF headers and `table` only, so it allocates nothing and needs no device (#1238).
+    /// `table` must hold every tensor the shards carry.
     static bool weight_bytes_for(const std::vector<std::string>& shards, WeightTable& table, bool include_ple_key,
                                  int64_t lb, int64_t le, uint64_t& out, std::string& err);
+    static bool weight_bytes_for(const std::vector<std::string>& shards, const std::map<std::string, WeightRef>& table,
+                                 bool include_ple_key, int64_t lb, int64_t le, uint64_t& out, std::string& err);
     /// #326: a native pack whose `blk.1.ple_key.weight` row is unquantized (iq_pack --compat-bf16 of a GGUF key
     /// the native kernel also reads, e.g. OrcaRouter's IQ3_XXS) serves the PLE from that row, so it is taken out
     /// of `skip` and `load` does not upload the GGUF key over it.  A quantized row leaves `skip` unchanged.
@@ -59,14 +102,16 @@ public:
     static void hc_bf16_release(void* stream, int slot, int cls);
     static void hc_bf16_release_pair(void* stream, int cls);
     uint64_t weight_bytes() const { return bytes_; }
-    /// What the device lost to `load`: each matrix rounded up to the granule `cudaMalloc` backs it with.
+    /// What the device lost to `load`: the contiguous arena rounded up to the 2 MiB granule `cudaMalloc` backs it with.
     uint64_t allocated_bytes() const { return allocated_; }
-    size_t tensor_count() const { return weights_.size() - packed_keys_.size(); }
+    size_t tensor_count() const { return tensor_count_; }
 
 private:
-    std::vector<void*> weights_;
+    void* arena_ = nullptr;
+    uint64_t arena_size_ = 0;
+    size_t tensor_count_ = 0;
     std::vector<const void*> packed_keys_;   // GGUF-layout pointers registered with STRATA_Q8_PACKED=1
-    void* scratch_ = nullptr;
+    void* scratch_ = nullptr;                // native_q8_1 scratch carved inside arena_
     uint64_t bytes_ = 0;
     uint64_t allocated_ = 0;
 };

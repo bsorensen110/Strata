@@ -1,7 +1,9 @@
 #include "strata/core/auto_cache.hpp"
+#include "strata/core/native_dense.hpp"
 
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 using namespace strata::core;
 namespace {
@@ -38,6 +40,20 @@ int main() {
     const int64_t edge_free = reserve_b + (kLateAllocMib * MiB) + min_slots * blob;
     check(auto_cache_slots(edge_free, reserve_b, blob, min_slots).late_priced, "exactly min_slots after the late allocation: priced");
     check(!auto_cache_slots(edge_free - 1, reserve_b, blob, min_slots).late_priced, "one byte less: the old sizing");
+    // Audit finding 10: pricing a NativeDense stage as one contiguous 256B-aligned arena (one 2 MiB granule)
+    // instead of one cudaMalloc per matrix returns the saved granule slack directly to auto_cache_slots.
+    const std::vector<uint64_t> hc_192(192, 2560ull / 32ull * 34ull * 1280ull);   // 192 x ~3.32 MiB HC Q8_0
+    uint64_t per_matrix_bytes = 0;
+    for (uint64_t s : hc_192) per_matrix_bytes += NativeDense::alloc_bytes(s);
+    const uint64_t arena_bytes = NativeDense::arena_alloc_bytes(hc_192);
+    const int64_t saved_granules = (int64_t) (per_matrix_bytes - arena_bytes);
+    check(saved_granules >= 128 * MiB, "arena pricing reclaims >= 128 MiB of 2 MiB granule slack on 192 HC tensors");
+    const AutoCacheSlots before_arena = auto_cache_slots(free_b - per_matrix_bytes, reserve_b, blob, min_slots);
+    const AutoCacheSlots after_arena = auto_cache_slots(free_b - arena_bytes, reserve_b, blob, min_slots);
+    check(after_arena.slots - before_arena.slots == saved_granules / blob ||
+              after_arena.slots - before_arena.slots == saved_granules / blob + 1,
+          "reclaimed NativeDense arena granules convert directly into expert cache slots");
+
     std::printf("auto_cache_test: %d checks passed\n", checks);
     return 0;
 }

@@ -410,6 +410,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME dflash2_size_test COMMAND dflash2_size_test)
     set_tests_properties(dflash2_size_test PROPERTIES TIMEOUT 60
                          ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HIP_VISIBLE_DEVICES=-1")
+    # Audit finding 10: NativeDense single-arena 256B planning, 1-granule pricing, and host GGUF fixture check.
+    add_executable(native_dense_arena_test tests/core/native_dense_arena_test.cpp)
+    target_link_libraries(native_dense_arena_test PRIVATE strata_engine)
+    add_test(NAME native_dense_arena_test COMMAND native_dense_arena_test)
+    set_tests_properties(native_dense_arena_test PROPERTIES TIMEOUT 60
+                         ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HIP_VISIBLE_DEVICES=-1")
   endif()
   if(STRATA_BUILD_CONVERSATION_TESTS)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)
@@ -1561,10 +1567,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(ple_residency_test PRIVATE include)
   add_test(NAME ple_residency_test COMMAND ple_residency_test)
 
-  # #4474: the automatic expert cache's slot rule (the late allocation priced); header-only, needs nothing
+  # #4474 + Audit Findings 8/10: automatic expert cache slot rule, NativeDense arena pricing, and exact DFlash2/verifier bind pricing
   add_executable(auto_cache_test src/core/auto_cache_test.cpp)
-  target_include_directories(auto_cache_test PRIVATE include)
+  target_link_libraries(auto_cache_test PRIVATE strata_engine)
   add_test(NAME auto_cache_test COMMAND auto_cache_test)
+  set_tests_properties(auto_cache_test PROPERTIES TIMEOUT 60
+                       ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HIP_VISIBLE_DEVICES=-1")
 
   # 0.2.7 (#3911): the qwen35 host sampler's penalties on a short (draft-vocab) logit row; header-only, CPU
   add_executable(qwen35_sampling_test src/qwen35/sampling_test.cpp)
