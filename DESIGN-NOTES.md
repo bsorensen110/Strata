@@ -64,3 +64,25 @@ When `--expert-profile-save P` is enabled at startup and no valid `.heat` sideca
   4. `<expert-profile>.heat` if valid `profile-rank prior`.
 - **Provenance and crash safety**: `.heat.meta` records `provenance=profile-rank-prior` vs `provenance=runtime`, the source profile, dimensions, and `heat_fnv1a64`.  Existing valid `.heat` files without `.meta` remain accepted as legacy unmarked measured heat.  Bootstrapping stages `.meta` before `.heat`; runtime saving stages both `.tmp` files first and skips overwrites when zero runtime routing counts were observed, then renames `.heat` before `.meta` so a failure or crash never silently upgrades a prior's provenance to `runtime`.  `--expert-cache-quota auto` logs `profile-rank prior` (never `learned`) when allocating from a prior.
 - **Developer note**: Profile-rank priors are synthetic monotonic ordering weights derived from profile rank, **not** true observed route counts.  Actual live traffic and periodic/`QUIT` saves under `--expert-profile-save` overwrite both `P.heat` and `P.heat.meta` with real routing counts and upgrade provenance to `runtime`.
+
+## Fork-main integration (2026-11-14)
+
+The history split matches the production snapshot exactly before integration.
+The fork-main merge adds its CUDA DFlash2 head, selector and small-matrix series.
+The conflict in `src/core/dflash2.cpp` combines both independent switches:
+`STRATA_DF2_PRECOMP_GRAPH` and `STRATA_DF2_SELECT_TABLE`.
+
+Buffer sizing keeps the VRAM stack's solo parent and clone allocations at eight
+rows, and its multi-slot parent at 64 rows with 16 logit rows. The fork's sizing
+fix calls the Q8 helpers with eight columns, because a default CUDA build rejects
+a 16-column helper call. The merged code uses those legal calls, doubles the
+ordinary Q8 capacity for batches, and retains the stack's arithmetic 16-column
+interleaved capacity for wide-head builds. Allocation pricing uses the same
+formulas. The fork's selector table is allocated and freed for each drafter;
+its 8192 bytes are included in the allocation breakdown.
+
+The deferred-tap chunking fix in `70e634cd7` remains unchanged: integration
+does not change `src/program/generate.cpp`. CUDA selector/top-16/Q4 kernels and
+their parity/round-benchmark sources retain the fork's changes. Validation here
+is the HIP gfx1201 build and the six CPU-only host tests; no GPU workload is run.
+CUDA and SYCL execution are not validated by this integration.

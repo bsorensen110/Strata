@@ -65,6 +65,12 @@ bool df2_precomp_graph_on() {
     return on;
 }
 
+// STRATA_DF2_SELECT_TABLE=0: the selector walks with its one-block steps (the walk's scores computed in one parallel launch first is the default: bitwise the same drafts)
+bool df2_select_table() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DF2_SELECT_TABLE"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
 int df2_head_il_mode() {
     static const int mode = [] {
         const char* e = std::getenv("STRATA_DF2_HEAD_IL");
@@ -147,7 +153,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     fr(landing_); if (dpend_) cudaFreeHost(dpend_); fr(tag_); fr(d_meta_); fr(xq_); fr(xil_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rt_bctx_); fr(rope_inv_);
     for (int l = 0; l < 8; ++l) { fr(kring_[l]); fr(vring_[l]); }
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
-    fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(fn_batch_); fr(hsel_batch_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
+    fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(fn_batch_); fr(hsel_batch_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_); fr(seltab_);
     if (!dhead_shared_ && !blob_shared_) {
         if (dhead_ != nullptr && head_type_ == 14) kernels::native_q6_k_unpack(dhead_);
         fr(dvocab_);
@@ -397,7 +403,6 @@ Dflash2Drafter::VramBreakdown Dflash2Drafter::alloc_breakdown(const BufferShape&
     const std::size_t B = eff * (std::size_t) kRows;
     const std::size_t HMax = logits_row_count(shape.batch_slots, shape.blob_shared);
     const int il_max = multi_batch ? 16 : (int) kRows;
-    const int xq_rows = multi_batch ? 16 : (int) kRows;
     const std::size_t top_rows = multi_batch ? (std::size_t) kBatchMaxRows : (std::size_t) kDrafts;
     const std::size_t N = (std::size_t) shape.N;
     const std::size_t L = (std::size_t) shape.L;
@@ -409,13 +414,13 @@ Dflash2Drafter::VramBreakdown Dflash2Drafter::alloc_breakdown(const BufferShape&
     const std::size_t nt = std::max<std::size_t>((std::size_t) shape.n_taps, 1);
 
     const std::size_t xil_bytes = std::max(
-        kernels::native_q8_1_il_bytes((int) N, il_max),
+        kernels::native_q8_1_il_bytes((int) N, kRows),
         (N / 32) * (std::size_t) il_max * (8 * sizeof(int) + 8 * sizeof(int) + sizeof(float))) + 4096;
 
     VramBreakdown v{};
     v.row_buffers =
         (uint64_t) kMetaInts * sizeof(int32_t) +
-        (uint64_t) (kernels::native_q8_1_bytes((int) N, xq_rows) + 4096) +
+        (uint64_t) (kernels::native_q8_1_bytes((int) N, kRows) * (multi_batch ? 2 : 1) + 4096) +
         (uint64_t) xil_bytes +
         (uint64_t) (5 * N * B + 4096) +
         (uint64_t) (5 * N / 32 * B + 64) * sizeof(float) +
@@ -433,7 +438,8 @@ Dflash2Drafter::VramBreakdown Dflash2Drafter::alloc_breakdown(const BufferShape&
         (uint64_t) (top_rows * 16) * sizeof(float) +
         (uint64_t) (top_rows * 16) * sizeof(int32_t) +
         (uint64_t) (B * rank) * sizeof(float) +
-        (uint64_t) (HMax * (std::size_t) kernels::kDf2TopBlocks * (std::size_t) kernels::kDf2TopK * 2) * sizeof(uint32_t);
+        (uint64_t) (HMax * (std::size_t) kernels::kDf2TopBlocks * (std::size_t) kernels::kDf2TopK * 2) * sizeof(uint32_t) +
+        (uint64_t) ((std::size_t) kRows * kernels::kDf2TopK * kernels::kDf2TopK) * sizeof(float);
 
     if (multi_batch) {
         v.batch_only =
@@ -509,19 +515,21 @@ bool Dflash2Drafter::alloc(std::string& err) {
     alloc_rows_ = B;
     const size_t HMax = logits_row_count((int) eff, blob_shared_);
     const int il_max = multi_batch ? 16 : (int) kRows;
-    const int xq_rows = multi_batch ? 16 : (int) kRows;
     const size_t top_rows = multi_batch ? (size_t) kBatchMaxRows : (size_t) kDrafts;
+    // Keep 16-column capacity without calling helpers outside an 8-column build's legal window.
+    const size_t xq_bytes = kernels::native_q8_1_bytes(N_, kRows) * (multi_batch ? 2 : 1);
     const size_t xil_bytes = std::max(
-        kernels::native_q8_1_il_bytes(N_, il_max),
+        kernels::native_q8_1_il_bytes(N_, kRows),
         (size_t) (N_ / 32) * (size_t) il_max * (8 * sizeof(int) + 8 * sizeof(int) + sizeof(float))) + 4096;
-    bool ok = dev(&d_meta_, kMetaInts) && dev(&xq_, kernels::native_q8_1_bytes(N_, xq_rows) + 4096) && dev(&xil_, xil_bytes) && dev(&xqp_, (size_t) 5 * N_ * B + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * B + 64) && dev(&xqc_, (size_t) 5 * N_ * B + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * B + 64) && dev(&rt_ctx_, 2 * kRows * 128) && (!multi_batch || dev(&rt_bctx_, 2 * B * 128)) && dev(&rope_inv_, 64) &&
+    bool ok = dev(&d_meta_, kMetaInts) && dev(&xq_, xq_bytes + 4096) && dev(&xil_, xil_bytes) && dev(&xqp_, (size_t) 5 * N_ * B + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * B + 64) && dev(&xqc_, (size_t) 5 * N_ * B + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * B + 64) && dev(&rt_ctx_, 2 * kRows * 128) && (!multi_batch || dev(&rt_bctx_, 2 * B * 128)) && dev(&rope_inv_, 64) &&
               dev(&fcy_, B * N_) && dev(&hctx_, B * N_) && dev(&kc_, (size_t) L_ * B * NKV_ * HD_) && dev(&vc_, (size_t) L_ * B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
               dev(&xc_, B * N_) && dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
               dev(&part_, (B / kRows) * (size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) && dev(&fn_, B * N_) &&
               dev(&topval_, top_rows * 16) &&
               dev(&toptok_, top_rows * 16) &&
-              dev(&hsel_, B * rank_) && dev(&topscratch_, HMax * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
+              dev(&hsel_, B * rank_) && dev(&topscratch_, HMax * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2) &&
+              dev(&seltab_, (size_t) kRows * kernels::kDf2TopK * kernels::kDf2TopK);
     if (multi_batch) {
         ok = ok && dev(&fn_batch_, (size_t) kBatchMaxRows * N_) && dev(&hsel_batch_, (size_t) kBatchMaxRows * rank_);
     }
@@ -971,7 +979,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, out_tok_,
-                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0", df2_beam());
+                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0", df2_beam(), df2_select_table() ? seltab_ : nullptr);
     } catch (const std::exception& e) {
         err = e.what();
         return false;

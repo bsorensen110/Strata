@@ -1256,6 +1256,145 @@ __global__ void __launch_bounds__(256) topk_merge_kernel(const float* __restrict
     }
 }
 
+// The same top-16 with no serial loop.  The order (value desc, key asc) is total, so the 16th best of the 256 threads' own bests is a bound no
+// better than the block's 16th best: only the values at or above it can be in the top 16, and each one's place is the count of those better than it.
+// A value above the bound belongs to one of the 15 threads whose best beats it, so there are at most 15 * PER + 1 of them.
+constexpr int TK_CAND = 256;
+struct TopRankSmem {
+    unsigned long long wk[8][kDf2TopK];   // each warp's 16 best thread bests, best first
+    unsigned long long ck[TK_CAND];
+    float cv[TK_CAND];
+    unsigned long long bound;
+    int cnt;
+};
+
+// (value, key) as one number that orders like better(): the value's bits made monotone (-0 as +0, since better() has them equal), then the key
+// reversed.  0 is below every value that is not -inf or NaN.
+__device__ __forceinline__ unsigned long long top_key(float v, int k) {
+    uint32_t b = v == 0.0f ? 0u : __float_as_uint(v);
+    b ^= (b & 0x80000000u) ? 0xffffffffu : 0x80000000u;
+    return ((unsigned long long) b << 32) | (uint32_t) (0x7fffffff - k);
+}
+
+// rv/ri: the thread's PER values and keys (ri < 0: none; a value with a key is never -inf or NaN).  Gathers the candidates into s.cv/s.ck; returns their count.
+template <int PER>
+__device__ __forceinline__ int top16_candidates(const float (&rv)[PER], const int (&ri)[PER], TopRankSmem& s) {
+    static_assert((kDf2TopK - 1) * PER + 1 <= TK_CAND, "top16_candidates: the candidates must fit");
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    unsigned long long mk = 0;
+#pragma unroll
+    for (int j = 0; j < PER; ++j)
+        if (ri[j] >= 0) {
+            const unsigned long long k = top_key(rv[j], ri[j]);
+            mk = k > mk ? k : mk;
+        }
+#pragma unroll
+    for (int k = 2; k <= 32; k <<= 1) {   // the warp's 32 thread bests, sorted best first (bitonic)
+#pragma unroll
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            const unsigned long long o = __shfl_xor_sync(0xffffffffu, mk, j);
+            mk = (((lane & j) == 0) == ((lane & k) == 0)) == (o > mk) ? o : mk;   // the lower lane of a pair keeps the larger in a descending run
+        }
+    }
+    if (lane < kDf2TopK) s.wk[warp][lane] = mk;
+    if (tid == 0) { s.bound = 0; s.cnt = 0; }
+    __syncthreads();
+    if (tid < 8 * kDf2TopK) {   // the 16th best of all 256 thread bests is in some warp's 16: its place = its place in its warp + the better ones in the others
+        const int w = tid >> 4, p = tid & 15;
+        const unsigned long long me = s.wk[w][p];
+        if (me != 0) {
+            int place = p;
+            for (int w2 = 0; w2 < 8; ++w2) {
+                if (w2 == w) continue;
+                int lo = 0, hi = kDf2TopK;   // the count of s.wk[w2][*] > me (they are sorted best first)
+                while (lo < hi) {
+                    const int mid = (lo + hi) >> 1;
+                    if (s.wk[w2][mid] > me) lo = mid + 1; else hi = mid;
+                }
+                place += lo;
+            }
+            if (place == kDf2TopK - 1) s.bound = me;   // fewer than 16 thread bests: bound 0, every value is a candidate
+        }
+    }
+    __syncthreads();
+    const unsigned long long bound = s.bound;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        if (ri[j] >= 0) {
+            const unsigned long long k = top_key(rv[j], ri[j]);
+            if (k >= bound) {
+                const int p = atomicAdd(&s.cnt, 1);
+                s.ck[p] = k;
+                s.cv[p] = rv[j];
+            }
+        }
+    }
+    __syncthreads();
+    return s.cnt;
+}
+
+// the place of candidate p among the c (0 = best)
+__device__ __forceinline__ int top16_place(const TopRankSmem& s, int c, int p) {
+    const unsigned long long k = s.ck[p];
+    int r = 0;
+    for (int q = 0; q < c; ++q) r += s.ck[q] > k;
+    return r;
+}
+
+__device__ __forceinline__ int top_key_index(unsigned long long k) { return 0x7fffffff - (int) (uint32_t) k; }
+template <int MAX_PER_THR>
+__global__ void __launch_bounds__(256) topk_part_rank_kernel(const float* __restrict__ logits, int n, float* __restrict__ cval, int32_t* __restrict__ cidx) {
+    __shared__ TopRankSmem s;
+    const int row = blockIdx.x, blk = blockIdx.y, tid = threadIdx.x;
+    const int cs = (n + kDf2TopBlocks - 1) / kDf2TopBlocks;
+    const int c0 = blk * cs, c1 = min(c0 + cs, n);
+    float rv[MAX_PER_THR];
+    int ri[MAX_PER_THR];
+#pragma unroll
+    for (int j = 0; j < MAX_PER_THR; ++j) {
+        const int i = tid + j * 256;
+        const bool in = i < cs && c0 + i < c1;
+        rv[j] = in ? logits[(size_t) row * n + c0 + i] : -INFINITY;
+        ri[j] = in && rv[j] > -INFINITY ? i : -1;   // the serial loop never picks -inf (it ends the list) or NaN
+    }
+    const int c = top16_candidates<MAX_PER_THR>(rv, ri, s);
+    const size_t o = ((size_t) row * kDf2TopBlocks + blk) * kDf2TopK;
+    if (tid < c) {
+        const int r = top16_place(s, c, tid);
+        if (r < kDf2TopK) { cval[o + r] = s.cv[tid]; cidx[o + r] = c0 + top_key_index(s.ck[tid]); }
+    } else if (tid < kDf2TopK) {
+        cval[o + tid] = -INFINITY;
+        cidx[o + tid] = -1;
+    }
+}
+
+__global__ void __launch_bounds__(256) topk_merge_rank_kernel(const float* __restrict__ cval, const int32_t* __restrict__ cidx, const int32_t* __restrict__ idx_map,
+                                                              float* __restrict__ val, int32_t* __restrict__ tok) {
+    constexpr int NC = kDf2TopBlocks * kDf2TopK;
+    constexpr int PER = NC / 256;
+    __shared__ TopRankSmem s;
+    const int row = blockIdx.x, tid = threadIdx.x;
+    float rv[PER];
+    int ri[PER];
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+        rv[j] = cval[(size_t) row * NC + tid + j * 256];
+        ri[j] = cidx[(size_t) row * NC + tid + j * 256];
+    }
+    const int c = top16_candidates<PER>(rv, ri, s);
+    if (tid < c) {
+        const int r = top16_place(s, c, tid);
+        if (r < kDf2TopK) {
+            const int ix = top_key_index(s.ck[tid]);
+            val[row * kDf2TopK + r] = s.cv[tid];
+            tok[row * kDf2TopK + r] = idx_map ? idx_map[ix] : ix;
+        }
+    } else if (tid < kDf2TopK) {
+        val[row * kDf2TopK + tid] = -INFINITY;
+        tok[row * kDf2TopK + tid] = 0;
+    }
+}
+
 // one value / eight values of a ggml Q4_0 row of 256 (8 blocks of 18 bytes: fp16 d, then 16 bytes with value i in the low nibble of byte i and value i + 16 in the high one)
 __device__ __forceinline__ float q4row_at(const uint8_t* row, int i) {
     const uint8_t* blk = row + (size_t) (i >> 5) * 18;
@@ -1298,20 +1437,50 @@ __device__ void select_eval_step(const float* __restrict__ hp_row, const float* 
     __syncthreads();
 }
 
-template <bool Q4, int BEAM>
+// Every predecessor the walk can reach is the anchor (row 0) or one of row i - 1's 16 candidates, so the scores of all the walk's steps form a table
+// T[i][jp][j] (row 0: jp = 0 only) that does not depend on the walk's choices.  One block per (jp, i) fills a row of it with select_eval_step, the very
+// arithmetic of the walk's own step, so a walk that reads T picks the same tokens with the same probabilities, bitwise; the 16-25 dependent codebook
+// steps of the one-block walk become one parallel launch.
+template <bool Q4>
+__global__ void __launch_bounds__(256) select_table_kernel(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
+                                                           const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank,
+                                                           const int32_t* __restrict__ anchor_tok, float* __restrict__ table) {
+    __shared__ float vp[256];
+    __shared__ float sc[kDf2TopK];
+    const int jp = blockIdx.x, i = blockIdx.y;
+    if (i == 0 && jp > 0) return;
+    const int ptok = i == 0 ? *anchor_tok : tok[(i - 1) * kDf2TopK + jp];
+    select_eval_step<Q4>(hp + (size_t) i * rank, unary + i * kDf2TopK, tok + i * kDf2TopK, pred_cb, succ_cb, rank, ptok, vp, sc);
+    if (threadIdx.x < kDf2TopK) table[((size_t) i * kDf2TopK + jp) * kDf2TopK + threadIdx.x] = sc[threadIdx.x];
+}
+
+// TABLE: the step's scores come from select_table_kernel's T (indexed by the predecessor's candidate slot) instead of select_eval_step
+template <bool Q4, int BEAM, bool TABLE = false>
 __device__ void select_slot_walk(const float* __restrict__ hp, const float* __restrict__ unary, const int32_t* __restrict__ tok,
                                  const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
-                                 int prev0, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+                                 int prev0, int32_t* __restrict__ out_tok, float* __restrict__ out_prob, const float* __restrict__ table = nullptr) {
     if (rows <= 0) return;
     __shared__ float vp[256];
     __shared__ float sc[kDf2TopK];
     const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    __shared__ float tab_s[TABLE ? kDf2Rows * kDf2TopK * kDf2TopK : 1];   // the whole table and the candidates up front: the walk's steps then wait on no memory
+    __shared__ int32_t tok_s[TABLE ? kDf2Rows * kDf2TopK : 1];
+    if constexpr (TABLE) {
+        for (int k = tid; k < rows * kDf2TopK * kDf2TopK; k += blockDim.x) tab_s[k] = table[k];
+        for (int k = tid; k < rows * kDf2TopK; k += blockDim.x) tok_s[k] = tok[k];
+        __syncthreads();
+        tok = tok_s;
+    }
     if constexpr (BEAM <= 1) {
-        __shared__ int prev;
-        if (tid == 0) prev = prev0;
+        __shared__ int prev, prev_j;
+        if (tid == 0) { prev = prev0; prev_j = 0; }
         __syncthreads();
         for (int i = 0; i < rows; ++i) {
-            select_eval_step<Q4>(hp + (size_t) i * rank, unary + i * kDf2TopK, tok + i * kDf2TopK, pred_cb, succ_cb, rank, prev, vp, sc);
+            if constexpr (TABLE) {
+                if (tid < kDf2TopK) sc[tid] = tab_s[(i * kDf2TopK + prev_j) * kDf2TopK + tid];
+                __syncthreads();
+            } else
+                select_eval_step<Q4>(hp + (size_t) i * rank, unary + i * kDf2TopK, tok + i * kDf2TopK, pred_cb, succ_cb, rank, prev, vp, sc);
             if (w == 0) {
                 const float sj = (lane < kDf2TopK) ? sc[lane] : -INFINITY;
                 float bv = sj;
@@ -1335,6 +1504,7 @@ __device__ void select_slot_walk(const float* __restrict__ hp, const float* __re
                     const int32_t picked = tok[i * kDf2TopK + bj];
                     out_prob[i] = 1.0f / z;
                     prev = picked;
+                    prev_j = bj;
                     if (i + 1 == rows) __threadfence_system();
                     out_tok[i] = picked;
                 }
@@ -1446,6 +1616,104 @@ __global__ void select_kernel(const float* __restrict__ hp, const float* __restr
                               const uint16_t* __restrict__ pred_cb, const uint16_t* __restrict__ succ_cb, int rank, int rows,
                               const int32_t* __restrict__ anchor_tok, int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
     select_slot_walk<Q4, BEAM>(hp, unary, tok, pred_cb, succ_cb, rank, rows, *anchor_tok, out_tok, out_prob);
+}
+
+// greedy (BEAM = 1) over the table
+template <int BEAM>
+__global__ void select_walk_table_kernel(const float* __restrict__ table, const int32_t* __restrict__ tok, int rows, int32_t* __restrict__ out_tok,
+                                         float* __restrict__ out_prob) {
+    select_slot_walk<false, BEAM, true>(nullptr, nullptr, tok, nullptr, nullptr, 0, rows, 0, out_tok, out_prob, table);
+}
+
+// The beam walk (BEAM > 1) over select_table_kernel's T, with select_slot_walk's arithmetic per value: warp b scores beam b (the beams of a row at once
+// instead of one after another), warp 0 keeps the Viterbi pick, and each kept beam stores a back-pointer instead of copying its path (the path is
+// read back once at the end).  Two barriers a row.
+template <int BEAM>
+__global__ void __launch_bounds__(BEAM * 32) select_walk_beam_table_kernel(const float* __restrict__ table, const int32_t* __restrict__ tok, int rows,
+                                                                           int32_t* __restrict__ out_tok, float* __restrict__ out_prob) {
+    if (rows <= 0) return;
+    __shared__ float tab_s[kDf2Rows * kDf2TopK * kDf2TopK];
+    __shared__ int32_t tok_s[kDf2Rows * kDf2TopK];
+    __shared__ float beam_score[BEAM];
+    __shared__ int beam_j[BEAM];
+    __shared__ float cand_logp[BEAM * kDf2TopK], cand_prob[BEAM * kDf2TopK];
+    __shared__ int8_t parent[kDf2Rows][BEAM], keep_j[kDf2Rows][BEAM];
+    __shared__ float keep_p[kDf2Rows][BEAM];
+    const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+    for (int k = tid; k < rows * kDf2TopK * kDf2TopK; k += blockDim.x) tab_s[k] = table[k];
+    for (int k = tid; k < rows * kDf2TopK; k += blockDim.x) tok_s[k] = tok[k];
+    __syncthreads();
+    for (int i = 0; i < rows; ++i) {
+        const int n_prev = (i == 0) ? 1 : BEAM;
+        if (w < n_prev) {
+            const int b = w;
+            const float sj = (lane < kDf2TopK) ? tab_s[(i * kDf2TopK + (i == 0 ? 0 : beam_j[b])) * kDf2TopK + lane] : -INFINITY;
+            float bv = sj;
+#pragma unroll
+            for (int o = 8; o > 0; o >>= 1) bv = fmaxf(bv, __shfl_xor_sync(0xffffffffu, bv, o));
+            bv = __shfl_sync(0xffffffffu, bv, 0);
+            const float ej = (lane < kDf2TopK) ? __expf(sj - bv) : 0.0f;
+            float z = 0.0f;
+#pragma unroll
+            for (int j = 0; j < kDf2TopK; ++j) z += __shfl_sync(0xffffffffu, ej, j);
+            if (lane < kDf2TopK) {
+                const float base = (i == 0) ? 0.0f : beam_score[b];
+                cand_logp[b * kDf2TopK + lane] = base + ((sj - bv) - logf(z));
+                cand_prob[b * kDf2TopK + lane] = ej / z;
+            }
+        }
+        __syncthreads();
+        if (w == 0) {
+            float v_logp = -INFINITY, v_p = 0.0f;
+            int v_b = 0;
+            if (lane < kDf2TopK) {
+                for (int b = 0; b < n_prev; ++b) {
+                    const float lp = cand_logp[b * kDf2TopK + lane];
+                    if (lp > v_logp) {
+                        v_logp = lp;
+                        v_b = b;
+                        v_p = cand_prob[b * kDf2TopK + lane];
+                    }
+                }
+            }
+            for (int k = 0; k < BEAM; ++k) {
+                float bv = v_logp;
+                int bj = lane;
+#pragma unroll
+                for (int o = 8; o > 0; o >>= 1) {
+                    const float obv = __shfl_xor_sync(0xffffffffu, bv, o);
+                    const int obj = __shfl_xor_sync(0xffffffffu, bj, o);
+                    if (obv > bv || (obv == bv && obj < bj)) {
+                        bv = obv;
+                        bj = obj;
+                    }
+                }
+                const int win_j = __shfl_sync(0xffffffffu, bj, 0);
+                if (lane == win_j) {
+                    beam_j[k] = win_j;   // the beams' scores of this row are all read (the barrier above): the next row's state is written in place
+                    beam_score[k] = v_logp;
+                    parent[i][k] = (int8_t) v_b;
+                    keep_j[i][k] = (int8_t) win_j;
+                    keep_p[i][k] = v_p;
+                    v_logp = -INFINITY;
+                }
+                __syncwarp();
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) {   // the best beam's path, back to front
+        int b = 0, last = 0;
+        for (int r = rows - 1; r >= 0; --r) {
+            const int32_t t = tok_s[r * kDf2TopK + keep_j[r][b]];
+            out_prob[r] = keep_p[r][b];
+            if (r + 1 < rows) out_tok[r] = t;
+            else last = t;
+            b = parent[r][b];
+        }
+        __threadfence_system();   // the last token is the host's sentinel: written after everything else
+        out_tok[rows - 1] = last;
+    }
 }
 
 template <bool Q4, int BEAM>
@@ -1679,12 +1947,13 @@ static int df2_q8_auto(int rows) {
     return rows <= 1024 ? 20 : rows <= 3072 ? 13 : rows >= 15000 ? 10 : (rows % 32 == 0 ? 1 : 2);
 }
 
-static int df2_q4_auto(int rows) {
+// CUDA: one row a warp for the small matrices (the selector's 256 rows, the 640 of akp/mkp) at up to 8 columns, measured 3 to 6 us a round faster on an RTX 5080.
+static int df2_q4_auto(int rows, int ncols) {
     if (df2_hip_wave32_u1()) return rows <= 640 ? 31 : 26;
-    return 17;
+    return rows <= 640 && ncols <= 8 ? 31 : 17;
 }
 #ifndef DF2_Q4_AUTO
-#define DF2_Q4_AUTO(rows) df2_q4_auto(rows)
+#define DF2_Q4_AUTO(rows, ncols) df2_q4_auto(rows, ncols)
 #endif
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream) {
     if (n < 1 || n > kDf2MaxSegs || n_in % 512 != 0 || ncols < 1 || ncols > 64) throw std::invalid_argument("df2_gemm: unsupported shape");
@@ -1732,7 +2001,7 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
         return;
     }
     if (mats[0].q4) {   // the Q4_0 pack: 4 warps a block when the rows allow, else 2; the rows-a-warp variants (bitwise the same results) by matrix size
-        int v4 = g_gemm_variant != 0 ? g_gemm_variant : tune4 >= 10 ? tune4 : tune4 != 0 ? 1 : DF2_Q4_AUTO(rows);
+        int v4 = g_gemm_variant != 0 ? g_gemm_variant : tune4 >= 10 ? tune4 : tune4 != 0 ? 1 : DF2_Q4_AUTO(rows, ncols);
 #define DF2_ROWS4_CASE(V, W, R, U) case V: if (ncols <= 8) gemm4_rows_kernel<W, R, U, 8><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); else gemm4_rows_kernel<W, R, U, 16><<<(rows / 8) * (8 / R) / W, W * 32, 0, st>>>(segs, xqp, xd, n_in, ncols); break;
         switch (v4) {
             DF2_ROWS4_CASE(10, 4, 4, 2)
@@ -1868,23 +2137,48 @@ void df2_q8_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t coun
     check("q8_tile");
 }
 
+static int g_topk_variant = 0;
+void df2_topk_variant(int v) { g_topk_variant = v; }
+static bool df2_topk_rank() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DF2_TOPK_RANK"); return !(e && e[0] == '0'); }();
+    return g_topk_variant != 0 ? g_topk_variant == 2 : on;
+}
+
 void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint32_t* scratch, float* val, int32_t* tok, void* stream) {
     const int cs = (n + kDf2TopBlocks - 1) / kDf2TopBlocks;
     if (cs > TK_CHUNK_MAX) throw std::invalid_argument("df2_topk: too many logits per row");
     float* cval = reinterpret_cast<float*>(scratch);
     int32_t* cidx = reinterpret_cast<int32_t*>(scratch + (size_t) rows * kDf2TopBlocks * kDf2TopK);
-    if (cs <= 8 * 256)
-        topk_part_kernel<8><<<dim3(rows, kDf2TopBlocks), 256, 0, (cudaStream_t) stream>>>(logits, n, cval, cidx);
-    else
-        topk_part_kernel<TK_PER_THR><<<dim3(rows, kDf2TopBlocks), 256, 0, (cudaStream_t) stream>>>(logits, n, cval, cidx);
-    check("topk_part");
-    topk_merge_kernel<<<rows, 256, 0, (cudaStream_t) stream>>>(cval, cidx, idx_map, val, tok);
+    cudaStream_t st = (cudaStream_t) stream;
+    const dim3 grid(rows, kDf2TopBlocks);
+    if (df2_topk_rank()) {
+        if (cs <= 8 * 256) topk_part_rank_kernel<8><<<grid, 256, 0, st>>>(logits, n, cval, cidx);
+        else               topk_part_rank_kernel<TK_PER_THR><<<grid, 256, 0, st>>>(logits, n, cval, cidx);
+        check("topk_part");
+        topk_merge_rank_kernel<<<rows, 256, 0, st>>>(cval, cidx, idx_map, val, tok);
+    } else {
+        if (cs <= 8 * 256) topk_part_kernel<8><<<grid, 256, 0, st>>>(logits, n, cval, cidx);
+        else               topk_part_kernel<TK_PER_THR><<<grid, 256, 0, st>>>(logits, n, cval, cidx);
+        check("topk_part");
+        topk_merge_kernel<<<rows, 256, 0, st>>>(cval, cidx, idx_map, val, tok);
+    }
     check("topk_merge");
 }
 
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4, int beam) {
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4, int beam, float* table) {
     if (rank != 256) throw std::invalid_argument("df2_select: the selector rank must be 256");
+    cudaStream_t st = (cudaStream_t) stream;
+    if (table != nullptr && rows >= 1 && rows <= kDf2Rows) {
+        const dim3 grid(kDf2TopK, rows);
+        if (cb_q4) select_table_kernel<true><<<grid, 256, 0, st>>>(hp, unary, tok, pred_cb, succ_cb, rank, anchor_tok, table);
+        else select_table_kernel<false><<<grid, 256, 0, st>>>(hp, unary, tok, pred_cb, succ_cb, rank, anchor_tok, table);
+        check("select_table");
+        if (beam <= 1) select_walk_table_kernel<1><<<1, 256, 0, st>>>(table, tok, rows, out_tok, out_prob);
+        else select_walk_beam_table_kernel<4><<<1, 4 * 32, 0, st>>>(table, tok, rows, out_tok, out_prob);
+        check("select_walk_table");
+        return;
+    }
     if (beam <= 1) {
         if (cb_q4) select_kernel<true, 1><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);
         else select_kernel<false, 1><<<1, 256, 0, (cudaStream_t) stream>>>(hp, unary, tok, pred_cb, succ_cb, rank, rows, anchor_tok, out_tok, out_prob);

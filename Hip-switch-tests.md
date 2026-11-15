@@ -14,6 +14,8 @@ With no env vars set, HIP builds now run with:
 |---|---|---|---|
 | `STRATA_DF2_HEAD` | `native` (unset/empty) | Native drafter head (`df2_gemm`) instead of pruned copy | `STRATA_DF2_HEAD=pruned` (or `0`, `off`, `false`) |
 | `STRATA_DF2_BEAM` | `4` | Order-1 Viterbi log-probability beam search (`select_slot_walk`) | `STRATA_DF2_BEAM=1` (greedy, old behavior) |
+| `STRATA_DF2_SELECT_TABLE` | `1` | Solo selector: all walk step scores in one parallel launch, then the walk over the table (bitwise the same drafts) | `STRATA_DF2_SELECT_TABLE=0` (one-block walk) |
+| `STRATA_DF2_TOPK_RANK` | `1` | Head top-16 by a bound and ranking instead of 16 serial picks (bitwise the same) | `STRATA_DF2_TOPK_RANK=0` (serial picks) |
 | `STRATA_DF2_ATTN_F16_SMEM` | `1` (HIP) / `0` (CUDA) | FP16 attention score SMEM + parallel `4x2` `Q K^T` tile | `STRATA_DF2_ATTN_F16_SMEM=0` (FP32 SMEM) |
 | `STRATA_DF2_FP16_RING` | `1` (`true`) | FP16 K/V ring buffers in DFlash2 attention | `STRATA_DF2_FP16_RING=0` (FP32 ring) |
 | `STRATA_DF2_GEMM_32` | `1` | Single-pass 17..32 col drafter GEMM (`33..64` in steps of 32) | `STRATA_DF2_GEMM_32=0` (split by 16 cols) |
