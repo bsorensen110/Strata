@@ -197,6 +197,8 @@ public:
     /// caller that predates this flag is bit-for-bit unaffected.
     void set_per_layer_admission(bool on) { per_layer_ = on; }
     bool per_layer_admission() const { return per_layer_; }
+    /// Install startup-only contiguous layer ranges whose slot counts sum to the opened cache.
+    bool set_layer_quotas(const std::vector<int64_t>& quotas, std::string& err);
     /// Interleaves per-layer slots rank-major (`slot = rank * n_layers + layer`) so prefill tail loans (`[slots() - need, slots())`)
     /// borrow the coldest ranks evenly across all layers rather than wiping out the highest-numbered layers.
     void set_per_layer_rank_major(bool on) { per_layer_rank_major_ = on; }
@@ -291,6 +293,8 @@ private:
     bool per_layer_rank_major_ = false;
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<int32_t> layer_count_;  ///< [n_layers] -> count admitted in that layer (rank-major mode)
+    std::vector<int64_t> layer_quotas_; ///< optional non-uniform, layer-major startup ranges
+    std::vector<int64_t> layer_begin_;  ///< exclusive prefix of layer_quotas_
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
     int64_t admitted_ = 0;
     bool sealed_ = false;               ///< STRATA_EXPERT_NIBBLE: `seal` was called (no slot is written after it)

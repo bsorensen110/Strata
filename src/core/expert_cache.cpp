@@ -760,6 +760,8 @@ void ExpertCache::close() {
     sealed_ = false;
     layer_next_.clear();
     layer_count_.clear();
+    layer_quotas_.clear();
+    layer_begin_.clear();
 }
 
 /// R4.2g.  Layer `l` owns `[l*q, (l+1)*q)` with `q = slots_ / n_layers_`; the LAST layer takes whatever is
@@ -768,9 +770,39 @@ void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) cons
     lo = 0;
     hi = 0;
     if (n_layers_ <= 0 || slots_ <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (layer_quotas_.size() == (size_t) n_layers_ && layer_begin_.size() == (size_t) n_layers_ + 1) {
+        lo = layer_begin_[(size_t) layer];
+        hi = layer_begin_[(size_t) layer + 1];
+        return;
+    }
     const int64_t q = slots_ / n_layers_;
     lo = layer * q;
     hi = (layer == n_layers_ - 1) ? slots_ : (layer + 1) * q;
+}
+
+bool ExpertCache::set_layer_quotas(const std::vector<int64_t>& quotas, std::string& err) {
+    if (quotas.size() != (size_t) n_layers_ || n_layers_ <= 0 || slots_ <= 0) {
+        err = "ExpertCache::set_layer_quotas: quota count does not match the opened cache";
+        return false;
+    }
+    std::vector<int64_t> begins(quotas.size() + 1, 0);
+    for (size_t i = 0; i < quotas.size(); ++i) {
+        if (quotas[i] <= 0 || quotas[i] > n_expert_ || quotas[i] > slots_ - begins[i]) {
+            err = "ExpertCache::set_layer_quotas: a quota is out of range";
+            return false;
+        }
+        begins[i + 1] = begins[i] + quotas[i];
+    }
+    if (begins.back() != slots_) {
+        err = "ExpertCache::set_layer_quotas: quotas do not cover the opened cache";
+        return false;
+    }
+    layer_quotas_ = quotas;
+    layer_begin_ = std::move(begins);
+    layer_next_.resize(quotas.size());
+    layer_count_.assign(quotas.size(), 0);
+    for (size_t i = 0; i < quotas.size(); ++i) layer_next_[i] = (int32_t) layer_begin_[i];
+    return true;
 }
 
 int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
