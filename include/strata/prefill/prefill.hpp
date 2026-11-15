@@ -226,6 +226,14 @@ public:
     void clear_taps();
     /// Allocate the staging now (serve: so a request never fails on it): `cap_rows` rows of `layers` x `n_embd` floats.  False: the card has no room.
     bool reserve_taps(const std::vector<int>& layers, int64_t cap_rows, int64_t n_embd, std::string& err);
+    /// Device bytes `reserve_taps` allocates for the given row capacity, hidden width, and stage layer slice `[stage_lb, stage_le)`.
+    inline static uint64_t tap_bytes(const std::vector<int>& layers, int64_t cap_rows, int64_t n_embd,
+                                     int64_t stage_lb = 0, int64_t stage_le = -1) noexcept {
+        if (cap_rows <= 0 || n_embd <= 0) return 0;
+        uint64_t mine = 0;   // a layer split's stage keeps the taps of the layers it runs (the others arrive from the other stages)
+        for (int l : layers) if (l >= stage_lb && (stage_le < 0 || l < stage_le)) ++mine;
+        return mine * (uint64_t) cap_rows * (uint64_t) n_embd * 4ull;
+    }
     std::function<bool(const float* taps, int64_t rows, int64_t pos0, std::string& err)> on_taps;
 
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state

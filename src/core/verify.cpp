@@ -954,6 +954,128 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     return true;
 }
 
+int64_t Verifier::plan_i32_count(int max_t, int64_t k_used, int64_t* dst2_off_out) noexcept {
+    const int64_t cap = (int64_t) ((uint64_t) max_t * (uint64_t) k_used);
+    const int64_t i32 = 4 + (cap + 1) + cap + cap;
+    const int64_t ptr_off = (i32 + 1) & ~1ll;
+    const int64_t dst2_off = (ptr_off + 4 * cap + (cap + 1) + 1 + 1) & ~1ll;
+    if (dst2_off_out != nullptr) *dst2_off_out = dst2_off;
+    return dst2_off + 2 * kStagingBlobs;
+}
+
+uint64_t Verifier::carve_arena(Verifier* self, uint8_t* base, const ModelGeometry& g, int64_t max_blocks,
+                               int64_t cap, int64_t attn_scratch_floats, int64_t plan_i32, int64_t n_vocab,
+                               int64_t k_used, uint64_t staging_blob_bytes, bool had_gu_any, int max_t) {
+    const strata::kernels::QsaShapes s = shapes_of(g);
+    const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) k_used;
+    const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
+    const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
+    const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
+    const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
+    const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
+    const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
+
+    Bump b{base, 0};
+#define STRATA_CARVE(field, ElemT, count_expr) \
+    do { ElemT* p_ = b.take<ElemT>(count_expr); if (self != nullptr) self->field = p_; } while (0)
+
+    STRATA_CARVE(tok_, int32_t, T);
+    STRATA_CARVE(step_, int32_t, T * strata::kernels::kStepCount);
+    STRATA_CARVE(pos_, int32_t, T * (NH + NKV + IQ));
+    STRATA_CARVE(commit_, int32_t, 2 + T);
+    STRATA_CARVE(ple_, float, T * N);
+    STRATA_CARVE(emb_, float, T * N);
+    STRATA_CARVE(R_, float, T * HC * N);
+    STRATA_CARVE(mixed_, float, T * N);
+    STRATA_CARVE(bo_, float, T * N);
+    STRATA_CARVE(inj_, float, T * HC);
+    STRATA_CARVE(inj2_, float, T * HC);
+    STRATA_CARVE(lo_, float, T * (uint64_t) g.hc_lr);
+    STRATA_CARVE(rs_, float, T * HC);
+    STRATA_CARVE(xn_, float, T * HC * N);
+    // the q8_1 activations of one token group (or one column chunk of the head): at most kVerifyMaxT columns
+    const int qcols = (int) std::min<uint64_t>(T, (uint64_t) strata::kernels::kVerifyMaxT);
+    STRATA_CARVE(xq_, uint8_t, strata::kernels::native_q8_1_bytes(max_in, qcols));
+    STRATA_CARVE(sh_xq_, uint8_t, strata::kernels::native_q8_1_bytes(max_in, qcols));
+    STRATA_CARVE(xil_, uint8_t, strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));   // 147-verify: 5-8 columns too
+    STRATA_CARVE(sh_xil_, uint8_t, strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));
+    STRATA_CARVE(qkv_L_, float, nG * T * C);
+    STRATA_CARVE(h_L_, float, nG * T * C);
+    STRATA_CARVE(gate_L_, float, nG * T * HV);
+    STRATA_CARVE(beta_L_, float, nG * T * HV);
+    STRATA_CARVE(z_, float, T * ZV);
+    STRATA_CARVE(y_, float, T * ZV);
+    STRATA_CARVE(y_dummy_, float, T * ZV);
+    STRATA_CARVE(qfull_, float, T * NH * 2 * HD);
+    STRATA_CARVE(qcur_, float, T * NH * HD);
+    STRATA_CARVE(kcur_, float, T * NKV * HD);
+    STRATA_CARVE(vcur_, float, T * NKV * HD);
+    STRATA_CARVE(idx_raw_L_, float, nQ * T * ID);
+    STRATA_CARVE(qidx_, float, T * IQ * ID);
+    STRATA_CARVE(scores_, float, T * (uint64_t) max_blocks);
+    STRATA_CARVE(sel_, int32_t, T * (uint64_t) cap);
+    if (select_long_on() && strata::kernels::qsa_topk_multi_scratch_ints(T) > 0)   // STRATA_SELECT_LONG only
+        STRATA_CARVE(topk_scratch_, int32_t, (uint64_t) strata::kernels::qsa_topk_multi_scratch_ints(T));
+    STRATA_CARVE(attn_, float, T * NH * HD);
+    STRATA_CARVE(attn32_, float, T * NH * HD);
+    STRATA_CARVE(attn_scratch_, float, T * (uint64_t) attn_scratch_floats);
+    STRATA_CARVE(tail_snap_, float, nQ * TS);
+    STRATA_CARVE(logits_, float, T * (uint64_t) g.n_expert);
+    STRATA_CARVE(w_, float, T * K);
+    STRATA_CARVE(ids_, int32_t, T * K);
+    STRATA_CARVE(shared_, float, T * N);
+    STRATA_CARVE(parts_, float, T * K * N);
+    STRATA_CARVE(hit_out_, float, T * K * N);
+    STRATA_CARVE(hit_slot_, int32_t, T * K);
+    STRATA_CARVE(hit_dst_, int32_t, T * K);
+    STRATA_CARVE(hit_count_, int32_t, 4);
+    STRATA_CARVE(plan_, int32_t, 2 * ((uint64_t) plan_i32 + 16));
+    STRATA_CARVE(staging_, uint8_t, (uint64_t) kStagingBlobs * staging_blob_bytes);
+    STRATA_CARVE(hit_xq_, uint8_t, T * (N / 32) * 34);
+    STRATA_CARVE(hit_xs_, float, T * (N / 32));
+    STRATA_CARVE(nat_xq_, uint8_t, T * (N / 32) * 36);
+    if (had_gu_any) STRATA_CARVE(nat_xr_, float, T * N);
+    else if (self != nullptr) self->nat_xr_ = nullptr;
+    STRATA_CARVE(hit_scratch_, uint8_t,
+                 std::max<uint64_t>(
+                     strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
+                     strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+    STRATA_CARVE(head_mixed_, float, T * N);
+    STRATA_CARVE(head_inj_, float, HC);
+    STRATA_CARVE(sh_bf16_, uint16_t, T * N);
+    STRATA_CARVE(sh_gate_, float, T * (uint64_t) g.n_ff);
+    STRATA_CARVE(sh_up_, float, T * (uint64_t) g.n_ff);
+    STRATA_CARVE(sh_g_, float, T + 4);
+    STRATA_CARVE(head_logits_, float, T * (uint64_t) n_vocab);
+    STRATA_CARVE(arg_scratch_, uint8_t, strata::kernels::argmax_rows_scratch_bytes((int) T));
+    STRATA_CARVE(one_, int32_t, 4);
+    STRATA_CARVE(hist_snap_, float, T * HS);
+    STRATA_CARVE(ple_key_, float, T * (uint64_t) strata::kernels::NG_HC_DIM);
+    STRATA_CARVE(ple_val_, float, T * N);
+
+#undef STRATA_CARVE
+    return b.used;
+}
+
+uint64_t Verifier::arena_bytes(const ModelGeometry& g, const SessionState& ss, int64_t n_vocab, int max_t,
+                               int64_t staging_blob_bytes, int had_gu_any) {
+    if (max_t <= 0 || n_vocab <= 0 || g.n_embd <= 0) return 0;
+    const strata::kernels::QsaShapes s = shapes_of(g);
+    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    const int64_t max_cells = ss.qsa_states == nullptr ? ss.max_cells : ss.qsa_states[ss.qsa_primary()].max_cells;
+    const int64_t max_blocks = s.idx_block > 0 ? max_cells / s.idx_block + 2 : 2;
+    const int64_t attn_scratch_floats = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap, s);
+    const int64_t plan_i32 = plan_i32_count(max_t, ss.k);
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t blob_b = staging_blob_bytes >= 0 ? (uint64_t) staging_blob_bytes : lay.max_blob;
+    bool had_gu = had_gu_any > 0;
+    if (had_gu_any < 0) {
+        for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l) had_gu = had_gu || lay.fmt[l].had_gu;
+    }
+    return carve_arena(nullptr, nullptr, g, max_blocks, cap, attn_scratch_floats, plan_i32, n_vocab, ss.k, blob_b, had_gu, max_t);
+}
+
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
     g_diag_verifier.store(this);
@@ -1081,9 +1203,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (nt == 0 && tap_path == nullptr) {
             // a stage that holds none of the tapped layers: nothing to keep, nothing captured
         } else
-        if (nt == 0 || cudaMalloc((void**) &tap_dev_, (size_t) T * nt * N * 4) != cudaSuccess ||
+        if (nt == 0 || cudaMalloc((void**) &tap_dev_, (size_t) tap_bytes(tap_layers_, max_t, g.n_embd, 0, g.n_layers, g.n_layers)) != cudaSuccess ||
             (tap_path != nullptr && (cudaMalloc((void**) &tap_scratch_, (size_t) HC * N * 4) != cudaSuccess ||
-                                     !mapped((size_t) T * nt * N * 4, (void**) &h_tap_, (void**) &m_tap_)))) {
+                                     !mapped((size_t) tap_bytes(tap_layers_, max_t, g.n_embd, 0, g.n_layers, g.n_layers), (void**) &h_tap_, (void**) &m_tap_)))) {
             err = "verify: the DFlash2 tap buffers could not be allocated";
             return false;
         }
@@ -1112,10 +1234,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // | pad | dst2(kStagingBlobs u64)
     {
         const int64_t cap = (int64_t) (T * K);
-        const int64_t i32 = 4 + (cap + 1) + cap + cap;
-        const int64_t ptr_off = (i32 + 1) & ~1ll;
-        dst2_off_ = (ptr_off + 4 * cap + (cap + 1) + 1 + 1) & ~1ll;
-        plan_i32_ = dst2_off_ + 2 * kStagingBlobs;
+        const int64_t ptr_off = ((4 + (cap + 1) + cap + cap) + 1) & ~1ll;
+        plan_i32_ = plan_i32_count(max_t, ss.k, &dst2_off_);
         if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
             err = "verify: mapped plan allocation failed " + strata::core::pin_exhausted_hint();
             return false;
@@ -1136,64 +1256,16 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
     // APR: the rotated copy of the expert input (nat_xr_, T x N floats) only where a layer's gate/up is
     // Hadamard-folded; its one reader is that layer's f.had_gu branch in the expert-input step below
+    const auto& lay = strata::kernels::cpu::expert_layout();
     bool had_gu_any = false;
-    {
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l) had_gu_any = had_gu_any || lay.fmt[l].had_gu;
-    }
-    // ---- the device arena: the same sequence counted, then carved
-    auto carve = [&](Bump& b) {
-        tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
-        pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
-        ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
-        mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
-        inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
-        lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
-        // the q8_1 activations of one token group (or one column chunk of the head): at most kVerifyMaxT columns
-        const int qcols = (int) std::min<uint64_t>(T, (uint64_t) strata::kernels::kVerifyMaxT);
-        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
-        sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
-        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));   // 147-verify: 5-8 columns too
-        sh_xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));
-        qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
-        gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
-        z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
-        qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
-        kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
-        idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
-        scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
-        if (select_long_on() && strata::kernels::qsa_topk_multi_scratch_ints(T) > 0)   // STRATA_SELECT_LONG only
-            topk_scratch_ = b.take<int32_t>((uint64_t) strata::kernels::qsa_topk_multi_scratch_ints(T));
-        attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
-        attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
-        tail_snap_ = b.take<float>(nQ * TS);
-        logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
-        shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
-        hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
-        plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
-        nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
-        hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
-            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
-        head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
-        sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
-        sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
-        head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
-        arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
-        one_ = b.take<int32_t>(4);
-        hist_snap_ = b.take<float>(T * HS);
-        ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
-    };
-    Bump count;
-    carve(count);
-    if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
-        err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
+    for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l) had_gu_any = had_gu_any || lay.fmt[l].had_gu;
+    const uint64_t arena_bytes_needed = carve_arena(
+        nullptr, nullptr, g, max_blocks_, cap_, attn_scratch_floats_, plan_i32_, n_vocab_, ss.k, lay.max_blob, had_gu_any, max_t);
+    if (cudaMalloc(&arena_, arena_bytes_needed) != cudaSuccess) {
+        err = "verify: the device arena (" + std::to_string(arena_bytes_needed >> 20) + " MiB) does not fit";
         return false;
     }
-    cudaMemset(arena_, 0, count.used);
+    cudaMemset(arena_, 0, arena_bytes_needed);
     if (hflag_out_d_ != nullptr && hcount_d_ == nullptr) {   // the overlapped split's hand-off counter
         if (cudaMalloc((void**) &hcount_d_, 64) != cudaSuccess) { err = "verify: hand-off counter allocation failed"; return false; }
         cudaMemset(hcount_d_, 0, 64);
@@ -1234,9 +1306,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
     }
-    Bump real;
-    real.base = (uint8_t*) arena_;
-    carve(real);
+    (void) carve_arena(this, (uint8_t*) arena_, g, max_blocks_, cap_, attn_scratch_floats_, plan_i32_, n_vocab_, ss.k,
+                       lay.max_blob, had_gu_any, max_t);
     {
         const int32_t one = 1;
         if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -1398,7 +1469,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
-                 (double) count.used / 1048576.0,
+                 (double) arena_bytes_needed / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
     return true;
 }

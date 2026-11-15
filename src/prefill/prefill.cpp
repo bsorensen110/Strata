@@ -1363,10 +1363,9 @@ bool Prefill::reserve_taps(const std::vector<int>& layers, int64_t cap_rows, int
     tap_layers_ = layers;
     tap_cap_ = cap_rows;
     if (tap_dev_ != nullptr) return true;
-    size_t mine = 0;   // a layer split's stage keeps the taps of the layers it runs (the others arrive from the other stages)
-    for (int l : layers) if (l >= stage_lb_ && (stage_le_ < 0 || l < stage_le_)) ++mine;
-    if (mine == 0) return true;
-    if (cudaMalloc((void**) &tap_dev_, (size_t) cap_rows * mine * (size_t) n_embd * 4) != cudaSuccess) {
+    const size_t bytes = (size_t) tap_bytes(layers, cap_rows, n_embd, stage_lb_, stage_le_);
+    if (bytes == 0) return true;
+    if (cudaMalloc((void**) &tap_dev_, bytes) != cudaSuccess) {
         (void) cudaGetLastError();
         tap_dev_ = nullptr;
         err = "the prompt staging of the DFlash2 taps does not fit in VRAM";
