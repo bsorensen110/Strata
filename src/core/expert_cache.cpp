@@ -379,6 +379,72 @@ bool write_expert_profile_heat(const std::string& path, int64_t n_layers, int64_
     return true;
 }
 
+std::vector<int64_t> uniform_expert_cache_quotas(const std::vector<int64_t>& slot_bytes, int64_t n_expert,
+                                                uint64_t byte_budget) {
+    if (slot_bytes.empty() || n_expert <= 0) return {};
+    uint64_t bytes_per_round = 0;
+    for (const int64_t bytes : slot_bytes) {
+        if (bytes <= 0 || (uint64_t) bytes > std::numeric_limits<uint64_t>::max() - bytes_per_round) return {};
+        bytes_per_round += (uint64_t) bytes;
+    }
+    const int64_t q = std::min<int64_t>(n_expert, (int64_t) std::min<uint64_t>(
+                                                           byte_budget / bytes_per_round,
+                                                           (uint64_t) std::numeric_limits<int64_t>::max()));
+    return q > 0 ? std::vector<int64_t>(slot_bytes.size(), q) : std::vector<int64_t>{};
+}
+
+std::vector<int64_t> learned_expert_cache_quotas(const std::vector<double>& heat,
+                                                 const std::vector<int64_t>& slot_bytes, int64_t n_expert,
+                                                 uint64_t byte_budget) {
+    if (slot_bytes.empty() || n_expert <= 0 ||
+        (size_t) n_expert > std::numeric_limits<size_t>::max() / slot_bytes.size() ||
+        heat.size() != slot_bytes.size() * (size_t) n_expert ||
+        std::any_of(slot_bytes.begin(), slot_bytes.end(), [](int64_t b) { return b <= 0; }) ||
+        std::any_of(heat.begin(), heat.end(), [](double v) { return !std::isfinite(v) || v < 0.0; }))
+        return {};
+    const std::vector<int64_t> uniform = uniform_expert_cache_quotas(slot_bytes, n_expert, byte_budget);
+    if (uniform.empty() || std::none_of(heat.begin(), heat.end(), [](double v) { return v > 0.0; })) return uniform;
+    int64_t slot_limit = 0;
+    for (const int64_t quota : uniform) {
+        if (quota > std::numeric_limits<int64_t>::max() - slot_limit) return {};
+        slot_limit += quota;
+    }
+
+    std::vector<std::vector<double>> ranked(slot_bytes.size());
+    uint64_t used = 0;
+    for (size_t layer = 0; layer < slot_bytes.size(); ++layer) {
+        const uint64_t cost = (uint64_t) slot_bytes[layer];
+        if (cost > std::numeric_limits<uint64_t>::max() - used) return {};
+        used += cost;   // floor each layer at one slot
+        ranked[layer].assign(heat.begin() + (ptrdiff_t) (layer * (size_t) n_expert),
+                             heat.begin() + (ptrdiff_t) ((layer + 1) * (size_t) n_expert));
+        std::sort(ranked[layer].begin(), ranked[layer].end(), std::greater<double>());
+    }
+    if (used > byte_budget) return {};
+    std::vector<int64_t> quotas(slot_bytes.size(), 1);
+    int64_t assigned = (int64_t) quotas.size();
+    for (;;) {
+        if (assigned >= slot_limit) break;
+        size_t best = slot_bytes.size();
+        long double best_value = 0.0L;
+        for (size_t layer = 0; layer < slot_bytes.size(); ++layer) {
+            const int64_t next = quotas[layer];
+            if (next >= n_expert || (uint64_t) slot_bytes[layer] > byte_budget - used) continue;
+            const long double value = (long double) ranked[layer][(size_t) next] / (long double) slot_bytes[layer];
+            if (value > best_value ||
+                (value == best_value && best != slot_bytes.size() && quotas[layer] < quotas[best])) {
+                best = layer;
+                best_value = value;
+            }
+        }
+        if (best == slot_bytes.size()) break;
+        ++quotas[best];
+        ++assigned;
+        used += (uint64_t) slot_bytes[best];
+    }
+    return quotas;
+}
+
 ExpertCache::~ExpertCache() { close(); }
 
 #if !defined(STRATA_EC_NO_VMM)

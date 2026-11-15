@@ -77,6 +77,12 @@ bool read_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t
 bool write_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t n_expert,
                                const std::vector<double>& heat, std::string& err);
 
+std::vector<int64_t> uniform_expert_cache_quotas(const std::vector<int64_t>& slot_bytes, int64_t n_expert,
+                                                uint64_t byte_budget);
+std::vector<int64_t> learned_expert_cache_quotas(const std::vector<double>& heat,
+                                                 const std::vector<int64_t>& slot_bytes, int64_t n_expert,
+                                                 uint64_t byte_budget);
+
 /// Free device memory for the expert cache.  On a unified memory system - one memory for the CPU and the GPU, such as
 /// the DGX Spark (GB10); CUDA reports it as cudaDevAttrIntegrated - cudaMemGetInfo counts only MemFree, not the page cache - which, with the experts read from the GGUF in place, is mostly those
 /// files' clean pages and gives way to a device allocation.  There the figure is MemAvailable less 6 GiB for the OS
