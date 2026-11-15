@@ -5418,8 +5418,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: native dense projections: %s\n", err.c_str());
             return 1;
         }
-        std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights, in %.1f s\n",
-                     native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
+        std::fprintf(stderr,
+                     "strata generate: %zu native projection matrices, %.2f MiB of weights (%.2f MiB arena allocated), in %.1f s\n",
+                     native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0),
+                     (double) native_dense.allocated_bytes() / (1024.0 * 1024.0), load_s());
     }
     // ---- THE LAYER SPLIT'S SPILL WALK, STEP 1: THE TRIM.  CUDA0 holds the whole dense set now; every later card is about to load a copy of it (3.5 GiB for IQ3_S), which on a
     // card that is short (two 8 GB cards: 6 of 6 starts failed in 0.2.10) is what leaves its expert cache and its prompt path no room.  A card that cannot afford the copy
