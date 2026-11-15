@@ -218,7 +218,10 @@ const Dflash2Drafter::Tensor& Dflash2Drafter::find(const std::string& name) cons
     throw std::runtime_error("dflash2: tensor " + name + " is missing from the pack");
 }
 
-bool Dflash2Drafter::load(const std::string& path, int device, std::string& err) {
+bool Dflash2Drafter::load(const std::string& path, int device, std::string& err, int max_batch_slots) {
+    blob_shared_ = false;
+    alloc_slots_ = effective_batch_slots(max_batch_slots, false);
+    alloc_rows_ = row_count(max_batch_slots, false);
     device_ = device;
     const OnDevice on_device(device_);
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -374,6 +377,124 @@ bool Dflash2Drafter::wait_precomp_on_cs(cudaStream_t cs) {
     return true;
 }
 
+std::size_t Dflash2Drafter::effective_batch_slots(int requested_batch_slots, bool blob_shared) noexcept {
+    // Batch body graphs index kBatchMaxSlots * kRows (= 64) offsets in rt_bctx_ / kc_ / xqc_, so multi-slot batch keeps 8 slots while solo uses 1.
+    return (blob_shared || requested_batch_slots <= 1) ? 1 : (std::size_t) kBatchMaxSlots;
+}
+
+std::size_t Dflash2Drafter::row_count(int requested_batch_slots, bool blob_shared) noexcept {
+    return effective_batch_slots(requested_batch_slots, blob_shared) * (std::size_t) kRows;
+}
+
+std::size_t Dflash2Drafter::logits_row_count(int requested_batch_slots, bool blob_shared) noexcept {
+    const std::size_t eff = effective_batch_slots(requested_batch_slots, blob_shared);
+    return (!blob_shared && eff > 1) ? std::max<std::size_t>(16, (std::size_t) (2 * kDrafts)) : (std::size_t) kDrafts;
+}
+
+Dflash2Drafter::VramBreakdown Dflash2Drafter::alloc_breakdown(const BufferShape& shape, std::size_t ring_elem_size) {
+    const std::size_t eff = effective_batch_slots(shape.batch_slots, shape.blob_shared);
+    const bool multi_batch = !shape.blob_shared && eff > 1;
+    const std::size_t B = eff * (std::size_t) kRows;
+    const std::size_t HMax = logits_row_count(shape.batch_slots, shape.blob_shared);
+    const int il_max = multi_batch ? 16 : (int) kRows;
+    const int xq_rows = multi_batch ? 16 : (int) kRows;
+    const std::size_t top_rows = multi_batch ? (std::size_t) kBatchMaxRows : (std::size_t) kDrafts;
+    const std::size_t N = (std::size_t) shape.N;
+    const std::size_t L = (std::size_t) shape.L;
+    const std::size_t NH = (std::size_t) shape.NH;
+    const std::size_t NKV = (std::size_t) shape.NKV;
+    const std::size_t HD = (std::size_t) shape.HD;
+    const std::size_t I = (std::size_t) shape.I;
+    const std::size_t rank = (std::size_t) shape.rank;
+    const std::size_t nt = std::max<std::size_t>((std::size_t) shape.n_taps, 1);
+
+    const std::size_t xil_bytes = std::max(
+        kernels::native_q8_1_il_bytes((int) N, il_max),
+        (N / 32) * (std::size_t) il_max * (8 * sizeof(int) + 8 * sizeof(int) + sizeof(float))) + 4096;
+
+    VramBreakdown v{};
+    v.row_buffers =
+        (uint64_t) kMetaInts * sizeof(int32_t) +
+        (uint64_t) (kernels::native_q8_1_bytes((int) N, xq_rows) + 4096) +
+        (uint64_t) xil_bytes +
+        (uint64_t) (5 * N * B + 4096) +
+        (uint64_t) (5 * N / 32 * B + 64) * sizeof(float) +
+        (uint64_t) (5 * N * B + 4096) +
+        (uint64_t) (5 * N / 32 * B + 64) * sizeof(float) +
+        (uint64_t) (2 * (std::size_t) kRows * 128) * sizeof(float) +
+        (uint64_t) 64 * sizeof(double) +
+        (uint64_t) (8 * B * N) * sizeof(float) +                                 // fcy, hctx, h, xn, xc, o, mlp, fn
+        (uint64_t) (2 * L * B * NKV * HD) * sizeof(float) +                      // kc, vc
+        (uint64_t) (B * 640) * sizeof(float) +                                   // dyn
+        (uint64_t) (3 * B * NH * HD) * sizeof(float) +                           // q, qn, ao
+        (uint64_t) (3 * B * NKV * HD) * sizeof(float) +                          // k, v, kblk
+        (uint64_t) (2 * B * I) * sizeof(float) +                                 // gate, up
+        (uint64_t) ((B / (std::size_t) kRows) * (std::size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) * sizeof(float) +
+        (uint64_t) (top_rows * 16) * sizeof(float) +
+        (uint64_t) (top_rows * 16) * sizeof(int32_t) +
+        (uint64_t) (B * rank) * sizeof(float) +
+        (uint64_t) (HMax * (std::size_t) kernels::kDf2TopBlocks * (std::size_t) kernels::kDf2TopK * 2) * sizeof(uint32_t);
+
+    if (multi_batch) {
+        v.batch_only =
+            (uint64_t) (2 * B * 128) * sizeof(float) +                           // rt_bctx
+            (uint64_t) ((std::size_t) kBatchMaxRows * N) * sizeof(float) +       // fn_batch
+            (uint64_t) ((std::size_t) kBatchMaxRows * rank) * sizeof(float);     // hsel_batch
+    }
+
+    const uint64_t ring_bytes = (uint64_t) kRing * NKV * HD * (uint64_t) ring_elem_size;
+    v.ring_buffers =
+        (uint64_t) ((std::size_t) kRows * nt * N) * sizeof(float) +              // landing_
+        2ull * (uint64_t) L * ring_bytes +                                       // kring_, vring_
+        (uint64_t) kRing * sizeof(uint64_t);                                     // tag_
+
+    v.total_alloc = v.row_buffers + v.batch_only + v.ring_buffers;
+    return v;
+}
+
+int64_t Dflash2Drafter::resolve_dvocab(int64_t n_vocab, const std::string& vocab_file, bool same_head_device) {
+    const bool use_native = head_native() && same_head_device;
+    if (!vocab_file.empty() && !use_native) {
+        if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
+            std::fseek(vf, 0, SEEK_END);
+            const long size = std::ftell(vf);
+            std::fclose(vf);
+            if (size >= 4 && size % 4 == 0) return (int64_t) (size / 4);
+        }
+    }
+    return n_vocab;
+}
+
+uint64_t Dflash2Drafter::logits_bytes(int requested_batch_slots, bool blob_shared, int64_t n_dvocab) {
+    if (n_dvocab <= 0) return 0;
+    return (uint64_t) logits_row_count(requested_batch_slots, blob_shared) * (uint64_t) n_dvocab * sizeof(float);
+}
+
+uint64_t Dflash2Drafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file,
+                                    bool head_shared, bool same_head_device) const {
+    const bool use_native = head_native() && same_head_device;
+    int64_t ndvocab = n_vocab;
+    uint64_t bytes = 0;
+    if (!vocab_file.empty() && !use_native) {
+        if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
+            std::fseek(vf, 0, SEEK_END);
+            const long size = std::ftell(vf);
+            std::fclose(vf);
+            if (size >= 4 && size % 4 == 0) {
+                ndvocab = (int64_t) (size / 4);
+                if (!head_shared) bytes += (uint64_t) ndvocab * head_row_bytes + (uint64_t) size;
+            }
+        }
+    }
+    bytes += logits_bytes((int) alloc_slots_, blob_shared_, ndvocab);
+    return bytes;
+}
+
+uint64_t Dflash2Drafter::clone_bind_bytes(int64_t n_vocab, const std::string& vocab_file, bool same_head_device) const {
+    const int64_t ndvocab = resolve_dvocab(n_vocab, vocab_file, same_head_device);
+    return logits_bytes(1, /*blob_shared=*/true, ndvocab);
+}
+
 bool Dflash2Drafter::alloc(std::string& err) {
     auto dev = [&](auto** p, size_t n) {
         using T = std::remove_pointer_t<std::remove_reference_t<decltype(*p)>>;
@@ -381,21 +502,27 @@ bool Dflash2Drafter::alloc(std::string& err) {
         vram_ += n * sizeof(T);
         return true;
     };
-    const size_t B = blob_shared_ ? (size_t) kRows : (size_t) (kBatchMaxSlots * kRows);
-    const size_t HMax = blob_shared_ ? (size_t) kDrafts : std::max<size_t>(16, (size_t) (2 * kDrafts));
-    const int il_max = blob_shared_ ? (int) kRows : 16;
+    const size_t eff = effective_batch_slots((int) alloc_slots_, blob_shared_);
+    alloc_slots_ = eff;
+    const bool multi_batch = !blob_shared_ && eff > 1;
+    const size_t B = eff * (size_t) kRows;
+    alloc_rows_ = B;
+    const size_t HMax = logits_row_count((int) eff, blob_shared_);
+    const int il_max = multi_batch ? 16 : (int) kRows;
+    const int xq_rows = multi_batch ? 16 : (int) kRows;
+    const size_t top_rows = multi_batch ? (size_t) kBatchMaxRows : (size_t) kDrafts;
     const size_t xil_bytes = std::max(
         kernels::native_q8_1_il_bytes(N_, il_max),
         (size_t) (N_ / 32) * (size_t) il_max * (8 * sizeof(int) + 8 * sizeof(int) + sizeof(float))) + 4096;
-    bool ok = dev(&d_meta_, kMetaInts) && dev(&xq_, kernels::native_q8_1_bytes(N_, blob_shared_ ? kRows : 16) + 4096) && dev(&xil_, xil_bytes) && dev(&xqp_, (size_t) 5 * N_ * B + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * B + 64) && dev(&xqc_, (size_t) 5 * N_ * B + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * B + 64) && dev(&rt_ctx_, 2 * kRows * 128) && (blob_shared_ || dev(&rt_bctx_, 2 * kBatchMaxSlots * kRows * 128)) && dev(&rope_inv_, 64) &&
+    bool ok = dev(&d_meta_, kMetaInts) && dev(&xq_, kernels::native_q8_1_bytes(N_, xq_rows) + 4096) && dev(&xil_, xil_bytes) && dev(&xqp_, (size_t) 5 * N_ * B + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * B + 64) && dev(&xqc_, (size_t) 5 * N_ * B + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * B + 64) && dev(&rt_ctx_, 2 * kRows * 128) && (!multi_batch || dev(&rt_bctx_, 2 * B * 128)) && dev(&rope_inv_, 64) &&
               dev(&fcy_, B * N_) && dev(&hctx_, B * N_) && dev(&kc_, (size_t) L_ * B * NKV_ * HD_) && dev(&vc_, (size_t) L_ * B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
               dev(&xc_, B * N_) && dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
               dev(&part_, (B / kRows) * (size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) && dev(&fn_, B * N_) &&
-              dev(&topval_, (size_t) (blob_shared_ ? kDrafts : kBatchMaxRows) * 16) &&
-              dev(&toptok_, (size_t) (blob_shared_ ? kDrafts : kBatchMaxRows) * 16) &&
+              dev(&topval_, top_rows * 16) &&
+              dev(&toptok_, top_rows * 16) &&
               dev(&hsel_, B * rank_) && dev(&topscratch_, HMax * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
-    if (!blob_shared_) {
+    if (multi_batch) {
         ok = ok && dev(&fn_batch_, (size_t) kBatchMaxRows * N_) && dev(&hsel_batch_, (size_t) kBatchMaxRows * rank_);
     }
     ok = ok && dev(&landing_, (size_t) kRows * std::max<size_t>(taps_.size(), 1) * (size_t) N_);
@@ -418,7 +545,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
     h_out_ = (int32_t*) hd;
     out_tok_ = (int32_t*) dd;            // the select kernel writes the 7 picks here (host-visible) ...
     out_prob_ = (float*) dd + 16;        // ... and their probabilities at +16 ints
-    if (!blob_shared_) {
+    if (multi_batch) {
         if (!mapped((kBatchMaxSlots * 4) * 4, &hd, &dd)) { err = "dflash2: mapped batch staging"; return false; }
         h_bmeta_ = (int32_t*) hd;
         m_bmeta_ = (int32_t*) dd;
@@ -430,8 +557,8 @@ bool Dflash2Drafter::alloc(std::string& err) {
     rt_blk_ = rt_ctx_ + kRows * 128;
     cudaMemset(rt_ctx_, 0, 2 * kRows * 128 * 4);
     if (rt_bctx_) {
-        rt_bblk_ = rt_bctx_ + (kBatchMaxSlots * kRows) * 128;
-        cudaMemset(rt_bctx_, 0, 2 * kBatchMaxSlots * kRows * 128 * 4);
+        rt_bblk_ = rt_bctx_ + B * 128;
+        cudaMemset(rt_bctx_, 0, 2 * B * 128 * 4);
     }
     kernels::df2_rope_inv(theta_, rope_inv_, nullptr);
     if (cudaMalloc((void**) &tag_, (size_t) kRing * 8) != cudaSuccess) { err = "dflash2: ring tags"; return false; }
@@ -464,7 +591,7 @@ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, 
         }
     }
     if ((n_dvocab_ + kernels::kDf2TopBlocks - 1) / kernels::kDf2TopBlocks > 4096) { err = "dflash2: the head has too many rows for the top-k"; return false; }
-    const size_t hmax = blob_shared_ ? (size_t) kDrafts : std::max<size_t>(16, (size_t) (2 * kDrafts));
+    const size_t hmax = logits_rows();
     if (!logits_ && cudaMalloc((void**) &logits_, hmax * (size_t) n_dvocab_ * 4) != cudaSuccess) { err = "dflash2: the draft logits do not fit"; return false; }
     vram_ += (uint64_t) hmax * (uint64_t) n_dvocab_ * 4;
     bound_ = true;
@@ -591,7 +718,7 @@ bool Dflash2Drafter::record_kv(int n, cudaStream_t cs, const uint8_t* xq, const 
     try {
         const float* rt = rt_override != nullptr ? rt_override : rt_ctx_;
         const int32_t* ep = epoch_override != nullptr ? epoch_override : (d_meta_ + 18);
-        const size_t B = blob_shared_ ? (size_t) kRows : (size_t) (kBatchMaxSlots * kRows);
+        const size_t B = alloc_rows_;
         const size_t l_stride = B * NKV_ * HD_;
         if (!fork_ && (L_ == 5 || L_ == 8)) {
             if (L_ == 5) {
@@ -934,6 +1061,8 @@ bool Dflash2Drafter::clone_alloc(const Dflash2Drafter& parent, std::string& err)
     group_ = parent.group_; rank_ = parent.rank_; mask_token_ = parent.mask_token_; theta_ = parent.theta_; eps_ = parent.eps_;
     taps_ = parent.taps_; vocab_ = parent.vocab_; q4_ = parent.q4_; tensors_ = parent.tensors_;
     blob_ = parent.blob_; blob_shared_ = true;
+    alloc_slots_ = 1;
+    alloc_rows_ = kRows;
     return make_streams(err) && alloc(err);
 }
 
@@ -1567,7 +1696,7 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
     const int tap_n = (int) taps_.size() * N_;
     const int64_t stage_cap = (int64_t) kRows * 8;
     int precomp_off = 0;
-    if (!blob_shared_ && rt_bctx_ != nullptr && !prof_ && !skip_part("ctx") && n >= 1 && n <= kBatchMaxSlots * kRows &&
+    if (!blob_shared_ && rt_bctx_ != nullptr && !prof_ && !skip_part("ctx") && n >= 1 && n <= (int64_t) alloc_rows_ &&
         has_precomputed_context(taps, (int) n, pos0, &precomp_off)) {
         if (precomp_off + (int) n >= precomp_rows_) clear_precomputed_context();
         try {
@@ -1575,7 +1704,7 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
             h_meta_[18] = epoch_;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             kernels::copy_i32_from_mapped(d_meta_ + 18, m_meta_ + 18, 1, cs_);
-            const size_t l_stride = (size_t) (kBatchMaxSlots * kRows) * NKV_ * HD_;
+            const size_t l_stride = alloc_rows_ * NKV_ * HD_;
             const size_t row_kv = (size_t) precomp_off * NKV_ * HD_;
             for (int l = 0; l < L_; ++l) {
                 const std::string p = "layers." + std::to_string(l) + ".";
@@ -1787,7 +1916,7 @@ void Dflash2Drafter::record_precompute_batch_context(const float* taps, int n_ro
     df2_quant_rows(taps, tap_n, n_rows, xqc_, xdc_, cs);
     gemm({"fc.weight"}, {fcy_}, n_rows, cs, xqc_, xdc_);
     df2_rms_quant(fcy_, f32("hidden_norm.weight"), nullptr, n_rows, N_, eps_, xqc_, xdc_, cs);
-    const size_t l_stride = (size_t) (kBatchMaxSlots * kRows) * NKV_ * HD_;
+    const size_t l_stride = alloc_rows_ * NKV_ * HD_;
     if (L_ == 5) {
         gemm({"layers.0.self_attn.k_proj.weight", "layers.0.self_attn.v_proj.weight",
               "layers.1.self_attn.k_proj.weight", "layers.1.self_attn.v_proj.weight",
@@ -1909,7 +2038,7 @@ void Dflash2Drafter::prewarm_precompute(const float* taps, int max_rows) {
 
 void Dflash2Drafter::precompute_batch_context(const float* taps, int n_rows, const int64_t* pos) noexcept {
     if (!bound_ || blob_shared_ || skip_part("ctx") || taps == nullptr || pos == nullptr ||
-        n_rows < 1 || n_rows > kBatchMaxSlots * kRows || rt_bctx_ == nullptr) return;
+        n_rows < 1 || n_rows > (int) alloc_rows_ || rt_bctx_ == nullptr) return;
     try {
         const OnDevice on_device(device_);
         cudaStream_t pre_cs = cs_pre_ ? cs_pre_ : cs_;
@@ -1979,7 +2108,7 @@ bool Dflash2Drafter::record_batch_body(const BatchSlotItem* items, int n_items, 
         int total_ctx = 0;
         for (int idx = 0; idx < n_items; ++idx) total_ctx += items[idx].n_new;
         const int total_B = n_items * kRows;
-        df2_rope_table_inv(d_meta_ + kMetaCtx, (kBatchMaxSlots * kRows) + total_B, rope_inv_, rt_bctx_, cs);
+        df2_rope_table_inv(d_meta_ + kMetaCtx, (int) alloc_rows_ + total_B, rope_inv_, rt_bctx_, cs);
         if (!skip_part("ctx") && total_ctx > 0) {
             const int tap_n = (int) taps_.size() * N_;
             int c0 = 0;
@@ -2000,7 +2129,7 @@ bool Dflash2Drafter::record_batch_body(const BatchSlotItem* items, int n_items, 
                 for (int r = 0; r < n; ++r) bkv.row_slot[c0 + r] = (uint8_t) idx;
                 c0 += n;
             }
-            const size_t l_stride = (size_t) (kBatchMaxSlots * kRows) * NKV_ * HD_;
+            const size_t l_stride = alloc_rows_ * NKV_ * HD_;
             if (L_ == 5) {
                 gemm({"layers.0.self_attn.k_proj.weight", "layers.0.self_attn.v_proj.weight",
                       "layers.1.self_attn.k_proj.weight", "layers.1.self_attn.v_proj.weight",
@@ -2122,7 +2251,7 @@ bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n
         for (int l = 0; l < L_; ++l) {
             bkv.gk[l] = f32("layers." + std::to_string(l) + ".self_attn.k_norm.weight");
         }
-        const size_t l_stride = (size_t) (kBatchMaxSlots * kRows) * NKV_ * HD_;
+        const size_t l_stride = alloc_rows_ * NKV_ * HD_;
         if (!skip_part("ctx")) {
             if (fp16_ring_)
                 df2_kv_ring_batch_precomp_f16(kc_, vc_, l_stride, d_meta_ + kMetaPrecompPos, rt_bctx_, bkv, d_meta_ + kMetaSlotInfo, d_meta_ + kMetaEpoch,
@@ -2239,7 +2368,7 @@ bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t
 }
 
 bool Dflash2Drafter::capture_batch_body(const BatchSlotItem* items, int n_items, cudaGraphExec_t& exec_out, std::string& err) {
-    if (n_items < 2 || n_items > kBatchMaxSlots) return false;
+    if (!is_multi_batch() || rt_bctx_ == nullptr || n_items < 2 || n_items > kBatchMaxSlots) return false;
     BatchBodyGraphKey key{};
     key.n_items = n_items;
     for (int idx = 0; idx < n_items; ++idx) {
@@ -2284,7 +2413,7 @@ bool Dflash2Drafter::capture_batch_body(const BatchSlotItem* items, int n_items,
 }
 
 bool Dflash2Drafter::capture_batch_full(const BatchSlotItem* items, int n_items, int total_rows, cudaGraphExec_t& exec_out, std::string& err) {
-    if (n_items < 1 || n_items > kBatchMaxSlots || total_rows < 1 || total_rows > n_items * kDrafts) return false;
+    if (!is_multi_batch() || rt_bctx_ == nullptr || n_items < 1 || n_items > kBatchMaxSlots || total_rows < 1 || total_rows > n_items * kDrafts) return false;
     BatchFullGraphKey key{};
     key.n_items = n_items;
     key.total_rows = total_rows;
@@ -2327,7 +2456,7 @@ bool Dflash2Drafter::capture_batch_full(const BatchSlotItem* items, int n_items,
 }
 
 bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_items, std::string& err) {
-    if (!bound_ || blob_shared_) { err = "dflash2: draft_batch_slots requires bound parent drafter"; return false; }
+    if (!bound_ || blob_shared_ || !is_multi_batch()) { err = "dflash2: draft_batch_slots requires multi-slot batch parent drafter"; return false; }
     if (n_items == 0) return true;
     if (items == nullptr || n_items < 0 || n_items > kBatchMaxSlots) { err = "dflash2: invalid batch slot items"; return false; }
     if (!context_wait(err)) return false;

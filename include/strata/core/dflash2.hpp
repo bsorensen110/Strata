@@ -60,8 +60,9 @@ public:
     Dflash2Drafter(const Dflash2Drafter&) = delete;
     Dflash2Drafter& operator=(const Dflash2Drafter&) = delete;
 
-    /// Reads the pack (tools/dflash2_pack.py) to the GPU `device` and allocates the ring and the buffers (about 0.8 GB).
-    bool load(const std::string& pack_path, int device, std::string& err);
+    /// Reads the pack (tools/dflash2_pack.py) to the GPU `device` and allocates the ring and the buffers.
+    /// `max_batch_slots` <= 1 sizes row buffers for solo use (8 rows, 7 logit rows); > 1 keeps the 64-row multi-slot batch buffers.
+    bool load(const std::string& pack_path, int device, std::string& err, int max_batch_slots = 1);
     /// The target's embedding and head (and the draft vocabulary file, "" or missing: the whole head).
     /// `head_device` >= 0 and not this card's: the head sits on another card (a layer split's last stage); the draft vocabulary's rows are gathered there and
     /// copied over once, so the drafter can sit on the first stage's card.
@@ -212,6 +213,38 @@ public:
     std::size_t ring_elem_bytes() const { return fp16_ring_ ? 2 : 4; }
 
     uint64_t vram_bytes() const { return vram_; }
+    std::size_t alloc_slots() const noexcept { return alloc_slots_; }
+    std::size_t alloc_rows() const noexcept { return alloc_rows_; }
+    std::size_t logits_rows() const noexcept { return logits_row_count((int) alloc_slots_, blob_shared_); }
+    bool is_multi_batch() const noexcept { return !blob_shared_ && alloc_slots_ > 1; }
+
+    struct BufferShape {
+        int N = 2560;
+        int L = 5;
+        int NH = 32;
+        int NKV = 8;
+        int HD = 128;
+        int I = 7680;
+        int rank = 256;
+        int n_taps = 5;
+        int batch_slots = 1;    ///< <= 1: solo/clones (kRows = 8, kDrafts = 7); > 1: multi-slot batch (64 rows, 16 logit rows)
+        bool blob_shared = false;
+    };
+    struct VramBreakdown {
+        uint64_t row_buffers = 0;   ///< activations, RoPE, quant/head buffers sized by B / HMax (excludes batch_only)
+        uint64_t batch_only = 0;    ///< rt_bctx_, fn_batch_, hsel_batch_ (0 when batch_slots <= 1 or blob_shared)
+        uint64_t ring_buffers = 0;  ///< kring_, vring_, tag_, landing_
+        uint64_t total_alloc = 0;   ///< exact bytes allocated in Dflash2Drafter::alloc()
+    };
+    static std::size_t effective_batch_slots(int requested_batch_slots, bool blob_shared) noexcept;
+    static std::size_t row_count(int requested_batch_slots, bool blob_shared) noexcept;
+    static std::size_t logits_row_count(int requested_batch_slots, bool blob_shared) noexcept;
+    static VramBreakdown alloc_breakdown(const BufferShape& shape, std::size_t ring_elem_size = 4);
+    static int64_t resolve_dvocab(int64_t n_vocab, const std::string& vocab_file, bool same_head_device = true);
+    static uint64_t logits_bytes(int requested_batch_slots, bool blob_shared, int64_t n_dvocab);
+    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file,
+                        bool head_shared, bool same_head_device = true) const;
+    uint64_t clone_bind_bytes(int64_t n_vocab, const std::string& vocab_file, bool same_head_device = true) const;
     int64_t n_draft_vocab() const { return n_dvocab_; }
     int n_embd() const { return N_; }
     int mask_token() const { return mask_token_; }   ///< the token whose embedding fills the block's 7 mask rows (the split engine stages the block's embeddings itself)
@@ -256,6 +289,8 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* blob_ = nullptr;
     bool blob_shared_ = false;      ///< blob_ (and the bound head) belong to the parent drafter (clone_for_slot)
+    std::size_t alloc_slots_ = 1;   ///< effective batch slots sized in alloc() (1 solo/clones, kBatchMaxSlots multi-slot batch)
+    std::size_t alloc_rows_ = kRows; ///< row capacity in alloc() (alloc_slots_ * kRows: 8 solo/clones, 64 batch)
     float* landing_ = nullptr;
     float* dpend_ = nullptr;        ///< pinned host: deferred taps, row = position % kRing2048
     int64_t dpend_lo_ = 0, dpend_hi_ = 0;
