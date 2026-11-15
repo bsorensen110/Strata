@@ -71,11 +71,37 @@ std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, 
 /// so a reader (the next start) never sees half a file.  False with `err` when it could not be written.
 bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                           const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
-
 bool read_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t n_expert,
                               std::vector<double>& heat, std::string& err);
 bool write_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t n_expert,
                                const std::vector<double>& heat, std::string& err);
+
+enum class ExpertHeatProvenance {
+    None,
+    Runtime,
+    LegacyUnmarked,
+    ProfileRankPrior,
+    Malformed,
+};
+
+const char* expert_heat_provenance_name(ExpertHeatProvenance p);
+
+/// Return the `.heat.meta` provenance sidecar path paired with `heat_path`.
+std::string expert_profile_heat_meta_path(const std::string& heat_path);
+
+/// Read and validate `<heat_path>` together with `<heat_path>.meta` when present.
+/// Without `.meta`, a valid STRH v1 file has `LegacyUnmarked` provenance for compatibility with prior builds.
+bool read_expert_profile_heat_with_provenance(const std::string& heat_path, int64_t n_layers, int64_t n_expert,
+                                              std::vector<double>& heat, ExpertHeatProvenance& provenance,
+                                              std::string& source_profile, std::string& err);
+
+/// Atomically write `<heat_path>` (STRH v1) and `<heat_path>.meta` provenance metadata.
+/// Only `Runtime` and `ProfileRankPrior` provenance are accepted. Prior writes `.meta` first; runtime stages
+/// both `.tmp` files first, then renames `.heat` before `.meta` so failures cannot silently upgrade provenance.
+bool write_expert_profile_heat_with_provenance(const std::string& heat_path, int64_t n_layers, int64_t n_expert,
+                                               const std::vector<double>& heat, ExpertHeatProvenance provenance,
+                                               const std::string& source_profile, const std::string& source_kind,
+                                               int64_t ranked_pairs, std::string& err);
 
 std::vector<int64_t> uniform_expert_cache_quotas(const std::vector<int64_t>& slot_bytes, int64_t n_expert,
                                                 uint64_t byte_budget);

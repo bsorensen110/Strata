@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <filesystem>
 #include <cstdlib>
@@ -443,6 +444,413 @@ std::vector<int64_t> learned_expert_cache_quotas(const std::vector<double>& heat
         used += (uint64_t) slot_bytes[best];
     }
     return quotas;
+}
+
+const char* expert_heat_provenance_name(ExpertHeatProvenance p) {
+    switch (p) {
+        case ExpertHeatProvenance::None: return "none";
+        case ExpertHeatProvenance::Runtime: return "runtime";
+        case ExpertHeatProvenance::LegacyUnmarked: return "legacy-unmarked";
+        case ExpertHeatProvenance::ProfileRankPrior: return "profile-rank prior";
+        case ExpertHeatProvenance::Malformed: return "malformed";
+    }
+    return "unknown";
+}
+
+std::string expert_profile_heat_meta_path(const std::string& heat_path) {
+    return heat_path.empty() ? std::string{} : heat_path + ".meta";
+}
+
+namespace {
+
+constexpr uint64_t kHeatFnvOffset = 14695981039346656037ull;
+constexpr uint64_t kHeatFnvPrime  = 1099511628211ull;
+
+bool valid_heat_dimensions(int64_t n_layers, int64_t n_expert) {
+    return n_layers > 0 && n_expert > 0 && n_layers <= 65535 && n_expert <= 65535 &&
+           (size_t) n_layers <= std::numeric_limits<size_t>::max() / (size_t) n_expert &&
+           (size_t) n_layers * (size_t) n_expert <= std::numeric_limits<size_t>::max() / sizeof(double);
+}
+
+bool valid_heat_values(const std::vector<double>& heat, int64_t n_layers, int64_t n_expert) {
+    return valid_heat_dimensions(n_layers, n_expert) &&
+           heat.size() == (size_t) n_layers * (size_t) n_expert &&
+           std::none_of(heat.begin(), heat.end(), [](double v) { return !std::isfinite(v) || v < 0.0; });
+}
+
+uint64_t heat_payload_fnv1a64(const std::vector<double>& heat) {
+    uint64_t h = kHeatFnvOffset;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(heat.data());
+    const size_t nbytes = heat.size() * sizeof(double);
+    for (size_t i = 0; i < nbytes; ++i) {
+        h ^= (uint64_t) bytes[i];
+        h *= kHeatFnvPrime;
+    }
+    return h;
+}
+
+std::string format_hex64(uint64_t v) {
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long) v);
+    return std::string(buf, 16);
+}
+
+std::string sanitize_meta_value(std::string s) {
+    for (char& c : s) {
+        if (c == '\r' || c == '\n' || c == '\0') c = ' ';
+    }
+    return s;
+}
+
+bool parse_strict_i64(const std::string& s, int64_t& out) {
+    if (s.empty()) return false;
+    size_t idx = 0;
+    if (s[0] == '+' || s[0] == '-') {
+        if (s[0] == '+' || s.size() == 1) return false;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const long long val = std::strtoll(s.c_str(), &end, 10);
+    if (errno != 0 || end == s.c_str() || *end != '\0') return false;
+    (void) idx;
+    out = (int64_t) val;
+    return true;
+}
+
+bool parse_strict_hex64(const std::string& s, uint64_t& out) {
+    if (s.size() != 16) return false;
+    uint64_t acc = 0;
+    for (unsigned char ch : s) {
+        acc <<= 4;
+        if (ch >= '0' && ch <= '9') acc |= (uint64_t) (ch - '0');
+        else if (ch >= 'a' && ch <= 'f') acc |= (uint64_t) (10 + (ch - 'a'));
+        else if (ch >= 'A' && ch <= 'F') acc |= (uint64_t) (10 + (ch - 'A'));
+        else return false;
+    }
+    out = acc;
+    return true;
+}
+
+bool stage_heat_tmp(const std::string& tmp_path, int64_t n_layers, int64_t n_expert,
+                    const std::vector<double>& heat, std::string& err) {
+    const uint32_t hdr[3] = {1u, (uint32_t) n_layers, (uint32_t) n_expert};
+    std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    if (f == nullptr) {
+        err = "write_expert_profile_heat_with_provenance: cannot create " + tmp_path;
+        return false;
+    }
+    bool ok = std::fwrite("STRH", 1, 4, f) == 4 && std::fwrite(hdr, 4, 3, f) == 3 &&
+              (heat.empty() || std::fwrite(heat.data(), sizeof(double), heat.size(), f) == heat.size());
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok) {
+        std::error_code ec;
+        std::filesystem::remove(tmp_path, ec);
+        err = "write_expert_profile_heat_with_provenance: cannot write " + tmp_path;
+        return false;
+    }
+    return true;
+}
+
+bool stage_meta_tmp(const std::string& tmp_path, int64_t n_layers, int64_t n_expert,
+                    ExpertHeatProvenance provenance, const std::string& source_profile,
+                    const std::string& source_kind, int64_t ranked_pairs, uint64_t heat_hash,
+                    std::string& err) {
+    const char* prov_str = provenance == ExpertHeatProvenance::Runtime ? "runtime" : "profile-rank-prior";
+    const std::string body =
+        "strata_heat_meta=1\n"
+        "provenance=" + std::string(prov_str) + "\n"
+        "source_kind=" + sanitize_meta_value(source_kind) + "\n"
+        "source_profile=" + sanitize_meta_value(source_profile) + "\n"
+        "n_layers=" + std::to_string((long long) n_layers) + "\n"
+        "n_expert=" + std::to_string((long long) n_expert) + "\n"
+        "ranked_pairs=" + std::to_string((long long) ranked_pairs) + "\n"
+        "heat_fnv1a64=" + format_hex64(heat_hash) + "\n";
+
+    std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    if (f == nullptr) {
+        err = "write_expert_profile_heat_with_provenance: cannot create " + tmp_path;
+        return false;
+    }
+    bool ok = std::fwrite(body.data(), 1, body.size(), f) == body.size();
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok) {
+        std::error_code ec;
+        std::filesystem::remove(tmp_path, ec);
+        err = "write_expert_profile_heat_with_provenance: cannot write " + tmp_path;
+        return false;
+    }
+    return true;
+}
+
+bool read_heat_meta_file(const std::string& meta_path, int64_t n_layers, int64_t n_expert,
+                         ExpertHeatProvenance& provenance, std::string& source_profile,
+                         uint64_t& recorded_hash, std::string& err) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(meta_path, ec) || ec) {
+        err = "read_expert_profile_heat_with_provenance: invalid metadata path " + meta_path;
+        return false;
+    }
+    const uintmax_t fsize = std::filesystem::file_size(meta_path, ec);
+    if (ec || fsize > 8192) {
+        err = "read_expert_profile_heat_with_provenance: unreadable or oversized metadata file " + meta_path;
+        return false;
+    }
+    std::FILE* f = std::fopen(meta_path.c_str(), "rb");
+    if (f == nullptr) {
+        err = "read_expert_profile_heat_with_provenance: cannot open metadata file " + meta_path;
+        return false;
+    }
+    std::string content((size_t) fsize, '\0');
+    const size_t nread = content.empty() ? 0 : std::fread(content.data(), 1, content.size(), f);
+    const int extra = std::fgetc(f);
+    const bool io_err = std::ferror(f) != 0;
+    std::fclose(f);
+    if (nread != content.size() || extra != EOF || io_err) {
+        err = "read_expert_profile_heat_with_provenance: truncated metadata file " + meta_path;
+        return false;
+    }
+
+    bool have_ver = false;
+    bool have_prov = false;
+    bool have_nl = false;
+    bool have_ne = false;
+    bool have_hash = false;
+    ExpertHeatProvenance parsed_prov = ExpertHeatProvenance::None;
+    std::string parsed_src;
+    uint64_t parsed_hash = 0;
+
+    size_t pos = 0;
+    while (pos < content.size()) {
+        const size_t nl = content.find('\n', pos);
+        std::string line = (nl == std::string::npos) ? content.substr(pos) : content.substr(pos, nl - pos);
+        pos = (nl == std::string::npos) ? content.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            err = "read_expert_profile_heat_with_provenance: malformed metadata line in " + meta_path;
+            return false;
+        }
+        const std::string key = line.substr(0, eq);
+        const std::string val = line.substr(eq + 1);
+        if (key == "strata_heat_meta") {
+            if (have_ver || val != "1") {
+                err = "read_expert_profile_heat_with_provenance: unsupported metadata version in " + meta_path;
+                return false;
+            }
+            have_ver = true;
+        } else if (key == "provenance") {
+            if (have_prov) {
+                err = "read_expert_profile_heat_with_provenance: duplicate provenance in " + meta_path;
+                return false;
+            }
+            if (val == "runtime") parsed_prov = ExpertHeatProvenance::Runtime;
+            else if (val == "profile-rank-prior") parsed_prov = ExpertHeatProvenance::ProfileRankPrior;
+            else {
+                err = "read_expert_profile_heat_with_provenance: unknown provenance '" + val + "' in " + meta_path;
+                return false;
+            }
+            have_prov = true;
+        } else if (key == "n_layers") {
+            int64_t v = 0;
+            if (have_nl || !parse_strict_i64(val, v) || v != n_layers) {
+                err = "read_expert_profile_heat_with_provenance: metadata n_layers mismatch in " + meta_path;
+                return false;
+            }
+            have_nl = true;
+        } else if (key == "n_expert") {
+            int64_t v = 0;
+            if (have_ne || !parse_strict_i64(val, v) || v != n_expert) {
+                err = "read_expert_profile_heat_with_provenance: metadata n_expert mismatch in " + meta_path;
+                return false;
+            }
+            have_ne = true;
+        } else if (key == "heat_fnv1a64") {
+            if (have_hash || !parse_strict_hex64(val, parsed_hash)) {
+                err = "read_expert_profile_heat_with_provenance: invalid heat checksum in " + meta_path;
+                return false;
+            }
+            have_hash = true;
+        } else if (key == "source_profile") {
+            parsed_src = val;
+        } else if (key == "source_kind" || key == "ranked_pairs") {
+            if (key == "ranked_pairs") {
+                int64_t rp = -1;
+                if (!parse_strict_i64(val, rp) || rp < 0) {
+                    err = "read_expert_profile_heat_with_provenance: invalid ranked_pairs in " + meta_path;
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (!have_ver || !have_prov || !have_nl || !have_ne || !have_hash) {
+        err = "read_expert_profile_heat_with_provenance: incomplete metadata in " + meta_path;
+        return false;
+    }
+    provenance = parsed_prov;
+    source_profile = std::move(parsed_src);
+    recorded_hash = parsed_hash;
+    return true;
+}
+
+}  // namespace
+
+bool read_expert_profile_heat_with_provenance(const std::string& heat_path, int64_t n_layers, int64_t n_expert,
+                                              std::vector<double>& heat, ExpertHeatProvenance& provenance,
+                                              std::string& source_profile, std::string& err) {
+    heat.clear();
+    source_profile.clear();
+    if (heat_path.empty()) {
+        provenance = ExpertHeatProvenance::None;
+        err = "read_expert_profile_heat_with_provenance: empty path";
+        return false;
+    }
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(heat_path, ec);
+    if (ec) {
+        provenance = ExpertHeatProvenance::Malformed;
+        err = "read_expert_profile_heat_with_provenance: cannot stat " + heat_path + ": " + ec.message();
+        return false;
+    }
+    if (!exists) {
+        provenance = ExpertHeatProvenance::None;
+        err = "read_expert_profile_heat_with_provenance: missing " + heat_path;
+        return false;
+    }
+    if (std::filesystem::is_directory(heat_path, ec) || ec) {
+        provenance = ExpertHeatProvenance::Malformed;
+        err = "read_expert_profile_heat_with_provenance: invalid heat file path " + heat_path;
+        return false;
+    }
+
+    std::vector<double> values;
+    if (!read_expert_profile_heat(heat_path, n_layers, n_expert, values, err)) {
+        provenance = ExpertHeatProvenance::Malformed;
+        return false;
+    }
+
+    const std::string meta_path = expert_profile_heat_meta_path(heat_path);
+    const bool has_meta = std::filesystem::exists(meta_path, ec);
+    if (ec) {
+        provenance = ExpertHeatProvenance::Malformed;
+        err = "read_expert_profile_heat_with_provenance: cannot stat metadata " + meta_path + ": " + ec.message();
+        return false;
+    }
+    if (!has_meta) {
+        provenance = ExpertHeatProvenance::LegacyUnmarked;
+        heat = std::move(values);
+        return true;
+    }
+
+    ExpertHeatProvenance meta_prov = ExpertHeatProvenance::None;
+    std::string meta_src;
+    uint64_t meta_hash = 0;
+    if (!read_heat_meta_file(meta_path, n_layers, n_expert, meta_prov, meta_src, meta_hash, err)) {
+        provenance = ExpertHeatProvenance::Malformed;
+        return false;
+    }
+    const uint64_t actual_hash = heat_payload_fnv1a64(values);
+    if (meta_prov == ExpertHeatProvenance::Runtime && meta_hash != actual_hash) {
+        provenance = ExpertHeatProvenance::Malformed;
+        err = "read_expert_profile_heat_with_provenance: runtime heat checksum mismatch with " + meta_path;
+        return false;
+    }
+    // Note: if meta_prov == ProfileRankPrior and meta_hash != actual_hash (e.g. a crash occurred after
+    // renaming runtime .heat before renaming .meta), provenance intentionally stays ProfileRankPrior so a
+    // failed/interrupted write never silently upgrades a prior to Runtime.
+    provenance = meta_prov;
+    source_profile = std::move(meta_src);
+    heat = std::move(values);
+    return true;
+}
+
+bool write_expert_profile_heat_with_provenance(const std::string& heat_path, int64_t n_layers, int64_t n_expert,
+                                               const std::vector<double>& heat, ExpertHeatProvenance provenance,
+                                               const std::string& source_profile, const std::string& source_kind,
+                                               int64_t ranked_pairs, std::string& err) {
+    if (heat_path.empty() || !valid_heat_values(heat, n_layers, n_expert) || ranked_pairs < 0) {
+        err = "write_expert_profile_heat_with_provenance: invalid arguments, dimensions, or heat values";
+        return false;
+    }
+    if (provenance != ExpertHeatProvenance::Runtime && provenance != ExpertHeatProvenance::ProfileRankPrior) {
+        err = "write_expert_profile_heat_with_provenance: provenance must be Runtime or ProfileRankPrior";
+        return false;
+    }
+
+    const std::string meta_path = expert_profile_heat_meta_path(heat_path);
+    const std::string heat_tmp = heat_path + ".tmp";
+    const std::string meta_tmp = meta_path + ".tmp";
+    const uint64_t heat_hash = heat_payload_fnv1a64(heat);
+
+    std::error_code ec;
+    const bool had_heat = std::filesystem::exists(heat_path, ec);
+    if (ec) {
+        err = "write_expert_profile_heat_with_provenance: cannot inspect " + heat_path;
+        return false;
+    }
+    const bool had_meta = std::filesystem::exists(meta_path, ec);
+    if (ec) {
+        err = "write_expert_profile_heat_with_provenance: cannot inspect " + meta_path;
+        return false;
+    }
+
+    auto cleanup_tmps = [&] {
+        std::error_code rm_ec;
+        std::filesystem::remove(heat_tmp, rm_ec);
+        std::filesystem::remove(meta_tmp, rm_ec);
+    };
+
+    if (provenance == ExpertHeatProvenance::ProfileRankPrior) {
+        if (!stage_meta_tmp(meta_tmp, n_layers, n_expert, provenance, source_profile, source_kind, ranked_pairs,
+                            heat_hash, err) ||
+            !stage_heat_tmp(heat_tmp, n_layers, n_expert, heat, err)) {
+            cleanup_tmps();
+            return false;
+        }
+        std::filesystem::rename(meta_tmp, meta_path, ec);
+        if (ec) {
+            cleanup_tmps();
+            err = "write_expert_profile_heat_with_provenance: cannot commit metadata " + meta_path + ": " + ec.message();
+            return false;
+        }
+        std::filesystem::rename(heat_tmp, heat_path, ec);
+        if (ec) {
+            cleanup_tmps();
+            if (!had_heat && !had_meta) {
+                std::error_code rm_ec;
+                std::filesystem::remove(meta_path, rm_ec);
+            }
+            err = "write_expert_profile_heat_with_provenance: cannot commit heat " + heat_path + ": " + ec.message();
+            return false;
+        }
+        return true;
+    }
+
+    // Runtime write: stage BOTH temp files first so staging failures leave existing heat & metadata intact,
+    // then commit .heat before .meta so a failure or crash between renames never upgrades a prior to Runtime.
+    if (!stage_heat_tmp(heat_tmp, n_layers, n_expert, heat, err) ||
+        !stage_meta_tmp(meta_tmp, n_layers, n_expert, provenance, source_profile, source_kind, ranked_pairs,
+                        heat_hash, err)) {
+        cleanup_tmps();
+        return false;
+    }
+    std::filesystem::rename(heat_tmp, heat_path, ec);
+    if (ec) {
+        cleanup_tmps();
+        err = "write_expert_profile_heat_with_provenance: cannot commit runtime heat " + heat_path + ": " +
+              ec.message();
+        return false;
+    }
+    std::filesystem::rename(meta_tmp, meta_path, ec);
+    if (ec) {
+        cleanup_tmps();
+        err = "write_expert_profile_heat_with_provenance: cannot commit runtime metadata " + meta_path + ": " +
+              ec.message();
+        return false;
+    }
+    return true;
 }
 
 ExpertCache::~ExpertCache() { close(); }
