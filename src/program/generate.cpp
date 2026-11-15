@@ -8656,6 +8656,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
         mem_mark("opening the expert cache");
+        if (xcache.segmented()) {
+            std::fprintf(stderr, "strata generate: elastic ExpertCache: %lld mapped slots, %lld live slots "
+                                 "(%lld of %lld MiB mapped)\n",
+                         (long long) xcache.slots_within(xcache.mapped_bytes()), (long long) xcache.slots(),
+                         (long long) (xcache.mapped_bytes() >> 20), (long long) (xcache.full_bytes() >> 20));
+        }
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         xcache.set_per_layer_rank_major(o.expert_cache_per_layer && per_layer_rank_major);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from
