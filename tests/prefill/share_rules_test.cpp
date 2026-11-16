@@ -40,8 +40,8 @@ int main() {
     CHECK(strata::prefill::share_rules::default_share_limit() == 3072);
     CHECK(strata::prefill::share_rules::default_share_limit(true) == strata::prefill::share_rules::kShareLimitNew);
     CHECK(strata::prefill::share_rules::default_share_limit(false) == 1024);
-    CHECK(strata::prefill::share_rules::gfx12_share_limit(true) == 1536 && strata::prefill::share_rules::gfx12_share_limit(false) == 3072);   // AMD-Q
-    CHECK(strata::prefill::share_rules::gfx12_share_limit(true, false) == 1536);
+    CHECK(strata::prefill::share_rules::gfx12_share_limit(true) == 2304 && strata::prefill::share_rules::gfx12_share_limit(false) == 3072);   // AMD-Q
+    CHECK(strata::prefill::share_rules::gfx12_share_limit(true, false) == 2304);
     CHECK(strata::prefill::share_rules::gfx12_share_limit(true, true) == 2560);
     CHECK(!strata::prefill::share_rules::batch_cpu_share_enabled_from(nullptr, true, false));
     CHECK(strata::prefill::share_rules::batch_cpu_share_enabled_from(nullptr, true, true));

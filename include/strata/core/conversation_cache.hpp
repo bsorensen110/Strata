@@ -326,6 +326,14 @@ public:
     /// exactly the reuse it wanted.  0 parks every conversation, whatever its size.
     bool wants(int64_t tokens) const { return min_tokens_ <= 0 || tokens >= min_tokens_; }
     size_t bytes() const { return bytes_ + reuse_.bytes(); }
+    /// STRATA_PARK_SEGPOOL_MIB: the segment pool whose idle (resident, unused) bytes count against this cache's budget
+    /// beside the images: make_room() gives them back BEFORE the budget could push an image out, so the pool never causes
+    /// an eviction, a refused park or a failed RAM check that the cache would not have had without it.  Not owned; the
+    /// pool outlives the cache.  bytes() stays the images' (what the logs and every caller have always meant).
+    void set_pool(SegmentPoolBudget* pool) { pool_ = pool; }
+    size_t pool_idle_bytes() const { return pool_ != nullptr ? pool_->idle_bytes() : 0; }
+    /// What the cache holds in RAM: its images, the retained K/V and the pool's idle bytes
+    size_t resident_bytes() const { return bytes() + pool_idle_bytes(); }
     size_t size() const { return entries_.size(); }
     size_t evictions() const { return evictions_; }
     // the longest parked conversation, in tokens (--kv-grow keeps the K/V that long while it could be restored)
@@ -475,6 +483,9 @@ public:
                 }
             if (kept >= slots_ || kept_bytes > budget_ - held - incoming) { guard_blocked_ = true; return false; }
         }
+        // the pool's idle bytes go first (never an image for them); the decisions below read the images only, so they are
+        // the ones the cache makes with no pool
+        trim_pool(held + incoming);
         if (bytes() > budget_ - held - incoming) reuse_ = {};
         while (!entries_.empty() && bytes_ > budget_ - held - incoming) {
             if (has_l2_disk() ? !evict_oldest_l1() : !evict_oldest_slot()) return false;
@@ -482,6 +493,7 @@ public:
         while (!entries_.empty() && entries_.size() >= slots_) {
             if (!evict_oldest_slot()) return false;
         }
+        trim_pool(held + incoming);   // (an evicted image that lived in the pool left its bytes idle)
         return true;
     }
 
@@ -646,6 +658,13 @@ public:
     }
 
 private:
+    // gives the pool's idle bytes back as far as images + idle + `incoming` would pass the budget (images alone never
+    // need more than the loop in make_room leaves them)
+    void trim_pool(size_t incoming_and_held) {
+        if (pool_ == nullptr) return;
+        const size_t total = bytes() + pool_->idle_bytes();
+        if (incoming_and_held > budget_ || total > budget_ - incoming_and_held) pool_->shrink(total - (budget_ - std::min(budget_, incoming_and_held)));
+    }
     static void unlink_if_disk(const SavedConversation& e) {
         if (!e.disk_path.empty()) {
             std::error_code ec;
@@ -720,6 +739,7 @@ private:
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
     ConversationKvReuse reuse_;
+    SegmentPoolBudget* pool_ = nullptr;   // STRATA_PARK_SEGPOOL_MIB (not owned)
 };
 
 } // namespace strata::core

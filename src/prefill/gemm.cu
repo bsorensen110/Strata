@@ -1,7 +1,9 @@
 // src/prefill/gemm.cu - see include/strata/prefill/gemm.hpp.
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/core/arch_defaults.hpp"   // prompt_f16_resolve (inline)
 #if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #endif
 
@@ -607,17 +609,21 @@ bool prompt_f16() {
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= kMaxDev) { (void) hipGetLastError(); return false; }
     if (const int8_t c = cached[dev].load(std::memory_order_relaxed)) return c == 2;
-    // Opt-in (#835): preserve the historical first-character `1` check for all-device FP16; `all` is a new explicit
-    // alias. `gfx103x` selects FP16 only on RDNA2 devices, leaving other architectures on BF16 for mixed layer splits.
+    // Opt-in (#835): preserve the measured gfx1103 default and allow explicit all-device or gfx103x selection.
     const char* e = std::getenv("STRATA_HIP_PROMPT_F16");
     hipDeviceProp_t p{};
-    if (hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); p.gcnArchName[0] = 0; }
+    if (hipGetDeviceProperties(&p, dev) != hipSuccess) { (void) hipGetLastError(); p.gcnArchName[0] = 0; p.integrated = 0; }
+#if defined(_WIN32)
+    constexpr bool kWin = true;
+#else
+    constexpr bool kWin = false;
+#endif
     const bool gfx103x = std::strncmp(p.gcnArchName, "gfx103", 6) == 0;
-    // The upstream parser accepted any nonempty value beginning with `1`; retain that undocumented behavior.
-    const bool all = e != nullptr && (e[0] == '1' || std::strcmp(e, "all") == 0);
+    const bool all = e != nullptr && std::strcmp(e, "all") == 0;
     const bool gfx103x_only = e != nullptr && std::strcmp(e, "gfx103x") == 0;
-    const bool on = all || (gfx103x_only && gfx103x);
-    if (on) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=%s: the prompt's 16-bit GEMMs run FP16 in and out "
+    const bool on = all || (gfx103x_only && gfx103x) ||
+                    strata::core::prompt_f16_resolve(e, p.gcnArchName, p.integrated != 0, kWin);
+    if (on && e != nullptr) std::fprintf(stderr, "strata prefill: HIP device %d%s%s - STRATA_HIP_PROMPT_F16=%s: the prompt's 16-bit GEMMs run FP16 in and out "
                                  "(rocBLAS is tuned only for that on gfx103x; not bit-identical to the default)%s",
                          dev, p.gcnArchName[0] ? " " : "", p.gcnArchName, e, "\n");
     else if (gfx103x_only)
@@ -1301,8 +1307,12 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
     if (ldy <= 0) ldy = N;
 
     const auto up = [](size_t v) { return (v + 255) & ~(size_t) 255; };
+    // The row table is read past its end by llama.cpp's MMQ (mul_mat_q: a whole J-column tile from the start of each tile, J up to 128; the stream-k fixup:
+    // up to roundup(max_rows, J) from the expert's first row): kRows + the margin of mmq_ids_margin.hpp (max_rows <= kRows), the identity written over all of it.
+    // Exact, with only the 256 bytes of the bounds after it, a tile of 112 columns on a full chunk read 384 bytes past the table, 128 past the allocation.
+    const size_t ids_rows = (size_t) mmq::mmq_ids_table_rows((uint64_t) kRows, (uint64_t) kRows);
     const size_t ident_off = up(mmq::q8_bytes(kRows, kMaxK));
-    const size_t bounds_off = ident_off + up((size_t) kRows * 4);
+    const size_t bounds_off = ident_off + up(ids_rows * 4);
     if (!mmq_buf_) {
         if (cudaMalloc(&mmq_buf_, bounds_off + 256) != cudaSuccess) {
             cudaGetLastError();
@@ -1310,7 +1320,7 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
             return false;
         }
         mmq_ctx_ = new mmq::Context();
-        mmq::iota((int32_t*) ((uint8_t*) mmq_buf_ + ident_off), kRows, stream_);
+        mmq::iota((int32_t*) ((uint8_t*) mmq_buf_ + ident_off), (int64_t) ids_rows, stream_);
         std::fprintf(stderr, "prefill gemm: dense MMQ on (STRATA_DENSE_MMQ=1)\n");
     }
     void* xq = mmq_buf_;

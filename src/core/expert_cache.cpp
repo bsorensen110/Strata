@@ -1,5 +1,6 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_cache_refuse.hpp"
 
 // The gfx906 compatibility layer and Metal do not expose the VMM driver API. STRATA_EC_NO_VMM remains
 // an explicit build-time kill switch; HIP VMM-capable devices use the shared Vmm implementation.
@@ -349,6 +350,10 @@ bool read_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t
     heat = std::move(values);
     return true;
 }
+
+namespace ec_test {   // strata/core/expert_cache_refuse.hpp: tests only, null in the engine
+bool (*refuse_segment_call)(const char* call, int64_t seg) = nullptr;
+}  // namespace ec_test
 
 bool write_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t n_expert,
                                const std::vector<double>& heat, std::string& err) {
@@ -1152,6 +1157,9 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 void ExpertCache::release_segmented() {
 #if !defined(STRATA_EC_NO_VMM)
     if (base_ != nullptr) cudaDeviceSynchronize();
+    for (VmmChunk h : unmapped_vmm_chunks_)
+        if (h != 0) vmm_chunk_free(h);
+    unmapped_vmm_chunks_.clear();
 #endif
     segmented_vmm_.reset();
     reserved_ = 0;
@@ -1198,9 +1206,23 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
+    auto refused = [](const char* call, int64_t seg) {
+        return ec_test::refuse_segment_call != nullptr && ec_test::refuse_segment_call(call, seg);
+    };
     for (int64_t i = mapped_chunks - 1; i >= keep_chunks; --i) {
+        if (refused("unmap", i)) {
+            err = "the driver refused to release an expert-cache segment";
+            live_slots_ = slots_within(mapped_bytes());
+            return false;
+        }
         const VmmChunk h = segmented_vmm_->unmap(i);
         if (h == 0) {
+            err = "the driver refused to release an expert-cache segment";
+            live_slots_ = slots_within(mapped_bytes());   // segment i is still mapped: [0, i] stay
+            return false;
+        }
+        if (refused("release", i)) {
+            unmapped_vmm_chunks_.push_back(h);
             err = "the driver refused to release an expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
             return false;
@@ -1228,7 +1250,12 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
                                       : (int64_t) ((capped / (uint64_t) seg_) * (uint64_t) seg_ / gran);
     const int64_t mapped_chunks = segmented_vmm_->mapped_count();
     if (target_chunks > mapped_chunks &&
-        !segmented_vmm_->map_range(mapped_chunks, target_chunks, [] { return (VmmChunk) 0; })) {
+        !segmented_vmm_->map_range(mapped_chunks, target_chunks, [this] {
+            if (unmapped_vmm_chunks_.empty()) return (VmmChunk) 0;
+            const VmmChunk h = unmapped_vmm_chunks_.back();
+            unmapped_vmm_chunks_.pop_back();
+            return h;
+        })) {
         (void) cudaGetLastError();
         err = "the driver has no VRAM for another expert-cache segment";
         live_slots_ = slots_within(mapped_bytes());

@@ -61,9 +61,14 @@ constexpr int64_t default_share_limit(bool raise = true) { return raise ? kShare
 /// AMD-Q: a gfx12 card whose fused IQ2_S / IQ4_XS gate/up kernels are on (fused::gfx12_iq2s_default): chunks below this are staged and take the CPU share, a chunk
 /// from it up streams every expert and runs the fused kernels.  R9700 (p620, IQ3_S, 54% resident), prompt speed against the share-only default (limit 3,072):
 /// limit 1,536: 1.3K 1.00, 1.5K 1.00, 1.8K +7.1%, 2K +10.0%, 2.6K +16.2%, 3K +11.1% (two pairs each); limit 2,048: 1.8K +1.4%, 2K +9.7%; limit 3,072 (fused only above): no gain at 1.5K-2.6K.
+/// Raised to 2,304 on a later engine state (same card, IQ3_S, 3 rounds; prompt ms, limit 1,536 -> 2,304): 1,537 tokens 1,995 -> 1,249, 1,793 1,672 -> 1,406,
+/// 2,049 1,697 -> 1,544; 2,305 1,728 -> 1,792 (+3.7%: the chunk that sits exactly on the limit pays), 2,561 and above within 0.6%.  The earlier 2,048 row was
+/// measured on an earlier engine state, so the two rows are not comparable.  Forced-token KL against an FP16 reference
+/// (16 prompts each of 1,793 and 2,049 tokens, 64 tokens): 0.01350 -> 0.01176 (ratio 0.871, interval 0.758-1.016), top-1 96.2% -> 96.6%.
+/// STRATA_PREFILL_CPU_SHARE_MAX=1536 restores the old limit.
+constexpr int64_t kShareLimitGfx12Fused = 2304;
 /// When batch slots are used on single-card gfx12 (`batch_active`), co-prefill chunks are capped at 2,048 tokens, so raising the staged CPU-share ceiling to 2,560
 /// keeps 2,048-token co-prefill pieces on the staged MMQ + CPU share path (`STAGE_GRP = 32` slots) instead of streaming all non-resident experts with the CPU pool idle.
-constexpr int64_t kShareLimitGfx12Fused = 1536;
 constexpr int64_t kShareLimitGfx12Batch = 2560;
 constexpr int64_t gfx12_share_limit(bool fused_iq2s, bool batch_active = false) {
     return batch_active ? kShareLimitGfx12Batch : (fused_iq2s ? kShareLimitGfx12Fused : kShareLimitNew);

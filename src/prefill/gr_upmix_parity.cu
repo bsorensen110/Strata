@@ -40,6 +40,33 @@ float from_bf16(uint16_t h) {
     std::memcpy(&f, &u, 4);
     return f;
 }
+// FP16 (IEEE binary16) from a float, round to nearest even; values beyond 65504 saturate (the engine's hf_sat)
+uint16_t to_f16(float f) {
+    f = std::fmin(std::fmax(f, -65504.0f), 65504.0f);
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    const int e = (int) ((u >> 23) & 0xffu) - 127;
+    uint32_t m = u & 0x7fffffu;
+    if (e < -25) return (uint16_t) sign;
+    if (e < -14) {   // subnormal
+        m |= 0x800000u;
+        const int sh = -e - 1;   // 14 .. 24
+        uint32_t r = m >> sh;
+        const uint32_t rem = m & ((1u << sh) - 1u), half = 1u << (sh - 1);
+        if (rem > half || (rem == half && (r & 1u))) ++r;
+        return (uint16_t) (sign | r);
+    }
+    uint32_t r = ((uint32_t) (e + 15) << 10) | (m >> 13);
+    const uint32_t rem = m & 0x1fffu;
+    if (rem > 0x1000u || (rem == 0x1000u && (r & 1u))) ++r;
+    return (uint16_t) (sign | r);
+}
+float from_f16(uint16_t h) {
+    const uint32_t e = (h >> 10) & 0x1fu, m = h & 0x3ffu;
+    float f = e == 0 ? std::ldexp((float) m, -24) : std::ldexp((float) (m | 0x400u), (int) e - 25);
+    return (h & 0x8000u) ? -f : f;
+}
 bool ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) std::printf("FAIL: %s: %s\n", what, cudaGetErrorString(e));
     return e == cudaSuccess;
@@ -52,15 +79,16 @@ template <typename T> T* dalloc(size_t n) {
 
 struct Inputs {
     int64_t T;
+    bool f16;   // lo16 holds FP16 bits (the HIP FP16 prompt path); w_up stays BF16
     std::vector<uint16_t> lo16, wu;
     std::vector<float> R, rs, w;
     uint16_t *d_lo16, *d_wu;
     float *d_R, *d_rs, *d_w;
-    Inputs(int64_t t, uint32_t seed) : T(t) {
+    Inputs(int64_t t, uint32_t seed, bool as_f16 = false) : T(t), f16(as_f16) {
         std::mt19937 g(seed);
         std::normal_distribution<float> nd(0.0f, 1.0f);
         lo16.resize((size_t) T * LR);
-        for (auto& x : lo16) x = to_bf16(nd(g) * 0.5f);            // silu outputs: O(1) and below
+        for (auto& x : lo16) x = f16 ? to_f16(nd(g) * 0.5f) : to_bf16(nd(g) * 0.5f);   // silu outputs: O(1) and below
         wu.resize((size_t) D * LR);
         for (auto& x : wu) x = to_bf16(nd(g) * 0.12f);              // gated ~ N(0, ~1): sigmoid in its live range
         R.resize((size_t) T * D);
@@ -101,15 +129,24 @@ double exact_mixed(const Inputs& in, int64_t t, int d) {
         double g = 0.0;
         const int j = c * N + d;
         for (int k = 0; k < LR; ++k)
-            g += (double) from_bf16(in.lo16[(size_t) t * LR + k]) * (double) from_bf16(in.wu[(size_t) j * LR + k]);
+            g += (double) (in.f16 ? from_f16(in.lo16[(size_t) t * LR + k]) : from_bf16(in.lo16[(size_t) t * LR + k])) *
+                 (double) from_bf16(in.wu[(size_t) j * LR + k]);
         const double x = (double) in.R[(size_t) t * D + j] * in.rs[(size_t) t * HC + c] * in.w[j];
         s += x / (1.0 + std::exp(-g));
     }
     return s / HC;
 }
 
-int check(strata::prefill::Gemm& gm, cudaStream_t st, float* gated, int64_t T, uint32_t seed) {
-    Inputs in(T, seed);
+// f16 (HIP only): the FP16 prompt path, as Prefill::init sets it up (Gemm::set_f16_io + set_act_f16): lo16 holds FP16 bits, the pair's
+// GEMM writes FP16-rounded outputs, gr_upmix runs its FP16 matrix-core variant; the bound against the pair is the FP16 output rounding.
+int check(strata::prefill::Gemm& gm, cudaStream_t st, float* gated, int64_t T, uint32_t seed, bool f16 = false) {
+    if (f16) { gm.set_f16_io(true); strata::prefill::set_act_f16(true); }
+    struct Reset {
+        bool on;
+        strata::prefill::Gemm& g;
+        ~Reset() { if (on) { g.set_f16_io(false); strata::prefill::set_act_f16(false); } }
+    } reset{f16, gm};
+    Inputs in(T, seed, f16);
     Outputs ref(T), got(T);
     gm.bf16(in.d_lo16, in.d_wu, gated, T, D, LR);
     strata::prefill::gr_mix_r(in.d_R, in.d_rs, in.d_w, gated, ref.mixed, ref.bf, T, st, ref.h);
@@ -151,10 +188,9 @@ int check(strata::prefill::Gemm& gm, cudaStream_t st, float* gated, int64_t T, u
         }
     }
     const double rel = md / std::max(mv, 1e-30);
-    const bool bad = nonfinite != 0 || rel > 1e-5 || eb > 2.0 * ea + 1e-6 * ev;
+    const bool bad = nonfinite != 0 || rel > (f16 ? 2e-3 : 1e-5) || eb > 2.0 * ea + 1e-6 * ev;
 #if defined(__HIPCC__)
-    // Also verify that gr_upmix reading Q8_0 (w_up_q8) directly is bitwise identical to gr_upmix reading
-    // fused_gr_dequant_q8_0(w_up_q8).
+    // Verify that direct Q8_0 reads match the fused_gr_dequant_q8_0 route.
     bool q8_bad = false;
     if (!bad) {
         const int64_t nb = (int64_t) D * LR / 32;
@@ -193,9 +229,9 @@ int check(strata::prefill::Gemm& gm, cudaStream_t st, float* gated, int64_t T, u
 #else
     constexpr bool q8_bad = false;
 #endif
-    std::printf("%s T=%-6lld %s mixed max |diff| / max |value| %.2e, BF16 / FP16 images differing %.4f%% / %.4f%%; "
-                "vs FP64 (sampled): cuBLAS + mix %.2e, fused %.2e%s\n", (bad || q8_bad) ? "FAIL" : "ok  ", (long long) T,
-                bit_diff == 0 && bf_diff == 0 && h_diff == 0 ? "bitwise " : "        ", rel,
+    std::printf("%s %sT=%-6lld %s mixed max |diff| / max |value| %.2e, BF16 / FP16 images differing %.4f%% / %.4f%%; "
+                "vs FP64 (sampled): cuBLAS + mix %.2e, fused %.2e%s\n", (bad || q8_bad) ? "FAIL" : "ok  ", f16 ? "FP16 io " : "",
+                (long long) T, bit_diff == 0 && bf_diff == 0 && h_diff == 0 ? "bitwise " : "        ", rel,
                 100.0 * (double) bf_diff / (double) n, 100.0 * (double) h_diff / (double) n, ea / ev, eb / ev,
                 q8_bad ? " [Q8_0 direct != dequant]" : "");
     return (bad || q8_bad) ? 1 : 0;
@@ -266,7 +302,7 @@ int main(int argc, char** argv) {
         }
     }
 #else
-    {   // the fused read is sm_80+ (cp.async, BF16 mma): an older card has nothing to compare
+    {
         int dev = 0, major = 0;
         if (cudaGetDevice(&dev) != cudaSuccess || cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) {
             std::printf("gr_upmix_parity: no CUDA device, skipped\n");
@@ -275,20 +311,28 @@ int main(int argc, char** argv) {
         if (major < 8) { std::printf("gr_upmix_parity: sm_%d0, the fused read needs sm_80+: skipped\n", major); return 77; }
     }
 #endif
-    const bool do_bench = argc > 1 && std::string(argv[1]) == "--bench";
+    bool do_bench = false;
+    int64_t Tmax = 32768;   // --max-t N: smaller sizes only
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--bench") do_bench = true;
+        else if (std::string(argv[i]) == "--max-t" && i + 1 < argc) Tmax = std::atoll(argv[++i]);
+    }
     cudaStream_t st = nullptr;
     if (!ck(cudaStreamCreate(&st), "stream")) return 1;
     strata::prefill::Gemm gm;
     std::string err;
-    if (!gm.init(st, 0, err)) { std::printf("FAIL: %s\n", err.c_str()); return 1; }
-    const int64_t Tmax = 32768;
+    if (!gm.init(st, (int64_t) D * LR, err)) { std::printf("FAIL: %s\n", err.c_str()); return 1; }
     float* gated = dalloc<float>((size_t) Tmax * D);
     int fails = 0;
     uint32_t seed = 101;
-    for (const int64_t T : {1, 7, 16, 31, 32, 33, 48, 63, 64, 65, 96, 126, 127, 128, 129, 600, 1000, 2048, 4099, 8192, 32768}) fails += check(gm, st, gated, T, seed++);
+    for (const int64_t T : {1, 7, 16, 31, 32, 33, 48, 63, 64, 65, 96, 126, 127, 128, 129, 600, 1000, 2048, 4099, 8192, 32768}) { if (T <= Tmax) fails += check(gm, st, gated, T, seed++); }
+#if defined(__HIPCC__)
+    // the FP16 prompt path (STRATA_HIP_PROMPT_F16=1): the up-mix reads FP16 images (it read them as BF16 before; the FP64 column is the arbiter)
+    for (const int64_t T : {33, 128, 600, 2048, 4099, 8192}) { if (T <= Tmax) fails += check(gm, st, gated, T, seed++, true); }
+#endif
     if (do_bench) {
         std::printf("--bench: the hyper-connection read's up projection + mix (medians of 20 alternating runs)\n");
-        for (const int64_t T : {2048, 8192, 32768}) bench(gm, st, gated, T);
+        for (const int64_t T : {2048, 8192, 32768}) { if (T <= Tmax) bench(gm, st, gated, T); }
     }
     (void) cudaFree(gated);
     std::printf("gr_upmix_parity: %d failures\n", fails);

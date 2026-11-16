@@ -363,6 +363,7 @@ private:
     int64_t seg_ = 0;                   ///< #533: the segment size used (a multiple of the driver's granularity)
     uint64_t reserved_ = 0;             ///< #533: the reserved address range's size
     std::unique_ptr<VmmRange> segmented_vmm_;   ///< #533: segmented cache range, eager-mapped on open
+    std::vector<VmmChunk> unmapped_vmm_chunks_;  ///< Unmapped handles kept when a release is refused.
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
