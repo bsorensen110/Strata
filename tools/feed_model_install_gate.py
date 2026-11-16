@@ -22,7 +22,7 @@ What it does, in a scratch folder (nothing of the real install, %APPDATA% or the
     python tools/feed_model_install_gate.py --tokenizer-from <a real Flash-Next shard 1> --engine <engine folder> --full
 
 `tools/test_feed_model_install_realfile.py` runs step 1 to 4 as a test in `python tools/check` (py-tools). The preparation tools read GGUF files with the vendored
-their own GGUF code (tools/strata_gguf.py), so no gguf-py, no llama.cpp checkout, no STRATA_TEST_LLAMA_CPP and no network are needed; the check also fails if setup says it
+their own GGUF code (tools/strata_gguf.py), so no gguf-py, no llama.cpp checkout, no `"STRATA_TEST_LLAMA_CPP"` environment variable, and no network are needed; the check also fails if setup says it
 fetched llama.cpp. Without numpy it is SKIPPED with that reason (never a pass).
 Exit codes: 0 pass, 1 a check failed, 2 not run (no numpy, no NVIDIA card on a Windows box), 3 the engine phase failed.
 """

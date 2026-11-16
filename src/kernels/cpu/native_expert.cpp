@@ -64,12 +64,12 @@ bool iq4nl_reference_ok() {
                 for (size_t k = 0; k < nb; ++k) { uint8_t* d = &w[(size_t) r * rb + k * bb]; d[0] = 0x66; d[1] = 0x2e; }
             std::vector<float> x((size_t) n);
             for (auto& v : x) v = ((float) (rnd() % 2001) - 1000.f) * 0.001f;
-            t8.from_float(x.data(), act.data(), n);
+        t8.from_float(x.data(), act.data(), n);
             std::vector<float> got((size_t) rows), want((size_t) rows);
             const void* hp[1] = {act.data()};
             float* op[1] = {got.data()};
             iq4nl_reference_rows(w.data(), rb, n, hp, 1, op, 0, rows);
-            for (int r = 0; r < rows; ++r) tr.dot(n, &want[(size_t) r], w.data() + (size_t) r * rb, act.data());
+        for (int r = 0; r < rows; ++r) tr.dot(n, &want[(size_t) r], w.data() + (size_t) r * rb, act.data());
             if (std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) != 0) {
                 std::fprintf(stderr, "strata: the window-invariant IQ4_NL rows differ from this ggml-cpu's dot (n=%d): its dot runs per token instead\n", n);
                 return false;
@@ -155,26 +155,26 @@ bool x512_one_ok(int type) {
 bool iq4nl512_reference_ok() {
     static const bool ok = [] {
         if (!cpu_avx512_ok()) return false;
-        const ggml_type_traits_cpu* tr = traits(GGML_TYPE_IQ4_NL);
-        const ggml_type_traits_cpu* t8 = traits(GGML_TYPE_Q8_0);
-        if (tr == nullptr || tr->vec_dot == nullptr || t8 == nullptr || t8->from_float == nullptr) return false;
+        const Tr tr = traits(kTIq4nl);
+        const Tr t8 = traits(kTQ8_0);
+        if (!tr.has_dot() || !t8.has_from_float()) return false;
         uint32_t seed = 4242u;
         auto rnd = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
         for (const int n : {64, 96, 160, 640}) {
             constexpr int rows = 16;
-            const size_t rb = ggml_row_size(GGML_TYPE_IQ4_NL, (int64_t) n), nb = (size_t) n / 32, bb = rb / nb;
-            std::vector<uint8_t> w((size_t) rows * rb), act(ggml_row_size(GGML_TYPE_Q8_0, (int64_t) n));
+            const size_t rb = row_size_of(kTIq4nl, n), nb = (size_t) n / 32, bb = rb / nb;
+            std::vector<uint8_t> w((size_t) rows * rb), act(row_size_of(kTQ8_0, n));
             for (auto& b : w) b = (uint8_t) rnd();
             for (int r = 0; r < rows; ++r)
                 for (size_t k = 0; k < nb; ++k) { uint8_t* d = &w[(size_t) r * rb + k * bb]; d[0] = 0x66; d[1] = 0x2e; }
             std::vector<float> x((size_t) n);
             for (auto& v : x) v = ((float) (rnd() % 2001) - 1000.f) * 0.001f;
-            t8->from_float(x.data(), act.data(), n);
+            t8.from_float(x.data(), act.data(), n);
             std::vector<float> got((size_t) rows), want((size_t) rows);
             const void* hp[1] = {act.data()};
             float* op[1] = {got.data()};
             iq4nl512_down_rows(w.data(), rb, n, hp, 1, op, 0, rows);
-            for (int r = 0; r < rows; ++r) tr->vec_dot(n, &want[(size_t) r], 0, w.data() + (size_t) r * rb, 0, act.data(), 0, 1);
+            for (int r = 0; r < rows; ++r) tr.dot(n, &want[(size_t) r], w.data() + (size_t) r * rb, act.data());
             if (std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) != 0) return false;
         }
         return true;
@@ -188,12 +188,12 @@ bool kq512_reference_ok(int type) {
     std::lock_guard<std::mutex> lk(mu);
     if (const auto it = memo.find(type); it != memo.end()) return it->second;
     bool ok = false;
-    const ggml_type_traits_cpu* tr = traits(type);
-    const ggml_type_traits_cpu* t8 = tr ? traits((int) tr->vec_dot_type) : nullptr;
-    if (cpu_avx512_ok() && tr != nullptr && tr->vec_dot != nullptr && t8 != nullptr && t8->from_float != nullptr) {
+    const Tr tr = traits(type);
+    const Tr t8 = traits(tr.vec_dot_type);
+    if (cpu_avx512_ok() && tr.has_dot() && t8.has_from_float()) {
         constexpr int n = 512, rows = 16;
-        const size_t rb = ggml_row_size((ggml_type) type, n), bb = ggml_type_size((ggml_type) type), nb = rb / bb;
-        std::vector<uint8_t> w((size_t) rows * rb), act(ggml_row_size(tr->vec_dot_type, n));
+        const size_t rb = row_size_of(type, n), bb = type_size_of(type), nb = rb / bb;
+        std::vector<uint8_t> w((size_t) rows * rb), act(row_size_of(tr.vec_dot_type, n));
         uint32_t seed = 9191u + (uint32_t) type;
         auto rnd = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
         for (auto& b : w) b = (uint8_t) rnd();
@@ -208,12 +208,12 @@ bool kq512_reference_ok(int type) {
             }
         std::vector<float> x(n);
         for (auto& v : x) v = ((float) (rnd() % 2001) - 1000.f) * 0.001f;
-        t8->from_float(x.data(), act.data(), n);
+        t8.from_float(x.data(), act.data(), n);
         std::vector<float> got((size_t) rows), want((size_t) rows);
         const void* ap[1] = {act.data()};
         float* op[1] = {got.data()};
         kq512_rows(type, w.data(), rb, n, ap, 1, op, 0, rows);
-        for (int r = 0; r < rows; ++r) tr->vec_dot(n, &want[(size_t) r], 0, w.data() + (size_t) r * rb, 0, act.data(), 0, 1);
+        for (int r = 0; r < rows; ++r) tr.dot(n, &want[(size_t) r], w.data() + (size_t) r * rb, act.data());
         ok = std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) == 0;
     }
     memo[type] = ok;
@@ -396,7 +396,7 @@ namespace {
 bool q8k_avx512(int type) {
     static const bool on = cpu_avx512_ok() && std::getenv("STRATA_NO_Q8K_AVX512") == nullptr &&
                            std::getenv("STRATA_NO_Q8K_AVX2") == nullptr;
-    return on && type == (int) GGML_TYPE_Q8_K;
+    return on && type == (int) kTQ8_K;
 }
 bool q8k_avx2(int type) {
     static const bool on = (cpu_avx2_ok() || cpu_arm_neon_ok()) && std::getenv("STRATA_NO_Q8K_AVX2") == nullptr;
@@ -677,7 +677,7 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (singleton_iq) {
 #if defined(__x86_64__) || defined(_M_X64)
-            if (avx512 && flavour_avx2() && ggml_cpu_has_avx2() && ggml_cpu_has_fma() &&
+            if (avx512 && cpu_avx2_ok() &&
                 (f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22) &&
                 iq512_supported(f.gu_type) && iq512_reference_ok(f.gu_type)) {
                 iq512_reference_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);

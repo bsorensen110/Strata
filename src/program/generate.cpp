@@ -19985,7 +19985,7 @@ int main(int argc, char** argv) {
                         }
 #endif
                         bool shrunk_for_active = false;
-                        int64_t need_p = part_slots(p, want_p, tail_p);
+                        need_p = part_slots(p, want_p, tail_p);
                         if (n_act_lend > 0) {
                             const int64_t eff_c = strata::program::batch_prefill_chunk(want_p, n_act_lend, lend_batch_chunk_env);
                             if (eff_c < want_p) {

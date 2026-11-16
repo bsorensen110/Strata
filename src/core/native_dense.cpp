@@ -227,8 +227,8 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, const
                     const bool f32_inject = hc_q8_inject_env() && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
                     if ((tensor.type == 8 || f32_inject) && (!hc_q8_stage_local() || in_stage(tensor.name)) &&
                         hc_seen.insert(tensor.name).second) {
-                        const auto found = table.table_.find(tensor.name);
-                        if (found != table.table_.end() && found->second.ne0 % 32 == 0 &&
+                        const auto found = table.find(tensor.name);
+                        if (found != table.end() && found->second.ne0 % 32 == 0 &&
                             tensor.shape[0] == (uint64_t) found->second.ne0 && tensor.shape[1] == (uint64_t) found->second.ne1)
                             payload += arena_align((uint64_t) found->second.ne0 / 32 * 34 * (uint64_t) found->second.ne1);
                     }
@@ -262,7 +262,7 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, const
             }
         }
         if (hc_q8_env())   // a bf16 pack: `load` quantizes the layers' down / up projections that the GGUF does not carry as Q8_0
-            for (const auto& [name, ref] : table.table_) {
+            for (const auto& [name, ref] : table) {
                 if (name.rfind("blk.", 0) != 0 || !in_stage(name) || !hc_q8_name(name) || hc_seen.count(name) ||
                     !(name.ends_with("_down.weight") || name.ends_with("_up.weight")))
                     continue;
