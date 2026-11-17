@@ -21,6 +21,12 @@
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/emulate.hpp"
+#if defined(__HIPCC__)
+#include "strata/prefill/moe_iu8_gfx.hpp"
+#include "strata/prefill/hip_projection.hpp"
+#include "strata/core/dispatch_stats.hpp"
+#include <stdexcept>
+#endif
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -819,3 +825,56 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
 }
 
 }  // namespace strata::prefill::fused
+
+#if defined(__HIPCC__)
+namespace strata::prefill::iu8 {
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Kaden Schutt
+// Port note: hipfire gemm_mq6sym_i8.gfx1201.hip x4 launch contract;
+// modified for Strata planar verified packs and independent opt-in admission.
+bool strata_gemm_sym_i8_x4(const std::array<Window, 4>& p, int count, bool enabled, void* stream) {
+    if (!enabled) return false;
+    int device = -1;
+    hipDeviceProp_t prop{};
+    if (hipGetDevice(&device) != hipSuccess || hipGetDeviceProperties(&prop, device) != hipSuccess)
+        throw std::runtime_error("HIP x4: cannot query device");
+    if (prop.warpSize != 32 || !strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1201")) return false;
+    std::array<int,4> rows{};
+    if (count < 2 || count > 4) throw std::invalid_argument("HIP x4: needs two to four members");
+    for (int i = 0; i < count; ++i) rows[i] = p[i].rows;
+    const auto plan = x4_plan(rows,count,p[0].cols,p[0].tokens);
+    if (plan.entry < 0) throw std::invalid_argument("HIP x4: invalid tile/grid extent");
+    for (int i = 0; i < 4; ++i) {
+        const auto& m = p[i];
+        if (i >= count) {
+            if (m.rows || m.y || m.weight.codes) throw std::invalid_argument("HIP x4: live inactive member");
+            continue;
+        }
+        const auto& w = m.weight;
+        const size_t bytes = (size_t) m.rows * m.cols * w.bits / 8;
+        if (!m.x || !m.y || m.x != p[0].x || m.cols != p[0].cols || m.tokens != p[0].tokens ||
+            m.x_rows != m.tokens || m.ld != m.rows || m.count || m.groups != 1 ||
+            !w.symmetric_verified || !w.codes || !w.scales || w.device != device ||
+            w.rows != m.rows || w.cols != m.cols || (w.bits != 4 && w.bits != 6) ||
+            w.bits != p[0].weight.bits ||
+            (const uint8_t*) w.scales != w.codes + ((bytes + 1) & ~size_t{1}))
+            throw std::invalid_argument("HIP x4: members must share K/N/prepared X and exact planar encoding");
+        const uintptr_t lo = (uintptr_t) m.y, hi = lo + (size_t) m.tokens * m.rows * sizeof(float);
+        const uintptr_t xlo = (uintptr_t) m.x, xhi = xlo + (size_t) (m.cols/128) * m.tokens * sizeof(Block);
+        if (lo < xhi && xlo < hi) throw std::invalid_argument("HIP x4: output overlaps input");
+        for (int j = 0; j < i; ++j) {
+            const uintptr_t other = (uintptr_t) p[j].y;
+            if (lo < other + (size_t) p[j].tokens * p[j].rows * sizeof(float) && other < hi)
+                throw std::invalid_argument("HIP x4: overlapping outputs");
+        }
+    }
+    if (plan.x > (unsigned) prop.maxGridSize[0] || plan.y > 65536 ||
+        plan.y > (unsigned) prop.maxGridSize[1] || prop.maxGridSize[2] < 1)
+        throw std::invalid_argument("HIP x4: device grid limit");
+    strata::dispatch::notef("HIP x4: %ld members -> 1 launch, rows=%ld tile=%ld",
+                            (long) count,(long) p[0].tokens,(long) plan.entry);
+    launch_sym_i8_x4(p,plan,stream);
+    return true;
+}
+}  // namespace strata::prefill::iu8
+#endif

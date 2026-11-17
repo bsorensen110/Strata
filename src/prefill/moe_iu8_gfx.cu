@@ -6,6 +6,7 @@
 #if defined(__HIPCC__)
 #include "strata/prefill/moe_iu8_quant.cuh"
 #include "strata/prefill/moe_iu8_pack.hpp"
+#include "strata/prefill/hip_projection.hpp"
 #include "strata/prefill/moe_iu4_quant.cuh"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/prefill/moe_hip_config.hpp"
@@ -145,15 +146,15 @@ __global__ void __launch_bounds__(256) grouped_prefill(Product p) {
 // weight LDS: each wave owns 16 rows. gfx12 splits K64 between lane halves;
 // gfx11 fetches a K128 epoch per half, exchanging it for its duplicate twin.
 template<int Rows, int Tokens, bool Split, bool BF16>
-__device__ __forceinline__ void narrow_body(Window p) {
+__device__ __forceinline__ void narrow_body(Window p, int bx) {
 #if defined(__gfx1100__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
     constexpr int NT = Rows / 16 * 32;
     constexpr int TG = Tokens / 16;
     const int mt = (p.rows + Rows - 1) / Rows;
-    const int group = blockIdx.x / mt;
+    const int group = bx / mt;
     if (p.count && group >= *p.count) return;
     const int slice = Split ? blockIdx.y : 0;
-    const int row0 = (blockIdx.x % mt) * Rows;
+    const int row0 = (bx % mt) * Rows;
     const int begin = p.count ? p.starts[group] : 0;
     const int end = p.count ? p.starts[group + 1] : p.tokens;
     const int token0 = begin + slice * Tokens;
@@ -256,7 +257,7 @@ __device__ __forceinline__ void narrow_body(Window p) {
 
 #define NARROW_ENTRY(R, N, SUFFIX, SPLIT, BF) \
 extern "C" __global__ __launch_bounds__(R / 16 * 32) \
-void strata_gemm_sym_i8_set_m##R##n##N##SUFFIX##_gfx12(Window p) { narrow_body<R, N, SPLIT, BF>(p); }
+void strata_gemm_sym_i8_set_m##R##n##N##SUFFIX##_gfx12(Window p) { narrow_body<R, N, SPLIT, BF>(p, (int) blockIdx.x); }
 #define NARROW_FAMILY(SUFFIX, SPLIT, BF) \
 NARROW_ENTRY(32,16,SUFFIX,SPLIT,BF) NARROW_ENTRY(32,32,SUFFIX,SPLIT,BF) NARROW_ENTRY(32,48,SUFFIX,SPLIT,BF) \
 NARROW_ENTRY(64,16,SUFFIX,SPLIT,BF) NARROW_ENTRY(64,32,SUFFIX,SPLIT,BF) NARROW_ENTRY(64,48,SUFFIX,SPLIT,BF)
@@ -266,6 +267,83 @@ NARROW_FAMILY(_bf16, false, true)
 NARROW_FAMILY(_y_bf16, true, true)
 #undef NARROW_FAMILY
 #undef NARROW_ENTRY
+
+// Port note: hipfire SYM_NARROW_X4_ENTRY. Fifteen scalar arguments, 96 B;
+// W points to Strata's contiguous codes + aligned f16 scales, not qt47 headers.
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1201__)
+#define X4_BODY(R,N,SPLIT,BITS) \
+    const uint8_t* weights[4] = {W0,W1,W2,W3}; \
+    float* outputs[4] = {Y0,Y1,Y2,Y3}; \
+    const int rows[4] = {M0,M1,M2,M3}; \
+    int bx = (int) blockIdx.x, member = 0; \
+    for (; member < 3; ++member) { \
+        const int blocks = (int) (((int64_t) rows[member] + R - 1) / R); \
+        if (bx < blocks) break; \
+        bx -= blocks; \
+    } \
+    Window p; \
+    p.rows = rows[member]; p.cols = K; p.tokens = p.x_rows = T; \
+    p.x = Xq; p.y = outputs[member]; p.ld = p.rows; \
+    const size_t bytes = (size_t) p.rows * K * BITS / 8; \
+    p.weight.codes = weights[member]; \
+    p.weight.scales = (const uint16_t*) (weights[member] + ((bytes + 1) & ~size_t{1})); \
+    p.weight.bits = BITS; \
+    narrow_body<R,N,SPLIT,false>(p,bx);
+#else
+#define X4_BODY(R,N,SPLIT,BITS) __builtin_trap();
+#endif
+#define X4_ENTRY(R, N, S, SPLIT, BITS) \
+extern "C" __global__ __launch_bounds__(R / 16 * 32) \
+void strata_gemm_sym_i8_m##R##n##N##S##_w##BITS##_x4_gfx1201( \
+    const uint8_t* W0, const uint8_t* W1, const uint8_t* W2, const uint8_t* W3, \
+    float* Y0, float* Y1, float* Y2, float* Y3, const Block* Xq, \
+    int M0, int M1, int M2, int M3, int K, int T) { \
+    X4_BODY(R,N,SPLIT,BITS) \
+}
+#define X4_FAMILY(B) \
+X4_ENTRY(32,16,,false,B) X4_ENTRY(32,32,,false,B) \
+X4_ENTRY(64,16,,false,B) X4_ENTRY(64,32,,false,B) \
+X4_ENTRY(64,48,,false,B) X4_ENTRY(64,16,y,true,B)
+X4_FAMILY(4)
+X4_FAMILY(6)
+#undef X4_FAMILY
+#undef X4_ENTRY
+#undef X4_BODY
+
+void launch_sym_i8_member(const Window& p, int entry, void* stream) {
+    const auto t = kNarrowTiles.at((size_t) entry);
+    const dim3 blocks((unsigned) (((int64_t) p.rows + t.rows - 1) / t.rows),
+                      t.split ? (p.tokens + t.tokens - 1) / t.tokens : 1, 1);
+#define MEMBER(I,R,N,S) case I: strata_gemm_sym_i8_set_m##R##n##N##S##_gfx12 \
+    <<<blocks,R/16*32,0,(hipStream_t) stream>>>(p); break
+    switch (entry) {
+        MEMBER(0,32,16,); MEMBER(1,32,32,); MEMBER(3,64,16,);
+        MEMBER(4,64,32,); MEMBER(5,64,48,); MEMBER(9,64,16,_y);
+        default: invalid("projection standalone tile");
+    }
+#undef MEMBER
+    check(hipGetLastError(), "projection standalone launch");
+}
+
+void launch_sym_i8_x4(const std::array<Window, 4>& p, const X4Plan& plan, void* stream) {
+    const dim3 grid(plan.x, plan.y, 1);
+#define X4_LAUNCH(I,R,N,S,B) case I: strata_gemm_sym_i8_m##R##n##N##S##_w##B##_x4_gfx1201 \
+    <<<grid,R/16*32,0,(hipStream_t) stream>>>( \
+        p[0].weight.codes,p[1].weight.codes,p[2].weight.codes,p[3].weight.codes, \
+        (float*)p[0].y,(float*)p[1].y,(float*)p[2].y,(float*)p[3].y,p[0].x, \
+        p[0].rows,p[1].rows,p[2].rows,p[3].rows,p[0].cols,p[0].tokens); break
+#define X4_SWITCH(B) \
+    switch (plan.entry) { \
+        X4_LAUNCH(0,32,16,,B); X4_LAUNCH(1,32,32,,B); \
+        X4_LAUNCH(3,64,16,,B); X4_LAUNCH(4,64,32,,B); \
+        X4_LAUNCH(5,64,48,,B); X4_LAUNCH(9,64,16,y,B); \
+        default: invalid("x4 tile"); \
+    }
+    if (p[0].weight.bits == 4) { X4_SWITCH(4) } else { X4_SWITCH(6) }
+#undef X4_SWITCH
+#undef X4_LAUNCH
+    check(hipGetLastError(), "x4 launch");
+}
 
 bool window_admitted(int tokens, int cols) {
     return tokens > 0 && tokens <= 48 && cols > 0 && cols % 128 == 0 && usable();
