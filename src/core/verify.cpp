@@ -665,6 +665,7 @@ const int64_t g_test_drop = [] {
 #if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
 }  // namespace strata::core
 #include "strata/hip/pm4_tape.hpp"
+#include "strata/hip/pm4_plan.hpp"
 namespace strata::core {
 namespace {
 
@@ -705,11 +706,27 @@ bool hip_device_range_resolver(uint64_t device_ptr, strata::hip::pm4::Allocation
 strata::hip::pm4::Pm4WindowCaptureSlot* pm4_begin_verifier_capture(
     const Verifier* v, int sel_long, int T, bool all_resident_ar, bool is_batch,
     bool single_stage, bool has_side_streams) {
-    static const bool pm4_env = [] {
-        const char* val = std::getenv("STRATA_HIP_PM4");
-        return val != nullptr && (std::strcmp(val, "1") == 0 || std::strcmp(val, "on") == 0 || std::strcmp(val, "true") == 0);
-    }();
-    if (!pm4_env || !all_resident_ar || is_batch || !single_stage || has_side_streams) {
+    int dev = 0;
+    cudaDeviceProp prop{};
+    const bool have_prop = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
+    if (!have_prop) {
+        (void) cudaGetLastError();
+    }
+    strata::hip::pm4::Pm4EligibilityInput elig{};
+    elig.env_strata_hip_pm4 = std::getenv("STRATA_HIP_PM4");
+    elig.is_linux = true;
+    elig.hsa_available = have_prop;
+    elig.arch_name = have_prop ? prop.gcnArchName : nullptr;
+    elig.is_prefill = false;
+    elig.is_batched = is_batch;
+    elig.is_layer_split = !single_stage;
+    elig.all_experts_resident = all_resident_ar;
+    elig.early_ple_flag = true;
+    elig.has_side_streams = has_side_streams;
+    elig.window_tokens = T;
+
+    const auto decision = strata::hip::pm4::evaluate_pm4_eligibility(elig);
+    if (!decision.admitted) {
         return nullptr;
     }
     std::lock_guard<std::mutex> lock(pm4_verifier_mutex());

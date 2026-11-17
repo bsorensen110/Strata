@@ -311,6 +311,8 @@ them in the server config's `env`, or in the shell.
 | `STRATA_HIP_QUEUE_PRIME=0` | gfx1200, gfx1201, Linux | On | Turn off the ordered opening of two GPU queues at start (it avoids slow starts) |
 | `STRATA_PLE_AUTO_RAM=0` | all | On where the RAM fits | Keep the n-gram table in RAM when `--ple-io` was not given (RDNA4: 8K prompt +22.5%, see [RDNA4](#rdna4-gfx1201)); `=0` keeps the direct reads |
 | `STRATA_TOPK_OLD=1`, `STRATA_TOPK_STREAM=0` | HIP | Off | Run the original top-k kernel, or the register kernel in the 90K-135K band |
+| `STRATA_HIP_PM4=1` | gfx1200, gfx1201, Linux | Off (`=0`) | Opt-in retained PM4 indirect-buffer replay for all-resident solo decode/verify windows ([below](#opt-in-retained-pm4-indirect-buffer-replay-on-rdna4-linux)) |
+| `STRATA_GFX1201_PM4_PACING` | gfx1201, Linux | `auto` (`nop:64`) | Post-dispatch NOP pacing inside retained PM4 indirect buffers (`auto`, `off`, or `nop:N` for `1..16384` dwords) |
 
 ### Opt-in chunked prompt GDN on gfx11
 
@@ -440,6 +442,23 @@ signed dot4 instruction and a 100 MHz wall clock. Switch defaults for gfx12 are 
 
 Later engines are faster; see [History](#history--older-measurements) for the R9700 gains from WMMA attention, fused
 experts and the router kernel.
+
+### Opt-in retained PM4 indirect-buffer replay on RDNA4 (Linux)
+
+On Linux with an RDNA4 card (`gfx1201` or `gfx1200`), `STRATA_HIP_PM4=1` enables an experimental retained PM4 indirect-buffer (IB) replay path for decode and speculative verify windows (ported from [`warpfront/hipfire`](https://github.com/warpfront/hipfire), `Apache-2.0`). Instead of submitting one AQL kernel-dispatch packet per node through `hipGraphLaunch`, the engine lowers an eligible window into a single GFX12 PM4 command buffer with allocation-derived cache boundaries (`EVENT_WRITE` compute-idle + `ACQUIRE_MEM` `GCR_CNTL` `0x10180` / `0xc3b1`) and submits it through one ROCr vendor PM4-IB packet (`0x1500`).
+
+It is **off by default** (`STRATA_HIP_PM4=0`); when unset or `0`, the existing `hipGraph` path runs unchanged.
+
+| Variable | Default | Values | Effect |
+| --- | --- | --- | --- |
+| `STRATA_HIP_PM4` | `0` (off) | `0`, `off`, `false`, `1`, `on`, `true` | Master switch for GFX12 retained PM4 indirect-buffer replay on Linux. `=0` or unset keeps `hipGraphLaunch` everywhere. |
+| `STRATA_GFX1201_PM4_PACING` | `auto` | `auto`, `0`, `off`, `nop:N` (`1..16384`) | Post-dispatch `PACKET3_NOP` body dwords emitted after each `DISPATCH_DIRECT` on `gfx1201` (`auto` emits 64 dwords on `gfx1201` and 0 on `gfx1200`). |
+
+**Eligibility and automatic fallback (`hipGraph`):**
+
+- **Admitted:** Linux only (`libhsa-runtime64.so.1` loaded via `dlopen`), exact `gfx1201` or `gfx1200`, `STRATA_HIP_PM4=1`, single-GPU stage, 100% of routed experts resident in VRAM (`ar_on`), early PLE flag raised before launch, no side-stream event forks, and window size `1 <= T <= 16` (plain AR decode `T=1` and solo verify windows).
+- **Excluded (falls back to `hipGraph`):** Windows, non-RDNA4 cards (`gfx1100`, `gfx1151`, `gfx1030`, `gfx906`), prompt prefill, multi-sequence `--batch` windows (`exec_bm_`), multi-GPU `--layer-split`, windows with CPU or PCIe expert streaming, side-stream branches (`STRATA_SH_STREAM=1`, `STRATA_SIDE_MIXER`, `STRATA_DF_BRANCH`), and any window containing an unrecorded launch, an unknown kernel family, a `grid.y` / `grid.z > 65536` geometry, a kernarg arena overflow, or a non-quiescent previous replay.
+- **Per-window latch:** when a window size `T` is refused at capture or prepare time, that window slot latches to `hipGraphLaunch` for the rest of the session so it never retries in a per-token loop. Hardware decode A/B measurements on R9700 / RX 9070 XT are pending validation.
 
 ## Integrated GPUs (mini PCs)
 

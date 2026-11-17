@@ -42,6 +42,59 @@ bool resolve_gfx12_post_dispatch_nop(
     const char* env_value,
     uint32_t& out_nop_dwords) noexcept;
 
+/// Parse `STRATA_HIP_PM4` kill-switch.
+/// Default OFF (`nullptr`, `""`, `"0"`, `"off"`, `"false"`, or unknown values return false).
+/// Returns true only for `"1"`, `"on"`, `"true"` (case-insensitive).
+bool parse_strata_hip_pm4_env(const char* env_value) noexcept;
+
+/// Reason code returned by the T5 PM4 eligibility gate.
+enum class Pm4EligibilityReason : uint8_t {
+    Admitted = 0,
+    RefusedDisabledByEnv = 1,
+    RefusedNotLinux = 2,
+    RefusedHsaUnavailable = 3,
+    RefusedUnsupportedArch = 4,
+    RefusedPrefill = 5,
+    RefusedBatchedWindow = 6,
+    RefusedLayerSplit = 7,
+    RefusedCpuOffloadOrDoorbells = 8,
+    RefusedLatePleFlagWait = 9,
+    RefusedSideStreamBranches = 10,
+    RefusedInvalidWindowSize = 11,
+};
+
+const char* pm4_eligibility_reason_to_string(Pm4EligibilityReason reason) noexcept;
+
+/// Inputs to the T5 PM4 eligibility gate.
+struct Pm4EligibilityInput {
+    const char* env_strata_hip_pm4 = nullptr;
+    bool is_linux = false;
+    bool hsa_available = false;
+    const char* arch_name = nullptr;
+    bool is_prefill = false;
+    bool is_batched = false;
+    bool is_layer_split = false;
+    bool all_experts_resident = false;
+    bool early_ple_flag = true;
+    bool has_side_streams = false;
+    int window_tokens = 1;
+};
+
+/// Result of evaluating the T5 PM4 eligibility gate.
+struct Pm4EligibilityDecision {
+    bool admitted = false;
+    Pm4EligibilityReason reason = Pm4EligibilityReason::RefusedDisabledByEnv;
+    Gfx12Arch arch = Gfx12Arch::Gfx1201;
+    const char* message = "";
+};
+
+/// Evaluate whether a window is eligible for retained PM4 indirect-buffer replay.
+/// Admits only Linux + ROCr HSA + exact gfx1201/gfx1200 + STRATA_HIP_PM4=1 +
+/// plain AR decode (T=1) or solo verify windows (1 <= T <= 16) with 100% resident
+/// experts, single-GPU stage, early PLE flag, and no side-stream forks.
+/// Refuses prefill, batched exec_bm_ graphs, layer-split stages, and CPU/PCIe offload.
+Pm4EligibilityDecision evaluate_pm4_eligibility(const Pm4EligibilityInput& input) noexcept;
+
 /// Derived boundary plan produced by walking a `Pm4Tape`'s allocation-level effects.
 struct Pm4BoundaryPlan {
     Gfx12Arch arch = Gfx12Arch::Gfx1201;

@@ -109,6 +109,105 @@ bool resolve_gfx12_post_dispatch_nop(
     return false;
 }
 
+bool parse_strata_hip_pm4_env(const char* env_value) noexcept {
+    if (env_value == nullptr) {
+        return false;
+    }
+    while (*env_value == ' ' || *env_value == '\t') {
+        ++env_value;
+    }
+    size_t len = std::strlen(env_value);
+    while (len > 0 && (env_value[len - 1] == ' ' || env_value[len - 1] == '\t')) {
+        --len;
+    }
+    if (len == 1u && env_value[0] == '1') {
+        return true;
+    }
+    if (len == 2u && equals_ignore_case(env_value, "on", 2u)) {
+        return true;
+    }
+    if (len == 4u && equals_ignore_case(env_value, "true", 4u)) {
+        return true;
+    }
+    return false;
+}
+
+const char* pm4_eligibility_reason_to_string(Pm4EligibilityReason reason) noexcept {
+    switch (reason) {
+        case Pm4EligibilityReason::Admitted:
+            return "admitted to GFX12 PM4 indirect-buffer replay";
+        case Pm4EligibilityReason::RefusedDisabledByEnv:
+            return "STRATA_HIP_PM4 is off (default 0)";
+        case Pm4EligibilityReason::RefusedNotLinux:
+            return "PM4 replay requires Linux (/dev/kfd + ROCr HSA)";
+        case Pm4EligibilityReason::RefusedHsaUnavailable:
+            return "ROCr HSA runtime (libhsa-runtime64.so.1) is unavailable";
+        case Pm4EligibilityReason::RefusedUnsupportedArch:
+            return "GPU architecture is not gfx1201 or gfx1200";
+        case Pm4EligibilityReason::RefusedPrefill:
+            return "prompt prefill is excluded from PM4 replay";
+        case Pm4EligibilityReason::RefusedBatchedWindow:
+            return "multi-sequence batched windows (exec_bm_) are excluded from PM4 replay";
+        case Pm4EligibilityReason::RefusedLayerSplit:
+            return "multi-GPU layer-split stages are excluded from PM4 replay";
+        case Pm4EligibilityReason::RefusedCpuOffloadOrDoorbells:
+            return "window has non-resident experts or host doorbell waits (!ar_on)";
+        case Pm4EligibilityReason::RefusedLatePleFlagWait:
+            return "window waits on post-launch host PLE flag spin";
+        case Pm4EligibilityReason::RefusedSideStreamBranches:
+            return "window uses side-stream event forks or profiling hooks";
+        case Pm4EligibilityReason::RefusedInvalidWindowSize:
+            return "window token count T is outside 1..16";
+    }
+    return "refused by PM4 eligibility gate";
+}
+
+Pm4EligibilityDecision evaluate_pm4_eligibility(const Pm4EligibilityInput& input) noexcept {
+    auto refuse = [](Pm4EligibilityReason r) noexcept {
+        return Pm4EligibilityDecision{false, r, Gfx12Arch::Gfx1201, pm4_eligibility_reason_to_string(r)};
+    };
+    if (!parse_strata_hip_pm4_env(input.env_strata_hip_pm4)) {
+        return refuse(Pm4EligibilityReason::RefusedDisabledByEnv);
+    }
+    if (!input.is_linux) {
+        return refuse(Pm4EligibilityReason::RefusedNotLinux);
+    }
+    if (!input.hsa_available) {
+        return refuse(Pm4EligibilityReason::RefusedHsaUnavailable);
+    }
+    Gfx12Arch arch = Gfx12Arch::Gfx1201;
+    if (!parse_gfx12_arch(input.arch_name, arch)) {
+        return refuse(Pm4EligibilityReason::RefusedUnsupportedArch);
+    }
+    if (input.is_prefill) {
+        return refuse(Pm4EligibilityReason::RefusedPrefill);
+    }
+    if (input.is_batched) {
+        return refuse(Pm4EligibilityReason::RefusedBatchedWindow);
+    }
+    if (input.is_layer_split) {
+        return refuse(Pm4EligibilityReason::RefusedLayerSplit);
+    }
+    if (!input.all_experts_resident) {
+        return refuse(Pm4EligibilityReason::RefusedCpuOffloadOrDoorbells);
+    }
+    if (!input.early_ple_flag) {
+        return refuse(Pm4EligibilityReason::RefusedLatePleFlagWait);
+    }
+    if (input.has_side_streams) {
+        return refuse(Pm4EligibilityReason::RefusedSideStreamBranches);
+    }
+    if (input.window_tokens < 1 || input.window_tokens > 16) {
+        return refuse(Pm4EligibilityReason::RefusedInvalidWindowSize);
+    }
+    return Pm4EligibilityDecision{
+        /*admitted=*/true,
+        /*reason=*/Pm4EligibilityReason::Admitted,
+        /*arch=*/arch,
+        /*message=*/pm4_eligibility_reason_to_string(Pm4EligibilityReason::Admitted),
+    };
+}
+
 bool plan_pm4_boundaries(
     const Pm4Tape& tape,
     Gfx12Arch arch,

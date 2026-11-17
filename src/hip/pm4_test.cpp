@@ -866,6 +866,121 @@ void test_pm4_boundary_planner_and_replay() {
     }
 }
 
+void test_pm4_eligibility_gate() {
+    // 1. Kill-switch parsing: default OFF (nullptr, "", "0", "off", "false", unknown)
+    CHECK(!parse_strata_hip_pm4_env(nullptr));
+    CHECK(!parse_strata_hip_pm4_env(""));
+    CHECK(!parse_strata_hip_pm4_env("0"));
+    CHECK(!parse_strata_hip_pm4_env("off"));
+    CHECK(!parse_strata_hip_pm4_env("false"));
+    CHECK(!parse_strata_hip_pm4_env("auto"));
+    CHECK(parse_strata_hip_pm4_env("1"));
+    CHECK(parse_strata_hip_pm4_env("on"));
+    CHECK(parse_strata_hip_pm4_env("true"));
+    CHECK(parse_strata_hip_pm4_env(" ON "));
+
+    // 2. Baseline valid solo verify / AR decode configuration
+    Pm4EligibilityInput base{};
+    base.env_strata_hip_pm4 = "1";
+    base.is_linux = true;
+    base.hsa_available = true;
+    base.arch_name = "gfx1201:sramecc-:xnack-";
+    base.is_prefill = false;
+    base.is_batched = false;
+    base.is_layer_split = false;
+    base.all_experts_resident = true;
+    base.early_ple_flag = true;
+    base.has_side_streams = false;
+    base.window_tokens = 1;  // plain AR decode
+
+    const Pm4EligibilityDecision d_ar1 = evaluate_pm4_eligibility(base);
+    CHECK(d_ar1.admitted);
+    CHECK(d_ar1.reason == Pm4EligibilityReason::Admitted);
+    CHECK(d_ar1.arch == Gfx12Arch::Gfx1201);
+
+    // Solo verify window (T=4) on gfx1200 is also admitted
+    Pm4EligibilityInput solo4 = base;
+    solo4.arch_name = "gfx1200";
+    solo4.window_tokens = 4;
+    const Pm4EligibilityDecision d_solo4 = evaluate_pm4_eligibility(solo4);
+    CHECK(d_solo4.admitted);
+    CHECK(d_solo4.arch == Gfx12Arch::Gfx1200);
+
+    // 3. Every refusal gate fails closed with the exact reason
+    {
+        auto in = base;
+        in.env_strata_hip_pm4 = nullptr;  // default unset
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedDisabledByEnv);
+    }
+    {
+        auto in = base;
+        in.env_strata_hip_pm4 = "0";  // explicit kill-switch
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedDisabledByEnv);
+    }
+    {
+        auto in = base;
+        in.is_linux = false;  // Windows
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedNotLinux);
+    }
+    {
+        auto in = base;
+        in.hsa_available = false;
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedHsaUnavailable);
+    }
+    for (const char* bad_arch : {"gfx1100", "gfx1151", "gfx1030", "gfx906", "sm_89", ""}) {
+        auto in = base;
+        in.arch_name = bad_arch;
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedUnsupportedArch);
+    }
+    {
+        auto in = base;
+        in.is_prefill = true;
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedPrefill);
+    }
+    {
+        auto in = base;
+        in.is_batched = true;  // exec_bm_ multi-sequence batch
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedBatchedWindow);
+    }
+    {
+        auto in = base;
+        in.is_layer_split = true;
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedLayerSplit);
+    }
+    {
+        auto in = base;
+        in.all_experts_resident = false;  // CPU/PCIe expert offload or doorbell graph
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedCpuOffloadOrDoorbells);
+    }
+    {
+        auto in = base;
+        in.early_ple_flag = false;
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedLatePleFlagWait);
+    }
+    {
+        auto in = base;
+        in.has_side_streams = true;
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedSideStreamBranches);
+    }
+    for (int bad_t : {0, -1, 17, 64}) {
+        auto in = base;
+        in.window_tokens = bad_t;
+        const auto d = evaluate_pm4_eligibility(in);
+        CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedInvalidWindowSize);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -882,6 +997,7 @@ int main(int argc, char** argv) {
     test_pm4_commands_and_roundtrip(pm4_golden);
     test_pm4_tape_and_contracts();
     test_pm4_boundary_planner_and_replay();
+    test_pm4_eligibility_gate();
 
     if (g_fails != 0) {
         std::printf("pm4_test: %d failure(s)\n", g_fails);
