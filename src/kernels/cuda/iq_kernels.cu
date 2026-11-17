@@ -17,6 +17,9 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if defined(__HIPCC__)
+#include "strata/hip_compat/buffer_load.hpp"
+#endif
 
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
@@ -894,6 +897,42 @@ __global__ void __launch_bounds__(128) mmvq_kernel(const uint8_t* __restrict__ w
 }
 
 // ---------------------------------------------------------------- decode once, apply to every column
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+// Raw weight-buffer addressing follows hipfire gfx12_weight_cache_policy.inc (Apache-2.0).
+// Each lane still adds exactly row_dot's k = lane, lane+32, ... terms.
+template <int TY>
+__global__ void __launch_bounds__(128) mmvq_buf_kernel(
+    const uint8_t* __restrict__ w, size_t row_bytes, const block_q8_1* __restrict__ x,
+    float* __restrict__ y, int n_in, int n_out) {
+    using namespace strata::hip_compat;
+    using F = Fmt<TY>;
+    constexpr int BPW = 32 / F::ipb;
+    extern __shared__ float4 buf_tiles[];
+    static_assert(32 % F::ipb == 0, "buffer tile must contain whole quant blocks");
+    const int lane = threadIdx.x, wave = threadIdx.y, row = blockIdx.x * 4 + wave;
+    if (row >= n_out) return;
+    const int nb = n_in / F::qk;
+    const unsigned block_bytes = row_bytes / nb;
+    const unsigned tile_bytes = (BPW * block_bytes + 15) & ~15u;
+    auto* tile = reinterpret_cast<unsigned char*>(buf_tiles) + wave * tile_bytes;
+    const size_t base_off = (size_t) row * row_bytes;
+    const uint8_t* src = w + base_off;
+    const BufRsrc rsrc = strata_hip_make_rsrc(src, (size_t) n_out * row_bytes - base_off);
+    float sum = 0.0f;
+    for (int kb = 0; kb < nb; kb += BPW) {
+        const unsigned bytes = min(BPW, nb - kb) * block_bytes;
+        strata_hip_buffer_copy_wave(tile, src, rsrc, kb * block_bytes, bytes, lane);
+        __syncwarp();
+        const int kbx = kb + lane / F::ipb, iqs = F::step * (lane % F::ipb);
+        if (kbx < nb)
+            sum += F::dot(tile, x + kb * (F::qk / 32), lane / F::ipb, iqs);
+        __syncwarp();
+    }
+    sum = warp_sum(sum);
+    if (lane == 0) y[row] = sum;
+}
+#endif
+
 // The kernels above call Fmt<TY>::dot once per (call, column): each column re-reads the weight words and redoes
 // the grid lookups and sign unpacking.  Here each dot is split, as native_mmvq.cu's multi-column traits are, into
 // `load` (everything that depends only on the weight: the signed grid words, the integer scales, the fp16 block

@@ -39,6 +39,9 @@
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#if defined(__HIPCC__)
+#include "strata/hip_compat/buffer_load.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdint>
@@ -1676,6 +1679,70 @@ bool b6_launch(const typename F::Block* w, const Q81Block* x, float* y, int n_in
         return true;
     }
 }
+
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+// Buffer/cache encoding: hipfire gfx12_weight_cache_policy.inc (Apache-2.0).
+// Stage contiguous row chunks once per wave; F::load/apply and the original reduction order stay intact.
+template <typename F, int ROWS>
+__global__ void __launch_bounds__(WARPS * WARP) native_mmvq_buf_kernel(
+    const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
+    float* __restrict__ y, int n_in, int n_out) {
+    using namespace strata::hip_compat;
+    constexpr int BPW = WARP / F::T, BPI = BPW * WARPS;
+    constexpr int TILE_BYTES = (BPW * sizeof(typename F::Block) + 15) & ~15;
+    static_assert(WARP % F::T == 0, "buffer tile must contain whole quant blocks");
+    __shared__ unsigned char tile[WARPS][TILE_BYTES] __attribute__((aligned(16)));
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    const int lane = threadIdx.x, wave = threadIdx.y, row0 = blockIdx.x * ROWS;
+    const int nb = n_in / F::DIV, kqs = F::kqs(wave * WARP + lane);
+    const size_t row_bytes = (size_t) nb * sizeof(typename F::Block);
+    const size_t extent = (size_t) n_out * row_bytes;
+    float sum[ROWS] = {};
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+        if (row0 + i >= n_out) continue;
+        const size_t base_off = (size_t) (row0 + i) * row_bytes;
+        const auto* src = reinterpret_cast<const unsigned char*>(w) + base_off;
+        const BufRsrc rsrc = strata_hip_make_rsrc(src, extent - base_off);
+        for (int kb = wave * BPW; kb < nb; kb += BPI) {
+            const unsigned bytes = min(BPW, nb - kb) * sizeof(typename F::Block);
+            strata_hip_buffer_copy_wave(tile[wave], src, rsrc, kb * sizeof(typename F::Block), bytes, lane);
+            __syncwarp();
+            const int kbx = kb + lane / F::T;
+            if (kbx < nb) {
+                const auto* blocks = reinterpret_cast<const typename F::Block*>(tile[wave]);
+                const typename F::W v = F::load(blocks + lane / F::T, kqs);
+                sum[i] += F::apply(v, x + kbx * F::KBY, kqs);
+            }
+            __syncwarp();
+        }
+    }
+    if (wave > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[wave - 1][i][lane] = sum[i];
+    }
+    mmvq_sync_lds();
+    if (wave > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int wv = 0; wv < WARPS - 1; ++wv) sum[i] += partial[wv][i][lane];
+        sum[i] = warp_sum(sum[i]);
+        if (lane == i && row0 + i < n_out) y[row0 + i] = sum[i];
+    }
+}
+
+template <typename F>
+void launch_buffer_mmvq(const void* weights, const void* x, float* y, int n_in, int n_out, cudaStream_t stream) {
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const auto* a = static_cast<const Q81Block*>(x);
+    const dim3 threads(WARP, WARPS);
+    if (n_in / F::DIV < F::BPI)
+        native_mmvq_buf_kernel<F, WARPS><<<unsigned((n_out + WARPS - 1) / WARPS), threads, 0, stream>>>(w, a, y, n_in, n_out);
+    else
+        native_mmvq_buf_kernel<F, 1><<<unsigned(n_out), threads, 0, stream>>>(w, a, y, n_in, n_out);
+}
+#endif
 
 template<typename F, int NCOLS>
 void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {

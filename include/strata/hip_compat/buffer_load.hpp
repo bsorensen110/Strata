@@ -53,7 +53,7 @@ __device__ __forceinline__ BufRsrc strata_hip_make_rsrc(const void* p, std::size
 template <int Ctrl = kBufferCachePolicy>
 __device__ __forceinline__ Buf128 strata_hip_buf_ld_b128(BufRsrc rsrc, unsigned int off, unsigned int soff = 0) {
 #if STRATA_HIP_BUFFER_RDNA
-    return __builtin_amdgcn_raw_buffer_load_b128(rsrc.value, off, soff, Ctrl);
+    return __builtin_bit_cast(Buf128, __builtin_amdgcn_raw_buffer_load_b128(rsrc.value, off, soff, Ctrl));
 #else
     Buf128 v;
     __builtin_memcpy(&v, rsrc.base + off + soff, sizeof(v));
@@ -64,7 +64,7 @@ __device__ __forceinline__ Buf128 strata_hip_buf_ld_b128(BufRsrc rsrc, unsigned 
 template <int Ctrl = kBufferCachePolicy>
 __device__ __forceinline__ Buf64 strata_hip_buf_ld_b64(BufRsrc rsrc, unsigned int off, unsigned int soff = 0) {
 #if STRATA_HIP_BUFFER_RDNA
-    return __builtin_amdgcn_raw_buffer_load_b64(rsrc.value, off, soff, Ctrl);
+    return __builtin_bit_cast(Buf64, __builtin_amdgcn_raw_buffer_load_b64(rsrc.value, off, soff, Ctrl));
 #else
     Buf64 v;
     __builtin_memcpy(&v, rsrc.base + off + soff, sizeof(v));
@@ -87,6 +87,21 @@ __device__ __forceinline__ void strata_hip_buffer_sched_barrier() {
 #if STRATA_HIP_BUFFER_RDNA
     __builtin_amdgcn_sched_barrier(0);
 #endif
+}
+
+// A row chunk, copied cooperatively by one wave. Never vector-read a partial tail or a misaligned dword.
+__device__ __forceinline__ void strata_hip_buffer_copy_wave(unsigned char* dst, const unsigned char* src,
+                                                           BufRsrc rsrc, unsigned int off,
+                                                           unsigned int bytes, unsigned int lane) {
+    const unsigned int misalignment = static_cast<unsigned int>(reinterpret_cast<uintptr_t>(src + off) & 3u);
+    const unsigned int prefix = min(bytes, (4u - misalignment) & 3u);
+    if (lane < prefix) dst[lane] = src[off + lane];
+    const unsigned int full_end = prefix + ((bytes - prefix) & ~15u);
+    for (unsigned int i = prefix + lane * 16; i < full_end; i += 32 * 16) {
+        const Buf128 v = strata_hip_buf_ld_b128(rsrc, off + i);
+        __builtin_memcpy(dst + i, &v, sizeof(v));
+    }
+    for (unsigned int i = full_end + lane; i < bytes; i += 32) dst[i] = src[off + i];
 }
 
 }  // namespace strata::hip_compat
