@@ -188,7 +188,11 @@ int main() {
               "add_hc_skip keeps blk.0.hc_attn_inject.weight in the BF16 arena");
         strata::core::WeightRef ref;
         check(!ref.hc_q8_from_gguf, "WeightRef::hc_q8_from_gguf defaults to false");
-        setenv("STRATA_HC_Q8", "1", 1);
+#if defined(_WIN32)
+            _putenv_s("STRATA_HC_Q8", "1");
+#else
+            setenv("STRATA_HC_Q8", "1", 1);
+#endif
         std::vector<char> hc_dense(35328, 0);
         // Set non-zero norm and BF16 weights so lm_head_mix produces a non-zero output when reading hc_q8
         for (size_t i = 0; i < 256; ++i) {
