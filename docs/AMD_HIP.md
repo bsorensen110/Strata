@@ -97,6 +97,41 @@ It requires one kernel node per fused launch, with the older IU8/IU4 flags off.
 Run that same test on an R9700 before accepting the device implementation.
 Host-oracle runtime is not measured here.
 
+**FP8 decode-attention probe (P3; no speed or quality claim).**
+The evidence supports packed E4M3 conversion on **exact gfx1201**, not a
+generic gfx12 FP8-WMMA gate. In hipfire's
+`kernels/src/attention_flash_fp8_e4m3_tile_gqa.gfx1201.hip`,
+lines 36-38 reject every other device target; lines 94, 103 and 136-137
+use `__builtin_amdgcn_cvt_pk_f32_fp8`. There is no FP8 WMMA in that file.
+Its `crates/rdna-compute/src/attention.rs:579-616` admits D256, tile128,
+GQA6 or exactly H16/KV2 (GQA8), and exact gfx1201.
+
+The other source, `attention_q8_0_fa2_gqa.gfx1201.hip:115-121`,
+guards `HIPFIRE_FA2_FP8` with gfx1200/gfx1201, and lines 1357 and 1455
+request `__builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12`.
+Those source guards do not prove that our compiler can lower FP8 WMMA on
+either target. Do not infer support on gfx1202/gfx1250 from the name, or
+from FP16/BF16 WMMA in Strata's prompt attention, select or expert kernels.
+This probe uses **no FP8 WMMA**. Both packed encode and decode builtins
+must be present in its exact-gfx1201 device image; otherwise it declines.
+
+Strata differs from that decode source: Flash-Next is H24/KV2 (GQA12),
+and q4_lite is H16/KV2 (GQA8). Those are the only probe instantiations.
+GQA16 stays on its current route. KV is paged and selected, not contiguous
+native-FP8 rows. The probe reads existing FP16 K/V only, rounds to E4M3
+on the fly, and stages each selected K/V row once for its KV head.
+It does not change writers, cache formats, rotations, snapshots or movers.
+INT8, Q4_0 and K8V4 are explicit refusal cases, not reinterpreted as FP8.
+Its tile128 must emit **two chunk64 records into the existing separate
+accumulator/max/sum planes**, not hipfire's interleaved 258-float records.
+The incumbent merge and scratch allocation stay unchanged.
+
+Hipfire's `CHANGELOG.md:454-455` reports 3.7-5.6% per-launch and
++0.67% served pp16000 on an R9700 for a **PeaceMaker versus hipcc
+Q-resident prefill scheduling twin**, not FP8 versus FP16 decode.
+These are upstream receipts, not reproduced Strata results.
+A logged refusal or no measured gain is a valid outcome for P3.
+
 | Card | Architecture | Status |
 | --- | --- | --- |
 | RX 7900 XT / XTX | gfx1100 | Maintainer-tested |
