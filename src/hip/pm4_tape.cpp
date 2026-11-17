@@ -515,7 +515,11 @@ bool Pm4Tape::begin_recording(ReplayQuiescence prev_quiescence) noexcept {
 }
 
 void Pm4Tape::invalidate(TapeStatus status, const char* reason) noexcept {
-    if (status_ == TapeStatus::Ok) {
+    // Fresh/finalized tapes carry the benign placeholders Ok (post-begin_recording)
+    // or InvalidatedEmptyTape (constructed/reset); either accepts the first real
+    // failure. A tape already holding a concrete failure keeps its first reason,
+    // so a secondary latch (e.g. set_quiescence) never masks why we really refused.
+    if (status_ == TapeStatus::Ok || status_ == TapeStatus::InvalidatedEmptyTape) {
         status_ = (status == TapeStatus::Ok) ? TapeStatus::InvalidatedUnknownKernel : status;
         failure_reason_ = (reason != nullptr && reason[0] != '\0')
                               ? reason
