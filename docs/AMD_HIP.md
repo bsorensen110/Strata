@@ -101,7 +101,7 @@ Host-oracle runtime is not measured here.
 The evidence supports packed E4M3 conversion on **exact gfx1201**, not a
 generic gfx12 FP8-WMMA gate. In hipfire's
 `kernels/src/attention_flash_fp8_e4m3_tile_gqa.gfx1201.hip`,
-lines 36-38 reject every other device target; lines 94, 103 and 136-137
+lines 37-39 reject every other device target; lines 86, 96 and 126-127
 use `__builtin_amdgcn_cvt_pk_f32_fp8`. There is no FP8 WMMA in that file.
 Its `crates/rdna-compute/src/attention.rs:579-616` admits D256, tile128,
 GQA6 or exactly H16/KV2 (GQA8), and exact gfx1201.
@@ -140,6 +140,55 @@ compiled image's two conversion builtins and wave32. Unsupported targets,
 images, shapes, pool formats or multi-query calls log one reason per device
 and keep the existing kernel. No target is admitted by compute capability.
 Multi-slot batched kernels and prompt WMMA families are not probed.
+Conversion uses round-to-nearest-even with saturation at +/-448 and no
+per-row rescaling. It changes arithmetic and is never a bitwise/default claim.
+
+Parent gates: build the affected CUDA/HIP backends, then run
+`hip_fp8_attn_parity_cpu`, `arch_defaults_test` and `hip_fp8_attn_test`.
+The device test skips a CUDA build or absent HIP device with code 77.
+On an unsupported HIP image it must pass a **decline assertion**, not skip:
+zero captured probe nodes, untouched scratch and the incumbent FP16 answer.
+On a supported image it checks the actual three production choosers, both
+incumbent merges, sparse pages, cap/tile boundaries, live widths and canaries.
+No C++ executable or GPU gate was run by the porting agent.
+
+R9700 per-launch A/B (Linux; already-built `build-hip` tree). Keep other
+experiments fixed. Each sample captures 128 chunk passes and times 32 graph
+replays with device events: 4,096 launches, no per-launch host synchronization.
+The off arm is explicitly reference **chunk kernel 0**, not a claim about
+the fastest production attention setting. The merge is excluded from both.
+A refusal prints no probe timing; record it as a null result.
+
+```sh
+ctest --test-dir build-hip --output-on-failure -R '^(hip_fp8_attn_parity_cpu|hip_fp8_attn_test|arch_defaults_test)$'
+for mode in 0 1 1 0 1 0 0 1; do
+  env STRATA_HIP_FP8_ATTN=$mode ./build-hip/hip_fp8_attn_test --bench
+done
+```
+
+Quality uses the existing `tools/quant_quality.py` decode yardstick; this
+checkout has no `tools/kv_precision_compare.py`. Both named arms force
+FP16 KV and `--spec 1`, keep the same text IDs, and save full first-output
+logits per text. The arm overrides an inherited value of the probe flag.
+The FP8 arm must log `selected` or `declined`; no evidence is an error.
+`--first` reports full-vocabulary **KL(current || probe)@0** and top-1 per
+text, separately from the teacher-forced top-64 KL over all positions.
+Refusals are labelled; identical fallback logits are not evidence of FP8
+quality. No quality threshold is assumed or promoted to a default.
+
+```sh
+python tools/quant_quality.py run --config r9700.json --arm current --out fp8-off.tsv
+python tools/quant_quality.py run --config r9700.json --arm fp8-attn --out fp8-on.tsv
+python tools/quant_quality.py compare fp8-off.tsv fp8-on.tsv --segments --first --json fp8-kl.json
+```
+
+Use the **same local model configuration** for both commands, with a matching
+tokenizer/text set; `r9700.json` is the user's engine config, not a supplied
+artifact. For decode tok/s, repeat the normal served workload in fresh
+processes in the same 0/1/1/0 order with this flag, FP16 KV and the same
+placement/context; retain route logs and per-run results. Graph chunk timing
+alone is not served throughput. Drop the probe if conversion loses, quality
+is unsuitable or the relevant route declines.
 
 | Card | Architecture | Status |
 | --- | --- | --- |

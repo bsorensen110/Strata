@@ -16,6 +16,9 @@ Q8_0, on one fixed text set (data/quant_quality/v1: code, docs, English, other l
         per segment and overall: top-1 agreement (same argmax), mean / p99 KL(REF || RUN) over REF's 64 most likely
         tokens (both renormalized to that set; a token RUN does not list gets RUN's 64th log-probability), and the
         perplexity of the text under each.
+    P3 HIP decode probe: `run --arm current|fp8-attn` uses --spec 1, records the actual probe route and full first-token
+        logits for each text; `compare REF.tsv RUN.tsv --segments --first` adds full-vocabulary KL@0 and top-1.
+        A declined probe is labelled as such, never treated as measured FP8 quality.
 
 The RUN.tsv rows are the engine's STRATA_LOGPOS format: pos, target id, logp(target), argmax id, logp(argmax),
 argmax==target, logp(<|im_end|>), logp(target without <|im_end|>), then 64 `id:logp` fields (natural log).
@@ -23,10 +26,12 @@ argmax==target, logp(<|im_end|>), logp(target without <|im_end|>), then 64 `id:l
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
 import pathlib
+import struct
 import subprocess
 import sys
 import time
@@ -38,6 +43,7 @@ TOPK = 64
 FIXED = ["--expert-cache", "1", "--adapt-every", "100000", "--pcie-frac", "0", "--suffix-draft", "0",
          "--prompt-cache", "0", "--kv", "fp16"]
 FIXED_ENV = {"STRATA_ROUTE_TAIL_SKIP": "0", "STRATA_PREFILL_CPU_SHARE": "0", "STRATA_PCIE_FRAC_DEFAULT": "old"}
+ARMS = {"current": {"STRATA_HIP_FP8_ATTN": "0"}, "fp8-attn": {"STRATA_HIP_FP8_ATTN": "1"}}
 # config args the yardstick replaces (value-taking) or drops (flags)
 DROP_VALUE = {"--expert-cache", "--adapt-every", "--pcie-frac", "--suffix-draft", "--prompt-cache", "--max-context",
               "--prefill", "--prompt-cache-every", "--short-read", "--conversation-cache-mib", "--eos-ids",
@@ -118,10 +124,31 @@ def check_ids_vocab(st: dict, cfg: dict, ids_path: str) -> None:
             raise SystemExit(f"{ids_path}: segment '{s['name']}' has token id {mx} >= the model's vocabulary ({vocab}): this ids file was "
                              f"made with another tokenizer; make one with `quant_quality.py ids --tokenizer <the model's tokenizer folder>`")
 
+def probe_decode_args(args: list[str]) -> list[str]:
+    out, i = [], 0
+    while i < len(args):
+        if args[i] == "--spec":
+            i += 2
+        else:
+            out.append(args[i])
+            i += 1
+    return [*out, "--spec", "1"]
+
+
+def probe_route(stderr: str) -> tuple[str, list[str]]:
+    lines = [line for line in stderr.splitlines() if line.startswith("strata fp8-attn probe:")]
+    if any("selected: " in line for line in lines):
+        return "selected", lines
+    if any("declined: " in line for line in lines):
+        return "declined (null probe; no FP8 quality claim)", lines
+    raise SystemExit("fp8-attn: no decode route evidence; use a HIP probe build, not a silent fallback")
+
 
 def cmd_run(a) -> int:
-    cfg = json.load(open(a.config, encoding="utf-8-sig"))
-    st = json.load(open(a.ids))
+    with open(a.config, encoding="utf-8-sig") as file:
+        cfg = json.load(file)
+    with open(a.ids) as file:
+        st = json.load(file)
     check_ids_vocab(st, cfg, a.ids)
     out = pathlib.Path(a.out).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -135,11 +162,24 @@ def cmd_run(a) -> int:
     for kv in a.env or []:
         k, _, v = kv.partition("=")
         env[k] = v
+    arm = getattr(a, "arm", None)
+    if arm is not None:
+        old_metadata = pathlib.Path(str(out) + ".seg.json")
+        if old_metadata.exists():
+            old_metadata.unlink()
+        env.update(ARMS[arm])
+        prefix = pathlib.Path(str(out) + ".first")
+        for path in out.parent.glob(prefix.name + ".*"):
+            if path.suffix[1:].isdigit():
+                path.unlink()
+        env["STRATA_DUMP_FIRST_LOGITS"] = str(prefix)
     env["STRATA_LOGPOS"] = str(out)
     env["STRATA_LOGPOS_TOPK"] = str(TOPK)
     if mem_available_gb() < a.min_free_gb:
         raise SystemExit(f"only {mem_available_gb():.0f} GB available (< {a.min_free_gb}): not starting an engine")
     args = engine_args(cfg, a.gpu_experts, st["seg_tokens"])
+    if arm is not None:
+        args = probe_decode_args(args)
     if a.wrap:
         args = a.wrap.split() + args
     errf = open(str(out) + ".stderr.txt", "w")
@@ -154,7 +194,10 @@ def cmd_run(a) -> int:
     segs, info = [], []
 
     def lines() -> int:
-        return sum(1 for _ in open(out)) if out.exists() else 0
+        if not out.exists():
+            return 0
+        with open(out) as file:
+            return sum(1 for _ in file)
 
     for s in st["segments"]:
         n0, t0 = lines(), time.time()
@@ -184,9 +227,17 @@ def cmd_run(a) -> int:
     errf.close()
     err = pathlib.Path(str(out) + ".stderr.txt").read_text(errors="replace")
     cache = [l for l in err.splitlines() if "expert cache" in l][:3]
-    pathlib.Path(str(out) + ".seg.json").write_text(json.dumps({"segments": segs, "config": a.config,
-                                                                 "args": args, "env": a.env or [],
-                                                                 "expert_cache_lines": cache}, indent=1))
+    metadata = {"segments": segs, "config": a.config, "args": args, "env": a.env or [], "expert_cache_lines": cache}
+    if arm is not None:
+        if p.wait() != 0:
+            raise SystemExit(f"{arm}: engine exited with {p.returncode}; see {out}.stderr.txt")
+        route, evidence = probe_route(err) if arm == "fp8-attn" else ("off", [])
+        for i in range(len(segs)):
+            read_first_logits(out, i)
+        metadata.update(arm=arm, fp8_route=route, fp8_route_lines=evidence,
+                        input_ids_sha256=hashlib.sha256(json.dumps(st, sort_keys=True).encode()).hexdigest())
+        print(f"{arm}: route={route}", flush=True)
+    pathlib.Path(str(out) + ".seg.json").write_text(json.dumps(metadata, indent=1))
     return 0
 
 
@@ -285,9 +336,52 @@ def cmd_pcompare(a) -> int:
 
 
 # ------------------------------------------------------------------------------------------------ compare
+def read_first_logits(run, index: int) -> tuple[float, ...]:
+    path = pathlib.Path(f"{run}.first.{index}")
+    if not path.is_file():
+        raise SystemExit(f"missing first-token logits: {path}")
+    data = path.read_bytes()
+    if len(data) < 8 or len(data) % 4:
+        raise SystemExit(f"invalid float32 logits: {path}")
+    values = struct.unpack(f"<{len(data) // 4}f", data)
+    if not all(math.isfinite(x) for x in values):
+        raise SystemExit(f"nonfinite first-token logits: {path}")
+    return values
+
+
+def compare_first_logits(ref, run) -> dict:
+    rm = json.loads(pathlib.Path(f"{ref}.seg.json").read_text())
+    am = json.loads(pathlib.Path(f"{run}.seg.json").read_text())
+    names = [s["name"] for s in rm["segments"]]
+    if not names or names != [s["name"] for s in am["segments"]] or len(names) != len(set(names)):
+        raise SystemExit("first-token text sets do not match")
+    if not rm.get("input_ids_sha256") or rm["input_ids_sha256"] != am.get("input_ids_sha256"):
+        raise SystemExit("first-token input IDs do not match (use run --arm for both runs)")
+    if rm.get("arm") != "current" or am.get("arm") not in ARMS:
+        raise SystemExit("KL@0 reference must be the current decode arm")
+    if am["arm"] == "fp8-attn" and not am.get("fp8_route_lines"):
+        raise SystemExit("FP8 arm is missing route evidence")
+    result = {}
+    for i, name in enumerate(names):
+        r, a = read_first_logits(ref, i), read_first_logits(run, i)
+        if len(r) != len(a):
+            raise SystemExit(f"{name}: first-token vocabulary sizes do not match")
+        mr, ma = max(r), max(a)
+        zr = math.log(math.fsum(math.exp(x - mr) for x in r))
+        za = math.log(math.fsum(math.exp(x - ma) for x in a))
+        kl = math.fsum(math.exp(x - mr - zr) * ((x - mr - zr) - (y - ma - za)) for x, y in zip(r, a))
+        top = max(range(len(r)), key=r.__getitem__) == max(range(len(a)), key=a.__getitem__)
+        result[name] = {"kl_at_0": kl, "top1": top, "vocab": len(r)}
+    return {"route": am["fp8_route"], "texts": result,
+            "mean_kl_at_0": math.fsum(x["kl_at_0"] for x in result.values()) / len(result),
+            "top1": sum(x["top1"] for x in result.values()) / len(result)}
+
+
 def read_run(path: str) -> dict:
-    rows = open(path).read().splitlines()
-    segs = json.load(open(path + ".seg.json"))["segments"]
+    with open(path) as file:
+        rows = file.read().splitlines()
+    with open(path + ".seg.json") as file:
+        segs = json.load(file)["segments"]
     out = {}
     for s in segs:
         d = {}
@@ -353,6 +447,13 @@ def cmd_compare(a) -> int:
                 continue
             print(f"{pathlib.Path(path).name[:40]:40s} {seg:13s} {v['positions']:5d} {100 * v['top1']:6.2f}% "
                   f"{v['kl']:8.5f} {v.get('kl_p99', float('nan')):8.4f} {v['ppl']:7.3f} {v['ppl_ref']:7.3f}")
+        if a.first:
+            first = compare_first_logits(a.ref, path)
+            allres[path]["first_token"] = first
+            print(f"{pathlib.Path(path).name}: full-vocabulary KL@0, route={first['route']}")
+            for name, v in first["texts"].items():
+                print(f"  {name:13s} KL@0 {v['kl_at_0']:.8f}  top-1 same {int(v['top1'])}")
+            print(f"  all           KL@0 {first['mean_kl_at_0']:.8f}  top-1 {100 * first['top1']:.2f}%")
     if a.json:
         pathlib.Path(a.json).write_text(json.dumps(allres, indent=1))
     return 0
@@ -371,6 +472,7 @@ def main() -> int:
     p.add_argument("--out", required=True)
     p.add_argument("--ids", default=str(SET_DIR / "set.ids.json"))
     p.add_argument("--env", action="append")
+    p.add_argument("--arm", choices=ARMS, help="HIP decode probe A/B: force --spec 1, save KL@0 logits and route evidence")
     p.add_argument("--gpu-experts", nargs="?", const=True, default=False,
                    help="--expert-cache 1500 (or the N given, e.g. auto) instead of one slot (the experts on the GPU kernels)")
     p.add_argument("--min-free-gb", type=float, default=16)
@@ -387,6 +489,7 @@ def main() -> int:
     p.add_argument("ref")
     p.add_argument("runs", nargs="+")
     p.add_argument("--segments", action="store_true")
+    p.add_argument("--first", action="store_true", help="full-vocabulary KL@0/top-1 from run --arm logits")
     p.add_argument("--json")
     p = sub.add_parser("pcompare", help="full-vocabulary KL and top-1 of `prompt` directories against a reference one")
     p.add_argument("ref")

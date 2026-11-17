@@ -83,6 +83,17 @@ void parity(int group, hipStream_t stream) {
     for (int cap : {1, 63, 64, 65, 127, 128, 129, 257})
     for (bool missing : {false, true}) {
         Case c(group, cap, missing);
+        if (cap == 65 && !missing) {
+            const float edge[] = {0.0f, -0.0f, 1.0f / 1024, 3.0f / 1024, 7.0f / 1024,
+                                  1.0f / 512, 1.0625f, 1.1875f, 448.0f, 464.0f, 65504.0f};
+            for (size_t i = 0; i < c.f.k.size(); ++i) {
+                c.f.v[i] = edge[i % (sizeof(edge) / sizeof(*edge))];
+                c.f.k[i] = i & 1 ? -c.f.v[i] : c.f.v[i];
+            }
+            std::fill(c.f.q.begin(), c.f.q.end(), 1.0f / 65536);
+            upload(c.q.p, c.f.q.data(), c.f.q.size() * 4);
+            upload_half(c.k.p, c.f.k); upload_half(c.v.p, c.f.v);
+        }
         for (int v2 : {0, 1}) {
             hipGraph_t graph = nullptr;
             check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "tile capture");
@@ -247,6 +258,8 @@ int main(int argc, char** argv) {
             for (auto bits : untouched) ref::require(bits == 0xa5a5a5a5u, "declined route wrote scratch");
             if (!timing) dispatch(c, stream, false);
             std::printf("PASS fp8-attn declined: %s (%s); no timing or quality claim\n", fp::reason(expected), support.arch);
+        } else if (timing) {
+            bench(group, on, stream);
         } else {
             c.pools.k_q = static_cast<const int8_t*>(c.k.p);
             refuse([&] { return c.probe(true, stream); }, fp::Refusal::format, stream);
@@ -259,12 +272,9 @@ int main(int argc, char** argv) {
                     static_cast<const int32_t*>(c.ids.p), static_cast<const int32_t*>(c.step.p), c.f.cap,
                     c.s, static_cast<float*>(c.scratch.p), 2, stream);
             }, fp::Refusal::queries, stream);
-            if (timing) bench(group, on, stream);
-            else {
-                dispatch(c, stream, true);
-                parity(group, stream);
-                std::puts("PASS fp8-attn GPU: production choosers, scalar reference, both merges, live-width graph replay, canaries and refusals");
-            }
+            dispatch(c, stream, true);
+            parity(group, stream);
+            std::puts("PASS fp8-attn GPU: production choosers, scalar reference, both merges, live-width graph replay, canaries and refusals");
         }
         check(hipStreamDestroy(stream), "free stream");
         return 0;

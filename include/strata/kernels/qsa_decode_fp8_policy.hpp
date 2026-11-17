@@ -15,7 +15,7 @@ inline constexpr int kTile = 128;
 inline constexpr int kChunk = 64;  // the incumbent merge's unit, not hipfire's record layout
 
 inline bool exact_arch(const char* arch) {
-    // hipfire attention_flash_fp8_e4m3_tile_gqa.gfx1201.hip:36-38,94,136-137.
+    // hipfire attention_flash_fp8_e4m3_tile_gqa.gfx1201.hip:37-39,86,96,126-127.
     // This qualifies packed conversion, NOT native FP8 WMMA.
     return gfx_arch_is(arch, "gfx1201");
 }
