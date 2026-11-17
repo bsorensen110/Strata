@@ -78,6 +78,47 @@ void fusion(hipStream_t stream) {
                     ref::require(std::memcmp(single[i].data(),got[i].data(),want[i].size()*4)==0,"x4/standalone bits/canaries");
                 }
             }
+            void dot4(hipStream_t stream) {
+                for (int n=1;n<=8;++n) {
+                    constexpr int k=2560,m=33,ld=36;
+                    const auto w=ref::projection_pack(m,k,6,191);
+                    const auto x=ref::quantize(ref::activations(k,n).data(),k,n);
+                    i8::DeviceWeight dw;
+                    std::string why;
+                    ref::require(i8::upload(w,dw,why),why.c_str());
+                    std::vector<float> want((size_t)n*ld+19,123.0f),got=want;
+                    for (int t=0;t<n;++t)
+                    for (int r=0;r<m;++r) want[(size_t)t*ld+r]=ref::fold(w,x.data(),n,t,r);
+                    Buffer dx(x.size()*sizeof(i8::Block)),dy(want.size()*4);
+                    check(hipMemcpy(dx.p,x.data(),x.size()*sizeof(i8::Block),hipMemcpyHostToDevice),"dot4 upload");
+                    got=want;
+                    for (int t=0;t<n;++t)
+                        std::fill_n(got.data()+(size_t)t*ld,m,0.0f);
+                    check(hipMemcpy(dy.p,got.data(),got.size()*4,hipMemcpyHostToDevice),"dot4 poison");
+                    i8::Window p;
+                    p.weight=i8::view(dw); p.x=(const i8::Block*)dx.p; p.y=dy.p;
+                    p.rows=m; p.cols=k; p.tokens=p.x_rows=n; p.ld=ld;
+                    ref::require(!i8::strata_gemv_sym_i8_dot4(p,false,stream),"disabled dot4 launched");
+                    hipGraph_t graph=nullptr;
+                    check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"dot4 capture");
+                    ref::require(i8::strata_gemv_sym_i8_dot4(p,true,stream),"dot4 refused");
+                    check(hipStreamEndCapture(stream,&graph),"dot4 end capture");
+                    hipGraphExec_t exec=nullptr;
+                    check(hipGraphInstantiate(&exec,graph,nullptr,nullptr,0),"dot4 instantiate");
+                    for (int replay=0;replay<2;++replay) {
+                        check(hipGraphLaunch(exec,stream),"dot4 replay");
+                        check(hipStreamSynchronize(stream),"dot4 complete");
+                        check(hipMemcpy(got.data(),dy.p,got.size()*4,hipMemcpyDeviceToHost),"dot4 download");
+                        ref::require(std::memcmp(want.data(),got.data(),want.size()*4)==0,"dot4 device/CPU bits and padding");
+                    }
+                    check(hipGraphExecDestroy(exec),"dot4 free exec"); check(hipGraphDestroy(graph),"dot4 free graph");
+                    i8::launch_sym_i8_member(p,3,stream);
+                    check(hipStreamSynchronize(stream),"dot4 WMMA twin finish");
+                    std::vector<float> twin(want.size());
+                    check(hipMemcpy(twin.data(),dy.p,twin.size()*4,hipMemcpyDeviceToHost),"dot4 WMMA twin download");
+                    ref::require(std::memcmp(twin.data(),got.data(),got.size()*4)==0,"dot4/standalone WMMA bits");
+                }
+            }
             check(hipGraphExecDestroy(exec),"free exec"); check(hipGraphDestroy(graph),"free graph");
             std::reverse(members.begin(),members.begin()+count);
             ref::require(i8::strata_gemm_sym_i8_x4(members,count,true,stream),"reversed x4 refused");
@@ -109,10 +150,11 @@ int main() {
             if (prop.warpSize!=32 || !strata::kernels::gfx_arch_is(prop.gcnArchName,"gfx1201")) continue;
             hipStream_t stream=nullptr; check(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking),"stream");
             fusion(stream);
+            dot4(stream);
             check(hipStreamDestroy(stream),"free stream"); ++tested;
         }
         if (!tested) { std::puts("SKIP hip_projection_test: exact gfx1201 required"); return 77; }
-        std::puts("PASS hip_projection_test: fused/standalone/CPU bits, tails, graphs"); return 0;
+        std::puts("PASS hip_projection_test: x4/dot4/standalone/CPU bits, tails, graphs"); return 0;
     } catch (const std::exception& e) { std::fprintf(stderr,"FAIL hip_projection_test: %s\n",e.what()); return 1; }
 }
 #else

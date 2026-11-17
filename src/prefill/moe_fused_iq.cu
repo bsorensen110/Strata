@@ -29,6 +29,9 @@
 #if defined(__HIPCC__)
 #include "moe_f16_common.cuh"
 #include "moe_f16_kq.hpp"
+#include "strata/prefill/hip_projection.hpp"
+#include "strata/core/dispatch_stats.hpp"
+#include <stdexcept>
 #endif
 
 #include <cuda_fp16.h>
@@ -2262,3 +2265,32 @@ void experts_native(const WideBatch& b, const NativeGeom& g, int n_expert, int64
 }
 
 }  // namespace strata::prefill::fused
+
+#if defined(__HIPCC__)
+namespace strata::prefill::iu8 {
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Kaden Schutt
+// Port note: hipfire gemv_mq6sym_i8.gfx1201.hip:5-145; modified planar W6
+// consumer, independently opted in. FP8-dot sibling is motivation, not math.
+bool strata_gemv_sym_i8_dot4(const Window& p, bool enabled, void* stream) {
+    if (!enabled) return false;
+    int device=-1;
+    hipDeviceProp_t prop{};
+    if (hipGetDevice(&device)!=hipSuccess || hipGetDeviceProperties(&prop,device)!=hipSuccess)
+        throw std::runtime_error("HIP dot4: cannot query device");
+    if (prop.warpSize!=32 || !strata::kernels::gfx_arch_is(prop.gcnArchName,"gfx1201")) return false;
+    const auto& w=p.weight;
+    if (p.rows<=0 || p.rows>INT_MAX-127 || p.cols<=0 || p.cols%256 ||
+        p.tokens<1 || p.tokens>8 || p.x_rows!=p.tokens || p.ld<p.rows || !p.x || !p.y ||
+        p.count || p.groups!=1 || !w.symmetric_verified || !w.codes || !w.scales ||
+        w.rows!=p.rows || w.cols!=p.cols || w.bits!=6 || w.device!=device)
+        throw std::invalid_argument("HIP dot4: needs verified W6, shared A8, K256 and one to eight rows");
+    if (((int64_t)p.rows+31)/32>prop.maxGridSize[0] || prop.maxGridSize[1]<1 || prop.maxGridSize[2]<1)
+        throw std::invalid_argument("HIP dot4: device grid limit");
+    strata::dispatch::notef("HIP dot4: ordered K128 fold, tokens=%ld M=%ld K=%ld NT=0",
+                            (long)p.tokens,(long)p.rows,(long)p.cols);
+    launch_sym_i8_dot4(p,stream);
+    return true;
+}
+}  // namespace strata::prefill::iu8
+#endif

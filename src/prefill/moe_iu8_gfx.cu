@@ -345,6 +345,81 @@ void launch_sym_i8_x4(const std::array<Window, 4>& p, const X4Plan& plan, void* 
     check(hipGetLastError(), "x4 launch");
 }
 
+namespace {
+// Port note: hipfire gemv_mq6sym_i8.gfx1201.hip. Strata planar W6 adaptation:
+// K-split at R<=2, token-split thereafter; no FP reduction or NT loads.
+template<int R>
+__global__ void __launch_bounds__(128) sym_dot4(Window p) {
+#if defined(__gfx1201__)
+    const int lane=threadIdx.x&31, quad=lane&3;
+    const int row=(int)blockIdx.x*32+(threadIdx.x>>5)*8+(lane>>2);
+    const int clamped=row<p.rows?row:p.rows-1;
+    constexpr int half_tokens=(R+1)/2;
+    const int kh=R<=2?quad>>1:quad&1;
+    const int token0=R<=2?0:(quad>>1)*half_tokens;
+    constexpr int owned=R<=2?R:half_tokens;
+    float acc[owned]={};
+    for (int group=0;group<p.cols/256;++group) {
+        int c[owned]={};
+        const int first=R<=2?64*quad:128*kh;
+        const int length=R<=2?64:128;
+        for (int j=0;j<length;j+=8) {
+            const int k=group*256+first+j;
+            const uint8_t* codes=p.weight.codes+((size_t)clamped*p.cols+k)*3/4;
+            const unsigned a=(unsigned)codes[0]|((unsigned)codes[1]<<8)|((unsigned)codes[2]<<16);
+            const unsigned b=(unsigned)codes[3]|((unsigned)codes[4]<<8)|((unsigned)codes[5]<<16);
+            const unsigned even=dot4_word6(a,b,0), odd=dot4_word6(a,b,1);
+            for (int t=0;t<owned;++t) {
+                const int token=token0+t;
+                if (token>=R) continue;
+                const Block& x=p.x[(group*2+kh)*R+token];
+                const int offset=(first&127)+j;
+                const unsigned xe=*(const unsigned*)(x.qs+offset);
+                const unsigned xo=*(const unsigned*)(x.qs+offset+4);
+                c[t]=__builtin_amdgcn_sudot4(true,(int)even,true,(int)xe,c[t],false);
+                c[t]=__builtin_amdgcn_sudot4(true,(int)odd,true,(int)xo,c[t],false);
+            }
+        }
+        const float s0=__half2float(__ushort_as_half(p.weight.scales[(size_t)clamped*(p.cols/128)+2*group]));
+        const float s1=__half2float(__ushort_as_half(p.weight.scales[(size_t)clamped*(p.cols/128)+2*group+1]));
+        for (int t=0;t<owned;++t) {
+            int own=c[t], other;
+            if constexpr (R<=2) {
+                own+=__shfl_xor(own,1);
+                other=__shfl_xor(own,2);
+            } else other=__shfl_xor(own,1);
+            const int token=token0+t;
+            const bool writer=R<=2?quad==t:(t&1)==kh;
+            if (token<R && writer) {
+                const int c0=(kh?other:own)>>2, c1=(kh?own:other)>>2;
+                const Block* x=p.x+2*group*R+token;
+                acc[t]=__fmaf_rn(__fmul_rn(s0,x[0].d),(float)c0,acc[t]);
+                acc[t]=__fmaf_rn(__fmul_rn(s1,x[R].d),(float)c1,acc[t]);
+            }
+        }
+    }
+    if (row<p.rows)
+    for (int t=0;t<owned;++t) {
+        const int token=token0+t;
+        const bool writer=R<=2?quad==t:(t&1)==kh;
+        if (token<R && writer) ((float*)p.y)[(size_t)token*p.ld+row]=acc[t];
+    }
+#elif defined(__HIP_DEVICE_COMPILE__)
+    __builtin_trap();
+#endif
+}
+}  // namespace
+void launch_sym_i8_dot4(const Window& p, void* stream) {
+    const dim3 grid((unsigned)(((int64_t)p.rows+31)/32),1,1);
+#define DOT4(R) case R: sym_dot4<R><<<grid,128,0,(hipStream_t)stream>>>(p); break
+    switch (p.tokens) {
+        DOT4(1); DOT4(2); DOT4(3); DOT4(4); DOT4(5); DOT4(6); DOT4(7); DOT4(8);
+        default: invalid("dot4 row count");
+    }
+#undef DOT4
+    check(hipGetLastError(),"dot4 launch");
+}
+
 bool window_admitted(int tokens, int cols) {
     return tokens > 0 && tokens <= 48 && cols > 0 && cols % 128 == 0 && usable();
 }

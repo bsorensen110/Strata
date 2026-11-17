@@ -16,6 +16,35 @@ void fusion() {
             const int expected=n<=16?3:n<=32?1:n<=48?5:9;
             ref::require(plan.entry==expected,"trunk largest-member/token-split pick");
         }
+        void dot4() {
+            for (unsigned base=0;base<64;++base) {
+                const unsigned fields[8]={base,(base+1)%64,(base+17)%64,(base+31)%64,
+                                           (base+32)%64,(base+43)%64,(base+61)%64,(base+63)%64};
+                const unsigned a=fields[0]|fields[1]<<6|fields[2]<<12|fields[3]<<18;
+                const unsigned b=fields[4]|fields[5]<<6|fields[6]<<12|fields[7]<<18;
+                for (int odd=0;odd<2;++odd) {
+                    const auto v=i8::dot4_word6(a,b,odd);
+                    for (int j=0;j<4;++j) {
+                        int q=(v>>(8*j))&255;
+                        if (q>=128) q-=256;
+                        ref::require(q==4*((int)fields[2*j+odd]-32),"dot4 6-bit packing/sign");
+                    }
+                }
+            }
+            for (int n=1;n<=8;++n) {
+                constexpr int k=2560,m=17,ld=20;
+                const auto w=ref::projection_pack(m,k,6,171);
+                auto x=ref::quantize(ref::activations(k,n).data(),k,n);
+                // Include extrema and signed cancellation, not just ordinary activations.
+                if (n>1)
+                    for (int j=0;j<128;++j) x[1].qs[j]=(int8_t)(j&1?-127:127);
+                std::vector<float> want((size_t)n*ld+19,123.0f),got=want;
+                for (int t=0;t<n;++t)
+                for (int r=0;r<m;++r) want[(size_t)t*ld+r]=ref::fold(w,x.data(),n,t,r);
+                ref::projection_dot4(w,x.data(),n,got.data(),ld);
+                ref::require(std::memcmp(want.data(),got.data(),want.size()*4)==0,"dot4/scalar K128 fold bits or tails");
+            }
+        }
         const auto x=ref::quantize(ref::activations(2560,n).data(),2560,n);
         for (int bits : {4,6}) {
             std::array<i8::Pack,4> w{};
@@ -67,7 +96,8 @@ int main() {
     try {
         ref::require(std::fesetround(FE_TONEAREST)==0,"RNE unavailable");
         fusion();
-        std::puts("PASS hip_projection_parity: CPU x4 member bits, mappings and canaries; GPU untested");
+        dot4();
+        std::puts("PASS hip_projection_parity: CPU x4/dot4 bits, mappings and canaries; GPU untested");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr,"FAIL hip_projection_parity: %s\n",e.what()); return 1;

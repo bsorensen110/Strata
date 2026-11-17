@@ -16,6 +16,15 @@ struct X4Plan {
     int entry = -1;
     uint32_t x = 0, y = 0;
 };
+// Two packed 24-bit groups -> nibble-pair ordered signed 4*(q-32) bytes.
+#if defined(__HIPCC__)
+__host__ __device__
+#endif
+inline uint32_t dot4_word6(uint32_t a, uint32_t b, int odd) {
+    a >>= odd*6; b >>= odd*6;
+    return (((a&63u)<<2) | (((a>>12)&63u)<<10) |
+            ((b&63u)<<18) | (((b>>12)&63u)<<26)) ^ 0x80808080u;
+}
 inline X4Plan x4_plan(const std::array<int, 4>& rows, int count, int k, int n) {
     if (count < 2 || count > 4 || k <= 0 || k % 128 || n < 9 || n > 64) return {};
     int largest = 0;
@@ -40,5 +49,7 @@ bool strata_gemm_sym_i8_x4(const std::array<Window, 4>& members, int count, bool
 void launch_sym_i8_x4(const std::array<Window, 4>& members, const X4Plan& plan, void* stream);
 // Internal standalone twin, also used to check the >48-row split entry.
 void launch_sym_i8_member(const Window& member, int entry, void* stream);
+bool strata_gemv_sym_i8_dot4(const Window& member, bool enabled, void* stream);
+void launch_sym_i8_dot4(const Window& member, void* stream);
 #endif
 }  // namespace strata::prefill::iu8

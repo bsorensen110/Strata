@@ -60,5 +60,58 @@ inline void projection_x4(const std::array<Pack,4>& w, int count, const Block* x
         }
     }
 }
+
+inline int signed_dot4(uint32_t a, uint32_t b, int acc) {
+    for (int j=0;j<4;++j) {
+        int av=(a>>(8*j))&255, bv=(b>>(8*j))&255;
+        if (av>=128) av-=256;
+        if (bv>=128) bv-=256;
+        acc+=av*bv;
+    }
+    return acc;
+}
+inline int dot4_slice(const Pack& w, const Block& x, int row, int group, int first, int length) {
+    int sum=0;
+    for (int j=0;j<length;j+=8) {
+        const auto* code=w.codes.data()+((size_t)row*w.cols+group*256+first+j)*3/4;
+        const unsigned a=code[0]|((unsigned)code[1]<<8)|((unsigned)code[2]<<16);
+        const unsigned b=code[3]|((unsigned)code[4]<<8)|((unsigned)code[5]<<16);
+        uint32_t xe=0,xo=0;
+        for (int q=0;q<4;++q) {
+            xe|=(uint32_t)(uint8_t)x.qs[(first&127)+j+q]<<(8*q);
+            xo|=(uint32_t)(uint8_t)x.qs[(first&127)+j+4+q]<<(8*q);
+        }
+        sum=signed_dot4(dot4_word6(a,b,0),xe,sum);
+        sum=signed_dot4(dot4_word6(a,b,1),xo,sum);
+    }
+    return sum;
+}
+inline void projection_dot4(const Pack& w, const Block* x, int n, float* out, int ld) {
+    require(w.bits==6 && w.cols%256==0 && n>=1 && n<=8,"dot4 oracle shape");
+    const int half=(n+1)/2;
+    for (int row=0;row<w.rows;++row)
+    for (int token=0;token<n;++token) {
+        float acc=0.0f;
+        for (int group=0;group<w.cols/256;++group) {
+            int c[2]={};
+            if (n<=2) {
+                int lane[4];
+                for (int q=0;q<4;++q)
+                    lane[q]=dot4_slice(w,x[(group*2+(q>>1))*n+token],row,group,q*64,64);
+                c[0]=(lane[0]+lane[1])/4; c[1]=(lane[2]+lane[3])/4;
+            } else {
+                const int tp=token/half,local=token%half;
+                const int writer=2*tp+(local&1);
+                require(writer>=0 && writer<4,"dot4 token owner");
+                for (int kh=0;kh<2;++kh)
+                    c[kh]=dot4_slice(w,x[(group*2+kh)*n+token],row,group,kh*128,128)/4;
+            }
+            for (int kh=0;kh<2;++kh)
+                acc=std::fma(mul(half_value(w.scales[(size_t)row*(w.cols/128)+2*group+kh]),
+                                 x[(2*group+kh)*n+token].d),(float)c[kh],acc);
+        }
+        out[(size_t)token*ld+row]=acc;
+    }
+}
 }  // namespace strata::prefill::iu8::reference
 #endif
