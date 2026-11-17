@@ -138,13 +138,165 @@ __global__ void __launch_bounds__(256) grouped_prefill(Product p) {
 #endif
 }
 
+// A owns tokens, B owns weight rows, exactly as P1's prefill entry. No
+// weight LDS: each wave owns 16 rows, each lane half loads one K64 epoch.
+template<int Rows, int Tokens, bool Split, bool BF16>
+__device__ __forceinline__ void narrow_body(Window p) {
+#if defined(__gfx1100__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
+    constexpr int NT = Rows / 16 * 32;
+    constexpr int TG = Tokens / 16;
+    const int mt = (p.rows + Rows - 1) / Rows;
+    const int slices = Split ? (p.tokens + Tokens - 1) / Tokens : 1;
+    const int group = blockIdx.x / (mt * slices);
+    if (p.count && group >= *p.count) return;
+    const int slice = (blockIdx.x / mt) % slices;
+    const int row0 = (blockIdx.x % mt) * Rows;
+    const int begin = p.count ? p.starts[group] : 0;
+    const int end = p.count ? p.starts[group + 1] : p.tokens;
+    const int token0 = begin + slice * Tokens;
+    const WeightView w = p.count ? p.table[p.route[p.dst[begin]]] : p.weight;
+    const int tid = threadIdx.x, lane = tid & 31, lo = lane & 15, hi = lane >> 4;
+    const int row = row0 + (tid >> 5) * 16 + lo;
+    __shared__ __align__(16) Block xs[Tokens];
+    F8 acc[TG] = {};
+    for (int kb = 0; kb < p.cols / 128; ++kb) {
+        for (int t = tid; t < Tokens * 34; t += NT) {
+            const int token = token0 + t / 34;
+            const int source = token < end ? (p.count && !p.sorted_x ? p.tok[token] : token) : 0;
+            ((int*) xs)[t] = token < end ? ((const int*) (p.x + (int64_t) kb * p.x_rows + source))[t % 34] : 0;
+        }
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        I2 wr[8];
+        for (int step = 0; step < 8; ++step) {
+            I2 v{};
+            for (int j = 0; j < 8; ++j) {
+                const int k = hi * 64 + step * 8 + j;
+                ((int8_t*) &v)[byte_index(j)] = row < p.rows
+                    ? (int8_t) decode(w, (size_t) row * p.cols + kb * 128 + k) : 0;
+            }
+            wr[step] = v;
+        }
+#else
+        I4 wr[4];
+        for (int step = 0; step < 4; ++step) {
+            I4 v{};
+            for (int j = 0; j < 16; ++j) {
+                const int k = hi * 64 + step * 16 + j;
+                ((int8_t*) &v)[byte_index(j)] = row < p.rows
+                    ? (int8_t) decode(w, (size_t) row * p.cols + kb * 128 + k) : 0;
+            }
+            wr[step] = v;
+        }
+#endif
+        barrier();
+        I8 dot[TG] = {};
+        for (int step = 0; step < 8; ++step) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+            const I2 b = wr[step];
+            for (int tg = 0; tg < TG; ++tg) {
+                const I2 a = *(const I2*) (xs[tg * 16 + lo].qs + hi * 64 + step * 8);
+                dot[tg] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(
+                    true, a, true, b, dot[tg], false);
+            }
+#else
+            I4 b = wr[step & 3];
+            for (int j = 0; j < 4; ++j) {
+                const int peer = __builtin_amdgcn_permlanex16(b[j], b[j], 0x76543210u, 0xfedcba98u, false, false);
+                if (hi != step / 4) b[j] = peer;
+            }
+            for (int tg = 0; tg < TG; ++tg) {
+                const I4 a = *(const I4*) (xs[tg * 16 + lo].qs + step * 16);
+                dot[tg] = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(
+                    true, a, true, b, dot[tg], false);
+            }
+#endif
+        }
+        const float sc = row < p.rows
+            ? __half2float(__ushort_as_half(w.scales[(size_t) row * (p.cols / 128) + kb])) : 0.0f;
+        for (int tg = 0; tg < TG; ++tg)
+        for (int j = 0; j < 8; ++j) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+            const int t = tg * 16 + hi * 8 + j;
+#else
+            const int t = tg * 16 + 2 * j + hi;
+#endif
+            acc[tg][j] = __fmaf_rn(__fmul_rn(sc, xs[t].d), (float) dot[tg][j], acc[tg][j]);
+        }
+        barrier();
+    }
+    if (row < p.rows)
+    for (int tg = 0; tg < TG; ++tg)
+    for (int j = 0; j < 8; ++j) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        const int t = token0 + tg * 16 + hi * 8 + j;
+#else
+        const int t = token0 + tg * 16 + 2 * j + hi;
+#endif
+        if (t >= end) continue;
+        const int dst = p.count && !p.sorted_y ? p.dst[t] : t;
+        const int64_t offset = (int64_t) dst * p.ld + row;
+        if constexpr (BF16) {
+            const float v = 0.0f + acc[tg][j];
+            const unsigned u = __float_as_uint(v);
+            ((uint16_t*) p.y)[offset] = (uint16_t) (isfinite(v) ? (u + 0x7fffu + ((u >> 16) & 1u)) >> 16 : u >> 16);
+        } else ((float*) p.y)[offset] = acc[tg][j];
+    }
+#elif defined(__HIP_DEVICE_COMPILE__)
+    __builtin_trap();
+#endif
+}
+}  // namespace
+
+#define NARROW_ENTRY(R, N, SUFFIX, SPLIT, BF) \
+extern "C" __global__ __launch_bounds__(R / 16 * 32) \
+void strata_gemm_sym_i8_set_m##R##n##N##SUFFIX##_gfx12(Window p) { narrow_body<R, N, SPLIT, BF>(p); }
+#define NARROW_FAMILY(SUFFIX, SPLIT, BF) \
+NARROW_ENTRY(32,16,SUFFIX,SPLIT,BF) NARROW_ENTRY(32,32,SUFFIX,SPLIT,BF) NARROW_ENTRY(32,48,SUFFIX,SPLIT,BF) \
+NARROW_ENTRY(64,16,SUFFIX,SPLIT,BF) NARROW_ENTRY(64,32,SUFFIX,SPLIT,BF) NARROW_ENTRY(64,48,SUFFIX,SPLIT,BF)
+NARROW_FAMILY(, false, false)
+NARROW_FAMILY(_y, true, false)
+NARROW_FAMILY(_bf16, false, true)
+NARROW_FAMILY(_y_bf16, true, true)
+#undef NARROW_FAMILY
+#undef NARROW_ENTRY
+
+bool window_admitted(int tokens, int cols) {
+    return tokens > 0 && tokens <= 48 && cols > 0 && cols % 128 == 0 && usable();
+}
+void run_narrow(const Window& p, int entry, void* stream) {
+    if (entry < 0 || entry >= (int) kNarrowTiles.size() || !window_admitted(p.tokens, p.cols) ||
+        !p.x || !p.y || p.rows <= 0 || p.rows > INT_MAX - 127 || p.x_rows <= 0 ||
+        p.groups <= 0 || p.ld < p.rows) invalid("narrow shape");
+    if (p.count ? (!p.table || !p.starts || !p.tok || !p.dst || !p.route || p.topk <= 0)
+                : (!p.weight.symmetric_verified || !p.weight.codes || !p.weight.scales ||
+                   p.weight.rows != p.rows || p.weight.cols != p.cols || p.x_rows != p.tokens))
+        invalid("narrow operands");
+    const auto t = kNarrowTiles[entry];
+    if (!t.split && p.tokens > t.tokens) invalid("narrow token capacity");
+    const int64_t grid = ((int64_t) p.rows + t.rows - 1) / t.rows * p.groups *
+        (t.split ? (p.tokens + t.tokens - 1) / t.tokens : 1);
+    if (grid <= 0 || grid > INT_MAX) invalid("narrow folded grid");
+#define LAUNCH_CASE(I, R, N, S) case I: strata_gemm_sym_i8_set_m##R##n##N##S##_gfx12 \
+    <<<(unsigned) grid, R / 16 * 32, 0, (hipStream_t) stream>>>(p); break
+#define LAUNCH_FAMILY(I, S) \
+    LAUNCH_CASE(I,32,16,S); LAUNCH_CASE(I+1,32,32,S); LAUNCH_CASE(I+2,32,48,S); \
+    LAUNCH_CASE(I+3,64,16,S); LAUNCH_CASE(I+4,64,32,S); LAUNCH_CASE(I+5,64,48,S)
+    switch (entry) {
+        LAUNCH_FAMILY(0,); LAUNCH_FAMILY(6,_y); LAUNCH_FAMILY(12,_bf16); LAUNCH_FAMILY(18,_y_bf16);
+    }
+#undef LAUNCH_FAMILY
+#undef LAUNCH_CASE
+    check(hipGetLastError(), "narrow launch");
+}
+namespace {
 template<bool Scatter, bool SwiGLU>
 __global__ void produce(const float* x, const int32_t* map, Block* out, float* h,
-                        int cols, int ld, int rows, int topk) {
+                        int cols, int ld, int rows, int topk,
+                        const int32_t* starts = nullptr, const int32_t* count = nullptr) {
     const int64_t group = (int64_t) blockIdx.x * 16 + threadIdx.x / 16;
     const int kb = (int) (group % (cols / 128));
     const int64_t row = group / (cols / 128);
-    const bool live = row < rows;
+    const bool live = row < rows && (!starts || (row >= starts[0] && row < starts[*count]));
     const int j = threadIdx.x & 15;
     const int k0 = kb * 128 + j * 8;
     const int64_t source = live ? ((!Scatter && !SwiGLU && map) ? map[row] : row) : 0;
@@ -233,6 +385,19 @@ void quantize(const float* x, const int32_t* src, Block* out, int cols, int ld, 
     produce<false, false><<<producer_grid(cols, rows), 256, 0, (hipStream_t) stream>>>(
         x, src, out, nullptr, cols, ld, rows, 0);
     check(hipGetLastError(), "quantize launch");
+}
+void quantize_window(const float* x, Block* out, int cols, int rows, void* stream) {
+    if (!x || !out || !window_admitted(rows, cols)) invalid("window quantizer");
+    produce<false, false><<<producer_grid(cols, rows), 256, 0, (hipStream_t) stream>>>(
+        x, nullptr, out, nullptr, cols, cols, rows, 0);
+    check(hipGetLastError(), "window quantizer launch");
+}
+void swiglu_window(const float* gu, float* h, Block* out, int ff, int rows,
+                   const int32_t* starts, const int32_t* count, void* stream) {
+    if (!gu || !out || !starts || !count || !window_admitted(1, ff)) invalid("window SwiGLU");
+    produce<false, true><<<producer_grid(ff, rows), 256, 0, (hipStream_t) stream>>>(
+        gu, nullptr, out, h, ff, 2 * ff, rows, 0, starts, count);
+    check(hipGetLastError(), "window SwiGLU launch");
 }
 void quantize_scatter(const float* x, const int32_t* slot, Block* out, int cols, int ld,
                       int tokens, int topk, void* stream) {

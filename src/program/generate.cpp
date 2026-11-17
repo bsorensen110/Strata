@@ -11702,6 +11702,9 @@ int main(int argc, char** argv) {
         auto ver_holder = std::make_unique<strata::core::Verifier>();
         strata::core::Verifier& ver = *ver_holder;
         strata::core::VerifyHits vh;
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+        vh.hip_source = drive.d.src;
+#endif
         vh.d_res = thits.d_res;
         // STRATA_ROUTE_RESIDENT_MTP=1 (EXPERIMENTAL, with STRATA_ROUTE_RESIDENT=<margin>; changes the output): the MTP
         // draft's router gets the same residency bias, with the last layer's residency row as its table (single GPU)
@@ -11848,6 +11851,9 @@ int main(int argc, char** argv) {
                     GpuStage& gs = *stages[(size_t) st - 1];
                     const strata::core::OnDevice on(gs.dev);
                     strata::core::VerifyHits vs;
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                    vs.hip_source = drive.d.src;
+#endif
                     vs.d_res = gs.d_res;
                     vs.h_res = host_res.empty() ? nullptr : host_res.data();
                     vs.cache_base = gs.cache.device_slot(0);
@@ -11903,6 +11909,9 @@ int main(int argc, char** argv) {
                                    last ? nullptr : hand_b[(size_t) st]);
                 const strata::core::OnDevice on(gs.dev);
                 strata::core::VerifyHits vs;
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                vs.hip_source = drive.d.src;
+#endif
                 vs.d_res = gs.d_res;
                 vs.h_res = host_res.empty() ? nullptr : host_res.data();
                 vs.cache_base = gs.cache.device_slot(0);
@@ -22034,6 +22043,9 @@ int main(int argc, char** argv) {
         auto ver_holder = std::make_unique<strata::core::Verifier>();
         strata::core::Verifier& ver = *ver_holder;
         strata::core::VerifyHits vh;
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+        vh.hip_source = drive.d.src;
+#endif
         vh.d_res = thits.d_res;
         vh.h_res = host_res.empty() ? nullptr : host_res.data();
         vh.cache_base = thits.cache_base;

@@ -120,6 +120,71 @@ void grouped(int type, int m, int k, hipStream_t stream, strata::prefill::mmq::C
         ref::require(uploaded, why.c_str());
         p.weights[e] = iu8::view(weights[e]);
     }
+    void narrow_tiles(hipStream_t stream) {
+        for (int type : {GGML_TYPE_Q4_0, GGML_TYPE_Q6_K}) {
+            constexpr int m = 65, k = 512, ld = 68;
+            const auto src = ref::source(type, m, k);
+            iu8::Pack w;
+            iu8::DeviceWeight dw;
+            std::string why;
+            ref::require(iu8::pack_exact(type, src.data(), src.size(), m, k, w, why), why.c_str());
+            ref::require(iu8::upload(w, dw, why), why.c_str());
+            for (int n : {1, 5, 9, 16, 17, 24, 48}) {
+                const auto x = ref::quantize(ref::activations(k, n).data(), k, n);
+                Buffer dx(x.size() * sizeof(iu8::Block));
+                const size_t words = (size_t) n * ld + 17;
+                Buffer dy(words * sizeof(float)), baseline(words * sizeof(float));
+                upload(dx, x);
+                iu8::Product pre;
+                pre.weights[0] = iu8::view(dw); pre.ranges[0] = {0,n,0};
+                pre.n = pre.tiles = 1; pre.total_rows = n; pre.tokens = 64;
+                pre.x = (const iu8::Block*) dx.p; pre.dst = (float*) baseline.p; pre.ld = ld;
+                check(hipMemsetAsync(baseline.p, 0xa5, words * sizeof(float), stream), "prefill poison");
+                iu8::run(pre, stream);
+                check(hipStreamSynchronize(stream), "prefill cross-arm");
+                std::vector<float> expected(words), got(words);
+                download(baseline, expected);
+                for (int t = 0; t < n; ++t)
+                for (int r = 0; r < m; ++r) {
+                    const float f = ref::fold(w, x.data(), n, t, r);
+                    ref::require(std::memcmp(&f, &expected[(size_t) t * ld + r], 4) == 0, "prefill cross-arm CPU mismatch");
+                }
+                for (int entry = 0; entry < 24; ++entry) {
+                    const auto tile = iu8::kNarrowTiles[entry];
+                    if (!tile.split && n > tile.tokens) continue;
+                    iu8::Window p;
+                    p.weight = iu8::view(dw); p.x = pre.x; p.y = dy.p;
+                    p.rows = m; p.cols = k; p.tokens = p.x_rows = n; p.ld = ld;
+                    check(hipMemsetAsync(dy.p, 0xa5, words * sizeof(float), stream), "narrow poison");
+                    hipGraph_t graph = nullptr;
+                    check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "narrow capture");
+                    iu8::run_narrow(p, entry, stream);
+                    check(hipStreamEndCapture(stream, &graph), "end narrow capture");
+                    hipGraphExec_t exec = nullptr;
+                    check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate narrow");
+                    check(hipGraphLaunch(exec, stream), "replay narrow");
+                    check(hipStreamSynchronize(stream), "narrow completion");
+                    if (!tile.bf16) {
+                        download(dy, got);
+                        ref::require(std::memcmp(got.data(), expected.data(), words * sizeof(float)) == 0,
+                                     "narrow/pre-fill GPU bits or tail canaries differ");
+                    } else {
+                        std::vector<uint16_t> bits(words * 2, 0xa5a5), want(bits);
+                        for (int t = 0; t < n; ++t)
+                        for (int r = 0; r < m; ++r) {
+                            const float f = 0.0f + expected[(size_t) t * ld + r];
+                            uint32_t u; std::memcpy(&u, &f, 4);
+                            want[(size_t) t * ld + r] = (uint16_t) ((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+                        }
+                        download(dy, bits);
+                        ref::require(bits == want, "narrow bf16 bits/canaries differ");
+                    }
+                    check(hipGraphExecDestroy(exec), "free narrow exec");
+                    check(hipGraphDestroy(graph), "free narrow graph");
+                }
+            }
+        }
+    }
     std::vector<int32_t> ids(n);
     for (int i = 0; i < n; ++i) ids[i] = n - 1 - i;
     Buffer dx(x.size() * sizeof(float)), dq((blocks.size() + 1) * sizeof(iu8::Block));
@@ -174,6 +239,7 @@ int main() {
             check(hipStreamEndCapture(stream, &graph), "end admission capture");
             check(hipGraphDestroy(graph), "free capture graph");
             producers(stream);
+            narrow_tiles(stream);
             strata::prefill::mmq::Context context;
             for (const auto& shape : {std::pair{17, 128}, std::pair{129, 256},
                                       std::pair{128, 512}, std::pair{33, 1280}}) {

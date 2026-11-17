@@ -43,6 +43,20 @@ struct DeviceWeight {
 };
 struct Expert { DeviceWeight gu, down; };
 struct Layer { std::vector<Expert> experts; };
+// Stable across cache loans and evictions: indexed by original expert id,
+// never by the mutable VRAM cache slot or a captured blob address.
+struct WindowWeights {
+    void* allocation = nullptr;
+    const WeightView *gu = nullptr, *down = nullptr;
+    int device = -1;
+    WindowWeights() = default;
+    ~WindowWeights();
+    WindowWeights(WindowWeights&& other) noexcept;
+    WindowWeights& operator=(WindowWeights&& other) noexcept;
+    WindowWeights(const WindowWeights&) = delete;
+    WindowWeights& operator=(const WindowWeights&) = delete;
+    void upload(const Layer& layer);
+};
 
 bool upload(const Pack& pack, DeviceWeight& out, std::string& why);
 WeightView view(const DeviceWeight& w);

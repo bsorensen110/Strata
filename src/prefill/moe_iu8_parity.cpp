@@ -77,12 +77,38 @@ void product(const iu8::Pack& p, int n, const std::vector<float>& x) {
                 p.bits, p.rows, p.cols, n, rms);
     ref::require(std::isfinite(rms) && rms <= 0.0065, "RMS exceeds 0.65% fixture gate");
 }
+void narrow_tiles() {
+    for (int type : {GGML_TYPE_Q4_0, GGML_TYPE_Q6_K}) {
+        const auto src = ref::source(type, 65, 512);
+        iu8::Pack w;
+        std::string why;
+        ref::require(iu8::pack_exact(type, src.data(), src.size(), 65, 512, w, why), why.c_str());
+        for (int n : {1, 5, 9, 16, 17, 24, 48}) {
+            const auto x = ref::quantize(ref::activations(512, n).data(), 512, n);
+            constexpr int ld = 68;
+            std::vector<float> expected((size_t) n * ld + 17, -1234.0f);
+            for (int t = 0; t < n; ++t)
+            for (int r = 0; r < w.rows; ++r) expected[(size_t) t * ld + r] = ref::fold(w, x.data(), n, t, r);
+            for (int entry = 0; entry < 12; ++entry) {
+                const auto tile = iu8::kNarrowTiles[entry];
+                if (!tile.split && n > tile.tokens) continue;
+                for (bool gfx12 : {false, true}) {
+                    std::vector<float> got(expected.size(), -1234.0f);
+                    ref::narrow(w, x.data(), n, entry, gfx12, got.data(), ld);
+                    ref::require(std::memcmp(expected.data(), got.data(), got.size() * sizeof(float)) == 0,
+                                 "narrow/prefill CPU lane arms differ (including canaries)");
+                }
+            }
+        }
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
     try {
         ref::require(std::fesetround(FE_TONEAREST) == 0, "cannot set RNE");
         check_adapter();
+        narrow_tiles();
         iu8::Pack p;
         std::string why;
         if (argc == 1) {

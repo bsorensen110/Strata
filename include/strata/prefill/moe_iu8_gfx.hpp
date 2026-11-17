@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include "strata/prefill/moe_iu8_tiles.hpp"
 
 namespace strata::prefill::iu8 {
 #if defined(__HIPCC__) || defined(STRATA_USE_HIP) || defined(STRATA_MOE_IU8_CPU_ORACLE)
@@ -39,6 +40,24 @@ struct Product {
 inline constexpr int kPrefillLds = 36864;
 bool admitted(int tokens, int cols, void* stream);
 void run(const Product& p, void* stream);
+
+// Null count: one matrix. Otherwise one device-planned expert group per CTA
+// row tile; starts/tok/dst are the verifier's existing sorted route tables.
+struct Window {
+    WeightView weight;
+    const WeightView* table = nullptr;
+    const int32_t *count = nullptr, *starts = nullptr, *tok = nullptr, *dst = nullptr, *route = nullptr;
+    const Block* x = nullptr;
+    void* y = nullptr;
+    int rows = 0, cols = 0, tokens = 0, x_rows = 0, groups = 1, topk = 0;
+    int64_t ld = 0;
+    bool sorted_x = false, sorted_y = false;
+};
+bool window_admitted(int tokens, int cols);
+void run_narrow(const Window& p, int entry, void* stream);
+void quantize_window(const float* x, Block* out, int cols, int rows, void* stream);
+void swiglu_window(const float* gu, float* h, Block* out, int ff, int rows,
+                   const int32_t* starts, const int32_t* count, void* stream);
 
 struct Workspace {
     Block *gate = nullptr, *down = nullptr;

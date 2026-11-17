@@ -52,6 +52,35 @@ inline float fold(const Pack& w, const Block* x, int n, int token, int row) {
         const float sd = mul(half_value(w.scales[(size_t) row * (w.cols / 128) + kb]), b.d);
         acc = std::fma(sd, (float) c, acc);
     }
+
+    // Emulate the tile's lane halves and K16 instructions independently of fold().
+    inline void narrow(const Pack& w, const Block* x, int n, int entry, bool gfx12, float* y, int ld) {
+        const auto tile = kNarrowTiles.at((size_t) entry);
+        require(n <= tile.tokens || tile.split, "oracle tile capacity");
+        for (int row0 = 0; row0 < w.rows; row0 += tile.rows)
+        for (int token0 = 0; token0 < n; token0 += tile.tokens)
+        for (int wave = 0; wave < tile.rows / 16; ++wave)
+        for (int lane = 0; lane < 32; ++lane)
+        for (int tg = 0; tg < tile.tokens / 16; ++tg)
+        for (int j = 0; j < 8; ++j) {
+            const int row = row0 + wave * 16 + (lane & 15);
+            const int token = token0 + tg * 16 + (gfx12 ? 8 * (lane >> 4) + j : 2 * j + (lane >> 4));
+            if (row >= w.rows || token >= n) continue;
+            float acc = 0.0f;
+            for (int kb = 0; kb < w.cols / 128; ++kb) {
+                const auto& b = x[(size_t) kb * n + token];
+                int c = 0;
+                for (int step = 0; step < 8; ++step)
+                for (int h = 0; h < (gfx12 ? 2 : 1); ++h)
+                for (int q = 0; q < (gfx12 ? 8 : 16); ++q) {
+                    const int k = gfx12 ? 64 * h + 8 * step + q : 16 * step + q;
+                    c += signed_code(w, (size_t) row * w.cols + kb * 128 + k) * b.qs[byte_index(k)];
+                }
+                acc = std::fma(mul(half_value(w.scales[(size_t) row * (w.cols / 128) + kb]), b.d), (float) c, acc);
+            }
+            y[(size_t) token * ld + row] = acc;
+        }
+    }
     return acc;
 }
 

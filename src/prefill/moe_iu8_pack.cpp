@@ -168,6 +168,37 @@ WeightView view(const DeviceWeight& w) {
     return {w.codes, w.scales, w.rows, w.cols, w.bits, w.device, w.symmetric_verified};
 }
 
+WindowWeights::~WindowWeights() {
+    if (!allocation) return;
+    int previous = -1;
+    check(hipGetDevice(&previous), "window table device");
+    check(hipSetDevice(device), "window table owner");
+    check(hipFree(allocation), "free window table");
+    check(hipSetDevice(previous), "restore window table device");
+}
+WindowWeights::WindowWeights(WindowWeights&& other) noexcept { *this = std::move(other); }
+WindowWeights& WindowWeights::operator=(WindowWeights&& other) noexcept {
+    if (this == &other) return *this;
+    // Tables are uploaded once, before capture; vector relocation only moves empty destinations.
+    if (allocation) { std::fputs("HIP MoE IU8: replacing a live window table\n", stderr); std::abort(); }
+    allocation = other.allocation; gu = other.gu; down = other.down; device = other.device;
+    other.allocation = nullptr; other.gu = nullptr; other.down = nullptr;
+    return *this;
+}
+void WindowWeights::upload(const Layer& layer) {
+    if (allocation || layer.experts.empty()) {
+        std::fputs("HIP MoE IU8: invalid window table upload\n", stderr); std::abort();
+    }
+    std::vector<WeightView> views;
+    for (const auto& e : layer.experts) views.push_back(view(e.gu));
+    for (const auto& e : layer.experts) views.push_back(view(e.down));
+    check(hipGetDevice(&device), "window table upload device");
+    check(hipMalloc(&allocation, views.size() * sizeof(WeightView)), "allocate window table");
+    check(hipMemcpy(allocation, views.data(), views.size() * sizeof(WeightView), hipMemcpyHostToDevice),
+          "upload window table");
+    gu = (const WeightView*) allocation; down = gu + layer.experts.size();
+}
+
 bool upload(const Pack& p, DeviceWeight& out, std::string& why) {
     if (!p.symmetric_verified || p.rows <= 0 || p.cols <= 0 || p.cols % 128 ||
         (p.bits != 4 && p.bits != 6) ||

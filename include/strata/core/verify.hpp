@@ -30,6 +30,10 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+#include "strata/prefill/moe_iu8_gfx.hpp"
+#include "strata/prefill/moe_iu8_pack.hpp"
+#endif
 
 #include <cuda_runtime.h>
 
@@ -85,6 +89,9 @@ using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, i
                              int64_t layer);
 
 struct VerifyHits {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    ExpertSource* hip_source = nullptr;  // supplied before init, never inferred from post-init draft state
+#endif
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
     const int32_t* h_res = nullptr;      ///< host [n_layers * n_expert] slot or -1 (when all >= 0 in stage: zero-doorbell)
     const uint8_t* cache_base = nullptr; ///< slot 0 of the VRAM expert arena
@@ -770,6 +777,12 @@ private:
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    std::vector<strata::prefill::iu8::Layer> hip_tiles_;
+    std::vector<strata::prefill::iu8::WindowWeights> hip_tables_;
+    strata::prefill::iu8::Block *hip_x_ = nullptr, *hip_d_ = nullptr;
+    float *hip_gu_ = nullptr, *hip_h_ = nullptr;
+#endif
     float* nat_xr_ = nullptr;     // APR: the Hadamard-rotated expert input (the shared expert and the CPU keep xm); nullptr
                                   // unless some layer's gate/up is folded
     const float* had_sx_ = nullptr;   // APR: device sign vectors for x (n_embd) and h (n_ff); nullptr = identity

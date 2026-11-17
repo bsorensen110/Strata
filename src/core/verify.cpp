@@ -1015,6 +1015,30 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the stage's layer range or its hand-off buffers are wrong";
         return false;
     }
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    // Port note: hipfire narrow verify entries. Resolve from the environment and
+    // pre-init source only, before either solo or lazy batch graphs can capture.
+    if (hits.hip_source && strata::prefill::iu8::usable()) {
+        namespace i8 = strata::prefill::iu8;
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        hip_tiles_.resize((size_t) g.n_layers);
+        hip_tables_.resize((size_t) g.n_layers);
+        for (int l = lb_; lay.native && l < le_; ++l) {
+            const auto& f = lay.fmt[(size_t) l];
+            std::string reason;
+            if (f.had_gu || f.had_d || f.tail_off) reason = "rotated/scaled expert needs its own producer";
+            else if (i8::load_layer(f.gu_type, f.d_type, (int) g.n_embd, (int) g.n_ff, (int) g.n_expert,
+                                   f.bytes, f.up_off, f.down_off,
+                                   [&](int e) { return hits.hip_source->blob(l, e); },
+                                   hip_tiles_[(size_t) l], reason)) {
+                hip_tables_[(size_t) l].upload(hip_tiles_[(size_t) l]);
+                std::fprintf(stderr, "HIP MoE IU8 verify layer %d: exact packs ready before capture\n", l);
+                continue;
+            }
+            std::fprintf(stderr, "HIP MoE IU8 verify layer %d refused: %s; keeping incumbent\n", l, reason.c_str());
+        }
+    }
+#endif
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
@@ -1173,6 +1197,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
         hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
         nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+        if (std::any_of(hip_tables_.begin(), hip_tables_.end(), [](const auto& t) { return t.gu != nullptr; })) {
+            hip_x_ = b.take<strata::prefill::iu8::Block>(T * (N / 128));
+            hip_d_ = b.take<strata::prefill::iu8::Block>(T * K * ((uint64_t) g.n_ff / 128));
+            hip_gu_ = b.take<float>(T * K * 2 * (uint64_t) g.n_ff);
+            hip_h_ = b.take<float>(T * K * (uint64_t) g.n_ff);
+        }
+#endif
         nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
         hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
             strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
@@ -2598,6 +2630,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         } else
             quantize_q8_0_scaled(xm, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
         stamp(l, 18, grp);
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+        if ((size_t) l < hip_tables_.size() && hip_tables_[(size_t) l].gu &&
+            strata::prefill::iu8::window_admitted(n, (int) N))
+            strata::prefill::iu8::quantize_window(xm, hip_x_ + (size_t) tb * (N / 128), (int) N, n, cs);
+#endif
         return true;
     };
 
@@ -2630,6 +2667,29 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // gate/up there as 4-bit codes (expert_nibble.hpp); the PCIe share's blobs (host memory, staging) never do.
         auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf,
                            bool vram) {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+            namespace i8 = strata::prefill::iu8;
+            if ((size_t) l < hip_tables_.size() && hip_tables_[(size_t) l].gu && i8::window_admitted(n, (int) N)) {
+                const int ff = (int) g.n_ff;
+                i8::Window gu;
+                gu.table = hip_tables_[(size_t) l].gu;
+                gu.count = gn; gu.starts = gs; gu.tok = p_tok; gu.dst = p_dst;
+                gu.route = ids_ + (size_t) tb * K;
+                gu.x = hip_x_ + (size_t) tb * (N / 128);
+                gu.y = hip_gu_ + (size_t) tb * K * 2 * ff;
+                gu.rows = 2 * ff; gu.cols = (int) N; gu.tokens = n; gu.x_rows = n;
+                gu.groups = (int) cap; gu.topk = (int) K; gu.ld = 2 * ff; gu.sorted_y = true;
+                i8::run_narrow(gu, i8::narrow_entry(gu.rows, n), cs);
+                auto* dq = hip_d_ + (size_t) tb * K * (ff / 128);
+                i8::swiglu_window((const float*) gu.y, hip_h_ + (size_t) tb * K * ff, dq, ff, (int) cap, gs, gn, cs);
+                i8::Window dn = gu;
+                dn.table = hip_tables_[(size_t) l].down; dn.x = dq; dn.y = dst_buf;
+                dn.rows = (int) N; dn.cols = ff; dn.x_rows = (int) cap; dn.ld = N;
+                dn.sorted_x = true; dn.sorted_y = false;
+                i8::run_narrow(dn, i8::narrow_entry(dn.rows, n), cs);
+                return;
+            }
+#endif
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
