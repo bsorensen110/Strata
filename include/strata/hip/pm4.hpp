@@ -404,6 +404,17 @@ constexpr BoundaryVisibility join_visibility(BoundaryVisibility a, BoundaryVisib
 
 const char* packet_error_to_string(PacketErrorCode code) noexcept;
 
+/// In-IB dword positions recorded when a dispatch is lowered, so a prepared
+/// window can patch it in place. DISPATCH_DIRECT layout: header at +0,
+/// COMPUTE_DIMENSION_X/Y/Z at +1/+2/+3, DISPATCH_INITIATOR at +4 — hence
+/// dim_x == dispatch_initiator_dword - 3. `sh_reg_base_dword` is where the
+/// SET_SH_REG emission began (stateful cache mode may elide runs, so treat
+/// it as a locator, not a fixed-size header).
+struct Pm4DispatchOffsets {
+    uint32_t sh_reg_base_dword = 0;
+    uint32_t dispatch_initiator_dword = 0;
+};
+
 enum class Pm4BuildError {
     Ok = 0,
     MissingKernelDescriptor,
@@ -478,15 +489,22 @@ public:
     void emit_dispatch_direct(std::array<uint32_t, 3> grid_workitems, bool wave32);
 
     // Full zero-scratch kernel dispatch lowering (SET_SH_REG sequence + DISPATCH_DIRECT + pacing).
+    // When out_offsets is non-null, receives the in-IB dword positions of the
+    // emitted sequence (see Pm4DispatchOffsets) for later in-place patching.
     Pm4BuildError dispatch(
         const KernelMetadata& loader,
         const KernelPm4Metadata& pm4,
         const LaunchGeometry& geometry,
         uint32_t dynamic_group_bytes,
-        uint64_t kernarg_address);
+        uint64_t kernarg_address,
+        Pm4DispatchOffsets* out_offsets = nullptr);
 
     uint32_t len_dwords() const { return static_cast<uint32_t>(dwords_.size()); }
     bool is_empty() const { return dwords_.empty(); }
+    // Mutable view for in-place patching of an already-lowered IB (see
+    // PreparedPm4Window::patch_dispatch_dimensions). Prefer the targeted
+    // patch helpers; this is the raw seam they are written against.
+    std::vector<uint32_t>& dwords_mut() { return dwords_; }
     // Reset for reuse across captures: dwords AND the SH-register cache, so a
     // reused buffer never elides a SET_SH_REG against a previous IB's state.
     void clear() { dwords_.clear(); register_state_.clear(); }

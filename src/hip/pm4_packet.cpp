@@ -409,7 +409,8 @@ Pm4BuildError Gfx12Pm4CommandBuffer::dispatch(
     const KernelPm4Metadata& pm4,
     const LaunchGeometry& geometry,
     uint32_t dynamic_group_bytes,
-    uint64_t kernarg_address) {
+    uint64_t kernarg_address,
+    Pm4DispatchOffsets* out_offsets) {
     if (loader.private_segment_size != 0 || loader.dynamic_callstack) {
         return Pm4BuildError::ScratchUnsupported;
     }
@@ -445,6 +446,7 @@ Pm4BuildError Gfx12Pm4CommandBuffer::dispatch(
         static_cast<uint32_t>(pm4.code_entry >> 8),
         static_cast<uint32_t>(pm4.code_entry >> 40),
     };
+    const uint32_t seq_start = len_dwords();
     set_sh_regs(kComputePgmLo, pgm_words, 2);
 
     const uint32_t rsrc12_words[2] = {pm4.compute_pgm_rsrc1, rsrc2};
@@ -471,7 +473,13 @@ Pm4BuildError Gfx12Pm4CommandBuffer::dispatch(
         set_sh_regs(kComputeUserData0, kernarg_words, 2);
     }
 
+    const uint32_t dispatch_start = len_dwords();
     emit_dispatch_direct(geometry.grid_workitems, wave32);
+    if (out_offsets != nullptr) {
+        out_offsets->sh_reg_base_dword = seq_start;
+        // DISPATCH_INITIATOR is the 5th dword of the DISPATCH_DIRECT packet.
+        out_offsets->dispatch_initiator_dword = dispatch_start + 4u;
+    }
     return Pm4BuildError::Ok;
 }
 
