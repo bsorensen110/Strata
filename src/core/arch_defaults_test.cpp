@@ -4,11 +4,20 @@
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/spill_gate.hpp"
+#include "strata/hip_compat/buffer_load.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <type_traits>
+
+#if !defined(__HIPCC__)
+static_assert(std::is_same_v<decltype(strata::hip_compat::strata_hip_make_rsrc(nullptr, 0)), void>);
+static_assert(std::is_same_v<decltype(strata::hip_compat::strata_hip_buf_ld_b128({}, 0)), void>);
+static_assert(std::is_same_v<decltype(strata::hip_compat::strata_hip_buf_ld_b64({}, 0)), void>);
+static_assert(std::is_same_v<decltype(strata::hip_compat::strata_hip_buf_ld_b32({}, 0)), void>);
+#endif
 
 static int fails = 0;
 #define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++fails; } } while (0)
