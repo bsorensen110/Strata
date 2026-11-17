@@ -11,7 +11,7 @@
 #endif
 #include "strata/prefill/moe_fused.hpp"   // kMoeEmbd, kMoeFF: the compiled geometry's widths
 #include "strata/prefill/moe_iq4_w4a8.hpp"
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
 #include "strata/prefill/moe_iu8_gfx.hpp"
 #endif
 
@@ -478,7 +478,7 @@ Context::Context() {
 Context::~Context() { delete (ggml_backend_cuda_context*) ctx_; }
 
 void Context::run(const Product& p, void* stream) {
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     // Port note: hipfire gemm_mq6sym_i8.gfx1201.hip. Explicit sidecar ABI only;
     // never reinterpret the incumbent q8_1 payload as block_i8_128.
     if (p.hip_iu8) { iu8::run(*p.hip_iu8, stream); return; }

@@ -229,6 +229,7 @@ void Workspace::reserve(int gc, int dc, int rows) {
 
 void quantize(const float* x, const int32_t* src, Block* out, int cols, int ld, int rows, void* stream) {
     if (!x || !out || ld < cols) invalid("quantize operands");
+    if (!admitted(64, cols, stream)) invalid("quantize device/capture admission");
     produce<false, false><<<producer_grid(cols, rows), 256, 0, (hipStream_t) stream>>>(
         x, src, out, nullptr, cols, ld, rows, 0);
     check(hipGetLastError(), "quantize launch");
@@ -237,12 +238,14 @@ void quantize_scatter(const float* x, const int32_t* slot, Block* out, int cols,
                       int tokens, int topk, void* stream) {
     if (!x || !slot || !out || ld < cols || topk <= 0 || (int64_t) tokens * topk > INT_MAX)
         invalid("scatter operands");
+    if (!admitted(64, cols, stream)) invalid("scatter device/capture admission");
     produce<true, false><<<producer_grid(cols, tokens), 256, 0, (hipStream_t) stream>>>(
         x, slot, out, nullptr, cols, ld, tokens, topk);
     check(hipGetLastError(), "scatter launch");
 }
 void swiglu_quantize(const float* gu, float* h, Block* out, int ff, int rows, void* stream) {
     if (!gu || !out) invalid("SwiGLU operands");
+    if (!admitted(64, ff, stream)) invalid("SwiGLU device/capture admission");
     produce<false, true><<<producer_grid(ff, rows), 256, 0, (hipStream_t) stream>>>(
         gu, nullptr, out, h, ff, 2 * ff, rows, 0);
     check(hipGetLastError(), "SwiGLU quantize launch");

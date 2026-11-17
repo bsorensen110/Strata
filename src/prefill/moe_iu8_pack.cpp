@@ -4,7 +4,7 @@
 // IQ4's nonlinear table is decoded by ggml, not mistaken for symmetric nibbles.
 #include "strata/prefill/moe_iu8_pack.hpp"
 
-#if defined(__HIPCC__) || defined(STRATA_MOE_IU8_CPU_ORACLE)
+#if defined(__HIPCC__) || defined(STRATA_USE_HIP) || defined(STRATA_MOE_IU8_CPU_ORACLE)
 #include "ggml.h"
 #include <algorithm>
 #include <cmath>
@@ -115,7 +115,7 @@ bool pack_exact(int type, const void* source, size_t bytes, int rows, int cols, 
 }  // namespace strata::prefill::iu8
 #endif
 
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(STRATA_USE_HIP)
 #include "strata/core/arch_defaults.hpp"
 #include "strata/prefill/moe_iu8_gfx.hpp"
 #include <hip/hip_runtime.h>

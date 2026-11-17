@@ -6267,6 +6267,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     mmq::Product dn;
                                     dn.hip_iu8 = &dn8;
                                     m.mmq_ctx->run(dn, m.cs);
+                                    if (direct) {
+                                        tgu = mmq::WeightTab{};
+                                        td = mmq::WeightTab{};
+                                        gd = mmq::GuardTab{};
+                                        ns = 0;
+                                    }
                                     return true;
                                 }
 #endif

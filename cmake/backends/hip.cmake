@@ -42,7 +42,6 @@ macro(strata_hip_mmq)
     # Aurora: moe_fused.cu's gfx11 and moe_fused_iq.cu's gfx11 / gfx12 WMMA kernels for the prompt experts (opt-in STRATA_PF_FUSED=1)
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
-      src/prefill/moe_iu8_pack.cpp
       src/prefill/moe_iu8_gfx.cu
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
@@ -78,13 +77,14 @@ macro(strata_hip_mmq)
     set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_f16_kq.cu
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
+    target_sources(strata_mmq PRIVATE src/prefill/moe_iu8_pack.cpp)
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}" "${CMAKE_CURRENT_SOURCE_DIR}/src/prefill"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
     if(_strata_mmq_tq_overlay)
       target_include_directories(strata_mmq BEFORE PRIVATE ${_strata_tq_overlay_dir} ${_strata_tq_overlay_dir}/include)
     endif()
-    target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1)
+    target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP=1 PUBLIC STRATA_USE_HIP=1)
     if(STRATA_MMQ_TAB AND NOT STRATA_HIP_GFX906)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TAB=1)
     endif()
