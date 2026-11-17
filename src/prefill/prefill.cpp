@@ -57,6 +57,9 @@
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+#include "strata/prefill/moe_iu8_pack.hpp"
+#endif
 #include "strata/prefill/routed_stream.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/expert_nibble.hpp"
@@ -1199,6 +1202,9 @@ struct Prefill::Impl {
     std::vector<SubRange> sub;
     int64_t group_cap = 0;
     std::unique_ptr<mmq::Context> mmq_ctx;
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    std::vector<iu8::Layer> iu8_layers;
+#endif
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     // set_cpu_pool: a small chunk's CPU experts. The layer's MoE input (T x N, from `mixed`), the rows the pool writes
     // (Dm's tail, in Dm's row order), ones for row_sd (the CPU's rows carry s_down already), all pinned; and the
@@ -1875,6 +1881,25 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: the stage's layer range is wrong";
         return false;
     }
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    // Port note: hipfire CHANGELOG.md:856. All experts must pass exact dequant readback;
+    // a refused layer retains its original weights and every incumbent launch.
+    if (m.iu8_layers.empty() && src && iu8::usable()) {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        m.iu8_layers.resize((size_t) g.n_layers);
+        for (int l = stage_lb_; lay.native && l < stage_le_; ++l) {
+            const auto& f = lay.fmt[(size_t) l];
+            std::string why;
+            if (!iu8::load_layer(f.gu_type, f.d_type, (int) N, kFF, (int) g.n_expert,
+                                (size_t) f.bytes, (size_t) f.up_off, (size_t) f.down_off,
+                                [&](int e) { return src->blob(l, e); }, m.iu8_layers[(size_t) l], why))
+                std::fprintf(stderr, "HIP MoE IU8 layer %d refused: %s; keeping incumbent\n", l, why.c_str());
+            else
+                std::fprintf(stderr, "HIP MoE IU8 layer %d: all %lld experts symmetric-exact\n",
+                             l, (long long) g.n_expert);
+        }
+    }
+#endif
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)
     arm_cpu_share(cpu_pool_ != nullptr);
     for (int b = 0; next_ != nullptr && b < 2; ++b)

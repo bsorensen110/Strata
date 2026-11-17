@@ -42,6 +42,7 @@ macro(strata_hip_mmq)
     # Aurora: moe_fused.cu's gfx11 and moe_fused_iq.cu's gfx11 / gfx12 WMMA kernels for the prompt experts (opt-in STRATA_PF_FUSED=1)
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
+      src/prefill/moe_iu8_pack.cpp
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
       src/prefill/moe_f16_kq.cu
