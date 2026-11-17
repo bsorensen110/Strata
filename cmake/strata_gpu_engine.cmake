@@ -19,6 +19,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # cudaEventQuery: the .cu sources get cudart through the CUDA language rules, a .cpp does not, and the
   # linker error ("unresolved external symbol cudaGraphInstantiate") names the function rather than the cause.
   target_link_libraries(strata_core PUBLIC strata_plan strata_warnings ${_strata_gpu_runtime_target})
+  if(STRATA_WITH_HSA AND STRATA_ENABLE_HIP AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(strata_core PRIVATE src/hip/pm4_packet.cpp src/hip/hsa_linux.cpp src/hip/pm4_tape.cpp src/hip/pm4_plan.cpp)
+    target_compile_definitions(strata_core PUBLIC STRATA_WITH_HSA=1)
+    target_link_libraries(strata_core PUBLIC ${CMAKE_DL_LIBS})
+  endif()
 
   add_executable(strata-device src/core/device_main.cpp)
   target_link_libraries(strata-device PRIVATE strata_core)

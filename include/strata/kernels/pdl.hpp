@@ -22,6 +22,13 @@
 
 #include "strata/core/dispatch_stats.hpp"
 
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <type_traits>
+#endif
+
 #include <utility>
 
 namespace strata::kernels {
@@ -32,6 +39,43 @@ bool& pdl_scope();
 /// The current device runs PDL: a CUDA 12.3+ build, sm_90+ (STRATA_EMULATE_CC counts), code built for it, and
 /// STRATA_DF_PDL is set (1, or 2 for single-predecessor edges only).  Always false on HIP.
 bool pdl_supported();
+
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+/// True when the current thread is capturing a verify/decode window into a PM4 tape.
+bool pm4_scope() noexcept;
+
+/// Record one kernel launch packed by `launch_pdl` into the active thread-local PM4 tape.
+void pm4_record_pdl_launch(const void* host_kernel, dim3 grid, dim3 block,
+                           size_t smem, cudaStream_t stream,
+                           const void* kernarg_data, size_t kernarg_bytes) noexcept;
+
+namespace detail {
+inline constexpr size_t align_up_kernarg(size_t off, size_t align) noexcept {
+    return (off + align - 1u) & ~(align - 1u);
+}
+
+template <typename KArg, typename Arg>
+inline void pack_kernarg_field(uint8_t* buf, size_t cap, size_t& offset, const Arg& val) noexcept {
+    using FieldT = std::decay_t<KArg>;
+    const FieldT converted = static_cast<FieldT>(val);
+    offset = align_up_kernarg(offset, alignof(FieldT));
+    if (offset + sizeof(FieldT) <= cap) {
+        std::memcpy(buf + offset, &converted, sizeof(FieldT));
+    }
+    offset += sizeof(FieldT);
+}
+
+template <typename... KArgs, typename... Args>
+inline void record_pdl_kernargs(void (*kernel)(KArgs...), dim3 grid, dim3 block,
+                                size_t smem, cudaStream_t stream,
+                                const Args&... args) noexcept {
+    alignas(16) uint8_t buf[512] = {};
+    size_t offset = 0;
+    (pack_kernarg_field<KArgs>(buf, sizeof(buf), offset, args), ...);
+    pm4_record_pdl_launch(reinterpret_cast<const void*>(kernel), grid, block, smem, stream, buf, offset);
+}
+}  // namespace detail
+#endif
 
 #if (defined(__CUDACC__) || defined(__HIPCC__))
 
@@ -96,6 +140,11 @@ inline void launch_pdl(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t s
         return;
     }
     if (pdl_scope()) strata::dispatch::note("pdl: ordinary launch inside a PDL window (kernel not sm_90 code, or a predecessor is not a kernel)");
+#endif
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    if (pm4_scope()) {
+        detail::record_pdl_kernargs(kernel, grid, block, smem, stream, args...);
+    }
 #endif
     kernel<<<grid, block, smem, stream>>>(std::forward<Args>(args)...);
 }

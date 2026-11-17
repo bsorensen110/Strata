@@ -1,0 +1,35 @@
+# Golden GFX12 PM4 command stream fixtures (little-endian uint32 dwords)
+# Port note: derived from warpfront/hipfire crates/redline-rocr/src/{pm4.rs,pm4_decode.rs} (Apache-2.0)
+
+[acquire_and_compute_idle]
+# pm4.rs:836-853 (acquire_and_compute_idle_have_stable_rocr_encodings)
+# acquire_system() [8 dwords] + acquire_system_gfx12() [8 dwords] +
+# acquire_inter_node_gfx12() [8 dwords] + wait_compute_idle() [2 dwords]
+0xc0065800 0x00000000 0xffffffff 0x000000ff 0x00000000 0x00000000 0x00000004 0x0001c3f1
+0xc0065800 0x00000000 0xffffffff 0x00ffffff 0x00000000 0x00000000 0x0000000a 0x0000c3b1
+0xc0065800 0x00000000 0xffffffff 0x00ffffff 0x00000000 0x00000000 0x0000000a 0x00010180
+0xc0004600 0x00000407
+
+[decode_roundtrip_fixture]
+# pm4_decode.rs:291-303 (fixture)
+# acquire_system_gfx12() [8] + SET_SH_REG(0x20c, [0x1234, 0x5678]) [4] +
+# DISPATCH_DIRECT([256, 2, 1], 0x8025) [5] + wait_compute_idle() [2] +
+# acquire_inter_node_gfx12() [8]
+0xc0065800 0x00000000 0xffffffff 0x00ffffff 0x00000000 0x00000000 0x0000000a 0x0000c3b1
+0xc0027602 0x0000020c 0x00001234 0x00005678
+0xc0031502 0x00000100 0x00000002 0x00000001 0x00008025
+0xc0004600 0x00000407
+0xc0065800 0x00000000 0xffffffff 0x00ffffff 0x00000000 0x00000000 0x0000000a 0x00010180
+
+[full_kernel_dispatch_gfx12]
+# pm4.rs:427-498 + runtime.rs:3964-3972 descriptor values
+# code_entry=0x7f000120, rsrc1=0xe00f0004, rsrc2=0x84 (group=1024 + dyn=512 -> 3 blocks -> 0x00018084),
+# rsrc3=0x150, properties=0x408 (wave32 + kernarg), wg=[256,1,1], grid_items=[16384,2,1],
+# kernarg=0x00007fff12345680
+0xc0027602 0x0000020c 0x007f0001 0x00000000
+0xc0027602 0x00000212 0xe00f0004 0x00018084
+0xc0017602 0x00000228 0x00000150
+0xc0037602 0x00000207 0x00000100 0x00000001 0x00000001
+0xc0017602 0x00000215 0x000003ff
+0xc0027602 0x00000240 0x12345680 0x00007fff
+0xc0031502 0x00004000 0x00000002 0x00000001 0x00008025

@@ -1,0 +1,27 @@
+# Golden AQL packet fixtures (little-endian uint32 dwords, 16 dwords = 64 bytes per packet)
+# Port note: derived from warpfront/hipfire crates/redline-rocr/src/packet.rs (Apache-2.0)
+
+[pm4_ib_vendor_packet]
+# PacketImage::pm4_indirect_buffer(0x123456789000, 0x321, Signal(0x5566778899aabbcc))
+# packet.rs:669-688 (pm4_ib_packet_matches_aqlprofile_vendor_layout)
+0x00011500 0xc0023f00 0x56789000 0x00001234
+0x30800321 0x0000000a 0x00000000 0x00000000
+0x00000000 0x00000000 0x00000000 0x00000000
+0x00000000 0x00000000 0x99aabbcc 0x55667788
+
+[kernel_dispatch_1d_dynamic_lds]
+# KernelDispatchPacket::new(metadata{obj=7, kernarg=0, align=16, group=32, priv=64},
+#                           geom{grid=[1024,1,1], wg=[64,1,1]}, dyn_lds=16, kernarg=0, sig=9)
+# packet.rs:629-649 (kernel_header_is_barriered_system_scope_and_carries_dimensions)
+0x00011502 0x00010040 0x00000001 0x00000400
+0x00000001 0x00000001 0x00000040 0x00000030
+0x00000007 0x00000000 0x00000000 0x00000000
+0x00000000 0x00000000 0x00000009 0x00000000
+
+[barrier_and_packet]
+# BarrierAndPacket::new(&[Signal(11), Signal(12)], Signal(13))
+# packet.rs:651-666 (barrier_zero_fills_unused_dependencies)
+0x00001503 0x00000000 0x0000000b 0x00000000
+0x0000000c 0x00000000 0x00000000 0x00000000
+0x00000000 0x00000000 0x00000000 0x00000000
+0x00000000 0x00000000 0x0000000d 0x00000000
