@@ -351,6 +351,11 @@ enum class MemAccessKind : uint8_t {
     SmemLoad = 2,
 };
 
+/// AMD kernel-code-object ABI `kernel_code_properties` bit: the dispatch
+/// passes the kernarg segment via an SGPR pointer (always true for HIP
+/// kernels). Port note: from warpfront/hipfire crates/redline-rocr/src/pm4.rs:39 (Apache-2.0).
+inline constexpr uint16_t kAmdKernelCodePropertyEnableSgprKernargSegmentPtr = 1u << 3;
+
 enum class AcquireRung : uint8_t {
     None = 0,
     InterNode = 1,  // GCR 0x10180 (scalar + vector L0 + seq forward)
