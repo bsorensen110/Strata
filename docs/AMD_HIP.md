@@ -132,6 +132,15 @@ Q-resident prefill scheduling twin**, not FP8 versus FP16 decode.
 These are upstream receipts, not reproduced Strata results.
 A logged refusal or no measured gain is a valid outcome for P3.
 
+Set `STRATA_HIP_FP8_ATTN=1` **before** starting the engine to request the
+probe. Unset or exactly `0` keeps the old route; other values are errors.
+It resolves before `Verifier::init()` and never reads the environment during
+capture. It does not need `STRATA_PREFILL_MMQ`. Admission also requires the
+compiled image's two conversion builtins and wave32. Unsupported targets,
+images, shapes, pool formats or multi-query calls log one reason per device
+and keep the existing kernel. No target is admitted by compute capability.
+Multi-slot batched kernels and prompt WMMA families are not probed.
+
 | Card | Architecture | Status |
 | --- | --- | --- |
 | RX 7900 XT / XTX | gfx1100 | Maintainer-tested |

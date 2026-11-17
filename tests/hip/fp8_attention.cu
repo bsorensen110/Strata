@@ -120,6 +120,65 @@ void parity(int group, hipStream_t stream) {
     }
 }
 
+void dispatch(Case& c, hipStream_t stream, bool admitted) {
+    void* probe_function = nullptr;
+    if (admitted) {
+        hipGraph_t tile = nullptr;
+        check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "dispatch reference capture");
+        ref::require(c.probe(true, stream) == fp::Refusal::none, "dispatch reference declined");
+        check(hipStreamEndCapture(stream, &tile), "dispatch reference end");
+        hipGraphNode_t node = nullptr;
+        size_t n = 1;
+        check(hipGraphGetNodes(tile, &node, &n), "dispatch reference node");
+        hipKernelNodeParams params{};
+        check(hipGraphKernelNodeGetParams(node, &params), "dispatch reference function");
+        probe_function = params.func;
+        check(hipGraphDestroy(tile), "dispatch reference free");
+    }
+    for (int path = 0; path < 3; ++path) {
+        hipGraph_t graph = nullptr;
+        check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "dispatch capture");
+        const auto* q = static_cast<const float*>(c.q.p);
+        const auto* ids = static_cast<const int32_t*>(c.ids.p);
+        const auto* step = static_cast<const int32_t*>(c.step.p);
+        auto* scratch = static_cast<float*>(c.scratch.p);
+        auto* out = static_cast<float*>(c.out.p);
+        if (path == 0) strata::kernels::qsa_decode_attn_batch(q, c.pools, ids, step, c.f.cap, c.s, scratch, out, 1, stream);
+        else if (path == 1) strata::kernels::qsa_decode_attn_step(q, c.pools, ids, step, c.f.cap, c.s, scratch, out, stream);
+        else {
+            strata::kernels::QsaAttnPoolsRows rows{};
+            rows.p[0] = c.pools; rows.n = 1;
+            strata::kernels::qsa_decode_attn_batch_rows(q, rows, ids, step, c.f.cap, c.s, scratch, out, 1, stream);
+        }
+        check(hipStreamEndCapture(stream, &graph), "dispatch end capture");
+        size_t n = 0;
+        check(hipGraphGetNodes(graph, nullptr, &n), "dispatch node count");
+        ref::require(n == 2, "dispatch must capture chunk + merge");
+        if (admitted) {
+            std::vector<hipGraphNode_t> nodes(n);
+            check(hipGraphGetNodes(graph, nodes.data(), &n), "dispatch nodes");
+            int matches = 0;
+            for (auto node : nodes) {
+                hipKernelNodeParams params{};
+                check(hipGraphKernelNodeGetParams(node, &params), "dispatch function");
+                matches += params.func == probe_function;
+            }
+            ref::require(matches == 1, "production chooser bypassed the probe");
+        }
+        hipGraphExec_t exec = nullptr;
+        check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "dispatch instantiate");
+        check(hipGraphLaunch(exec, stream), "dispatch replay");
+        check(hipStreamSynchronize(stream), "dispatch finish");
+        std::vector<float> got(c.f.q.size());
+        check(hipMemcpy(got.data(), c.out.p, got.size() * 4, hipMemcpyDeviceToHost), "dispatch output");
+        const auto want = ref::attention(c.f, admitted);
+        for (size_t i = 0; i < want.size(); ++i)
+            ref::require(std::isfinite(got[i]) && std::fabs(got[i] - want[i]) <= 5e-5f * std::max(1.0f, std::fabs(want[i])),
+                         "production chooser output differs from admitted/fallback arithmetic");
+        check(hipGraphExecDestroy(exec), "dispatch free exec"); check(hipGraphDestroy(graph), "dispatch free graph");
+    }
+}
+
 void bench(int group, bool probe, hipStream_t stream) {
     Case c(group, 2048, false);
     const auto launch = [&] {
@@ -167,6 +226,8 @@ int main(int argc, char** argv) {
         check(e, "device count");
         std::string error;
         if (!fp::initialize("1", error)) throw std::runtime_error(error);
+        ref::require(!fp::initialize("0", error) && !fp::initialize("1junk", error) && fp::enabled(),
+                     "probe request changed after pre-capture freeze");
         const auto support = fp::support();
         const auto& g = strata::core::kCompiledGeometry;
         const int group = static_cast<int>(g.n_head / g.n_head_kv);
@@ -184,6 +245,7 @@ int main(int argc, char** argv) {
             std::vector<uint32_t> untouched(c.scratch_floats + 16);
             check(hipMemcpy(untouched.data(), c.scratch.p, untouched.size() * 4, hipMemcpyDeviceToHost), "refusal download");
             for (auto bits : untouched) ref::require(bits == 0xa5a5a5a5u, "declined route wrote scratch");
+            if (!timing) dispatch(c, stream, false);
             std::printf("PASS fp8-attn declined: %s (%s); no timing or quality claim\n", fp::reason(expected), support.arch);
         } else {
             c.pools.k_q = static_cast<const int8_t*>(c.k.p);
@@ -198,7 +260,11 @@ int main(int argc, char** argv) {
                     c.s, static_cast<float*>(c.scratch.p), 2, stream);
             }, fp::Refusal::queries, stream);
             if (timing) bench(group, on, stream);
-            else { parity(group, stream); std::puts("PASS fp8-attn GPU: scalar reference, both merges, live-width graph replay, canaries and refusals"); }
+            else {
+                dispatch(c, stream, true);
+                parity(group, stream);
+                std::puts("PASS fp8-attn GPU: production choosers, scalar reference, both merges, live-width graph replay, canaries and refusals");
+            }
         }
         check(hipStreamDestroy(stream), "free stream");
         return 0;

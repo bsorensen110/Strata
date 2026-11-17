@@ -19,6 +19,9 @@
 #include "strata/platform/io_priority.hpp"
 #include "strata/core/adapt_async_default.hpp"
 #include "strata/core/arch_defaults.hpp"
+#if defined(STRATA_USE_HIP)
+#include "strata/kernels/qsa_decode_fp8_probe.hpp"
+#endif
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/hip_projection.hpp"
 #endif
@@ -1094,6 +1097,10 @@ void usage() {
                  "  --native-flash-attn-short  diagnostic pinned vector attention; --max-context <=256\n"
                  "  --native-qsa-indexer  experimental pinned indexer key cache and pooling\n"
                  "  --native-qsa          experimental pinned QSA normalization and output gate\n"
+#if defined(STRATA_USE_HIP)
+                 "  STRATA_HIP_FP8_ATTN=1  probe: exact-gfx1201 FP16 decode reads rounded to E4M3;\n"
+                 "                       default off; unsupported image/shape/pool logs a refusal\n"
+#endif
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
                  "  --hip-moe-x4 0|1     opt-in exact-gfx1201 projection fusion (default 0;\n"
                  "                       STRATA_HIP_MOE_X4); requires exact symmetric weights\n"
@@ -3873,6 +3880,15 @@ int main(int argc, char** argv) {
         }
         }
     }
+#if defined(STRATA_USE_HIP)
+    {
+        std::string error;
+        if (!strata::kernels::fp8_probe::initialize(std::getenv(strata::core::kHipFp8AttnEnv), error)) {
+            std::fprintf(stderr, "%s: %s\n", strata::core::kHipFp8AttnEnv, error.c_str());
+            return 2;
+        }
+    }
+#endif
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
     {
         namespace i8 = strata::prefill::iu8;

@@ -13,6 +13,9 @@
 namespace strata::core {
 
 std::vector<std::pair<std::string, std::string>> arch_opt_in_env(const char* gcn_arch) {
+#if defined(STRATA_USE_HIP)
+    static_assert(!kHipFp8AttnDefaultOn);
+#endif
     // P4 is unmeasured in Strata. Keep this out of arch_default_env: a mixed rig resolves it per device.
     static_assert(!kHipBufloadDefaultOn);
     // Port note: hipfire CHANGELOG.md:856. Strata's IU8 route is unmeasured and never a default.
@@ -29,6 +32,9 @@ std::vector<std::pair<std::string, std::string>> arch_opt_in_env(const char* gcn
         t.push_back({kHipMoeX4Env, "0"});
         t.push_back({kHipDot4GemvEnv, "0"});
     }
+#if defined(STRATA_USE_HIP)
+    if (hip_fp8_attn_capable(gcn_arch)) t.push_back({kHipFp8AttnEnv, "0"});
+#endif
     return t;
 }
 

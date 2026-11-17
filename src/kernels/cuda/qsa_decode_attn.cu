@@ -5,6 +5,9 @@
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#if defined(STRATA_USE_HIP)
+#include "strata/kernels/qsa_decode_fp8_probe.hpp"
+#endif
 #if defined(__HIPCC__)
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/hip_compat/buffer_load.hpp"
@@ -1354,6 +1357,10 @@ void launch_merge(int v2, const float* part_acc, const float* part_m, const floa
 // kernel where it is built (the parity harness: never the environment).
 void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                          int64_t cap, const QsaShapes& s, float* scratch, int64_t n_q, cudaStream_t st, int kernel) {
+#if defined(STRATA_USE_HIP)
+    if (kernel < 0 && fp8_probe::launch_chunks(fp8_probe::enabled(), q, pools, ids, steps,
+                                               cap, s, scratch, n_q, st) == fp8_probe::Refusal::none) return;
+#endif
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
@@ -1589,6 +1596,13 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
         std::fprintf(stderr, "qsa_decode_attn_batch_rows: unsupported geometry or missing buffers\n");
         std::exit(1);
     }
+#if defined(STRATA_USE_HIP)
+    if (n_q == 1 && fp8_probe::launch_chunks(fp8_probe::enabled(), q, pools, ids, steps,
+                                               cap, s, scratch, 1, stream) == fp8_probe::Refusal::none) {
+        qsa_decode_attn_merge_only(steps, cap, s, scratch, attn, 1, attn_merge_v2(), stream);
+        return;
+    }
+#endif
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
@@ -1669,6 +1683,11 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
     cudaStream_t st = (cudaStream_t) stream;
+#if defined(STRATA_USE_HIP)
+    const bool probe = fp8_probe::launch_chunks(fp8_probe::enabled(), q, pools, ids, step,
+                                                cap, s, scratch, 1, st) == fp8_probe::Refusal::none;
+    if (!probe) {
+#endif
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     if (kv_mode == 1 && strata::hip_compat::hip_bufload_usable()) {
         if (s.n_head / kBufHeads > 65535) {
@@ -1698,6 +1717,9 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     else
         STRATA_ATTN_CHUNK(0)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
                                                         scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+#if defined(STRATA_USE_HIP)
+    }
+#endif
     launch_merge(attn_merge_v2(), part_acc, part_m, part_l, n_chunks, step, attn, 0, (unsigned) s.n_head, 1u, st);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {

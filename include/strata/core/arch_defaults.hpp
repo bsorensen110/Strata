@@ -15,9 +15,19 @@
 #include <utility>
 #include <vector>
 #include "strata/kernels/gfx_arch.hpp"
+#if defined(STRATA_USE_HIP)
+#include "strata/kernels/qsa_decode_fp8_policy.hpp"
+#endif
 
 namespace strata::core {
 
+#if defined(STRATA_USE_HIP)
+inline constexpr char kHipFp8AttnEnv[] = "STRATA_HIP_FP8_ATTN";
+inline constexpr bool kHipFp8AttnDefaultOn = false;
+inline bool hip_fp8_attn_capable(const char* gcn_arch) {
+    return strata::kernels::fp8_probe::exact_arch(gcn_arch);
+}
+#endif
 inline constexpr char kHipBufloadEnv[] = "STRATA_HIP_BUFLOAD";
 inline constexpr bool kHipBufloadDefaultOn = false;
 inline constexpr char kHipMoeIu8Env[] = "STRATA_HIP_MOE_IU8";
