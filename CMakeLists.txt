@@ -417,6 +417,10 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(io_priority_test PRIVATE include)
   add_test(NAME io_priority_test COMMAND io_priority_test)
   set_tests_properties(io_priority_test PROPERTIES SKIP_RETURN_CODE 77)
+  add_executable(hip_fp8_attn_parity src/kernels/qsa_decode_fp8_parity.cpp)
+  target_include_directories(hip_fp8_attn_parity PRIVATE include)
+  target_compile_definitions(hip_fp8_attn_parity PRIVATE STRATA_HIP_FP8_ATTN_CPU_ORACLE=1)
+  add_test(NAME hip_fp8_attn_parity_cpu COMMAND hip_fp8_attn_parity)
 endif()
 
 # ---- strata_plan ----------------------------------------------------------

@@ -100,6 +100,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/ngram/ple_reader.cpp
                           src/platform/direct_file.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_artifact)
+  if(STRATA_ENABLE_HIP)
+    target_sources(strata_kernels PRIVATE src/kernels/cuda/qsa_decode_fp8_probe.cu)
+  endif()
   # Exact gfx1100 prompt scorer (PR1825 method port): optional standalone test,
   # also available where the published source omits tests/.
   option(STRATA_PARITY_GFX1100_QSA_SCORES "Build the exact gfx1100 QSA score/ID check" OFF)
@@ -1116,6 +1119,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_test(NAME hip_projection_test COMMAND hip_projection_test)
   set_tests_properties(hip_projection_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
                       ENVIRONMENT "STRATA_HIP_MOE_X4=1;STRATA_HIP_DOT4_GEMV=1;STRATA_HIP_MOE_IU8=0;STRATA_HIP_MOE_IU4=0")
+  if(STRATA_ENABLE_HIP OR STRATA_HIP_GFX906)
+    set_source_files_properties(tests/hip/fp8_attention.cu PROPERTIES LANGUAGE HIP)
+  endif()
+  add_executable(hip_fp8_attn_test tests/hip/fp8_attention.cu)
+  target_include_directories(hip_fp8_attn_test PRIVATE include ${_strata_gpu_include_directories})
+  target_link_libraries(hip_fp8_attn_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME hip_fp8_attn_test COMMAND hip_fp8_attn_test)
+  set_tests_properties(hip_fp8_attn_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180
+                      ENVIRONMENT "STRATA_HIP_FP8_ATTN=1")
   add_executable(iq_multi_parity src/kernels/iq_multi_parity.cpp)
   target_include_directories(iq_multi_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(iq_multi_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
