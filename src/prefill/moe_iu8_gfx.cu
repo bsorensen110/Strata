@@ -6,6 +6,8 @@
 #if defined(__HIPCC__)
 #include "strata/prefill/moe_iu8_quant.cuh"
 #include "strata/prefill/moe_iu8_pack.hpp"
+#include "strata/prefill/moe_iu4_quant.cuh"
+#include "strata/core/arch_defaults.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <climits>
@@ -416,4 +418,57 @@ void swiglu_quantize(const float* gu, float* h, Block* out, int ff, int rows, vo
     check(hipGetLastError(), "SwiGLU quantize launch");
 }
 }  // namespace strata::prefill::iu8
+
+namespace strata::prefill::iu4 {
+namespace {
+void check4(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "HIP MoE A4: %s: %s\n", what, hipGetErrorString(e)); std::exit(1);
+    }
+}
+unsigned grid4(const float* x, Block* q, int cols, int rows) {
+    int device = -1;
+    check4(hipGetDevice(&device), "producer device");
+    hipDeviceProp_t prop{};
+    check4(hipGetDeviceProperties(&prop, device), "producer properties");
+    if (!x || !q || cols <= 0 || cols % 128 || rows <= 0 ||
+        (int64_t) (cols / 128) * rows > (int64_t) INT_MAX * 16 ||
+        prop.warpSize != 32 || !strata::core::hip_moe_iu8_capable(prop.gcnArchName)) {
+        std::fputs("HIP MoE A4: invalid producer operands or unsupported architecture\n", stderr); std::exit(1);
+    }
+    return (unsigned) (((int64_t) (cols / 128) * rows + 15) / 16);
+}
+template<bool SwiGLU>
+__global__ void produce_i4(const float* x, float* h, Block* out, int cols, int rows,
+                           const int32_t* starts, const int32_t* count) {
+    const int64_t group = (int64_t) blockIdx.x * 16 + threadIdx.x / 16;
+    const int kb = (int) (group % (cols / 128));
+    const int64_t row = group / (cols / 128);
+    const bool live = row < rows && (!starts || (row >= starts[0] && row < starts[*count]));
+    const int k0 = kb * 128 + (threadIdx.x & 15) * 8;
+    float xv[8] = {};
+    for (int k = 0; live && k < 8; ++k) {
+        if constexpr (SwiGLU) {
+            const float g = x[row * 2 * cols + k0 + k], u = x[row * 2 * cols + cols + k0 + k];
+            xv[k] = g / (1.0f + __expf(-g)) * u;
+            if (h) h[row * cols + k0 + k] = xv[k];
+        } else xv[k] = x[row * cols + k0 + k];
+    }
+    const OwnedBlock q = quantize_owned(xv);
+    if (live) store_owned(q, out + (int64_t) kb * rows + row, threadIdx.x);
+}
+}  // namespace
+void quantize(const float* x, Block* out, int cols, int rows, void* stream) {
+    produce_i4<false><<<grid4(x, out, cols, rows), 256, 0, (hipStream_t) stream>>>(
+        x, nullptr, out, cols, rows, nullptr, nullptr);
+    check4(hipGetLastError(), "quantizer launch");
+}
+void swiglu_window(const float* gu, float* h, Block* out, int ff, int rows,
+                   const int32_t* starts, const int32_t* count, void* stream) {
+    if (!starts || !count) { std::fputs("HIP MoE A4: missing live route bounds\n", stderr); std::exit(1); }
+    produce_i4<true><<<grid4(gu, out, ff, rows), 256, 0, (hipStream_t) stream>>>(
+        gu, h, out, ff, rows, starts, count);
+    check4(hipGetLastError(), "SwiGLU launch");
+}
+}  // namespace strata::prefill::iu4
 #endif
