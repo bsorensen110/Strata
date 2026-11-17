@@ -41,6 +41,62 @@ It still needs logit-KL and hardware timing measurements. No speedup is claimed.
 The IU4 kernel API exposes banded raster ordering separately; it is not enabled
 by the environment flag.
 
+**Experimental projection fusion and dot4 (source builds, exact gfx1201 only).**
+`STRATA_HIP_MOE_X4=1` opts into multi-matrix F32 projections.
+`STRATA_HIP_DOT4_GEMV=1` independently opts into signed-dot4 W6 decode at
+1..8 tokens. Both default to 0 and need `STRATA_PREFILL_MMQ=ON`.
+The engine flags `--hip-moe-x4 0|1` and `--hip-dot4-gemv 0|1` override the
+environment. They resolve before model setup and before any verifier captures
+its solo graphs. Restart to change them; existing graphs never change mode.
+Neither switch needs the IU8 or IU4 MoE switch.
+
+Eligible solo verifier input groups are GDN `qkv|z` (2 members) and QSA
+`q|k|v` (3 members; q includes its output gate). GDN alpha/beta already
+share a BF16 kernel and their post-ops. QSA's indexer is also BF16.
+Those kernels stay unchanged, not silently converted to A8.
+The low-level launcher supports up to 4 same-K, same-encoding matrices.
+Its largest member selects a tile: 9..16 tokens, 64x16; 17..32, 32x32;
+33..48, 64x48; 49..64, 64x16 with token slices (for trunk-sized members).
+These are local launch row counts. The current verifier still splits long
+windows into groups bounded by its compiled limit (at most 16), so it does
+not reach all of the low-level tiers. Batch, split-stage, side-stream and
+profiling paths keep the incumbent projections.
+
+Weights must pass the existing bit-exact symmetric W4/W6 packing check.
+Many GGUF tensors cannot: subscales, nonlinear codebooks and affine offsets
+can prevent an exact K128 representation. Startup logs every refusal and
+keeps that tensor's incumbent route; groups with any missing or mixed-width
+member are not fused. No approximate weight conversion is allowed.
+Dot4 also covers eligible GDN/QSA output projections. It uses ordinary
+loads, not non-temporal loads.
+
+Both experiments use prepared K128 A8 activations, not the incumbent Q8_1
+activation quantizer. The required bitwise comparisons are fused versus
+standalone **on the same prepared A8 input**, and dot4 versus the ordered
+IU8 fold. They do not establish parity with Q8_1, model quality, or a speedup.
+Logit-KL, greedy-id comparisons, launch counts and timing still need hardware.
+Use `STRATA_DISPATCH_REPORT` to record which groups actually ran. A fusion
+removes 1 GDN or 2 QSA GEMM launches, but its A8 producer adds a launch if
+the input was not prepared yet. No net launch-count saving is claimed here.
+
+Parent validation commands (not run by the porting agent):
+
+```powershell
+cmake --build build-cu130 --config Release
+ctest --test-dir build-cu130 -C Release --output-on-failure -R "arch_defaults_test|hip_projection|moe_iu[48]_parity_cpu"
+ctest --test-dir build-cu130 -C Release --output-on-failure
+```
+
+Run the build inside the parent's Visual Studio x64 environment. The
+`hip_projection_parity_cpu` target checks exact F32 words, member order,
+2/3/4-member prefixes and canary tails. It scales output rows down but keeps
+K=2560. `hip_projection_test` skips CUDA with return code 77. In a HIP build,
+it checks single-matrix versus fused versus CPU words, all dot4 row counts,
+padding, trunk-selected tiles, the independent A8 producer and graph replay.
+It requires one kernel node per fused launch, with the older IU8/IU4 flags off.
+Run that same test on an R9700 before accepting the device implementation.
+Host-oracle runtime is not measured here.
+
 | Card | Architecture | Status |
 | --- | --- | --- |
 | RX 7900 XT / XTX | gfx1100 | Maintainer-tested |

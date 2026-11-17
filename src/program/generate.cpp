@@ -19,6 +19,9 @@
 #include "strata/platform/io_priority.hpp"
 #include "strata/core/adapt_async_default.hpp"
 #include "strata/core/arch_defaults.hpp"
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+#include "strata/prefill/hip_projection.hpp"
+#endif
 #include "strata/core/gfx12_chunk.hpp"
 #include "strata/core/nv_chunk.hpp"
 #include "strata/core/nv_defaults.hpp"
@@ -615,6 +618,9 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
 }
 
 struct Options {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    int hip_moe_x4 = -1, hip_dot4_gemv = -1;  // -1: environment, resolved before every verifier exists
+#endif
     std::string pack = "pack/full";
     std::vector<int64_t> tokens;      // the prompt, PRE-TOKENIZED
     int64_t max_new = 16;
@@ -1088,6 +1094,12 @@ void usage() {
                  "  --native-flash-attn-short  diagnostic pinned vector attention; --max-context <=256\n"
                  "  --native-qsa-indexer  experimental pinned indexer key cache and pooling\n"
                  "  --native-qsa          experimental pinned QSA normalization and output gate\n"
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                 "  --hip-moe-x4 0|1     opt-in exact-gfx1201 projection fusion (default 0;\n"
+                 "                       STRATA_HIP_MOE_X4); requires exact symmetric weights\n"
+                 "  --hip-dot4-gemv 0|1  independent opt-in W6/A8 decode GEMV (default 0;\n"
+                 "                       STRATA_HIP_DOT4_GEMV); A8 model-quality gate still required\n"
+#endif
                  "  --native-rope         experimental pinned text-only CUDA rotary arithmetic\n"
                  "  --native-ple-postops  experimental pinned PLE postprojection arithmetic\n"
                  "  --native-router       experimental pinned CUDA 512-expert top-10 routing\n"
@@ -3533,6 +3545,15 @@ int main(int argc, char** argv) {
         else if (a == "--native-flash-attn-short") o.native_flash_attn_short = true;
         else if (a == "--native-qsa-indexer") o.native_qsa_indexer = true;
         else if (a == "--native-qsa") o.native_qsa = true;
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+        else if (a == "--hip-moe-x4" || a == "--hip-dot4-gemv") {
+            const char* value = next(a.c_str());
+            if ((value[0] != '0' && value[0] != '1') || value[1] != '\0') {
+                std::fprintf(stderr, "%s needs 0 or 1\n", a.c_str()); return 2;
+            }
+            (a == "--hip-moe-x4" ? o.hip_moe_x4 : o.hip_dot4_gemv) = value[0] - '0';
+        }
+#endif
         else if (a == "--native-rope") o.native_rope = true;
         else if (a == "--native-ple-postops") o.native_ple_postops = true;
         else if (a == "--native-router") o.native_router = true;
@@ -3852,6 +3873,17 @@ int main(int argc, char** argv) {
         }
         }
     }
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    {
+        namespace i8 = strata::prefill::iu8;
+        i8::ProjectionModes modes;
+        if (!i8::resolve_projection_mode(o.hip_moe_x4, std::getenv(strata::core::kHipMoeX4Env), modes.x4) ||
+            !i8::resolve_projection_mode(o.hip_dot4_gemv, std::getenv(strata::core::kHipDot4GemvEnv), modes.dot4)) {
+            std::fprintf(stderr, "HIP projection options/environment need exact 0 or 1\n"); return 2;
+        }
+        i8::set_projection_modes(modes);  // before model load and Verifier::init's solo graph captures
+    }
+#endif
     {   // --ram-keep-gib W (or STRATA_RAM_KEEP_GIB, for a program that cannot pass the flag; the flag wins): the RAM to leave free.  It also
         // raises the headroom of the explicit RAM modes (--resident-budget-gib, --resident-experts) to at least W, unless
         // STRATA_RESIDENT_HEADROOM_GIB is set (that value wins).

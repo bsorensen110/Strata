@@ -560,6 +560,18 @@ void quantize_window(const float* x, Block* out, int cols, int rows, void* strea
         x, nullptr, out, nullptr, cols, cols, rows, 0);
     check(hipGetLastError(), "window quantizer launch");
 }
+void quantize_projection(const float* x, Block* out, int cols, int rows, void* stream) {
+    if (!x || !out || rows<1 || rows>64 || cols<=0 || cols%128) invalid("projection quantizer");
+    int device=-1;
+    hipDeviceProp_t prop{};
+    check(hipGetDevice(&device),"projection producer device");
+    check(hipGetDeviceProperties(&prop,device),"projection producer properties");
+    if (prop.warpSize!=32 || !strata::core::hip_projection_capable(prop.gcnArchName))
+        invalid("projection producer exact gfx1201");
+    produce<false,false><<<producer_grid(cols,rows),256,0,(hipStream_t)stream>>>(
+        x,nullptr,out,nullptr,cols,cols,rows,0);
+    check(hipGetLastError(),"projection quantizer launch");
+}
 void swiglu_window(const float* gu, float* h, Block* out, int ff, int rows,
                    const int32_t* starts, const int32_t* count, void* stream) {
     if (!gu || !out || !starts || !count || !window_admitted(1, ff)) invalid("window SwiGLU");

@@ -7,6 +7,7 @@
 #include "strata/hip_compat/buffer_load.hpp"
 #include "strata/prefill/moe_iu8_gfx.hpp"
 #include "strata/prefill/moe_iu4_gfx.hpp"
+#include "strata/prefill/hip_projection.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -53,24 +54,46 @@ int main() {
                           "gfx1200", "gfx1201", "gfx1201:sramecc-:xnack-"}) {
         CHECK(hip_bufload_capable(a));
         const auto opt_in = arch_opt_in_env(a);
-        CHECK(opt_in.size() == 1 + (size_t) hip_moe_iu8_capable(a) + (size_t) hip_moe_iu4_capable(a));
+        CHECK(opt_in.size() == 1 + (size_t) hip_moe_iu8_capable(a) + (size_t) hip_moe_iu4_capable(a) +
+                               2 * (size_t) hip_projection_capable(a));
         CHECK(opt_in[0].first == kHipBufloadEnv && opt_in[0].second == "0");
         if (hip_moe_iu8_capable(a))
             CHECK(opt_in[1].first == kHipMoeIu8Env && opt_in[1].second == "0");
         if (hip_moe_iu4_capable(a))
-            CHECK(opt_in.back().first == kHipMoeIu4Env && opt_in.back().second == "0");
+            CHECK(opt_in[2].first == kHipMoeIu4Env && opt_in[2].second == "0");
+        if (hip_projection_capable(a)) {
+            CHECK(opt_in[3].first == kHipMoeX4Env && opt_in[3].second == "0");
+            CHECK(opt_in[4].first == kHipDot4GemvEnv && opt_in[4].second == "0");
+        }
         for (bool legacy : {false, true})
         for (bool windows : {false, true})
             for (const auto& kv : arch_default_env(a, legacy, windows)) {
                 CHECK(kv.first != kHipBufloadEnv);
                 CHECK(kv.first != kHipMoeIu8Env);
                 CHECK(kv.first != kHipMoeIu4Env);
+                CHECK(kv.first != kHipMoeX4Env);
+                CHECK(kv.first != kHipDot4GemvEnv);
             }
     }
     for (const char* a : {static_cast<const char*>(nullptr), "", "gfx1030", "gfx906", "gfx942",
                           "gfx1152", "gfx1202", "gfx12010", "sm_120"}) {
         CHECK(!hip_bufload_capable(a));
         CHECK(arch_opt_in_env(a).empty());
+        CHECK(!hip_projection_capable(a));
+    }
+    {
+        using strata::prefill::iu8::resolve_projection_mode;
+        bool value = true;
+        CHECK(resolve_projection_mode(-1,nullptr,value) && !value);
+        CHECK(resolve_projection_mode(-1,"1",value) && value);
+        CHECK(resolve_projection_mode(-1,"0",value) && !value);
+        CHECK(resolve_projection_mode(0,"1",value) && !value);
+        CHECK(resolve_projection_mode(1,"0",value) && value);
+        for (const char* bad : {"", "true", "01", "1junk", "-1", "2"})
+            CHECK(!resolve_projection_mode(-1,bad,value));
+        CHECK(!resolve_projection_mode(2,nullptr,value));
+        CHECK(!hip_projection_capable("gfx1200") && !hip_projection_capable("gfx1100") &&
+              !hip_projection_capable("gfx1151") && !hip_projection_capable("gfx12010"));
     }
     // Alternating names must not carry a previous device's capability into the next selection.
     CHECK(hip_bufload_capable("gfx1201") && !hip_bufload_capable("gfx1030") &&

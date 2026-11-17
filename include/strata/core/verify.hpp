@@ -34,6 +34,7 @@
 #include "strata/prefill/moe_iu8_gfx.hpp"
 #include "strata/prefill/moe_iu8_pack.hpp"
 #include "strata/prefill/moe_iu4_gfx.hpp"
+#include "strata/prefill/hip_projection.hpp"
 #endif
 
 #include <cuda_runtime.h>
@@ -782,6 +783,9 @@ private:
     std::vector<strata::prefill::iu8::Layer> hip_tiles_;
     std::vector<strata::prefill::iu8::WindowWeights> hip_tables_;
     std::vector<strata::prefill::iu4::WindowWeights> hip4_tables_;
+    strata::prefill::iu8::ProjectionModes hip_projection_modes_;
+    std::map<const WeightRef*, strata::prefill::iu8::DeviceWeight> hip_projection_weights_;
+    strata::prefill::iu8::Block* hip_proj_x_ = nullptr;
     strata::prefill::iu8::Block *hip_x_ = nullptr, *hip_d_ = nullptr;
     strata::prefill::iu4::Block *hip4_x_ = nullptr, *hip4_d_ = nullptr;
     float *hip_gu_ = nullptr, *hip_h_ = nullptr;

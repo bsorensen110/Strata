@@ -24,6 +24,13 @@ inline constexpr char kHipMoeIu8Env[] = "STRATA_HIP_MOE_IU8";
 inline constexpr bool kHipMoeIu8DefaultOn = false;
 inline constexpr char kHipMoeIu4Env[] = "STRATA_HIP_MOE_IU4";
 inline constexpr bool kHipMoeIu4DefaultOn = false;
+inline constexpr char kHipMoeX4Env[] = "STRATA_HIP_MOE_X4";
+inline constexpr bool kHipMoeX4DefaultOn = false;
+inline constexpr char kHipDot4GemvEnv[] = "STRATA_HIP_DOT4_GEMV";
+inline constexpr bool kHipDot4GemvDefaultOn = false;
+inline bool hip_projection_capable(const char* gcn_arch) {
+    return strata::kernels::gfx_arch_is(gcn_arch, "gfx1201");
+}
 inline bool hip_moe_iu4_capable(const char* gcn_arch) {
     return strata::kernels::gfx_arch_is(gcn_arch, "gfx1201") ||
            strata::kernels::gfx_arch_is(gcn_arch, "gfx1100") ||

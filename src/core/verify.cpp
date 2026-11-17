@@ -11,6 +11,10 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+#include "strata/core/arch_defaults.hpp"
+#include "ggml.h"
+#endif
 #include "strata/core/window_evict.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -955,6 +959,9 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
 
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    hip_projection_modes_ = strata::prefill::iu8::projection_modes();
+#endif
     g_diag_verifier.store(this);
     diag_verify_fn().store(&diag_active_verifier);
     for (auto& slot : g_live) {
@@ -1016,6 +1023,63 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    if (hip_projection_modes_.x4 || hip_projection_modes_.dot4) {
+        namespace i8 = strata::prefill::iu8;
+        cudaDeviceProp prop{};
+        const auto status = cudaGetDeviceProperties(&prop, device_);
+        if (status != cudaSuccess) {
+            err = std::string("HIP projection device query: ") + cudaGetErrorString(status); return false;
+        }
+        if (prop.warpSize != 32 || !hip_projection_capable(prop.gcnArchName) || lb_ != 0 || le_ != g.n_layers) {
+            std::fprintf(stderr, "HIP projections refused: exact gfx1201 and a single full-model stage required; keeping incumbent\n");
+            hip_projection_modes_ = {};
+        } else {
+            for (int l = lb_; l < le_; ++l) {
+                const LayerView layer(wt, l);
+                const char* gdn[] = {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight"};
+                const char* qsa[] = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight"};
+                const bool q = is_qsa_layer(g,l);
+                const int count = q ? 4 : 3;
+                for (int i = 0; i < count; ++i) {
+                    if (i == count-1 && !hip_projection_modes_.dot4) continue;
+                    const char* suffix = q ? qsa[i] : gdn[i];
+                    const auto* w = layer.get(suffix);
+                    if (!w || !w->native_data) {
+                        std::fprintf(stderr, "HIP projection %s refused: no native weight; keeping incumbent\n", layer.name(suffix).c_str());
+                        continue;
+                    }
+                    std::string reason;
+                    if (w->ne0 <= 0 || w->ne1 <= 0 || w->ne0 > INT_MAX || w->ne1 > INT_MAX-127 ||
+                        w->ne0 % 128 || (w->native_type != GGML_TYPE_Q4_0 && w->native_type != GGML_TYPE_Q6_K &&
+                                        w->native_type != GGML_TYPE_IQ4_NL && w->native_type != GGML_TYPE_IQ4_XS)) {
+                        reason = "not an admitted exact W4/W6 source/shape";
+                    } else if (w->ne0 % ggml_blck_size((ggml_type)w->native_type)) {
+                        reason = "incomplete native weight block";
+                    } else {
+                        const size_t bytes = strata::kernels::native_mmvq_weight_bytes(w->native_type, (int)w->ne0, (int)w->ne1);
+                        std::vector<uint8_t> host(bytes);
+                        const auto copied = cudaMemcpy(host.data(),w->native_data,bytes,cudaMemcpyDeviceToHost);
+                        if (copied != cudaSuccess) {
+                            err = "HIP projection " + layer.name(suffix) + ": " + cudaGetErrorString(copied); return false;
+                        }
+                        i8::Pack pack;
+                        i8::DeviceWeight device_weight;
+                        if (i8::pack_exact(w->native_type,host.data(),bytes,(int)w->ne1,(int)w->ne0,pack,reason)) {
+                            if ((!hip_projection_modes_.x4 || i==count-1) && pack.bits != 6) reason = "dot4 requires exact W6";
+                            else if (i8::upload(pack,device_weight,reason)) {
+                                hip_projection_weights_.emplace(w,std::move(device_weight));
+                                std::fprintf(stderr,"HIP projection %s: exact W%d ready before capture (new A8 route)\n",
+                                             layer.name(suffix).c_str(),pack.bits);
+                                continue;
+                            }
+                        }
+                    }
+                    std::fprintf(stderr,"HIP projection %s refused: %s; keeping incumbent\n",
+                                 layer.name(suffix).c_str(),reason.c_str());
+                }
+            }
+        }
+    }
     // Port note: hipfire narrow verify entries. Resolve from the environment and
     // pre-init source only, before either solo or lazy batch graphs can capture.
     const bool hip8_requested = strata::prefill::iu8::usable();
@@ -1209,6 +1273,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
         const bool hip8 = std::any_of(hip_tables_.begin(), hip_tables_.end(), [](const auto& t) { return t.gu != nullptr; });
         const bool hip4 = std::any_of(hip4_tables_.begin(), hip4_tables_.end(), [](const auto& t) { return t.gu != nullptr; });
+        if (!hip_projection_weights_.empty()) {
+            const uint64_t cols = std::max({N, ZV, NH*HD});
+            hip_proj_x_ = b.take<strata::prefill::iu8::Block>(T * (cols / 128));
+        }
         if (hip8) {
             hip_x_ = b.take<strata::prefill::iu8::Block>(T * (N / 128));
             hip_d_ = b.take<strata::prefill::iu8::Block>(T * K * ((uint64_t) g.n_ff / 128));
@@ -1753,10 +1821,58 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
         bool il_ready = q8_attn && want_attn_il;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+        namespace i8 = strata::prefill::iu8;
+        const bool hip_projection_lane = hip_proj_x_ && !batch_rec_ && !br && !side_mixer && !side_proj && !prof_on_;
+        if (hip_proj_x_ && !hip_projection_lane)
+            strata::dispatch::note("HIP projections declined: batch/side-stream/profiling path");
+        const float* hip_raw_x = xm;
+        const float* hip_prepared_x = nullptr;
+        int hip_prepared_cols = 0;
+        auto hip_prepare = [&](int cols) {
+            if (hip_prepared_x != hip_raw_x || hip_prepared_cols != cols) {
+                i8::quantize_projection(hip_raw_x,hip_proj_x_,cols,n,cs);
+                hip_prepared_x = hip_raw_x; hip_prepared_cols = cols;
+            }
+        };
+        auto hip_member = [&](const WeightRef* w, float* out, int cols, int rows) {
+            i8::Window p;
+            const auto it = hip_projection_weights_.find(w);
+            if (it == hip_projection_weights_.end()) return p;
+            if (it->second.rows != rows || it->second.cols != cols)
+                throw std::invalid_argument("HIP projection: captured weight shape differs");
+            p.weight=i8::view(it->second); p.x=hip_proj_x_; p.y=out;
+            p.rows=rows; p.cols=cols; p.tokens=p.x_rows=n; p.ld=rows;
+            return p;
+        };
+        auto hip_dot4_member = [&](const WeightRef* w) {
+            if (!hip_projection_lane || !hip_projection_modes_.dot4 || n>8) return false;
+            const auto it=hip_projection_weights_.find(w);
+            return it!=hip_projection_weights_.end() && it->second.bits==6 && it->second.cols%256==0;
+        };
+        auto hip_fuse = [&](const std::array<const WeightRef*,4>& weights,
+                            const std::array<float*,4>& outputs, const std::array<int,4>& rows, int count) {
+            if (!hip_projection_lane || !hip_projection_modes_.x4 || n<9 || n>64) return false;
+            std::array<i8::Window,4> members{};
+            for (int i=0;i<count;++i) {
+                members[i]=hip_member(weights[i],outputs[i],(int)N,rows[i]);
+                if (!members[i].y || members[i].weight.bits!=members[0].weight.bits) {
+                    strata::dispatch::note("HIP x4 declined: missing exact pack or mixed bit widths");
+                    return false;
+                }
+            }
+            hip_prepare((int)N);
+            return i8::strata_gemm_sym_i8_x4(members,count,true,cs);
+        };
+#endif
         // a projection input's q8_1 blocks and their interleaved copy in one launch (native_quantize_q8_1_il, the same
         // bytes): Turing default (+0.5..+1 % decode, two launches fewer per GDN layer and per QSA layer); STRATA_QIL=0 / 1
         // forces it off / on
         auto quant_in = [&](const float* x, int n_in) {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+            hip_raw_x=x;
+            hip_prepared_x=nullptr;
+#endif
             if (qil_on() && n >= 2 && n <= 8 && g_mmvq_il()) {   // (c): the plain blocks and their interleaved copy, one launch
                 strata::kernels::native_quantize_q8_1_il(x, xq_, xil_, n_in, n, cs);
                 il_ready = true;
@@ -1766,6 +1882,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             il_ready = false;
         };
         auto mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+            if (hip_dot4_member(w)) {
+                auto p=hip_member(w,out,n_in,n_out);
+                hip_prepare(n_in);
+                if (i8::strata_gemv_sym_i8_dot4(p,true,cs)) return;
+            }
+#endif
             if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(w->native_type, n, n_out)) {
                 if (!il_ready && n >= 2) {   // one column reads the plain q8_1 blocks
                     strata::kernels::native_q8_1_interleave(xq_, xil_, n_in, n, cs);
@@ -1804,6 +1927,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
                 }
                 if (!q8_attn) quant_in(xm, (int) N);
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                const bool hip_gdn_fused=hip_fuse({wqkv,wg,nullptr,nullptr},
+                    {qkv+(size_t)tb*C,z_+(size_t)tb*ZV,nullptr,nullptr},{(int)C,(int)ZV,0,0},2);
+                if (hip_gdn_fused) strata::dispatch::note("HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)");
+#endif
                 if (side_proj) {   // the gate projection (compute-bound for i-quants) beside qkv and the conv
                     // the branch reads F4's interleaved copy too (written on cs before the fork; bitwise native_mmvq's
                     // output), and qkv is recorded before the branch's launch, so its grid is dispatched first and the
@@ -1837,6 +1965,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool fuse_ab = fuse_convab_on() && !br && (!batch_rec_ || batch_same_slot) && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
                 strata::dispatch::notef("gdn layer: side_gates=%ld side_proj=%ld df_branch=%ld", (long) sidem, (long) side_proj, (long) br);
                 strata::dispatch::notef("gdn layer: conv+ab fused=%ld batch_rows=%ld", (long) fuse_ab, (long) batch_rec_);
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                if (!hip_gdn_fused)
+#endif
                 if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_ && !fuse_ab) {   // contiguous rows may be proposals for the same slot
@@ -1896,6 +2027,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                if (!hip_gdn_fused)
+#endif
                 if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
@@ -1962,6 +2096,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 stamp(l, 6, grp);
                 // STRATA_QFUSE / STRATA_GDN_GROUPS_QFUSE: done above by gdn_step_norm_groups / gdn_step_norm_multi
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                hip_raw_x=y_+(size_t)tb*ZV;
+#endif
                 if (!gdn_q_done) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = use_quant_il_wout;
                 mm(wout, bo_ + tb * N, (int) ZV, (int) N);
@@ -2011,6 +2148,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }();
                 const bool qb = dec_batch && n > 1 && native_qsa_enabled() && native_rope_enabled() && (!st.kv_q4 || qb_q4);
                 if (!q8_attn) quant_in(xm, (int) N);
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                const bool hip_qsa_fused=hip_fuse({wq,wk,wv,nullptr},
+                    {qfull_+tb*NH*2*HD,kcur_+tb*NKV*HD,vcur_+tb*NKV*HD,nullptr},
+                    {(int)(NH*2*HD),(int)(NKV*HD),(int)(NKV*HD),0},3);
+                if (hip_qsa_fused) strata::dispatch::note("HIP x4 QSA members=3: q|k|v (indexer stays BF16)");
+#endif
                 // STRATA_DF_BRANCH: the query side (q and its norm/RoPE/rotation on side 0, the indexer query on side 1)
                 // beside the K/V side; the indexer query joins before the block scores, the query before attention
                 const bool qbr = br && qb;
@@ -2140,11 +2283,17 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool q_il = side_proj && g_mmvq_il() &&
                                   strata::kernels::native_mmvq_il_supported(wq->native_type, n, (int) (NH * 2 * HD));
                 auto q_chain = [&](cudaStream_t ns) -> bool {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                    if (!hip_qsa_fused) {
+#endif
                     if (ns == cs) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
                     else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
                                                                    qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
                     else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
                                      (int) (NH * 2 * HD), n, ns);
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                    }
+#endif
                     if (qb) {
                         if (fuse_nr) {   // the q/gate split reads q straight out of the q|gate rows (stride 2 * HD)
                             native_qsa_rms_norm_rope(qfull_ + tb * NH * 2 * HD, (int) (2 * HD), (const float*) wqn->data,
@@ -2194,8 +2343,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                if (!hip_qsa_fused) {
+#endif
                 mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
                 mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                }
+#endif
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)
@@ -2464,7 +2619,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }();
                 const bool use_quant_il_wo = n >= 2 && n <= 8 && qil_on() && g_mmvq_il() &&
                                              strata::kernels::native_mmvq_il_supported(wo->native_type, n, (int) N);
-                const bool fuse_gate_q8 = qb && qsa_gate_qfuse && (HD % 32) == 0;
+                const bool fuse_gate_q8 = qb && qsa_gate_qfuse && (HD % 32) == 0
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                    && !hip_dot4_member(wo)  // dot4 needs the F32 gate output, not q8_1-only scratch
+#endif
+                    ;
                 if (fuse_gate_q8) {
                     native_qsa_gate_quantize_q8_1(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, xq_,
                                                   (int) (n * NH), (int) HD, cs,

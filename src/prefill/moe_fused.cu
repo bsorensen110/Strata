@@ -828,6 +828,9 @@ void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const
 
 #if defined(__HIPCC__)
 namespace strata::prefill::iu8 {
+namespace { ProjectionModes startup_projection_modes; }
+void set_projection_modes(ProjectionModes modes) { startup_projection_modes = modes; }
+ProjectionModes projection_modes() { return startup_projection_modes; }
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Kaden Schutt
 // Port note: hipfire gemm_mq6sym_i8.gfx1201.hip x4 launch contract;

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Kaden Schutt
-// Port note: hipfire gemm_mq6sym_i8.gfx1201.hip shared-body x4 oracle.
+// Port note: hipfire gemm_mq6sym_i8.gfx1201.hip shared-body x4 oracle
+// and gemv_mq6sym_i8.gfx1201.hip integer partition / ordered fold.
 // Modified for Strata planar packs. Test-only; no engine dependency.
 #pragma once
 #if defined(STRATA_MOE_IU8_CPU_ORACLE)
@@ -23,11 +24,19 @@ inline Pack projection_pack(int m, int k, int bits, uint32_t seed) {
 // Each CTA owns only one matrix. Reconstruct the flattened prefix mapping,
 // token slices and WMMA lane halves, independently of the scalar fold oracle.
 inline void projection_x4(const std::array<Pack,4>& w, int count, const Block* x, int n,
-                          std::array<std::vector<float>,4>& out) {
+                          std::array<std::vector<float>,4>& out, int entry_override=-1) {
     std::array<int,4> rows{};
     for (int i=0;i<count;++i) rows[i]=w[i].rows;
-    const auto plan=x4_plan(rows,count,w[0].cols,n);
+    auto plan=x4_plan(rows,count,w[0].cols,n);
     require(plan.entry>=0,"x4 oracle plan refused");
+    // Test trunk-selected lane shapes on scaled output-row fixtures.
+    if (entry_override>=0) {
+        plan.entry=entry_override;
+        const auto t=kNarrowTiles.at((size_t)entry_override);
+        require(!t.bf16 && (t.split || n<=t.tokens),"x4 oracle forced tile capacity");
+        plan.x=0; plan.y=t.split?(n+t.tokens-1)/t.tokens:1;
+        for (int i=0;i<count;++i) plan.x+=(rows[i]+t.rows-1)/t.rows;
+    }
     const auto tile=kNarrowTiles[plan.entry];
     for (uint32_t by=0;by<plan.y;++by)
     for (uint32_t bx=0;bx<plan.x;++bx) {

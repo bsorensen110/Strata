@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Kaden Schutt
-// Port note: hipfire gemm_mq6sym_i8.gfx1201.hip:146-406.
+// Port note: hipfire gemm_mq6sym_i8.gfx1201.hip:146-406 and
+// gemv_mq6sym_i8.gfx1201.hip:5-145.
 // Strata adaptation: planar exact W4/W6 packs, unchanged K128 arithmetic.
 #pragma once
 #include "strata/prefill/moe_iu8_tiles.hpp"
@@ -12,13 +13,22 @@
 #endif
 
 namespace strata::prefill::iu8 {
+struct ProjectionModes { bool x4 = false, dot4 = false; };
+inline bool resolve_projection_mode(int option, const char* env, bool& out) {
+    if (option == 0 || option == 1) { out = option == 1; return true; }
+    if (option != -1) return false;
+    if (!env) { out = false; return true; }
+    if ((env[0] != '0' && env[0] != '1') || env[1] != '\0') return false;
+    out = env[0] == '1';
+    return true;
+}
 struct X4Plan {
     int entry = -1;
     uint32_t x = 0, y = 0;
 };
 // Two packed 24-bit groups -> nibble-pair ordered signed 4*(q-32) bytes.
 #if defined(__HIPCC__)
-__host__ __device__
+__attribute__((host,device))
 #endif
 inline uint32_t dot4_word6(uint32_t a, uint32_t b, int odd) {
     a >>= odd*6; b >>= odd*6;
@@ -43,6 +53,9 @@ inline X4Plan x4_plan(const std::array<int, 4>& rows, int count, int k, int n) {
 }
 
 #if defined(__HIPCC__) || defined(STRATA_USE_HIP)
+void set_projection_modes(ProjectionModes modes);
+ProjectionModes projection_modes();
+void quantize_projection(const float* x, Block* out, int cols, int rows, void* stream);
 // F32 overwrite only; inactive members are zero-initialized. The opt-in is
 // frozen before graph capture, not read lazily from the process environment.
 bool strata_gemm_sym_i8_x4(const std::array<Window, 4>& members, int count, bool enabled, void* stream);
