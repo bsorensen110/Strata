@@ -7,6 +7,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #if defined(__HIPCC__)
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/hip_compat/buffer_load.hpp"
 #endif
 
 #include <cuda_fp16.h>
@@ -381,6 +382,159 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_rows_kernel(const float* _
     attn_chunk_body<KV_MODE, LANE_CELL, false, false>(q, rows.p[blockIdx.z], ids, step, n_kv_heads, page_size, scale,
                                                       part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
 }
+
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// Adapted from hipfire kernels/src/tensor_ops.hip:qsa_attention_batched_hg4_lite.
+// Keep Strata's 8-dimension score expressions, XOR trees and ascending-cell FMAs, not hipfire's serial dots.
+constexpr int kBufHeads = 4;
+constexpr int kBufLds = (CHUNK * kBufHeads + WARPS * kBufHeads) * sizeof(float);
+
+struct QdaPageRsrc {
+    strata::hip_compat::BufRsrc codes, scales;
+    long long page = -1;
+
+    __device__ void set(const int8_t* q, const uint16_t* s, long long row, int page_size) {
+        const long long next = row / page_size;
+        if (next != page) {
+            page = next;
+            codes = strata::hip_compat::strata_hip_make_rsrc(q + next * page_size * HD,
+                                                           (size_t) page_size * HD);
+            scales = strata::hip_compat::strata_hip_make_rsrc(s + next * page_size * (HD / KV_Q8_GROUP),
+                                                            (size_t) page_size * (HD / KV_Q8_GROUP) * 2);
+        }
+    }
+
+    __device__ float scale(long long row, int d, int page_size) const {
+        const unsigned off = (unsigned) (row % page_size) * (HD / KV_Q8_GROUP) * 2;
+        const unsigned group = d / KV_Q8_GROUP;
+        const uint32_t bits = strata::hip_compat::strata_hip_buf_ld_b32(scales, (group & ~1u) * 2, off);
+        return __half2float(__ushort_as_half((uint16_t) (bits >> ((group & 1u) * 16))));
+    }
+};
+
+struct QdaKey8 {
+    strata::hip_compat::Buf64 codes;
+    float scale;
+};
+
+__device__ __forceinline__ QdaKey8 qda_key8(QdaPageRsrc& r, const QsaAttnPools& p, long long row,
+                                           int lane, int page_size) {
+    QdaKey8 k{};
+    if (row >= 0) {
+        r.set(p.k_q, p.k_scale, row, page_size);
+        const unsigned off = (unsigned) (row % page_size) * HD;
+        k.codes = strata::hip_compat::strata_hip_buf_ld_b64(r.codes, lane * 8, off);
+        k.scale = r.scale(row, lane * 8, page_size);
+    }
+    return k;
+}
+
+__device__ __forceinline__ long long qda_selected_row(const QsaAttnPools& p, const int32_t* ids, int index,
+                                                     int count, int n_kv_heads, int kvh, int page_size) {
+    if ((unsigned) index >= (unsigned) count) return -1;
+    const int cell = ids[index];
+    if (cell < 0) return -1;
+    const long long page = p.page_table[cell / page_size];
+    return page >= 0 ? (page * n_kv_heads + kvh) * page_size + cell % page_size : -1;
+}
+
+__global__ void __launch_bounds__(THREADS) attn_chunk_q8_buf_kernel(
+    const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids,
+    const int32_t* __restrict__ steps, int n_kv_heads, int page_size, float scale,
+    float* __restrict__ part_acc, float* __restrict__ part_m, float* __restrict__ part_l,
+    int n_chunks, int cap, long long stride) {
+    using namespace strata::hip_compat;
+    const int z = blockIdx.z, chunk = blockIdx.x;
+    const int kvh = blockIdx.y / (G / kBufHeads), h0 = (blockIdx.y % (G / kBufHeads)) * kBufHeads;
+    const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
+    q += (size_t) z * n_kv_heads * G * HD + (kvh * G + h0) * HD;
+    ids += (size_t) z * cap + chunk * CHUNK;
+    steps += (size_t) z * kStepCount;
+    part_acc += (size_t) z * stride;
+    part_m += (size_t) z * stride;
+    part_l += (size_t) z * stride;
+    const int count = max(0, min(CHUNK, min(cap - chunk * CHUNK, __ldg(steps + kStepWidth) - chunk * CHUNK)));
+    const int slot = (kvh * n_chunks + chunk) * G + h0;
+    if (count == 0) {
+        if (t < kBufHeads) { part_m[slot + t] = -FLT_MAX; part_l[slot + t] = 0.0f; }
+        return;
+    }
+    extern __shared__ float4 buf_lds[];
+    float* den = reinterpret_cast<float*>(buf_lds);
+    float (*weights)[kBufHeads] = reinterpret_cast<float (*)[kBufHeads]>(den + WARPS * kBufHeads);
+    float qr[kBufHeads][8];
+#pragma unroll
+    for (int h = 0; h < kBufHeads; ++h) {
+        const float4 a = *reinterpret_cast<const float4*>(q + h * HD + lane * 8);
+        const float4 b = *reinterpret_cast<const float4*>(q + h * HD + lane * 8 + 4);
+        qr[h][0] = a.x; qr[h][1] = a.y; qr[h][2] = a.z; qr[h][3] = a.w;
+        qr[h][4] = b.x; qr[h][5] = b.y; qr[h][6] = b.z; qr[h][7] = b.w;
+    }
+    const auto row_at = [&](int c) {
+        return qda_selected_row(p, ids, c, count, n_kv_heads, kvh, page_size);
+    };
+    QdaPageRsrc kr;
+    long long row = row_at(wave), next_row = row_at(wave + WARPS);
+    QdaKey8 key = qda_key8(kr, p, row, lane, page_size);
+    for (int c = wave; c < CHUNK; c += WARPS) {
+        // The next key's pair of dwords and the token/page chain two tiles ahead precede this tile's arithmetic.
+        const QdaKey8 next_key = qda_key8(kr, p, next_row, lane, page_size);
+        const long long ahead_row = row_at(c + 2 * WARPS);
+        strata_hip_buffer_sched_barrier();
+        if (row >= 0) {
+            float k[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                k[j] = (float) (int8_t) (key.codes[j / 4] >> ((j % 4) * 8)) * key.scale;
+#pragma unroll
+            for (int h = 0; h < kBufHeads; ++h) {
+                float s = k[0] * qr[h][0] + k[1] * qr[h][1] + k[2] * qr[h][2] + k[3] * qr[h][3] +
+                          k[4] * qr[h][4] + k[5] * qr[h][5] + k[6] * qr[h][6] + k[7] * qr[h][7];
+                s = warp_sum(s);
+                if (lane == 0) weights[c][h] = s * scale;
+            }
+        } else if (lane < kBufHeads) weights[c][lane] = -FLT_MAX;
+        strata_hip_buffer_sched_barrier();
+        key = next_key;
+        row = next_row;
+        next_row = ahead_row;
+    }
+    qda_sync_lds();
+    // One wave runs exactly the original max/exp/denominator butterfly for each head.
+    if (wave == 0) {
+        const bool va = row_at(lane) >= 0, vb = row_at(lane + 32) >= 0;
+#pragma unroll
+        for (int h = 0; h < kBufHeads; ++h) {
+            const float a = weights[lane][h], b = weights[lane + 32][h];
+            const float m = warp_max(fmaxf(a, b));
+            const float ea = va ? __expf(a - m) : 0.0f, eb = vb ? __expf(b - m) : 0.0f;
+            weights[lane][h] = ea;
+            weights[lane + 32][h] = eb;
+            const float l = warp_sum(ea + eb);
+            if (lane == 0) { den[h] = l; part_m[slot + h] = m; }
+        }
+    }
+    qda_sync_lds();
+    QdaPageRsrc vr;
+    float acc[kBufHeads] = {};
+    for (int c = 0; c < count; ++c) {
+        const long long r = row_at(c);
+        if (r < 0) continue;
+        vr.set(p.v_q, p.v_scale, r, page_size);
+        const unsigned off = (unsigned) (r % page_size) * HD;
+        const uint32_t word = strata_hip_buf_ld_b32(vr.codes, t & ~3u, off);
+        const float sc = vr.scale(r, t, page_size);
+        const float v = (float) (int8_t) (word >> ((t & 3) * 8)) * sc;
+#pragma unroll
+        for (int h = 0; h < kBufHeads; ++h) acc[h] = fmaf(weights[c][h], v, acc[h]);
+    }
+    if (t < kBufHeads) part_l[slot + t] = den[t];
+#pragma unroll
+    for (int h = 0; h < kBufHeads; ++h) part_acc[(size_t) (slot + h) * HD + t] = acc[h];
+}
+#endif
 
 #if !defined(STRATA_HIP_GFX906)
 // Turing (INT8 pools): attn_chunk_kernel<1> bit for bit, rearranged for the SM's shared-memory pipe, which the
