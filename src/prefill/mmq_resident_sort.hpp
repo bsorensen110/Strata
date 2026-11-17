@@ -7,8 +7,28 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+#include "strata/prefill/moe_iu8_gfx.hpp"
+#endif
 
 namespace strata::prefill::detail {
+
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+// Port note: hipfire grouped qt44 slot tiles; use the existing sorted absolute bounds.
+// The prefix table is passed by value with kernargs: no asynchronous host-table lifetime.
+inline bool mmq_iu8_tile_ranges(const int32_t* bounds, int n, iu8::Product& p) {
+    if (!bounds || n <= 0 || n > 16 || bounds[0] < 0) return false;
+    int64_t tiles = 0;
+    for (int e = 0; e < n; ++e) {
+        if (bounds[e + 1] < bounds[e]) return false;
+        p.ranges[e] = {bounds[e], bounds[e + 1], (int32_t) tiles};
+        tiles += ((int64_t) bounds[e + 1] - bounds[e] + 127) / 128;
+    }
+    if (tiles <= 0 || tiles > INT32_MAX) return false;
+    p.n = n; p.tiles = (int) tiles;
+    return true;
+}
+#endif
 
 inline bool mmq_resident_sort_flag(const char* value) {
     return value != nullptr && std::strcmp(value, "1") == 0;

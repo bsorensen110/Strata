@@ -59,6 +59,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/moe_iu8_pack.hpp"
+#include "strata/prefill/moe_iu8_gfx.hpp"
 #endif
 #include "strata/prefill/routed_stream.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -369,6 +370,9 @@ int64_t g_ring_small_max = 0;
 // 8192 to 6144, but more experts stay resident).  A native pack likewise when the native kernels (moe_fused_iq.hpp)
 // take any of its layers: IQ2_XS, 4K / 32K, their first version at 384 slots -3% / -6% against MMQ, at 512 +8% / 0%.
 inline bool fused_ring() {
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    if (strata::prefill::iu8::usable()) return false;
+#endif
     if (strata::prefill::pf_fused_override().load(std::memory_order_relaxed) == 0) return false;   // the small-card prompt path decided on MMQ's layout
     if (core::peer_portable()) return false;   // multi-GPU: --peer-device keeps the MMQ path and its buffer sizes
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
@@ -1204,6 +1208,7 @@ struct Prefill::Impl {
     std::unique_ptr<mmq::Context> mmq_ctx;
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
     std::vector<iu8::Layer> iu8_layers;
+    iu8::Workspace iu8_scratch;
 #endif
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     // set_cpu_pool: a small chunk's CPU experts. The layer's MoE input (T x N, from `mixed`), the rows the pool writes
@@ -4896,7 +4901,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && !had_gu && !had_d &&
                                            fused::native_supported(mmq_gt, mmq_dt);
-                    const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                    const bool iu8_candidate = use_mmq && no_peer && !m.fused_bufs && m.group_cap == 0 &&
+                        lay.native && !lay.fmt[(size_t) l].tail_off && kFF % 128 == 0 &&
+                        (size_t) l < m.iu8_layers.size() &&
+                        m.iu8_layers[(size_t) l].experts.size() == (size_t) m.g->n_expert &&
+                        iu8::admitted((int) T, (int) N, m.cs);
+#endif
+                    const bool fused_l = ((use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat)
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                        && !iu8_candidate
+#endif
+                        ;
                     bool dm16_used = false;   // STRATA_PF_DM16: this layer's down rows are FP16 (fused::dm_f16_used() after the experts)
                     if (m.group_cap > 0 && (fused_l || !use_mmq)) {   // GU / H / Hq are one group's size
                         err = "prefill: STRATA_PF_GROUP_SCRATCH needs MMQ on every layer (a layer took the fused or FP16 path)";
@@ -5459,7 +5475,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // pf_wmma: this layer's groups on the FP16 tensor-core tiles (single GPU, native pack, Q2_0 / IQ4_NL down)
                         const bool wmma_l = use_mmq && pf_wmma() && !fused_l && on_peer.empty() && lay.native &&
                                             (mmq_dt == 42 || mmq_dt == 20) && !lay.fmt[(size_t) l].tail_off &&
-                                            strata::kernels::iq_row_bytes(mmq_gt, N) > 0;
+                                            strata::kernels::iq_row_bytes(mmq_gt, N) > 0
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                                            && !iu8_candidate
+#endif
+                                            ;
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                        const bool iu8_l = use_mmq && !wmma_l && !fused_l && !m.fused_bufs &&
+                            m.group_cap == 0 && rows_local == T * K && order_peer.empty() && ws::mode() == 0 &&
+                            lay.native && !lay.fmt[(size_t) l].tail_off &&
+                            (size_t) l < m.iu8_layers.size() &&
+                            m.iu8_layers[(size_t) l].experts.size() == (size_t) m.g->n_expert &&
+                            iu8::admitted((int) T, (int) N, m.cs) && kFF % 128 == 0;
+#endif
                         if (use_mmq && mmq_plan().wmma_only[(size_t) l] && !wmma_l) {
                             err = "prefill: an IQ1_M layer in the MMQ grouping needs the WMMA tiles, which this chunk cannot take";
                             return false;
@@ -5485,6 +5513,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
                                     xsrc = m.Xr;
                                 }
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                                if (iu8_l) {
+                                    m.iu8_scratch.reserve((int) N, kFF, (int) (T * K));
+                                    iu8::quantize_scatter(xsrc, m.slot_dev, m.iu8_scratch.gate, (int) N, (int) N,
+                                                         (int) T, (int) K, m.cs);
+                                } else
+#endif
                                 if (mmq::fp4_activations(mmq_gt))
                                     mmq::quantize(xsrc, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale);
                                 else
@@ -6195,6 +6230,46 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     if (!ok1 || !ok2) { err = "prefill: the WMMA expert tiles could not launch"; return false; }
                                     return true;
                                 }
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                                if (iu8_l) {
+                                    // Port note: hipfire grouped qt44 W4A8, CHANGELOG.md:856.
+                                    // GU shares one layer sidecar; down owns one group's sidecar after SwiGLU/rotation.
+                                    iu8::Product gu8, dn8;
+                                    gu8.tokens = dn8.tokens = (int) T;
+                                    if (!detail::mmq_iu8_tile_ranges(m.bounds_host.data() + j0, ngx, gu8) ||
+                                        !detail::mmq_iu8_tile_ranges(m.bounds_host.data() + n + 1 + g * (MMQ_GROUP + 1),
+                                                                     ngx, dn8)) {
+                                        err = "prefill: HIP IU8 sorted tile table is invalid"; return false;
+                                    }
+                                    for (int e = 0; e < ngx; ++e) {
+                                        const auto& expert = m.iu8_layers[(size_t) l].experts[(size_t) order[j0 + e]];
+                                        gu8.weights[e] = iu8::view(expert.gu);
+                                        dn8.weights[e] = iu8::view(expert.down);
+                                    }
+                                    gu8.total_rows = (int) (T * K); gu8.x = m.iu8_scratch.gate;
+                                    gu8.dst = m.GU; gu8.ld = kFF2;
+                                    mmq::Product gu;
+                                    gu.hip_iu8 = &gu8;
+                                    m.mmq_ctx->run(gu, m.cs);
+                                    if (had_d) {
+                                        mmq::swiglu(m.GU + r0 * kFF2, m.H + r0 * kFF, nr, kFF, false, m.cs);
+                                        strata::kernels::hadamard_rows(m.H + r0 * kFF, m.H + r0 * kFF,
+                                                                       nr, kFF, had_block, had_sh, m.cs);
+                                        iu8::quantize(m.H + r0 * kFF, nullptr, m.iu8_scratch.down,
+                                                      kFF, kFF, (int) nr, m.cs);
+                                    } else {
+                                        iu8::swiglu_quantize(m.GU + r0 * kFF2, m.H + r0 * kFF,
+                                                             m.iu8_scratch.down, kFF, (int) nr, m.cs);
+                                    }
+                                    pt.mark(kPfGemmD, cs);
+                                    dn8.total_rows = (int) nr; dn8.x = m.iu8_scratch.down;
+                                    dn8.dst = m.Dm + r0 * N; dn8.ld = N;
+                                    mmq::Product dn;
+                                    dn.hip_iu8 = &dn8;
+                                    m.mmq_ctx->run(dn, m.cs);
+                                    return true;
+                                }
+#endif
                                 if (direct) {
                                     // one launch: the direct experts' guards (their down over-read) and the zeroed tail
                                     // after the last gathered expert (see MMQ_TAIL)

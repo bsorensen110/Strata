@@ -26,6 +26,7 @@ float half_value(uint16_t h);
 
 #if defined(__HIPCC__) || defined(STRATA_USE_HIP)
 bool usable();
+struct WeightView;
 
 struct DeviceWeight {
     void* allocation = nullptr;
@@ -44,6 +45,7 @@ struct Expert { DeviceWeight gu, down; };
 struct Layer { std::vector<Expert> experts; };
 
 bool upload(const Pack& pack, DeviceWeight& out, std::string& why);
+WeightView view(const DeviceWeight& w);
 bool load_layer(int gu_type, int down_type, int embd, int ff, int experts, size_t blob_bytes,
                 size_t up_offset, size_t down_offset,
                 const std::function<const uint8_t*(int)>& blob, Layer& out, std::string& why);

@@ -9,6 +9,9 @@
 #include <cstdint>
 
 #include "strata/prefill/mmq_ids_margin.hpp"
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+namespace strata::prefill::iu8 { struct Product; }
+#endif
 
 namespace strata::prefill::mmq {
 
@@ -68,6 +71,9 @@ struct WeightTab {
 /// dst rows of the same indices (`ld_dst` floats apart, via `ids`: dst row = ids[row], an identity table works).
 /// `total_rows`: the rows of xq; `max_rows`: the most rows one expert has (the launch grid).
 struct Product {
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+    const iu8::Product* hip_iu8 = nullptr;
+#endif
     const void* w = nullptr;
     int type = -1;
     int64_t w_rows = 0, w_cols = 0;

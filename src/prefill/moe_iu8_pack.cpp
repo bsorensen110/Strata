@@ -117,6 +117,7 @@ bool pack_exact(int type, const void* source, size_t bytes, int rows, int cols, 
 
 #if defined(__HIPCC__)
 #include "strata/core/arch_defaults.hpp"
+#include "strata/prefill/moe_iu8_gfx.hpp"
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 
@@ -161,6 +162,10 @@ DeviceWeight& DeviceWeight::operator=(DeviceWeight&& other) noexcept {
     symmetric_verified = other.symmetric_verified;
     other.allocation = nullptr; other.codes = nullptr; other.scales = nullptr; other.symmetric_verified = false;
     return *this;
+}
+
+WeightView view(const DeviceWeight& w) {
+    return {w.codes, w.scales, w.rows, w.cols, w.bits, w.device, w.symmetric_verified};
 }
 
 bool upload(const Pack& p, DeviceWeight& out, std::string& why) {

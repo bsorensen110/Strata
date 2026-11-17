@@ -5,6 +5,7 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/spill_gate.hpp"
 #include "strata/hip_compat/buffer_load.hpp"
+#include "strata/prefill/moe_iu8_gfx.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,11 @@ static_assert(std::is_same_v<decltype(strata::hip_compat::strata_hip_make_rsrc(n
 static_assert(std::is_same_v<decltype(strata::hip_compat::strata_hip_buf_ld_b128({}, 0)), void>);
 static_assert(std::is_same_v<decltype(strata::hip_compat::strata_hip_buf_ld_b64({}, 0)), void>);
 static_assert(std::is_same_v<decltype(strata::hip_compat::strata_hip_buf_ld_b32({}, 0)), void>);
+#if !defined(STRATA_USE_HIP)
+static_assert(std::is_void_v<strata::prefill::iu8::Block>);
+static_assert(std::is_void_v<strata::prefill::iu8::Product>);
+static_assert(std::is_void_v<decltype(strata::prefill::iu8::run(nullptr))>);
+#endif
 #endif
 
 static int fails = 0;
@@ -43,10 +49,16 @@ int main() {
                           "gfx1200", "gfx1201", "gfx1201:sramecc-:xnack-"}) {
         CHECK(hip_bufload_capable(a));
         const auto opt_in = arch_opt_in_env(a);
-        CHECK(opt_in.size() == 1 && opt_in[0].first == kHipBufloadEnv && opt_in[0].second == "0");
+        CHECK(opt_in.size() == (hip_moe_iu8_capable(a) ? 2 : 1));
+        CHECK(opt_in[0].first == kHipBufloadEnv && opt_in[0].second == "0");
+        if (hip_moe_iu8_capable(a))
+            CHECK(opt_in[1].first == kHipMoeIu8Env && opt_in[1].second == "0");
         for (bool legacy : {false, true})
         for (bool windows : {false, true})
-            for (const auto& kv : arch_default_env(a, legacy, windows)) CHECK(kv.first != kHipBufloadEnv);
+            for (const auto& kv : arch_default_env(a, legacy, windows)) {
+                CHECK(kv.first != kHipBufloadEnv);
+                CHECK(kv.first != kHipMoeIu8Env);
+            }
     }
     for (const char* a : {static_cast<const char*>(nullptr), "", "gfx1030", "gfx906", "gfx942",
                           "gfx1152", "gfx1202", "gfx12010", "sm_120"}) {
