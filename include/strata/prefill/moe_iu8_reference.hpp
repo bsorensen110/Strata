@@ -52,9 +52,11 @@ inline float fold(const Pack& w, const Block* x, int n, int token, int row) {
         const float sd = mul(half_value(w.scales[(size_t) row * (w.cols / 128) + kb]), b.d);
         acc = std::fma(sd, (float) c, acc);
     }
+    return acc;
+}
 
-    // Emulate the tile's lane halves and K16 instructions independently of fold().
-    inline void narrow(const Pack& w, const Block* x, int n, int entry, bool gfx12, float* y, int ld) {
+// Emulate the tile's lane halves and K16 instructions independently of fold().
+inline void narrow(const Pack& w, const Block* x, int n, int entry, bool gfx12, float* y, int ld) {
         const auto tile = kNarrowTiles.at((size_t) entry);
         require(n <= tile.tokens || tile.split, "oracle tile capacity");
         for (int row0 = 0; row0 < w.rows; row0 += tile.rows)
@@ -80,8 +82,6 @@ inline float fold(const Pack& w, const Block* x, int n, int token, int row) {
             }
             y[(size_t) token * ld + row] = acc;
         }
-    }
-    return acc;
 }
 
 inline std::vector<float> activations(int k, int n, uint32_t seed = 41) {

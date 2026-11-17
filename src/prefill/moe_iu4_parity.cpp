@@ -30,7 +30,11 @@ void products() {
                 r4::emulate(w,x.data(),n,gfx12,symmetric,got.data(),ld,zp);
                 r8::require(std::memcmp(want.data(),got.data(),want.size()*4)==0, "IU4 K32/K16 emulation bits/tails differ");
             }
-            void configs() {
+        }
+    }
+}
+
+void configs() {
                 namespace mmq = strata::prefill::mmq;
                 for (const char* arch : {"gfx1201","gfx1201:sramecc-:xnack-","gfx1100","gfx1151","gfx1200","gfx906","gfx12010","sm_120"}) {
                     const auto q4=mmq::hip_config(GGML_PREC_Q4,arch,129,256,17,4,true);
@@ -56,10 +60,8 @@ void products() {
                             mmq::hip_config(GGML_PREC_DEFAULT,"gfx1201",65,256,17,4,true).entry==mmq::HipEntry::None &&
                             mmq::hip_config(GGML_PREC_Q4,"gfx1201",65,1088,17,4,true).entry==mmq::HipEntry::None,
                             "precision/K128/window refusal drift");
-            }
-        }
-    }
 }
+
 int main() {
     try {
         r8::require(std::fesetround(FE_TONEAREST) == 0, "cannot set RNE");
