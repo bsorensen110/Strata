@@ -21,10 +21,10 @@
 
 static int g_fails = 0;
 
-#define CHECK(c)                                                           \
+#define CHECK(...)                                                         \
     do {                                                                   \
-        if (!(c)) {                                                        \
-            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #c);       \
+        if (!(__VA_ARGS__)) {                                              \
+            std::printf("FAIL %s:%d: %s\n", __FILE__, __LINE__, #__VA_ARGS__); \
             ++g_fails;                                                     \
         }                                                                  \
     } while (0)
