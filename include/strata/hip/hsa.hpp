@@ -474,6 +474,14 @@ public:
 private:
     HsaRuntime();
 
+    // Resource classes manipulate the dlopen'd runtime and its pools directly
+    // (their destructors free into the owning pools; resolve_kernel() needs the
+    // symbol query). Friendship is intentionally narrow: these four only.
+    friend class HsaBuffer;
+    friend class HsaCompletionSignal;
+    friend class HsaAqlQueue;
+    friend class HsaStandaloneExecutable;
+
     bool query_symbol_and_pm4_metadata(
         HsaExecutable exec,
         const std::string& base_name,

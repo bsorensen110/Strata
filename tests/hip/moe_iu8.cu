@@ -120,6 +120,35 @@ void grouped(int type, int m, int k, hipStream_t stream, strata::prefill::mmq::C
         ref::require(uploaded, why.c_str());
         p.weights[e] = iu8::view(weights[e]);
     }
+    std::vector<int32_t> ids(n);
+    for (int i = 0; i < n; ++i) ids[i] = n - 1 - i;
+    Buffer dx(x.size() * sizeof(float)), dq((blocks.size() + 1) * sizeof(iu8::Block));
+    Buffer dy(((size_t) n * ld + 32) * sizeof(float)), did(ids.size() * sizeof(int32_t));
+    upload(dx, x); upload(did, ids);
+    iu8::quantize((const float*) dx.p, nullptr, (iu8::Block*) dq.p, k, k, n, stream);
+    p.total_rows = n; p.tokens = 65; p.x = (const iu8::Block*) dq.p;
+    p.dst = (float*) dy.p; p.ld = ld; p.ids = (const int32_t*) did.p;
+    std::vector<float> expected((size_t) n * ld + 32), first(expected.size()), second(expected.size());
+    std::memset(expected.data(), 0xa5, expected.size() * sizeof(float));
+    for (int e = 0; e < ne; ++e)
+    for (int token = bounds[e]; token < bounds[e + 1]; ++token)
+    for (int r = 0; r < m; ++r)
+        expected[(size_t) ids[token] * ld + r] = ref::fold(packs[e], blocks.data(), n, token, r);
+    for (auto* result : {&first, &second}) {
+        check(hipMemsetAsync(dy.p, 0xa5, expected.size() * sizeof(float), stream), "group poison");
+        strata::prefill::mmq::Product route;
+        route.hip_iu8 = &p;
+        context.run(route, stream);
+        check(hipStreamSynchronize(stream), "group completion");
+        download(dy, *result);
+        ref::require(std::memcmp(result->data(), expected.data(), expected.size() * sizeof(float)) == 0,
+                     "GPU grouped fold/scatter/canaries differ from CPU bits");
+    }
+    ref::require(std::memcmp(first.data(), second.data(), first.size() * sizeof(float)) == 0,
+                 "GPU grouped run is nondeterministic");
+    std::printf("PASS grouped W%d M=%d K=%d: empty/1/127/128/129 slots, offset, ids, tails, repeat\n",
+                packs[0].bits, m, k);
+}
     void narrow_tiles(hipStream_t stream) {
         for (const auto& spec : {std::pair{GGML_TYPE_Q4_0,128}, std::pair{GGML_TYPE_Q4_0,384},
                                  std::pair{GGML_TYPE_Q6_K,512}}) {
@@ -151,6 +180,42 @@ void grouped(int type, int m, int k, hipStream_t stream, strata::prefill::mmq::C
                     const float f = ref::fold(w, x.data(), n, t, r);
                     ref::require(std::memcmp(&f, &expected[(size_t) t * ld + r], 4) == 0, "prefill cross-arm CPU mismatch");
                 }
+                for (int entry = 0; entry < 24; ++entry) {
+                    const auto tile = iu8::kNarrowTiles[entry];
+                    if (!tile.split && n > tile.tokens) continue;
+                    iu8::Window p;
+                    p.weight = iu8::view(dw); p.x = pre.x; p.y = dy.p;
+                    p.rows = m; p.cols = k; p.tokens = p.x_rows = n; p.ld = ld;
+                    check(hipMemsetAsync(dy.p, 0xa5, words * sizeof(float), stream), "narrow poison");
+                    hipGraph_t graph = nullptr;
+                    check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "narrow capture");
+                    iu8::run_narrow(p, entry, stream);
+                    check(hipStreamEndCapture(stream, &graph), "end narrow capture");
+                    hipGraphExec_t exec = nullptr;
+                    check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate narrow");
+                    check(hipGraphLaunch(exec, stream), "replay narrow");
+                    check(hipStreamSynchronize(stream), "narrow completion");
+                    if (!tile.bf16) {
+                        download(dy, got);
+                        ref::require(std::memcmp(got.data(), expected.data(), words * sizeof(float)) == 0,
+                                     "narrow/pre-fill GPU bits or tail canaries differ");
+                    } else {
+                        std::vector<uint16_t> bits(words * 2, 0xa5a5), want(bits);
+                        for (int t = 0; t < n; ++t)
+                        for (int r = 0; r < m; ++r) {
+                            const float f = 0.0f + expected[(size_t) t * ld + r];
+                            uint32_t u; std::memcpy(&u, &f, 4);
+                            want[(size_t) t * ld + r] = (uint16_t) ((u + 0x7fff + ((u >> 16) & 1)) >> 16);
+                        }
+                        download(dy, bits);
+                        ref::require(bits == want, "narrow bf16 bits/canaries differ");
+                    }
+                    check(hipGraphExecDestroy(exec), "free narrow exec");
+                    check(hipGraphDestroy(graph), "free narrow graph");
+                }
+            }
+        }
+    }
                 void window_groups(hipStream_t stream, strata::prefill::mmq::Context& context) {
                     constexpr int n=24,k=256,m=65,ld=68,cap=48,prefix=2,ne=3;
                     const int counts[ne]={1,5,24};
@@ -208,71 +273,6 @@ void grouped(int type, int m, int k, hipStream_t stream, strata::prefill::mmq::C
                         check(hipGraphExecDestroy(exec),"window-group free exec"); check(hipGraphDestroy(graph),"window-group free graph");
                     }
                 }
-                for (int entry = 0; entry < 24; ++entry) {
-                    const auto tile = iu8::kNarrowTiles[entry];
-                    if (!tile.split && n > tile.tokens) continue;
-                    iu8::Window p;
-                    p.weight = iu8::view(dw); p.x = pre.x; p.y = dy.p;
-                    p.rows = m; p.cols = k; p.tokens = p.x_rows = n; p.ld = ld;
-                    check(hipMemsetAsync(dy.p, 0xa5, words * sizeof(float), stream), "narrow poison");
-                    hipGraph_t graph = nullptr;
-                    check(hipStreamBeginCapture(stream, hipStreamCaptureModeThreadLocal), "narrow capture");
-                    iu8::run_narrow(p, entry, stream);
-                    check(hipStreamEndCapture(stream, &graph), "end narrow capture");
-                    hipGraphExec_t exec = nullptr;
-                    check(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0), "instantiate narrow");
-                    check(hipGraphLaunch(exec, stream), "replay narrow");
-                    check(hipStreamSynchronize(stream), "narrow completion");
-                    if (!tile.bf16) {
-                        download(dy, got);
-                        ref::require(std::memcmp(got.data(), expected.data(), words * sizeof(float)) == 0,
-                                     "narrow/pre-fill GPU bits or tail canaries differ");
-                    } else {
-                        std::vector<uint16_t> bits(words * 2, 0xa5a5), want(bits);
-                        for (int t = 0; t < n; ++t)
-                        for (int r = 0; r < m; ++r) {
-                            const float f = 0.0f + expected[(size_t) t * ld + r];
-                            uint32_t u; std::memcpy(&u, &f, 4);
-                            want[(size_t) t * ld + r] = (uint16_t) ((u + 0x7fff + ((u >> 16) & 1)) >> 16);
-                        }
-                        download(dy, bits);
-                        ref::require(bits == want, "narrow bf16 bits/canaries differ");
-                    }
-                    check(hipGraphExecDestroy(exec), "free narrow exec");
-                    check(hipGraphDestroy(graph), "free narrow graph");
-                }
-            }
-        }
-    }
-    std::vector<int32_t> ids(n);
-    for (int i = 0; i < n; ++i) ids[i] = n - 1 - i;
-    Buffer dx(x.size() * sizeof(float)), dq((blocks.size() + 1) * sizeof(iu8::Block));
-    Buffer dy(((size_t) n * ld + 32) * sizeof(float)), did(ids.size() * sizeof(int32_t));
-    upload(dx, x); upload(did, ids);
-    iu8::quantize((const float*) dx.p, nullptr, (iu8::Block*) dq.p, k, k, n, stream);
-    p.total_rows = n; p.tokens = 65; p.x = (const iu8::Block*) dq.p;
-    p.dst = (float*) dy.p; p.ld = ld; p.ids = (const int32_t*) did.p;
-    std::vector<float> expected((size_t) n * ld + 32), first(expected.size()), second(expected.size());
-    std::memset(expected.data(), 0xa5, expected.size() * sizeof(float));
-    for (int e = 0; e < ne; ++e)
-    for (int token = bounds[e]; token < bounds[e + 1]; ++token)
-    for (int r = 0; r < m; ++r)
-        expected[(size_t) ids[token] * ld + r] = ref::fold(packs[e], blocks.data(), n, token, r);
-    for (auto* result : {&first, &second}) {
-        check(hipMemsetAsync(dy.p, 0xa5, expected.size() * sizeof(float), stream), "group poison");
-        strata::prefill::mmq::Product route;
-        route.hip_iu8 = &p;
-        context.run(route, stream);
-        check(hipStreamSynchronize(stream), "group completion");
-        download(dy, *result);
-        ref::require(std::memcmp(result->data(), expected.data(), expected.size() * sizeof(float)) == 0,
-                     "GPU grouped fold/scatter/canaries differ from CPU bits");
-    }
-    ref::require(std::memcmp(first.data(), second.data(), first.size() * sizeof(float)) == 0,
-                 "GPU grouped run is nondeterministic");
-    std::printf("PASS grouped W%d M=%d K=%d: empty/1/127/128/129 slots, offset, ids, tails, repeat\n",
-                packs[0].bits, m, k);
-}
 }  // namespace
 
 int main() {

@@ -39,6 +39,41 @@ void producers(hipStream_t stream) {
         x[2*k+j] = std::ldexp((float) (j - 64), -125);
         x[3*k+j] = (j & 1 ? -1.0f : 1.0f) * 0x1p100f;
     }
+    const auto want = r4::quantize(x.data(), k, n);
+    Buffer dx(x.size()*4), dq((want.size()+1)*sizeof(i4::Block));
+    upload(dx, x);
+    check(hipMemset(dq.p, 0xa5, (want.size()+1)*sizeof(i4::Block)), "poison A4");
+    i4::quantize((const float*) dx.p, (i4::Block*) dq.p, k, n, stream);
+    check(hipStreamSynchronize(stream), "quantize");
+    std::vector<i4::Block> got(want.size()+1);
+    download(dq, got);
+    r8::require(std::memcmp(want.data(), got.data(), want.size()*sizeof(i4::Block)) == 0,
+                "A4 producer differs from full eight-candidate CPU reference");
+    for (auto v : got.back().qs) r8::require(v == 0xa5, "A4 producer tail overwrite");
+    const auto* tail = (const uint8_t*) &got.back();
+    for (size_t j = 0; j < sizeof(i4::Block); ++j) r8::require(tail[j] == 0xa5, "A4 header tail overwrite");
+
+    auto gu = r8::activations(2*k, n, 67);
+    Buffer dg(gu.size()*4), dh((size_t) n*k*4), bounds(2*sizeof(int32_t)), count(sizeof(int32_t));
+    upload(dg, gu); upload(bounds, std::vector<int32_t>{3,n-2}); upload(count, std::vector<int32_t>{1});
+    check(hipMemset(dq.p, 0xa5, (want.size()+1)*sizeof(i4::Block)), "poison fused A4");
+    i4::swiglu_window((const float*) dg.p, (float*) dh.p, (i4::Block*) dq.p, k, n,
+                      (const int32_t*) bounds.p, (const int32_t*) count.p, stream);
+    check(hipStreamSynchronize(stream), "fused A4");
+    std::vector<float> h((size_t) n*k);
+    download(dh, h); download(dq, got);
+    for (int kb = 0; kb < k/128; ++kb)
+    for (int t = 0; t < n; ++t) {
+        const auto& b = got[kb*n+t];
+        if (t >= 3 && t < n-2) {
+            const auto ref = r4::quantize_block(h.data()+(size_t)t*k+kb*128);
+            r8::require(std::memcmp(&b, &ref, sizeof(b)) == 0, "fused A4 producer changed candidate/sum/packing");
+        } else {
+            const auto* bytes = (const uint8_t*) &b;
+            for (size_t j = 0; j < sizeof(b); ++j) r8::require(bytes[j] == 0xa5, "masked A4 producer wrote inactive row");
+        }
+    }
+}
     void products(hipStream_t stream) {
         namespace i8 = strata::prefill::iu8;
         for (const auto& shape : {std::array{17,128,5}, std::array{129,384,129}, std::array{1153,128,129}}) {
@@ -84,6 +119,12 @@ void producers(hipStream_t stream) {
                         r8::require(std::memcmp(want.data(),got.data(),words*4)==0,
                                     "IU4 device differs from own exact-fold CPU/canaries");
                     }
+                    check(hipGraphExecDestroy(exec),"IU4 exec free");
+                    check(hipGraphDestroy(graph),"IU4 graph free");
+                }
+            }
+        }
+    }
                     void window_groups(hipStream_t stream) {
                         namespace i8=strata::prefill::iu8;
                         constexpr int n=24,k=256,m=65,ld=68,cap=48,prefix=2,ne=3;
@@ -143,47 +184,6 @@ void producers(hipStream_t stream) {
                             check(hipGraphExecDestroy(exec),"IU4 group free exec"); check(hipGraphDestroy(graph),"IU4 group free graph");
                         }
                     }
-                    check(hipGraphExecDestroy(exec),"IU4 exec free");
-                    check(hipGraphDestroy(graph),"IU4 graph free");
-                }
-            }
-        }
-    }
-    const auto want = r4::quantize(x.data(), k, n);
-    Buffer dx(x.size()*4), dq((want.size()+1)*sizeof(i4::Block));
-    upload(dx, x);
-    check(hipMemset(dq.p, 0xa5, (want.size()+1)*sizeof(i4::Block)), "poison A4");
-    i4::quantize((const float*) dx.p, (i4::Block*) dq.p, k, n, stream);
-    check(hipStreamSynchronize(stream), "quantize");
-    std::vector<i4::Block> got(want.size()+1);
-    download(dq, got);
-    r8::require(std::memcmp(want.data(), got.data(), want.size()*sizeof(i4::Block)) == 0,
-                "A4 producer differs from full eight-candidate CPU reference");
-    for (auto v : got.back().qs) r8::require(v == 0xa5, "A4 producer tail overwrite");
-    const auto* tail = (const uint8_t*) &got.back();
-    for (size_t j = 0; j < sizeof(i4::Block); ++j) r8::require(tail[j] == 0xa5, "A4 header tail overwrite");
-
-    auto gu = r8::activations(2*k, n, 67);
-    Buffer dg(gu.size()*4), dh((size_t) n*k*4), bounds(2*sizeof(int32_t)), count(sizeof(int32_t));
-    upload(dg, gu); upload(bounds, std::vector<int32_t>{3,n-2}); upload(count, std::vector<int32_t>{1});
-    check(hipMemset(dq.p, 0xa5, (want.size()+1)*sizeof(i4::Block)), "poison fused A4");
-    i4::swiglu_window((const float*) dg.p, (float*) dh.p, (i4::Block*) dq.p, k, n,
-                      (const int32_t*) bounds.p, (const int32_t*) count.p, stream);
-    check(hipStreamSynchronize(stream), "fused A4");
-    std::vector<float> h((size_t) n*k);
-    download(dh, h); download(dq, got);
-    for (int kb = 0; kb < k/128; ++kb)
-    for (int t = 0; t < n; ++t) {
-        const auto& b = got[kb*n+t];
-        if (t >= 3 && t < n-2) {
-            const auto ref = r4::quantize_block(h.data()+(size_t)t*k+kb*128);
-            r8::require(std::memcmp(&b, &ref, sizeof(b)) == 0, "fused A4 producer changed candidate/sum/packing");
-        } else {
-            const auto* bytes = (const uint8_t*) &b;
-            for (size_t j = 0; j < sizeof(b); ++j) r8::require(bytes[j] == 0xa5, "masked A4 producer wrote inactive row");
-        }
-    }
-}
 }  // namespace
 int main() {
     try {
