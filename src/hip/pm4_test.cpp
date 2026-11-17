@@ -10,6 +10,7 @@
 
 #include "strata/hip/pm4.hpp"
 #include "strata/hip/pm4_tape.hpp"
+#include "strata/hip/pm4_plan.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -631,6 +632,240 @@ void test_pm4_tape_and_contracts() {
     }
 }
 
+struct MockSubmitContext {
+    std::vector<uint32_t> last_dwords;
+    uint64_t last_va = 0;
+    ReplayQuiescence next_quiescence = ReplayQuiescence::Proven;
+    bool next_return = true;
+    uint32_t calls = 0;
+};
+
+bool mock_submit_ib(
+    const uint32_t* ib_dwords,
+    uint32_t ib_len_dwords,
+    uint64_t ib_device_va,
+    ReplayQuiescence& out_quiescence,
+    void* user_ctx) {
+    auto* ctx = static_cast<MockSubmitContext*>(user_ctx);
+    ++ctx->calls;
+    ctx->last_dwords.assign(ib_dwords, ib_dwords + ib_len_dwords);
+    ctx->last_va = ib_device_va;
+    out_quiescence = ctx->next_quiescence;
+    return ctx->next_return;
+}
+
+void test_pm4_boundary_planner_and_replay() {
+    // 1. Arch parsing & pacing resolution (ported from replay.rs:4834-4850)
+    Gfx12Arch arch = Gfx12Arch::Gfx1200;
+    CHECK(parse_gfx12_arch("gfx1201", arch) && arch == Gfx12Arch::Gfx1201);
+    CHECK(parse_gfx12_arch("gfx1201:sramecc-:xnack-", arch) && arch == Gfx12Arch::Gfx1201);
+    CHECK(parse_gfx12_arch("gfx1200", arch) && arch == Gfx12Arch::Gfx1200);
+    CHECK(!parse_gfx12_arch("gfx1100", arch));
+    CHECK(!parse_gfx12_arch("gfx1151", arch));
+    CHECK(!parse_gfx12_arch("", arch));
+    CHECK(!parse_gfx12_arch(nullptr, arch));
+
+    uint32_t nop_dwords = 0;
+    CHECK(resolve_gfx12_post_dispatch_nop(Gfx12Arch::Gfx1201, nullptr, nop_dwords) &&
+          nop_dwords == kGfx1201PostDispatchNopDwords);
+    CHECK(resolve_gfx12_post_dispatch_nop(Gfx12Arch::Gfx1201, "auto", nop_dwords) &&
+          nop_dwords == kGfx1201PostDispatchNopDwords);
+    CHECK(resolve_gfx12_post_dispatch_nop(Gfx12Arch::Gfx1200, "auto", nop_dwords) &&
+          nop_dwords == 0u);
+    CHECK(resolve_gfx12_post_dispatch_nop(Gfx12Arch::Gfx1201, "off", nop_dwords) &&
+          nop_dwords == 0u);
+    CHECK(resolve_gfx12_post_dispatch_nop(Gfx12Arch::Gfx1201, "nop:128", nop_dwords) &&
+          nop_dwords == 128u);
+    CHECK(!resolve_gfx12_post_dispatch_nop(Gfx12Arch::Gfx1201, "nop:0", nop_dwords) &&
+          nop_dwords == kGfx1201PostDispatchNopDwords);
+
+    // Custom minimal contracts for testing exact railgun/src/plan.rs hazard cases:
+    // - "test_vstore1": 16B kernarg, VmemStore at 0
+    // - "test_vload1":  16B kernarg, VmemLoad at 0
+    const KernelPointerEffect eff_store0[] = {{0u, MemAccessKind::VmemStore}};
+    const KernelPointerEffect eff_load0[] = {{0u, MemAccessKind::VmemLoad}};
+    const KernelContract test_contracts[] = {
+        {"test_vstore1", 16u, eff_store0, 1u, false},
+        {"test_vload1", 16u, eff_load0, 1u, false},
+    };
+
+    AllocationTable allocs;
+    CHECK(allocs.insert(0x100000ULL, 0x1000ULL));  // R(0)
+    CHECK(allocs.insert(0x200000ULL, 0x1000ULL));  // R(1)
+    CHECK(allocs.insert(0x300000ULL, 0x1000ULL));  // R(2)
+
+    auto make_arg16 = [](uint64_t ptr, uint32_t scalar = 0u) {
+        std::array<uint8_t, 16> b{};
+        write_u64_le(b.data(), ptr);
+        b[8] = static_cast<uint8_t>(scalar & 0xffu);
+        b[9] = static_cast<uint8_t>((scalar >> 8) & 0xffu);
+        b[10] = static_cast<uint8_t>((scalar >> 16) & 0xffu);
+        b[11] = static_cast<uint8_t>((scalar >> 24) & 0xffu);
+        return b;
+    };
+
+    // 2. Ported from railgun/src/plan.rs:733-765
+    //    `raw_takes_the_dependent_row_and_independent_nodes_elide`
+    //    Node 0: VmemStore(R0), Node 1: VmemStore(R1) [independent], Node 2: VmemLoad(R0) [RAW on Node 0]
+    {
+        Pm4Tape tape(4096u);
+        tape.set_resolver(&AllocationTable::resolver_thunk, &allocs);
+        tape.set_custom_contracts(test_contracts, 2u);
+        CHECK(tape.begin_recording(ReplayQuiescence::Proven));
+        const auto a0 = make_arg16(0x100000ULL, 10u);
+        const auto a1 = make_arg16(0x200000ULL, 20u);
+        const auto a2 = make_arg16(0x100000ULL, 30u);
+        CHECK(tape.record_launch("test_vstore1", nullptr, {4u, 1u, 1u}, {64u, 1u, 1u}, 0u, a0.data(), a0.size()));
+        CHECK(tape.record_launch("test_vstore1", nullptr, {8u, 1u, 1u}, {64u, 1u, 1u}, 0u, a1.data(), a1.size()));
+        CHECK(tape.record_launch("test_vload1", nullptr, {16u, 1u, 1u}, {64u, 1u, 1u}, 0u, a2.data(), a2.size()));
+        CHECK(tape.finalize_recording(3u) == TapeStatus::Ok);
+
+        Pm4BoundaryPlan plan{};
+        CHECK(plan_pm4_boundaries(tape, Gfx12Arch::Gfx1201, plan));
+        CHECK(plan.post_dispatch_nop_dwords == kGfx1201PostDispatchNopDwords);
+        CHECK(plan.boundaries.size() == 3u);
+        // Node 1 is independent of Node 0 -> no wait, no acquire
+        CHECK(!plan.boundaries[1].wait_idle);
+        CHECK(plan.boundaries[1].acquire == AcquireRung::None);
+        // Node 2 has a RAW hazard against Node 0 (still in the open epoch!) -> WaitIdle + InterNode
+        CHECK(plan.boundaries[2].wait_idle);
+        CHECK(plan.boundaries[2].acquire == AcquireRung::InterNode);
+        CHECK(!plan.boundaries[2].pre_writer);
+    }
+
+    // 3. Ported from railgun/src/plan.rs:768-785
+    //    `writer_after_an_earlier_vmem_load_gets_the_system_pre_writer_rung`
+    //    Node 0: VmemLoad(R0), Node 1: VmemStore(R1), Node 2: VmemStore(R0) -> WarPreWriter -> System (0xc3b1)
+    {
+        Pm4Tape tape(4096u);
+        tape.set_resolver(&AllocationTable::resolver_thunk, &allocs);
+        tape.set_custom_contracts(test_contracts, 2u);
+        CHECK(tape.begin_recording(ReplayQuiescence::Proven));
+        const auto a0 = make_arg16(0x100000ULL);
+        const auto a1 = make_arg16(0x200000ULL);
+        const auto a2 = make_arg16(0x100000ULL);
+        CHECK(tape.record_launch("test_vload1", nullptr, {4u, 1u, 1u}, {64u, 1u, 1u}, 0u, a0.data(), a0.size()));
+        CHECK(tape.record_launch("test_vstore1", nullptr, {4u, 1u, 1u}, {64u, 1u, 1u}, 0u, a1.data(), a1.size()));
+        CHECK(tape.record_launch("test_vstore1", nullptr, {4u, 1u, 1u}, {64u, 1u, 1u}, 0u, a2.data(), a2.size()));
+        CHECK(tape.finalize_recording(3u) == TapeStatus::Ok);
+
+        Pm4BoundaryPlan plan{};
+        CHECK(plan_pm4_boundaries(tape, Gfx12Arch::Gfx1201, plan));
+        CHECK(!plan.boundaries[1].wait_idle);
+        CHECK(plan.boundaries[1].acquire == AcquireRung::None);
+        CHECK(plan.boundaries[2].wait_idle);
+        CHECK(plan.boundaries[2].acquire == AcquireRung::System);
+        CHECK(plan.boundaries[2].pre_writer);
+    }
+
+    // 4. Ported from railgun/src/plan.rs:788-800
+    //    `a_system_boundary_covers_earlier_readers_for_later_writers`
+    //    Node 0: VmemLoad(R0), Node 1: VmemLoad(R1), Node 2: VmemStore(R0) [emits System -> last_system=2],
+    //    Node 3: VmemStore(R1) [reader at 1 < last_system=2, and open was cleared at 2 -> elided!]
+    {
+        Pm4Tape tape(4096u);
+        tape.set_resolver(&AllocationTable::resolver_thunk, &allocs);
+        tape.set_custom_contracts(test_contracts, 2u);
+        CHECK(tape.begin_recording(ReplayQuiescence::Proven));
+        const auto a0 = make_arg16(0x100000ULL);
+        const auto a1 = make_arg16(0x200000ULL);
+        const auto a2 = make_arg16(0x100000ULL);
+        const auto a3 = make_arg16(0x200000ULL);
+        CHECK(tape.record_launch("test_vload1", nullptr, {4u, 1u, 1u}, {64u, 1u, 1u}, 0u, a0.data(), a0.size()));
+        CHECK(tape.record_launch("test_vload1", nullptr, {4u, 1u, 1u}, {64u, 1u, 1u}, 0u, a1.data(), a1.size()));
+        CHECK(tape.record_launch("test_vstore1", nullptr, {4u, 1u, 1u}, {64u, 1u, 1u}, 0u, a2.data(), a2.size()));
+        CHECK(tape.record_launch("test_vstore1", nullptr, {4u, 1u, 1u}, {64u, 1u, 1u}, 0u, a3.data(), a3.size()));
+        CHECK(tape.finalize_recording(4u) == TapeStatus::Ok);
+
+        Pm4BoundaryPlan plan{};
+        CHECK(plan_pm4_boundaries(tape, Gfx12Arch::Gfx1200, plan));
+        CHECK(plan.post_dispatch_nop_dwords == 0u);
+        CHECK(plan.boundaries[2].wait_idle);
+        CHECK(plan.boundaries[2].acquire == AcquireRung::System);
+        // Node 3 is covered by Node 2's System boundary!
+        CHECK(!plan.boundaries[3].wait_idle);
+        CHECK(plan.boundaries[3].acquire == AcquireRung::None);
+    }
+
+    // 5. End-to-end PreparedPm4Window lowering, in-place patching, grid.y/z<=65536 guard, and replay executor
+    {
+        Pm4Tape tape(4096u);
+        tape.set_resolver(&AllocationTable::resolver_thunk, &allocs);
+        tape.set_custom_contracts(test_contracts, 2u);
+        CHECK(tape.begin_recording(ReplayQuiescence::Proven));
+        const auto a0 = make_arg16(0x100000ULL, 111u);
+        const auto a1 = make_arg16(0x100000ULL, 222u);
+        CHECK(tape.record_launch("test_vstore1", nullptr, {10u, 1u, 1u}, {64u, 1u, 1u}, 0u, a0.data(), a0.size()));
+        CHECK(tape.record_launch("test_vload1", nullptr, {20u, 2u, 1u}, {64u, 1u, 1u}, 0u, a1.data(), a1.size()));
+        CHECK(tape.finalize_recording(2u) == TapeStatus::Ok);
+
+        PreparedPm4Window win;
+        std::string err;
+        CHECK(win.prepare(tape, Gfx12Arch::Gfx1201, nullptr, &err));
+        CHECK(win.ready());
+        CHECK(win.patch_points().size() == 2u);
+        // 2 dispatches * (64 + 1) NOP dwords = 130 pacing dwords on gfx1201
+        CHECK(win.command_buffer().pacing_dwords() == 2u * (kGfx1201PostDispatchNopDwords + 1u));
+
+        std::vector<DecodedPm4Packet> decoded;
+        CHECK(parse_pm4_gfx12(
+                  win.command_buffer().dwords().data(),
+                  win.command_buffer().dwords().size(),
+                  decoded,
+                  /*allow_nop=*/true)
+                  .ok);
+
+        // Patch kernarg scalar in-place (offset 8 is the 32-bit scalar after the 8B pointer)
+        CHECK(win.patch_kernarg_u32(0u, 8u, 0xdeadbeefu));
+        const uint8_t* slot0 = tape.arena().slot_ptr(win.patch_points()[0].kernarg_arena_offset);
+        const uint32_t patched_u32 =
+            static_cast<uint32_t>(slot0[8]) |
+            (static_cast<uint32_t>(slot0[9]) << 8) |
+            (static_cast<uint32_t>(slot0[10]) << 16) |
+            (static_cast<uint32_t>(slot0[11]) << 24);
+        CHECK(patched_u32 == 0xdeadbeefu);
+        // Unaligned or out-of-bounds kernarg patches fail closed
+        CHECK(!win.patch_kernarg_u32(0u, 2u, 1u));
+        CHECK(!win.patch_kernarg_u32(0u, 16u, 1u));
+        CHECK(!win.patch_kernarg_u64(0u, 4u, 1ULL));
+        CHECK(!win.patch_kernarg_u64(0u, 16u, 1ULL));
+
+        // Patch dispatch dimensions in-place: {32, 4, 1} workgroups * {64, 1, 1} workgroup_size = {2048, 4, 1} workitems
+        CHECK(win.patch_dispatch_dimensions(1u, {32u, 4u, 1u}));
+        const uint32_t dim_at = win.patch_points()[1].dim_x_dword;
+        CHECK(win.command_buffer().dwords()[dim_at + 0u] == 2048u);
+        CHECK(win.command_buffer().dwords()[dim_at + 1u] == 4u);
+        CHECK(win.command_buffer().dwords()[dim_at + 2u] == 1u);
+
+        // grid.y/z > 65536 wrap guard from src/hip/pm4_packet.cpp rejects invalid grid patches
+        CHECK(!win.patch_dispatch_dimensions(1u, {1u, 65537u, 1u}));
+        CHECK(!win.patch_dispatch_dimensions(1u, {1u, 1u, 65537u}));
+        // Dimensions remain untouched after rejected patch
+        CHECK(win.command_buffer().dwords()[dim_at + 0u] == 2048u);
+        CHECK(win.command_buffer().dwords()[dim_at + 1u] == 4u);
+
+        // Replay execution with Proven quiescence
+        MockSubmitContext mctx;
+        mctx.next_quiescence = ReplayQuiescence::Proven;
+        mctx.next_return = true;
+        CHECK(win.replay(&mock_submit_ib, &mctx));
+        CHECK(mctx.calls == 1u);
+        CHECK(win.replay_count() == 1u);
+        CHECK(win.ready());
+
+        // Replay execution where completion times out (ReplayQuiescence::Unknown) -> latches fallback!
+        mctx.next_quiescence = ReplayQuiescence::Unknown;
+        CHECK(!win.replay(&mock_submit_ib, &mctx));
+        CHECK(win.is_latched_fallback());
+        CHECK(!win.ready());
+        // Once non-quiescent / latched, all further patches and replays are refused!
+        CHECK(!win.patch_kernarg_u32(0u, 8u, 1u));
+        CHECK(!win.patch_dispatch_dimensions(0u, {1u, 1u, 1u}));
+        CHECK(!win.replay(&mock_submit_ib, &mctx));
+        CHECK(mctx.calls == 2u);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -646,6 +881,7 @@ int main(int argc, char** argv) {
     test_aql_packets(aql_golden);
     test_pm4_commands_and_roundtrip(pm4_golden);
     test_pm4_tape_and_contracts();
+    test_pm4_boundary_planner_and_replay();
 
     if (g_fails != 0) {
         std::printf("pm4_test: %d failure(s)\n", g_fails);
