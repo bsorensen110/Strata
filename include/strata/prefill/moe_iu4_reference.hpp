@@ -63,5 +63,101 @@ inline std::vector<Block> quantize(const float* x, int k, int n) {
         out[(size_t) kb * n + t] = quantize_block(x + (size_t) t * k + kb * 128);
     return out;
 }
+inline float fold_block(float acc, float sc, float zp, const Block& x, int c, bool symmetric) {
+    const float t1 = r8::mul(sc, x.d);
+    const float p = r8::mul(t1, (float) c);
+    const float term = symmetric ? p : std::fma(r8::mul(zp, x.d), (float) x.s, p);
+    return add(acc, term);
+}
+inline float fold(const iu8::Pack& w, const Block* x, int n, int token, int row, bool symmetric,
+                   const uint16_t* zp = nullptr) {
+    float acc = 0.0f;
+    for (int kb = 0; kb < w.cols / 128; ++kb) {
+        const auto& b = x[(size_t) kb * n + token];
+        int c = 0;
+        for (int k = 0; k < 128; ++k)
+            c += (iu8::signed_code(w, (size_t) row * w.cols + kb * 128 + k) + (symmetric ? 0 : 8)) * code(b, k);
+        const size_t h = (size_t) row * (w.cols / 128) + kb;
+        const float sc = iu8::half_value(w.scales[h]);
+        acc = fold_block(acc, sc, zp ? iu8::half_value(zp[h]) : r8::mul(-8.0f, sc), b, c, symmetric);
+    }
+    return acc;
+}
+inline int fragment_byte(int row, int k) {
+    return ((row / 16) * 2 + k / 32) * 256 +
+        ((row % 16) + 16 * ((k % 32) / 16)) * 8 + (k % 16) / 2;
+}
+inline int nibble(uint8_t b, int k, bool sign) {
+    const int u = (b >> (4 * (k & 1))) & 15;
+    return sign && u >= 8 ? u - 16 : u;
+}
+// Contract emulation uses physically staged bytes, not scalar weight dots.
+// The K32 fragment and K16 row-stride loads intentionally have separate code.
+inline void emulate(const iu8::Pack& w, const Block* x, int n, bool gfx12, bool symmetric,
+                     float* y, int ld, const uint16_t* zp = nullptr) {
+    for (int row0 = 0; row0 < w.rows; row0 += 128)
+    for (int token0 = 0; token0 < n; token0 += 128) {
+        std::vector<float> acc(128 * 128);
+        for (int kb = 0; kb < w.cols / 128; ++kb) {
+            std::vector<int> dots(128 * 128);
+            if (gfx12) {
+                for (int slab = 0; slab < 2; ++slab) {
+                    uint8_t ws[4096] = {}, xs[4096] = {};
+                    for (int r = 0; r < 128; ++r)
+                    for (int k = 0; k < 64; k += 2) {
+                        const int offset = fragment_byte(r, k);
+                        if (row0+r < w.rows) {
+                            const size_t i = (size_t) (row0+r) * w.cols + kb*128 + slab*64 + k;
+                            ws[offset] = w.codes[i/2] ^ (symmetric ? 0x88 : 0);
+                        }
+                        if (token0+r < n) xs[offset] = x[(size_t) kb*n+token0+r].qs[slab*32+k/2];
+                    }
+                    for (int r = 0; r < 128; ++r)
+                    for (int t = 0; t < 128; ++t)
+                    for (int step = 0; step < 2; ++step)
+                    for (int half = 0; half < 2; ++half)
+                    for (int k = 0; k < 16; ++k) {
+                        const int rk = step*32 + half*16 + k;
+                        dots[t*128+r] += nibble(ws[fragment_byte(r, rk)], k, symmetric) *
+                                         nibble(xs[fragment_byte(t, rk)], k, true);
+                    }
+                }
+            } else {
+                std::vector<uint8_t> ws(128*168), xs(128*72);
+                for (int r = 0; r < 128; ++r)
+                for (int k = 0; k < 128; k += 2) {
+                    if (row0+r < w.rows) ws[r*168+(kb&1)*64+k/2] =
+                        w.codes[((size_t)(row0+r)*w.cols+kb*128+k)/2] ^ (symmetric ? 0x88 : 0);
+                    if (token0+r < n) xs[r*72+8+k/2] = x[(size_t)kb*n+token0+r].qs[k/2];
+                }
+                for (int r = 0; r < 128; ++r)
+                for (int t = 0; t < 128; ++t)
+                for (int step = 0; step < 8; ++step)
+                for (int k = 0; k < 16; ++k) {
+                    const int rk = step*16+k;
+                    dots[t*128+r] += nibble(ws[r*168+(kb&1)*64+rk/2], k, symmetric) *
+                                     nibble(xs[t*72+8+rk/2], k, true);
+                }
+            }
+            for (int wave = 0; wave < 8; ++wave)
+            for (int lane = 0; lane < 32; ++lane)
+            for (int nb = 0; nb < 4; ++nb)
+            for (int rg = 0; rg < 2; ++rg)
+            for (int j = 0; j < 8; ++j) {
+                const int t = wave%2*64+nb*16+(lane&15);
+                const int r = wave/2*32+rg*16+(gfx12 ? 8*(lane>>4)+j : 2*j+(lane>>4));
+                if (token0+t >= n || row0+r >= w.rows) continue;
+                const size_t h = (size_t)(row0+r)*(w.cols/128)+kb;
+                const float sc = iu8::half_value(w.scales[h]);
+                acc[t*128+r] = fold_block(acc[t*128+r], sc,
+                    zp ? iu8::half_value(zp[h]) : r8::mul(-8.0f, sc),
+                    x[(size_t)kb*n+token0+t], dots[t*128+r], symmetric);
+            }
+        }
+        for (int t = 0; t < 128 && token0+t < n; ++t)
+        for (int r = 0; r < 128 && row0+r < w.rows; ++r)
+            y[(size_t)(token0+t)*ld+row0+r] = acc[t*128+r];
+    }
+}
 }  // namespace strata::prefill::iu4::reference
 #endif

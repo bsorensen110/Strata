@@ -39,6 +39,57 @@ void producers(hipStream_t stream) {
         x[2*k+j] = std::ldexp((float) (j - 64), -125);
         x[3*k+j] = (j & 1 ? -1.0f : 1.0f) * 0x1p100f;
     }
+    void products(hipStream_t stream) {
+        namespace i8 = strata::prefill::iu8;
+        for (const auto& shape : {std::array{17,128,5}, std::array{129,384,129}, std::array{1153,128,129}}) {
+            const int m = shape[0], k = shape[1], n = shape[2], ld = m+3;
+            const auto src = r8::source(GGML_TYPE_Q4_0,m,k);
+            i8::Pack w;
+            i8::DeviceWeight dw;
+            std::string why;
+            r8::require(i8::pack_exact(GGML_TYPE_Q4_0,src.data(),src.size(),m,k,w,why), why.c_str());
+            r8::require(i8::upload(w,dw,why), why.c_str());
+            const auto x = r4::quantize(r8::activations(k,n).data(),k,n);
+            std::vector<uint16_t> zeros(w.scales.size(),0xb000);
+            Buffer dx(x.size()*sizeof(i4::Block)), dz(zeros.size()*2);
+            const size_t words = (size_t)n*ld+17;
+            Buffer dy(words*4);
+            upload(dx,x); upload(dz,zeros);
+            for (int mode = 0; mode < 3; ++mode) {
+                std::vector<float> want(words),got(words);
+                std::memset(want.data(),0xa5,words*4);
+                const bool symmetric = mode == 0;
+                for (int t = 0; t < n; ++t)
+                for (int r = 0; r < m; ++r)
+                    want[(size_t)t*ld+r] = r4::fold(w,x.data(),n,t,r,symmetric,mode==2?zeros.data():nullptr);
+                i4::Product p;
+                p.weight.codes=dw.codes; p.weight.scales=dw.scales;
+                p.weight.zero_points=mode==2?(const uint16_t*)dz.p:nullptr;
+                p.weight.rows=m; p.weight.cols=k; p.weight.device=dw.device; p.weight.symmetric_verified=true;
+                p.x=(const i4::Block*)dx.p; p.y=(float*)dy.p;
+                p.rows=m; p.cols=k; p.tokens=p.x_rows=n; p.ld=ld; p.symmetric=symmetric;
+                for (bool banded : {false,true}) {
+                    p.banded=banded;
+                    check(hipMemsetAsync(dy.p,0xa5,words*4,stream),"IU4 output poison");
+                    hipGraph_t graph=nullptr;
+                    check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"IU4 capture");
+                    i4::run(p,stream);
+                    check(hipStreamEndCapture(stream,&graph),"IU4 end capture");
+                    hipGraphExec_t exec=nullptr;
+                    check(hipGraphInstantiate(&exec,graph,nullptr,nullptr,0),"IU4 instantiate");
+                    for (int repeat=0;repeat<2;++repeat) {
+                        check(hipGraphLaunch(exec,stream),"IU4 replay");
+                        check(hipStreamSynchronize(stream),"IU4 completion");
+                        download(dy,got);
+                        r8::require(std::memcmp(want.data(),got.data(),words*4)==0,
+                                    "IU4 device differs from own exact-fold CPU/canaries");
+                    }
+                    check(hipGraphExecDestroy(exec),"IU4 exec free");
+                    check(hipGraphDestroy(graph),"IU4 graph free");
+                }
+            }
+        }
+    }
     const auto want = r4::quantize(x.data(), k, n);
     Buffer dx(x.size()*4), dq((want.size()+1)*sizeof(i4::Block));
     upload(dx, x);
@@ -89,14 +140,15 @@ int main() {
             check(hipSetDevice(device), "select device");
             hipDeviceProp_t prop{};
             check(hipGetDeviceProperties(&prop, device), "properties");
-            if (prop.warpSize != 32 || !strata::core::hip_moe_iu8_capable(prop.gcnArchName)) continue;
+            if (!i4::usable()) continue;
             hipStream_t stream = nullptr;
             check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
             producers(stream);
+            products(stream);
             check(hipStreamDestroy(stream), "free stream"); ++tested;
         }
         if (!tested) { std::puts("SKIP hip_moe_iu4_test: exact gfx wave32 required"); return 77; }
-        std::puts("PASS hip_moe_iu4_test: A4 producer bits; quality requires separate KLD");
+        std::puts("PASS hip_moe_iu4_test: own A4/fold bits, affine/XOR/raster/tails/capture; KLD separate");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL hip_moe_iu4_test: %s\n", e.what()); return 1;

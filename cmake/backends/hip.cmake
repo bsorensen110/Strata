@@ -43,6 +43,7 @@ macro(strata_hip_mmq)
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
       src/prefill/moe_iu8_gfx.cu
+      src/prefill/moe_iu4_gfx.cu
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
       src/prefill/moe_f16_kq.cu
