@@ -142,7 +142,7 @@ struct LaunchGeometry {
     // also enforces the gfx1201 grid.y/z <= 65536 wrap guard.
     static PacketErrorCode from_hip_workgroups(
         std::array<uint32_t, 3> workgroups,
-        std::array<uint16_t, 3> wg,
+        std::array<uint32_t, 3> wg,
         LaunchGeometry& out);
 };
 
@@ -338,6 +338,19 @@ enum class HazardKind : uint8_t {
     WarPreWriter = 3,
 };
 
+/// A1 memory class of one pointer effect. Ported from warpfront/hipfire
+/// crates/railgun/src/kernel.rs (MemClass), trimmed to the classes this
+/// planner reasons about: VmemLoad/VmemStore drive the RAW/WAR/WAW edges and
+/// SmemLoad is workgroup-private (never crosses a dispatch boundary). The
+/// atomic/LDS-DMA classes hipfire defines are intentionally absent: no
+/// admitted kernel uses them, and an effect naming one fails closed.
+/// Port note: from warpfront/hipfire crates/railgun/src/kernel.rs:30-48 (Apache-2.0).
+enum class MemAccessKind : uint8_t {
+    VmemLoad = 0,
+    VmemStore = 1,
+    SmemLoad = 2,
+};
+
 enum class AcquireRung : uint8_t {
     None = 0,
     InterNode = 1,  // GCR 0x10180 (scalar + vector L0 + seq forward)
@@ -362,6 +375,29 @@ constexpr BoundaryVisibility gfx12_cache_table_lookup(HazardKind hazard) {
     }
     return {true, AcquireRung::System, false};
 }
+
+// Access-class-aware wrapper: SMEM effects are workgroup-private and never
+// cross a dispatch boundary, so a hazard pair involving one needs no
+// boundary at all. Everything else is keyed by the hazard alone, matching
+// hipfire railgun/src/plan.rs CacheTable::for_arch("gfx12xx").
+// Port note: from warpfront/hipfire crates/railgun/src/plan.rs (Apache-2.0).
+constexpr BoundaryVisibility gfx12_cache_table_lookup(HazardKind hazard, MemAccessKind src,
+                                                      MemAccessKind dst) {
+    if (hazard == HazardKind::WarPreWriter) return gfx12_cache_table_lookup(hazard);
+    if (src == MemAccessKind::SmemLoad || dst == MemAccessKind::SmemLoad) return {};
+    return gfx12_cache_table_lookup(hazard);
+}
+
+// Join two boundary visibilities: OR the waits, take the stronger acquire
+// rung (None < InterNode < System). Port note: from warpfront/hipfire
+// crates/railgun/src/plan.rs Visibility::join (Apache-2.0).
+constexpr BoundaryVisibility join_visibility(BoundaryVisibility a, BoundaryVisibility b) {
+    return {a.wait_idle || b.wait_idle,
+            a.acquire > b.acquire ? a.acquire : b.acquire,
+            a.pre_writer || b.pre_writer};
+}
+
+const char* packet_error_to_string(PacketErrorCode code) noexcept;
 
 enum class Pm4BuildError {
     Ok = 0,
@@ -405,7 +441,8 @@ public:
     void acquire_system();
 
     // GFX12 ownership-boundary / pre-writer system acquire (8 dwords, GCR 0xc3b1).
-    void acquire_system_gfx12();
+    // With `wait_idle` a CS_PARTIAL_FLUSH event precedes the ACQUIRE_MEM.
+    void acquire_system_gfx12(bool wait_idle = false);
 
     // Same-agent inter-node acquire for one retained gfx12 tape (8 dwords, GCR 0x10180).
     void acquire_inter_node_gfx12();
@@ -445,6 +482,9 @@ public:
 
     uint32_t len_dwords() const { return static_cast<uint32_t>(dwords_.size()); }
     bool is_empty() const { return dwords_.empty(); }
+    // Reset for reuse across captures: dwords AND the SH-register cache, so a
+    // reused buffer never elides a SET_SH_REG against a previous IB's state.
+    void clear() { dwords_.clear(); register_state_.clear(); }
     const std::vector<uint32_t>& dwords() const { return dwords_; }
     std::vector<uint8_t> as_bytes() const;
 

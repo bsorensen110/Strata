@@ -108,15 +108,39 @@ PacketErrorCode LaunchGeometry::from_workgroups(
 
 PacketErrorCode LaunchGeometry::from_hip_workgroups(
     std::array<uint32_t, 3> workgroups,
-    std::array<uint16_t, 3> wg,
+    std::array<uint32_t, 3> wg,
     LaunchGeometry& out) {
     if (workgroups[1] > kGfx12MaxGridYZWorkgroups || workgroups[2] > kGfx12MaxGridYZWorkgroups) {
         return PacketErrorCode::GridYZWrapExceedsLimit;
     }
-    const PacketErrorCode err = from_workgroups(workgroups, wg, out);
+    if (wg[0] > 0xffffu || wg[1] > 0xffffu || wg[2] > 0xffffu) {
+        return PacketErrorCode::WorkgroupExceedsGrid;
+    }
+    const PacketErrorCode err =
+        from_workgroups(workgroups, {static_cast<uint16_t>(wg[0]), static_cast<uint16_t>(wg[1]),
+                                     static_cast<uint16_t>(wg[2])}, out);
     if (err != PacketErrorCode::Ok) return err;
     out.dimensions = 3;
     return PacketErrorCode::Ok;
+}
+
+const char* packet_error_to_string(PacketErrorCode code) noexcept {
+    switch (code) {
+        case PacketErrorCode::Ok: return "ok";
+        case PacketErrorCode::ZeroDimension: return "zero-dimension";
+        case PacketErrorCode::WorkgroupExceedsGrid: return "workgroup-exceeds-grid";
+        case PacketErrorCode::InactiveDimensionNotOne: return "inactive-dimension-not-one";
+        case PacketErrorCode::GridDimensionOverflow: return "grid-dimension-overflow";
+        case PacketErrorCode::GridYZWrapExceedsLimit: return "grid-yz-wrap-exceeds-limit";
+        case PacketErrorCode::NullKernelObject: return "null-kernel-object";
+        case PacketErrorCode::NullKernarg: return "null-kernarg";
+        case PacketErrorCode::DynamicCallstackNeedsPrivateSize: return "dynamic-callstack-needs-private-size";
+        case PacketErrorCode::DynamicGroupSegmentOverflow: return "dynamic-group-segment-overflow";
+        case PacketErrorCode::TooManyBarrierDependencies: return "too-many-barrier-dependencies";
+        case PacketErrorCode::InvalidIndirectBufferAddress: return "invalid-indirect-buffer-address";
+        case PacketErrorCode::InvalidIndirectBufferSize: return "invalid-indirect-buffer-size";
+    }
+    return "unknown";
 }
 
 // ---- KernelDispatchPacket & BarrierAndPacket (packet.rs:242-396) ----
@@ -257,7 +281,8 @@ void Gfx12Pm4CommandBuffer::acquire_system() {
     dwords_.insert(dwords_.end(), std::begin(words), std::end(words));
 }
 
-void Gfx12Pm4CommandBuffer::acquire_system_gfx12() {
+void Gfx12Pm4CommandBuffer::acquire_system_gfx12(bool wait_idle) {
+    if (wait_idle) wait_compute_idle();
     emit_acquire_gcr(kGcrSystemGfx12);
 }
 

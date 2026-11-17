@@ -38,18 +38,8 @@ enum class ReplayQuiescence : uint8_t {
     Unknown = 1,
 };
 
-/// A1 memory class of one pointer effect. Ported from warpfront/hipfire
-/// crates/railgun/src/kernel.rs (MemClass), trimmed to the classes this
-/// planner reasons about: VmemLoad/VmemStore drive the RAW/WAR/WAW edges and
-/// SmemLoad is wave-private (never crosses a dispatch boundary). hipfire's
-/// atomic/DMA classes (Atomic, AtomicCommutative, LdsDma, AtomicRelease,
-/// LoadAcquire) are intentionally absent: no admitted kernel uses them, and an
-/// effect entry naming one would fail closed at the contract lookup.
-enum class MemAccessKind : uint8_t {
-    VmemLoad = 0,
-    VmemStore = 1,
-    SmemLoad = 2,
-};
+/// MemAccessKind (the A1 memory class of a pointer effect) lives in
+/// strata/hip/pm4.hpp alongside the hazard vocabulary that consumes it.
 
 /// Fail-closed status of a PM4 tape recording.
 enum class TapeStatus : uint8_t {
