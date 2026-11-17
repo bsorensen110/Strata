@@ -140,8 +140,114 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 
 }  // namespace
 
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+}  // namespace strata::core
+#include "strata/hip/pm4_tape.hpp"
+#include <map>
+#include <mutex>
+namespace strata::core {
+namespace {
+
+struct Pm4MtpSlotKey {
+    const MtpDrafter* drafter = nullptr;
+    int kind = 0;  // 0 = round, 1 = step
+    bool coupled = false;
+    int idx = 0;
+    bool operator<(const Pm4MtpSlotKey& o) const noexcept {
+        if (drafter != o.drafter) return drafter < o.drafter;
+        if (kind != o.kind) return kind < o.kind;
+        if (coupled != o.coupled) return coupled < o.coupled;
+        return idx < o.idx;
+    }
+};
+
+std::mutex& pm4_mtp_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::map<Pm4MtpSlotKey, strata::hip::pm4::Pm4WindowCaptureSlot>& pm4_mtp_slots() {
+    static std::map<Pm4MtpSlotKey, strata::hip::pm4::Pm4WindowCaptureSlot> slots;
+    return slots;
+}
+
+bool hip_mtp_range_resolver(uint64_t device_ptr, strata::hip::pm4::AllocationRange& out_range, void* /*ctx*/) noexcept {
+    void* base = nullptr;
+    size_t size = 0;
+    if (hipMemGetAddressRange(&base, &size, reinterpret_cast<hipDeviceptr_t>(static_cast<uintptr_t>(device_ptr))) != hipSuccess ||
+        base == nullptr || size == 0) {
+        (void) hipGetLastError();
+        return false;
+    }
+    out_range.base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(base));
+    out_range.size = static_cast<uint64_t>(size);
+    return true;
+}
+
+strata::hip::pm4::Pm4WindowCaptureSlot* pm4_begin_mtp_capture(
+    const MtpDrafter* d, int kind, bool coupled, int idx, bool has_side_stream) {
+    static const bool pm4_env = [] {
+        const char* val = std::getenv("STRATA_HIP_PM4");
+        return val != nullptr && (std::strcmp(val, "1") == 0 || std::strcmp(val, "on") == 0 || std::strcmp(val, "true") == 0);
+    }();
+    if (!pm4_env || has_side_stream) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(pm4_mtp_mutex());
+    auto& slot = pm4_mtp_slots()[Pm4MtpSlotKey{d, kind, coupled, idx}];
+    if (!slot.can_attempt_capture()) {
+        return nullptr;
+    }
+    slot.tape().set_resolver(&hip_mtp_range_resolver, nullptr);
+    if (!slot.begin_capture()) {
+        return nullptr;
+    }
+    return &slot;
+}
+
+void pm4_end_mtp_capture(strata::hip::pm4::Pm4WindowCaptureSlot* slot, cudaGraph_t graph, const char* what, int idx) {
+    if (slot == nullptr) return;
+    if (graph == nullptr) {
+        slot->latch_fallback(strata::hip::pm4::TapeStatus::InvalidatedIncompleteCapture,
+                             "hipStreamEndCapture failed");
+        return;
+    }
+    size_t nn = 0, nk = 0;
+    if (hipGraphGetNodes(graph, nullptr, &nn) == hipSuccess && nn > 0) {
+        std::vector<hipGraphNode_t> nodes(nn);
+        if (hipGraphGetNodes(graph, nodes.data(), &nn) == hipSuccess) {
+            for (hipGraphNode_t nd : nodes) {
+                hipGraphNodeType ty{};
+                if (hipGraphNodeGetType(nd, &ty) == hipSuccess && ty == hipGraphNodeTypeKernel) {
+                    ++nk;
+                }
+            }
+        }
+    }
+    if (!slot->end_capture(nk)) {
+        std::fprintf(stderr,
+                     "strata mtp: PM4 %s idx=%d capture refused (%s); latching fallback to hipGraph\n",
+                     what, idx, slot->tape().failure_reason().c_str());
+    }
+}
+
+void pm4_clear_mtp_slots(const MtpDrafter* d) {
+    std::lock_guard<std::mutex> lock(pm4_mtp_mutex());
+    auto& map = pm4_mtp_slots();
+    for (auto it = map.begin(); it != map.end();) {
+        if (it->first.drafter == d) it = map.erase(it);
+        else ++it;
+    }
+}
+
+}  // namespace
+#endif
+
 MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamSynchronize(cs_);
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    pm4_clear_mtp_slots(this);
+#endif
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : prefill_dev_exec_) if (e) cudaGraphExecDestroy(e);
     if (pf_dev_) cudaFree(pf_dev_);
@@ -1391,9 +1497,18 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
 }
 
 namespace {
-bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err) {
+bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+                    , strata::hip::pm4::Pm4WindowCaptureSlot* pm4_slot = nullptr, int pm4_idx = 0
+#endif
+) {
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    if (pm4_slot != nullptr) {
+        pm4_end_mtp_capture(pm4_slot, (ok && ce == cudaSuccess) ? graph : nullptr, what, pm4_idx);
+    }
+#endif
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         return false;
@@ -1440,6 +1555,11 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     const int64_t HCN = g_->hc * g_->n_embd;
     g_mp.init();   // (its allocation before the capture)
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    strata::hip::pm4::Pm4WindowCaptureSlot* pm4_slot =
+        pm4_begin_mtp_capture(this, 0, coupled, T, side_ != nullptr && sh_fork_ != nullptr && sh_join_ != nullptr);
+    strata::hip::pm4::Pm4TapeScopeGuard pm4_guard(pm4_slot != nullptr ? &pm4_slot->tape() : nullptr);
+#endif
     g_mp.base = 0;
     bool ok = true;
     // coupled: the request's chain and the penalty history's base, for this round's drafts
@@ -1469,7 +1589,11 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     if (ok) g_mp.stamp(16, cs_);
     g_mp.base = -1;
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err, pm4_slot, T);
+#else
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
+#endif
 }
 
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
@@ -1482,6 +1606,11 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     const int row = max_t_ + j - 1;
     g_mp.init();
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    strata::hip::pm4::Pm4WindowCaptureSlot* pm4_slot =
+        pm4_begin_mtp_capture(this, 1, coupled, j, side_ != nullptr && sh_fork_ != nullptr && sh_join_ != nullptr);
+    strata::hip::pm4::Pm4TapeScopeGuard pm4_guard(pm4_slot != nullptr ? &pm4_slot->tape() : nullptr);
+#endif
     const MappedCopy in[2] = {{step_ + row * 4, m_step_ + row * 4, 4},
                               {pos_ + row * g_->n_head, m_pos_ + row * g_->n_head, g_->n_head}};
     copy_from_mapped_multi(in, 2, cs_);
@@ -1494,7 +1623,11 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     if (ok) g_mp.stamp(16, cs_);
     g_mp.base = -1;
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err, pm4_slot, j);
+#else
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
+#endif
 }
 
 void MtpDrafter::kv_restore(int64_t upto) {

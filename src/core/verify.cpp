@@ -662,6 +662,111 @@ const int64_t g_test_drop = [] {
 }();
 }  // namespace
 
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+}  // namespace strata::core
+#include "strata/hip/pm4_tape.hpp"
+namespace strata::core {
+namespace {
+
+struct Pm4VerifierSlotKey {
+    const Verifier* verifier = nullptr;
+    int sel_long = 0;
+    int T = 0;
+    bool operator<(const Pm4VerifierSlotKey& o) const noexcept {
+        if (verifier != o.verifier) return verifier < o.verifier;
+        if (sel_long != o.sel_long) return sel_long < o.sel_long;
+        return T < o.T;
+    }
+};
+
+std::mutex& pm4_verifier_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::map<Pm4VerifierSlotKey, strata::hip::pm4::Pm4WindowCaptureSlot>& pm4_verifier_slots() {
+    static std::map<Pm4VerifierSlotKey, strata::hip::pm4::Pm4WindowCaptureSlot> slots;
+    return slots;
+}
+
+bool hip_device_range_resolver(uint64_t device_ptr, strata::hip::pm4::AllocationRange& out_range, void* /*ctx*/) noexcept {
+    void* base = nullptr;
+    size_t size = 0;
+    if (hipMemGetAddressRange(&base, &size, reinterpret_cast<hipDeviceptr_t>(static_cast<uintptr_t>(device_ptr))) != hipSuccess ||
+        base == nullptr || size == 0) {
+        (void) hipGetLastError();
+        return false;
+    }
+    out_range.base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(base));
+    out_range.size = static_cast<uint64_t>(size);
+    return true;
+}
+
+strata::hip::pm4::Pm4WindowCaptureSlot* pm4_begin_verifier_capture(
+    const Verifier* v, int sel_long, int T, bool all_resident_ar, bool is_batch,
+    bool single_stage, bool has_side_streams) {
+    static const bool pm4_env = [] {
+        const char* val = std::getenv("STRATA_HIP_PM4");
+        return val != nullptr && (std::strcmp(val, "1") == 0 || std::strcmp(val, "on") == 0 || std::strcmp(val, "true") == 0);
+    }();
+    if (!pm4_env || !all_resident_ar || is_batch || !single_stage || has_side_streams) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(pm4_verifier_mutex());
+    auto& slot = pm4_verifier_slots()[Pm4VerifierSlotKey{v, sel_long, T}];
+    if (!slot.can_attempt_capture()) {
+        return nullptr;  // already captured or latched to hipGraph fallback
+    }
+    slot.tape().set_resolver(&hip_device_range_resolver, nullptr);
+    if (!slot.begin_capture()) {
+        return nullptr;
+    }
+    return &slot;
+}
+
+void pm4_end_verifier_capture(strata::hip::pm4::Pm4WindowCaptureSlot* slot, cudaGraph_t graph, int T) {
+    if (slot == nullptr) return;
+    if (graph == nullptr) {
+        slot->latch_fallback(strata::hip::pm4::TapeStatus::InvalidatedIncompleteCapture,
+                             "hipStreamEndCapture failed");
+        return;
+    }
+    size_t nn = 0, nk = 0;
+    if (hipGraphGetNodes(graph, nullptr, &nn) == hipSuccess && nn > 0) {
+        std::vector<hipGraphNode_t> nodes(nn);
+        if (hipGraphGetNodes(graph, nodes.data(), &nn) == hipSuccess) {
+            for (hipGraphNode_t nd : nodes) {
+                hipGraphNodeType ty{};
+                if (hipGraphNodeGetType(nd, &ty) == hipSuccess && ty == hipGraphNodeTypeKernel) {
+                    ++nk;
+                }
+            }
+        }
+    }
+    if (!slot->end_capture(nk)) {
+        std::fprintf(stderr,
+                     "strata verify: PM4 window T=%d capture refused (%s); latching fallback to hipGraph\n",
+                     T, slot->tape().failure_reason().c_str());
+    }
+}
+
+void pm4_evict_verifier_slot(const Verifier* v, int sel_long, int T) {
+    std::lock_guard<std::mutex> lock(pm4_verifier_mutex());
+    pm4_verifier_slots().erase(Pm4VerifierSlotKey{v, sel_long, T});
+}
+
+void pm4_clear_verifier_slots(const Verifier* v) {
+    std::lock_guard<std::mutex> lock(pm4_verifier_mutex());
+    auto& map = pm4_verifier_slots();
+    for (auto it = map.begin(); it != map.end();) {
+        if (it->first.verifier == v) it = map.erase(it);
+        else ++it;
+    }
+}
+
+}  // namespace
+#endif
+
 bool Verifier::release_gpu_waits(int timeout_ms) {
     released_.store(true);
     trace_ev("RELEASE", -1, -1, timeout_ms);
@@ -772,6 +877,9 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    pm4_clear_verifier_slots(this);
+#endif
     for (auto& row : exec_)
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
@@ -3066,10 +3174,22 @@ bool Verifier::capture(int T, std::string& err) {
     prio_forks_.clear();
     prio_tails_.clear();
 #endif
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    strata::hip::pm4::Pm4WindowCaptureSlot* pm4_slot =
+        pm4_begin_verifier_capture(this, sel_long_, T, ar_on(), batch_rec_,
+                                   lb_ == 0 && (g_ != nullptr && le_ == g_->n_layers) && next_ == nullptr && remote_opt_ == nullptr,
+                                   sh_stream_on() || g_side_mixer() > 0 || df_branch_ || prof_on_);
+    strata::hip::pm4::Pm4TapeScopeGuard pm4_guard(pm4_slot != nullptr ? &pm4_slot->tape() : nullptr);
+#endif
     std::string rerr;
     const bool ok = record_window(T, cs_, rerr);
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    if (pm4_slot != nullptr) {
+        pm4_end_verifier_capture(pm4_slot, (ok && ce == cudaSuccess) ? graph : nullptr, T);
+    }
+#endif
     if (!ok) {
         if (graph) cudaGraphDestroy(graph);
         err = rerr;
@@ -4815,6 +4935,9 @@ bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
     cudaGraphExecDestroy(e);
     e = nullptr;
     (ar_off_ ? launched_nr_ : launched_)[sel_long_][victim] = false;   // the next graph of that size is a cold first launch again
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    if (!ar_off_) pm4_evict_verifier_slot(this, sel_long_, victim);
+#endif
     evicted = true;
     return true;
 }

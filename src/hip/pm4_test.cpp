@@ -9,6 +9,7 @@
 #endif
 
 #include "strata/hip/pm4.hpp"
+#include "strata/hip/pm4_tape.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -466,6 +467,170 @@ void test_pm4_commands_and_roundtrip(
     CHECK(tail == expected_tail);
 }
 
+void write_u64_le(uint8_t* dst, uint64_t val) {
+    for (size_t b = 0; b < 8u; ++b) {
+        dst[b] = static_cast<uint8_t>((val >> (b * 8u)) & 0xffu);
+    }
+}
+
+void test_pm4_tape_and_contracts() {
+    // 1. Static per-kernel-family effect table audit
+    size_t contract_count = 0;
+    const KernelContract* contracts = registered_kernel_contracts(contract_count);
+    CHECK(contracts != nullptr);
+    CHECK(contract_count >= 25u);
+    for (size_t i = 0; i < contract_count; ++i) {
+        CHECK(contracts[i].family_name != nullptr && contracts[i].family_name[0] != '\0');
+        CHECK(contracts[i].expected_kernarg_bytes >= 16u);
+        CHECK(lookup_kernel_contract(contracts[i].family_name) == &contracts[i]);
+        for (size_t e = 0; e < contracts[i].pointer_effect_count; ++e) {
+            CHECK((contracts[i].pointer_effects[e].offset % 8u) == 0u);
+            CHECK(static_cast<uint32_t>(contracts[i].pointer_effects[e].offset) + 8u <=
+                  contracts[i].expected_kernarg_bytes);
+        }
+    }
+    // Fail-closed on unknown / un-admitted kernel names
+    CHECK(lookup_kernel_contract(nullptr) == nullptr);
+    CHECK(lookup_kernel_contract("") == nullptr);
+    CHECK(lookup_kernel_contract("wait_flag_ge") == nullptr);
+    CHECK(lookup_kernel_contract("doorbell_publish_res") == nullptr);
+    CHECK(lookup_kernel_contract("unknown_custom_kernel") == nullptr);
+
+    // 2. KernargArena 64B slot alignment + overflow refusal without reallocation
+    KernargArena arena(128u);
+    CHECK(arena.capacity() == 128u);
+    CHECK(arena.used() == 0u);
+    uint8_t kbuf1[24] = {};
+    write_u64_le(kbuf1 + 0, 0x10002000ULL);
+    write_u64_le(kbuf1 + 8, 0x20004000ULL);
+    uint32_t off1 = 999u;
+    CHECK(arena.allocate_and_copy(kbuf1, sizeof(kbuf1), off1));
+    CHECK(off1 == 0u);
+    CHECK(arena.used() == 32u);  // 24B padded to 16B = 32B
+    uint32_t off2 = 999u;
+    CHECK(arena.allocate_and_copy(kbuf1, sizeof(kbuf1), off2));
+    CHECK(off2 == 64u);  // aligned to 64B
+    CHECK(arena.used() == 96u);
+    uint32_t off3 = 999u;
+    // Next slot starts at 128, which leaves 0 bytes in a 128B arena -> must fail closed
+    CHECK(!arena.allocate_and_copy(kbuf1, sizeof(kbuf1), off3));
+    CHECK(arena.capacity() == 128u);
+    CHECK(arena.used() == 96u);
+
+    // 3. AllocationTable + Pm4Tape happy path (interior pointers share one ResourceId)
+    AllocationTable allocs;
+    CHECK(allocs.insert(0x100000ULL, 0x10000ULL));
+    CHECK(allocs.insert(0x200000ULL, 0x20000ULL));
+    CHECK(allocs.insert(0x300000ULL, 0x10000ULL));
+    // Overlapping range rejected
+    CHECK(!allocs.insert(0x108000ULL, 0x1000ULL));
+
+    Pm4Tape tape(4096u);
+    tape.set_resolver(&AllocationTable::resolver_thunk, &allocs);
+    CHECK(tape.begin_recording(ReplayQuiescence::Proven));
+
+    // Launch 0: native_quantize_q8_1_kernel (24B: read(0), write(8))
+    uint8_t quant_args[24] = {};
+    write_u64_le(quant_args + 0, 0x100080ULL);  // interior of alloc 0 (0x100000)
+    write_u64_le(quant_args + 8, 0x200100ULL);  // interior of alloc 1 (0x200000)
+    CHECK(tape.record_launch(
+        "native_quantize_q8_1_kernel", nullptr,
+        {16u, 1u, 1u}, {256u, 1u, 1u}, 0u,
+        quant_args, sizeof(quant_args)));
+
+    // Launch 1: native_mmvq_multi_kernel (40B: read(0), read(8), write(16))
+    uint8_t mmvq_args[40] = {};
+    write_u64_le(mmvq_args + 0, 0x300000ULL);   // alloc 2 (weights)
+    write_u64_le(mmvq_args + 8, 0x200200ULL);   // another interior pointer into alloc 1!
+    write_u64_le(mmvq_args + 16, 0x100400ULL);  // another interior pointer into alloc 0!
+    CHECK(tape.record_launch(
+        "native_mmvq_multi_kernel", nullptr,
+        {64u, 2u, 1u}, {128u, 1u, 1u}, 0u,
+        mmvq_args, sizeof(mmvq_args)));
+
+    CHECK(tape.finalize_recording(2u) == TapeStatus::Ok);
+    CHECK(tape.valid());
+    CHECK(tape.launch_count() == 2u);
+    CHECK(tape.resource_count() == 3u);
+    CHECK(tape.dispatches()[0].effects.size() == 2u);
+    CHECK(tape.dispatches()[1].effects.size() == 3u);
+    // Interior pointers into the same allocation resolve to identical ResourceId
+    CHECK(tape.dispatches()[0].effects[1].resource == tape.dispatches()[1].effects[1].resource);
+    CHECK(tape.dispatches()[0].effects[0].resource == tape.dispatches()[1].effects[2].resource);
+
+    // 4. Fail-closed checks: unknown kernel, size mismatch, unresolved pointer, grid.y > 65536,
+    //    incomplete hipGraph node count, non-quiescent window, and per-window latch (no retry storm)
+    {
+        Pm4WindowCaptureSlot slot(4096u);
+        slot.tape().set_resolver(&AllocationTable::resolver_thunk, &allocs);
+        CHECK(slot.can_attempt_capture());
+        CHECK(slot.begin_capture());
+        CHECK(!slot.tape().record_launch(
+            "wait_flag_ge", nullptr, {1u, 1u, 1u}, {32u, 1u, 1u}, 0u, quant_args, sizeof(quant_args)));
+        CHECK(!slot.end_capture(1u));
+        CHECK(slot.is_latched_fallback());
+        CHECK(slot.tape().status() == TapeStatus::InvalidatedUnknownKernel);
+        CHECK(slot.capture_attempts() == 1u);
+        // Second capture attempt on a latched slot must be refused without retrying
+        CHECK(!slot.can_attempt_capture());
+        CHECK(!slot.begin_capture());
+        CHECK(slot.capture_attempts() == 1u);
+        slot.reset();
+        CHECK(slot.can_attempt_capture());
+    }
+    {
+        // Arena overflow latches fallback
+        Pm4WindowCaptureSlot small_slot(64u);
+        small_slot.tape().set_resolver(&AllocationTable::resolver_thunk, &allocs);
+        CHECK(small_slot.begin_capture());
+        CHECK(small_slot.tape().record_launch(
+            "native_quantize_q8_1_kernel", nullptr,
+            {16u, 1u, 1u}, {256u, 1u, 1u}, 0u, quant_args, sizeof(quant_args)));
+        CHECK(!small_slot.tape().record_launch(
+            "native_mmvq_multi_kernel", nullptr,
+            {64u, 1u, 1u}, {128u, 1u, 1u}, 0u, mmvq_args, sizeof(mmvq_args)));
+        CHECK(!small_slot.end_capture(2u));
+        CHECK(small_slot.is_latched_fallback());
+        CHECK(small_slot.tape().status() == TapeStatus::InvalidatedArenaOverflow);
+    }
+    {
+        // Incomplete capture (raw <<<...>>> bypassed launch_pdl -> hipGraph has more kernel nodes)
+        Pm4WindowCaptureSlot inc_slot(4096u);
+        inc_slot.tape().set_resolver(&AllocationTable::resolver_thunk, &allocs);
+        CHECK(inc_slot.begin_capture());
+        CHECK(inc_slot.tape().record_launch(
+            "native_quantize_q8_1_kernel", nullptr,
+            {16u, 1u, 1u}, {256u, 1u, 1u}, 0u, quant_args, sizeof(quant_args)));
+        CHECK(!inc_slot.end_capture(/*expected_graph_kernel_nodes=*/15u));
+        CHECK(inc_slot.is_latched_fallback());
+        CHECK(inc_slot.tape().status() == TapeStatus::InvalidatedIncompleteCapture);
+    }
+    {
+        // Non-quiescent previous window refuses capture and latches fallback
+        Pm4WindowCaptureSlot nq_slot(4096u);
+        nq_slot.set_quiescence(ReplayQuiescence::Unknown);
+        CHECK(nq_slot.is_latched_fallback());
+        CHECK(!nq_slot.begin_capture());
+        CHECK(nq_slot.tape().status() == TapeStatus::InvalidatedNonQuiescent);
+    }
+    {
+        // Host kernel family registry & TLS capture scope guard
+        int dummy_fn = 0;
+        clear_host_kernel_families();
+        register_host_kernel_family(&dummy_fn, "gpu_stamp_kernel");
+        CHECK( lookup_host_kernel_family(&dummy_fn) != nullptr &&
+               std::strcmp(lookup_host_kernel_family(&dummy_fn), "gpu_stamp_kernel") == 0 );
+        CHECK(!is_pm4_capture_scope_active());
+        {
+            Pm4TapeScopeGuard guard(&tape);
+            CHECK(is_pm4_capture_scope_active());
+            CHECK(active_pm4_tape() == &tape);
+        }
+        CHECK(!is_pm4_capture_scope_active());
+        clear_host_kernel_families();
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -480,6 +645,7 @@ int main(int argc, char** argv) {
 
     test_aql_packets(aql_golden);
     test_pm4_commands_and_roundtrip(pm4_golden);
+    test_pm4_tape_and_contracts();
 
     if (g_fails != 0) {
         std::printf("pm4_test: %d failure(s)\n", g_fails);

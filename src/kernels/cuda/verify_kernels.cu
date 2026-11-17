@@ -1966,6 +1966,39 @@ bool& pdl_scope() {
     return on;
 }
 
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+}  // namespace strata::kernels
+#include "strata/hip/pm4_tape.hpp"
+namespace strata::kernels {
+
+bool pm4_scope() noexcept {
+    return strata::hip::pm4::is_pm4_capture_scope_active();
+}
+
+void pm4_record_pdl_launch(const void* host_kernel, dim3 grid, dim3 block,
+                           size_t smem, cudaStream_t /*stream*/,
+                           const void* kernarg_data, size_t kernarg_bytes) noexcept {
+    strata::hip::pm4::Pm4Tape* tape = strata::hip::pm4::active_pm4_tape();
+    if (tape == nullptr) {
+        return;
+    }
+    const char* family = strata::hip::pm4::lookup_host_kernel_family(host_kernel);
+#if !defined(_WIN32)
+    if (family == nullptr && host_kernel != nullptr) {
+        family = hipKernelNameRefByPtr(host_kernel, nullptr);
+    }
+#endif
+    (void) tape->record_launch(
+        family,
+        host_kernel,
+        {grid.x, grid.y, grid.z},
+        {block.x, block.y, block.z},
+        static_cast<uint32_t>(smem),
+        kernarg_data,
+        kernarg_bytes);
+}
+#endif
+
 bool pdl_supported() {
 #if defined(__HIPCC__) || !defined(CUDART_VERSION) || CUDART_VERSION < 12030
     return false;   // HIP; or a CUDA runtime without the capture-dependency query pdl_launch_ok needs
