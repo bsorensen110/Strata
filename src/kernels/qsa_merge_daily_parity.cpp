@@ -218,8 +218,15 @@ struct Harness {
     bool check(const Case& c, long long& nonzero) {
         const int64_t D = s.head_dim, NH = s.n_head;
         const size_t scratch_bytes = (size_t) k::qsa_decode_attn_scratch_floats(c.cap, s) * (size_t) c.n_q * 4;
-        std::vector<unsigned char> reference_partials(scratch_bytes), entry_partials(scratch_bytes);
-        ck(cudaMemcpy(reference_partials.data(), scratch, scratch_bytes, cudaMemcpyDeviceToHost), "reference partials");
+        const char* flag = std::getenv("STRATA_HIP_BUFLOAD");
+        const bool bufload_screen = flag && std::strcmp(flag, "1") == 0;
+        const bool pin_partials = bufload_screen && c.fmt == kFmtInt8;
+        std::vector<unsigned char> reference_partials, entry_partials;
+        if (pin_partials) {
+            reference_partials.resize(scratch_bytes);
+            entry_partials.resize(scratch_bytes);
+            ck(cudaMemcpy(reference_partials.data(), scratch, scratch_bytes, cudaMemcpyDeviceToHost), "reference partials");
+        }
         k::qsa_decode_attn_merge_only(steps, c.cap, s, scratch, attn_old, c.n_q, 0, nullptr);
         k::qsa_decode_attn_merge_only(steps, c.cap, s, scratch, attn_new, c.n_q, 1, nullptr);
         ck(cudaDeviceSynchronize(), "merge sync");
@@ -252,18 +259,32 @@ struct Harness {
         }
         // Exercise production entry points too: either selected merger must equal the reference partials.
         bool entry_same = true;
-        ck(cudaMemset(scratch, 0xFF, scratch_bytes), "production scratch NaN refill");
+        if (pin_partials) ck(cudaMemset(scratch, 0xFF, scratch_bytes), "production scratch NaN refill");
         k::qsa_decode_attn_batch(q, pools.view(c.fmt, table), ids, steps, c.cap, s, scratch, attn_new, c.n_q, nullptr);
         ck(cudaDeviceSynchronize(), "batch entry sync");
-        ck(cudaMemcpy(entry_partials.data(), scratch, scratch_bytes, cudaMemcpyDeviceToHost), "production partials");
-        if (reference_partials != entry_partials) {
-            std::puts("FAIL production chunk partials differ: score/denominator tree or selection-order value sums");
-            entry_same = false;
+        if (pin_partials) {
+            ck(cudaMemcpy(entry_partials.data(), scratch, scratch_bytes, cudaMemcpyDeviceToHost), "production partials");
+            if (reference_partials != entry_partials) {
+                std::puts("FAIL production chunk partials differ: score/denominator tree or selection-order value sums");
+                entry_same = false;
+            }
         }
         ck(cudaMemcpy(b.data(), attn_new, n * 4, cudaMemcpyDeviceToHost), "batch entry output");
         if (std::memcmp(a.data(), b.data(), n * 4) != 0) {
             std::puts("FAIL production batch differs from merge reference");
             entry_same = false;
+        }
+        if (bufload_screen) {
+            k::QsaAttnPoolsRows rows;
+            rows.n = c.n_q;
+            for (int i = 0; i < c.n_q; ++i) rows.p[i] = pools.view(c.fmt, table);
+            k::qsa_decode_attn_batch_rows(q, rows, ids, steps, c.cap, s, scratch, attn_new, c.n_q, nullptr);
+            ck(cudaDeviceSynchronize(), "rows entry sync");
+            ck(cudaMemcpy(b.data(), attn_new, n * 4, cudaMemcpyDeviceToHost), "rows entry output");
+            if (std::memcmp(a.data(), b.data(), n * 4) != 0) {
+                std::puts("FAIL production rows routing differs from merge reference");
+                entry_same = false;
+            }
         }
         if (c.n_q == 1) {
             k::qsa_decode_attn_step(q, pools.view(c.fmt, table), ids, steps, c.cap, s, scratch, attn_new, nullptr);

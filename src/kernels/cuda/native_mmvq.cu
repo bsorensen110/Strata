@@ -41,6 +41,7 @@
 #include <cuda_runtime.h>
 #if defined(__HIPCC__)
 #include "strata/hip_compat/buffer_load.hpp"
+#include "strata/hip_compat/buffer_dispatch.hpp"
 #endif
 
 #include <algorithm>
@@ -1693,7 +1694,8 @@ __global__ void __launch_bounds__(WARPS * WARP) native_mmvq_buf_kernel(
     static_assert(WARP % F::T == 0, "buffer tile must contain whole quant blocks");
     __shared__ unsigned char tile[WARPS][TILE_BYTES] __attribute__((aligned(16)));
     __shared__ float partial[WARPS - 1][ROWS][WARP];
-    const int lane = threadIdx.x, wave = threadIdx.y, row0 = blockIdx.x * ROWS;
+    const int lane = threadIdx.x, wave = __builtin_amdgcn_readfirstlane((unsigned) threadIdx.y);
+    const int row0 = blockIdx.x * ROWS;
     const int nb = n_in / F::DIV, kqs = F::kqs(wave * WARP + lane);
     const size_t row_bytes = (size_t) nb * sizeof(typename F::Block);
     const size_t extent = (size_t) n_out * row_bytes;
@@ -1738,7 +1740,7 @@ void launch_buffer_mmvq(const void* weights, const void* x, float* y, int n_in, 
     const auto* a = static_cast<const Q81Block*>(x);
     const dim3 threads(WARP, WARPS);
     if (n_in / F::DIV < F::BPI)
-        native_mmvq_buf_kernel<F, WARPS><<<unsigned((n_out + WARPS - 1) / WARPS), threads, 0, stream>>>(w, a, y, n_in, n_out);
+        native_mmvq_buf_kernel<F, WARPS><<<unsigned((std::size_t(n_out) + WARPS - 1) / WARPS), threads, 0, stream>>>(w, a, y, n_in, n_out);
     else
         native_mmvq_buf_kernel<F, 1><<<unsigned(n_out), threads, 0, stream>>>(w, a, y, n_in, n_out);
 }
@@ -2800,6 +2802,16 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
 #define STRATA_WAVE_MMVQ(...)
 #endif
 
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+#define STRATA_HIP_BUF_MMVQ(...) \
+    if (ncols == 1 && strata::hip_compat::hip_bufload_usable()) { \
+        launch_buffer_mmvq<__VA_ARGS__>(weights, x_q8_1, y, n_in, n_out, static_cast<cudaStream_t>(stream)); \
+        launch_check(); return; \
+    }
+#else
+#define STRATA_HIP_BUF_MMVQ(...)
+#endif
+
 template<typename Weight, int Qi>
 void small_mmvq(const void* weights, const void* x_q8_1, float* y,
                 int n_in, int n_out, int ncols, void* stream) {
@@ -2809,6 +2821,7 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+    STRATA_HIP_BUF_MMVQ(SmallTraits<Weight, Qi>)
     STRATA_WAVE_MMVQ(SmallTraits<Weight, Qi>)
     if (ncols > 1) {
         launch_multi<SmallTraits<Weight, Qi>>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -3479,6 +3492,7 @@ void native_q5_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+    STRATA_HIP_BUF_MMVQ(Q5KTraits)
     STRATA_WAVE_MMVQ(Q5KTraits)
     if (ncols > 1) {
         launch_multi<Q5KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -3587,6 +3601,7 @@ void native_q2_0_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+    STRATA_HIP_BUF_MMVQ(Q20Traits)
     STRATA_WAVE_MMVQ(Q20Traits)
 #if !defined(__HIPCC__)
     // one column always (bitwise the single-column kernel); two to four only where the exact layout is the one in use
@@ -3645,6 +3660,7 @@ void native_q3_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+    STRATA_HIP_BUF_MMVQ(Q3KTraits)
     STRATA_WAVE_MMVQ(Q3KTraits)
     if (ncols > 1) {
         launch_multi<Q3KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -3685,6 +3701,7 @@ void native_iq4_xs_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+    STRATA_HIP_BUF_MMVQ(IQ4XSTraits)
     STRATA_WAVE_MMVQ(IQ4XSTraits)
     if (ncols > 1) {
         launch_multi<IQ4XSTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -3725,6 +3742,7 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+    STRATA_HIP_BUF_MMVQ(Q4KTraits)
     STRATA_WAVE_MMVQ(Q4KTraits)
     if (ncols > 1) {
         launch_multi<Q4KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
@@ -3766,6 +3784,7 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+    STRATA_HIP_BUF_MMVQ(Q6KTraits)
     STRATA_WAVE_MMVQ(Q6KTraits)
     if (ncols > 1) {
         launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);

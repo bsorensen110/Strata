@@ -14,8 +14,18 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "strata/kernels/gfx_arch.hpp"
 
 namespace strata::core {
+
+inline constexpr char kHipBufloadEnv[] = "STRATA_HIP_BUFLOAD";
+inline constexpr bool kHipBufloadDefaultOn = false;
+inline bool hip_bufload_capable(const char* gcn_arch) {
+    return strata::kernels::gfx_arch_is_gfx11_wmma(gcn_arch) ||
+           strata::kernels::gfx_arch_is_gfx12(gcn_arch);
+}
+/// Capability-qualified opt-ins, with their OFF values; never applied to the process environment.
+std::vector<std::pair<std::string, std::string>> arch_opt_in_env(const char* gcn_arch);
 
 /// The environment settings that are the defaults of `gcn_arch` (hipDeviceProp_t::gcnArchName; "gfx1151" or
 /// "gfx1151:sramecc-:xnack-"): empty for every other architecture.  `defaults026` (STRATA_DEFAULTS=026, defaults_026.hpp): the gfx12 table of

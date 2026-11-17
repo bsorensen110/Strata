@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #if defined(__HIPCC__)
 #include "strata/hip_compat/buffer_load.hpp"
+#include "strata/hip_compat/buffer_dispatch.hpp"
 #endif
 
 #define GGML_COMMON_DECL_CUDA
@@ -909,7 +910,8 @@ __global__ void __launch_bounds__(128) mmvq_buf_kernel(
     constexpr int BPW = 32 / F::ipb;
     extern __shared__ float4 buf_tiles[];
     static_assert(32 % F::ipb == 0, "buffer tile must contain whole quant blocks");
-    const int lane = threadIdx.x, wave = threadIdx.y, row = blockIdx.x * 4 + wave;
+    const int lane = threadIdx.x, wave = __builtin_amdgcn_readfirstlane((unsigned) threadIdx.y);
+    const int row = blockIdx.x * 4 + wave;
     if (row >= n_out) return;
     const int nb = n_in / F::qk;
     const unsigned block_bytes = row_bytes / nb;
@@ -925,7 +927,7 @@ __global__ void __launch_bounds__(128) mmvq_buf_kernel(
         __syncwarp();
         const int kbx = kb + lane / F::ipb, iqs = F::step * (lane % F::ipb);
         if (kbx < nb)
-            sum += F::dot(tile, x + kb * (F::qk / 32), lane / F::ipb, iqs);
+            sum += F::dot(tile, x + kbx * (F::qk / 32), lane / F::ipb, iqs);
         __syncwarp();
     }
     sum = warp_sum(sum);
@@ -3570,6 +3572,14 @@ template<int TY>
 void launch_mmvq(const uint8_t* W, size_t rb, const block_q8_1* X, float* y, int n_in, int n_out, int ncols,
                  cudaStream_t s) {
     const dim3 grid((unsigned) ((n_out + 3) / 4)), block(32, 4);
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if (ncols == 1 && n_in >= Fmt<TY>::qk && !g_old_kernels && strata::hip_compat::hip_bufload_usable()) {
+        const size_t block_bytes = rb / (n_in / Fmt<TY>::qk);
+        const size_t lds = 4 * (((32 / Fmt<TY>::ipb) * block_bytes + 15) & ~size_t(15));
+        mmvq_buf_kernel<TY><<<grid, block, lds, s>>>(W, rb, X, y, n_in, n_out);
+        return;
+    }
+#endif
     if constexpr (!kSplit<TY>) mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
     else if (g_old_kernels || split_off<TY>()) mmvq_kernel<TY><<<grid, block, 0, s>>>(W, rb, X, y, n_in, n_out, ncols);
     else if constexpr (kStageIqGrid<TY>) {

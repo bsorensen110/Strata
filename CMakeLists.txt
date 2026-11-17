@@ -587,6 +587,9 @@ if(STRATA_NATIVE_EXPERTS)
     target_link_libraries(native_dense_types_parity PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
     add_test(NAME native_dense_types_parity COMMAND native_dense_types_parity)
     set_tests_properties(native_dense_types_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    add_test(NAME native_dense_types_parity_bufload COMMAND native_dense_types_parity)
+    set_tests_properties(native_dense_types_parity_bufload PROPERTIES ENVIRONMENT "STRATA_HIP_BUFLOAD=1"
+                         SKIP_RETURN_CODE 77 TIMEOUT 300)
   endif()
   # #296's real-weight checks (OrcaRouter Q4_K_S files; docs/ORCA_Q4_K_S.md) - test programs, not part of a release
   if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS)

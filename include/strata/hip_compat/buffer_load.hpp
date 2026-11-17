@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // Buffer descriptor/cache encodings adapted from hipfire's
 // kernels/src/gfx12_weight_cache_policy.inc.
+// Strata adaptation: bounded descriptors, immediate-policy wrappers and cooperative copies.
+// License and upstream notices: third_party/hipfire/{LICENSE-APACHE,NOTICE}.
 #pragma once
 
 #include <cstddef>
@@ -10,7 +12,7 @@
 #if defined(__HIPCC__)
 #include <hip/hip_runtime.h>
 
-// Match gfx_arch_is_gfx11_wmma / gfx_arch_is_gfx12, including HIP's host pass.
+// Match gfx_arch_is_gfx11_wmma / gfx_arch_is_gfx12. The HIP host pass uses pointer placeholders.
 #if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || \
     defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
 #define STRATA_HIP_BUFFER_RDNA 1

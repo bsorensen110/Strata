@@ -8,6 +8,7 @@
 #if defined(__HIPCC__)
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/hip_compat/buffer_load.hpp"
+#include "strata/hip_compat/buffer_dispatch.hpp"
 #endif
 
 #include <cuda_fp16.h>
@@ -387,6 +388,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_rows_kernel(const float* _
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 // Adapted from hipfire kernels/src/tensor_ops.hip:qsa_attention_batched_hg4_lite.
+// License and upstream notices: third_party/hipfire/{LICENSE-APACHE,NOTICE}.
 // Keep Strata's 8-dimension score expressions, XOR trees and ascending-cell FMAs, not hipfire's serial dots.
 constexpr int kBufHeads = 4;
 constexpr int kBufLds = (CHUNK * kBufHeads + WARPS * kBufHeads) * sizeof(float);
@@ -419,6 +421,16 @@ struct QdaKey8 {
     float scale;
 };
 
+__device__ __forceinline__ long long qda_wave_row(long long row) {
+#if STRATA_HIP_BUFFER_RDNA
+    const uint64_t bits = (uint64_t) __builtin_amdgcn_readfirstlane((uint32_t) row) |
+                          ((uint64_t) __builtin_amdgcn_readfirstlane((uint32_t) ((uint64_t) row >> 32)) << 32);
+    return (long long) bits;
+#else
+    return row;
+#endif
+}
+
 __device__ __forceinline__ QdaKey8 qda_key8(QdaPageRsrc& r, const QsaAttnPools& p, long long row,
                                            int lane, int page_size) {
     QdaKey8 k{};
@@ -448,7 +460,8 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_buf_kernel(
     using namespace strata::hip_compat;
     const int z = blockIdx.z, chunk = blockIdx.x;
     const int kvh = blockIdx.y / (G / kBufHeads), h0 = (blockIdx.y % (G / kBufHeads)) * kBufHeads;
-    const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
+    const int t = threadIdx.x, lane = t & 31;
+    const int wave = __builtin_amdgcn_readfirstlane((unsigned) (t >> 5));
     q += (size_t) z * n_kv_heads * G * HD + (kvh * G + h0) * HD;
     ids += (size_t) z * cap + chunk * CHUNK;
     steps += (size_t) z * kStepCount;
@@ -476,12 +489,12 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_buf_kernel(
         return qda_selected_row(p, ids, c, count, n_kv_heads, kvh, page_size);
     };
     QdaPageRsrc kr;
-    long long row = row_at(wave), next_row = row_at(wave + WARPS);
+    long long row = qda_wave_row(row_at(wave)), next_row = qda_wave_row(row_at(wave + WARPS));
     QdaKey8 key = qda_key8(kr, p, row, lane, page_size);
     for (int c = wave; c < CHUNK; c += WARPS) {
         // The next key's pair of dwords and the token/page chain two tiles ahead precede this tile's arithmetic.
         const QdaKey8 next_key = qda_key8(kr, p, next_row, lane, page_size);
-        const long long ahead_row = row_at(c + 2 * WARPS);
+        const long long ahead_row = qda_wave_row(row_at(c + 2 * WARPS));
         strata_hip_buffer_sched_barrier();
         if (row >= 0) {
             float k[8];
@@ -520,7 +533,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_buf_kernel(
     QdaPageRsrc vr;
     float acc[kBufHeads] = {};
     for (int c = 0; c < count; ++c) {
-        const long long r = row_at(c);
+        const long long r = qda_wave_row(row_at(c));
         if (r < 0) continue;
         vr.set(p.v_q, p.v_scale, r, page_size);
         const unsigned off = (unsigned) (r % page_size) * HD;
@@ -1351,6 +1364,18 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
     float* part_l = part_m + (size_t) n_chunks * s.n_head;
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv, (unsigned) n_q);
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if (kernel < 0 && kv_mode == 1 && strata::hip_compat::hip_bufload_usable()) {
+        if (s.n_head / kBufHeads > 65535) {
+            std::fprintf(stderr, "qsa HIP buffer attention: grid.y exceeds 65535\n");
+            std::exit(1);
+        }
+        const dim3 buf_grid((unsigned) n_chunks, (unsigned) (s.n_head / kBufHeads), (unsigned) n_q);
+        attn_chunk_q8_buf_kernel<<<buf_grid, THREADS, kBufLds, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
+            (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        return;
+    }
+#endif
 #if defined(STRATA_ATTN_PRE75_BUILT)
     const bool pre = kernel < 0 ? pre75_attn() : kernel == 1;
 #endif
@@ -1511,6 +1536,9 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
         if (attn_kv_mode(pools.p[z]) != kv_mode) return false;
     }
     const bool lane_cell = lane_cell_attn();
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if (kv_mode == 1 && strata::hip_compat::hip_bufload_usable()) return false;
+#endif
     // only where qsa_decode_attn_batch runs attn_chunk_kernel; its other variants keep the per-query calls
 #if defined(STRATA_ATTN_PRE75_BUILT)
     if (!lane_cell && pre75_attn()) return false;
@@ -1575,6 +1603,9 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
     // pre-sm_75 / gfx103x kernel, the gfx906 swizzle): there each row goes through that call, one launch per row.
     const bool lane_cell = lane_cell_attn();
     bool per_row = false;
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    per_row = kv_mode == 1 && strata::hip_compat::hip_bufload_usable();
+#endif
 #if defined(STRATA_ATTN_PRE75_BUILT)
     per_row = per_row || (!lane_cell && pre75_attn());
 #endif
@@ -1638,6 +1669,17 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
     const float scale = 1.0f / sqrtf((float) HD);
     const dim3 grid((unsigned) n_chunks, (unsigned) s.n_head_kv);
     cudaStream_t st = (cudaStream_t) stream;
+#if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
+    if (kv_mode == 1 && strata::hip_compat::hip_bufload_usable()) {
+        if (s.n_head / kBufHeads > 65535) {
+            std::fprintf(stderr, "qsa HIP buffer attention: grid.y exceeds 65535\n");
+            std::exit(1);
+        }
+        const dim3 buf_grid((unsigned) n_chunks, (unsigned) (s.n_head / kBufHeads));
+        attn_chunk_q8_buf_kernel<<<buf_grid, THREADS, kBufLds, st>>>(q, pools, ids, step, (int) s.n_head_kv,
+            (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, 0);
+    } else
+#endif
 #if !defined(__HIPCC__)
     if (kv_mode == 1 && attn_v3_on())
         attn_chunk_q8_v3_kernel<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,

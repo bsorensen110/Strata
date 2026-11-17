@@ -39,6 +39,23 @@ static void put(const char* k, const char* v) {
 
 int main() {
     using namespace strata::core;
+    for (const char* a : {"gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151",
+                          "gfx1200", "gfx1201", "gfx1201:sramecc-:xnack-"}) {
+        CHECK(hip_bufload_capable(a));
+        const auto opt_in = arch_opt_in_env(a);
+        CHECK(opt_in.size() == 1 && opt_in[0].first == kHipBufloadEnv && opt_in[0].second == "0");
+        for (bool legacy : {false, true})
+        for (bool windows : {false, true})
+            for (const auto& kv : arch_default_env(a, legacy, windows)) CHECK(kv.first != kHipBufloadEnv);
+    }
+    for (const char* a : {static_cast<const char*>(nullptr), "", "gfx1030", "gfx906", "gfx942",
+                          "gfx1152", "gfx1202", "gfx12010", "sm_120"}) {
+        CHECK(!hip_bufload_capable(a));
+        CHECK(arch_opt_in_env(a).empty());
+    }
+    // Alternating names must not carry a previous device's capability into the next selection.
+    CHECK(hip_bufload_capable("gfx1201") && !hip_bufload_capable("gfx1030") &&
+          hip_bufload_capable("gfx1151") && !hip_bufload_capable("gfx906"));
     unset("STRATA_GFX1151_DEFAULTS");
     // 0.2.10: the parallel-request stack, Windows gfx1151 with 2 or more batch slots only
     unset("STRATA_GFX1151_DEFAULTS");

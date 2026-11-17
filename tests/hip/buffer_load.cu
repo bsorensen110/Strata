@@ -9,6 +9,7 @@
 
 #if defined(__HIPCC__)
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/hip_compat/buffer_dispatch.hpp"
 
 static void ck(hipError_t e, const char* what) {
     if (e != hipSuccess) {
@@ -46,6 +47,21 @@ int main() {
         return 77;
     }
     ck(e, "device count");
+    const char* setting = std::getenv(strata::core::kHipBufloadEnv);
+    const bool requested = setting && std::strcmp(setting, "1") == 0;
+    for (int device = count - 1; device >= 0; --device) {
+        ck(hipSetDevice(device), "switch device");
+        hipDeviceProp_t p{};
+        ck(hipGetDeviceProperties(&p, device), "switch properties");
+        bool expected = requested && p.warpSize == 32 && strata::core::hip_bufload_capable(p.gcnArchName);
+#if defined(STRATA_HIP_GFX906)
+        expected = false;
+#endif
+        if (strata::hip_compat::hip_bufload_usable() != expected) {
+            std::fprintf(stderr, "FAIL buffer dispatch capability for device %d (%s)\n", device, p.gcnArchName);
+            return 1;
+        }
+    }
     hipDeviceProp_t prop{};
     ck(hipGetDeviceProperties(&prop, 0), "properties");
     if (prop.warpSize != 32 || (!strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName) &&

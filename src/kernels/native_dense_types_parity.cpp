@@ -163,6 +163,10 @@ int main(int argc, char** argv) {
     const Case narrow[] = {{"Q5_0", GGML_TYPE_Q5_0, 640}, {"Q8_0", GGML_TYPE_Q8_0, 640}, {"IQ4_NL", GGML_TYPE_IQ4_NL, 640},
                            {"Q2_0", GGML_TYPE_Q2_0, 640}, {"Q6_K", GGML_TYPE_Q6_K, 2048}, {"Q5_K", GGML_TYPE_Q5_K, 2048}};
     for (const Case& c : narrow) run(c, 2560, false, s);
+    for (Case c : cases) {
+        c.n_in = (int) ggml_blck_size(c.t) * 3;
+        run(c, 7, false, s);   // short quant-block tiles, unaligned rows and the last partial row group
+    }
     std::printf("native_dense_types_parity: %d failures\n", g_fail);
     return g_fail ? 1 : 0;
 }
