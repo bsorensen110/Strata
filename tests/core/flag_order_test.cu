@@ -3,6 +3,7 @@
 // queued); a kernel plays the graph (waits for flag B >= value, then reads staging).  Run on every device found.
 #include "strata/core/flag_order.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -28,7 +29,11 @@ __global__ void consumer(volatile uint32_t* flag, uint32_t want, volatile uint32
     *seen = *staging;        // what the graph's PCIe group would read
 }
 
+#if defined(__GNUC__) && !defined(_MSC_VER)
 static uint32_t rd(volatile uint32_t* p) { return __atomic_load_n((uint32_t*) p, __ATOMIC_SEQ_CST); }
+#else
+static uint32_t rd(volatile uint32_t* p) { return std::atomic_ref<uint32_t>(*const_cast<uint32_t*>(p)).load(std::memory_order_seq_cst); }
+#endif
 
 static int run_device(int dev) {
     CK(cudaSetDevice(dev));
