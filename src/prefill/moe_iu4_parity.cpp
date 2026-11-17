@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 // Port note: hipfire block_i4_128_quant.hip eight-point reference search.
 #include "strata/prefill/moe_iu4_reference.hpp"
+#include "strata/prefill/moe_hip_config.hpp"
 #include <cfenv>
 #include <cstdio>
 #include <limits>
@@ -28,6 +29,33 @@ void products() {
                 std::vector<float> got(want.size(), -1234.0f);
                 r4::emulate(w,x.data(),n,gfx12,symmetric,got.data(),ld,zp);
                 r8::require(std::memcmp(want.data(),got.data(),want.size()*4)==0, "IU4 K32/K16 emulation bits/tails differ");
+            }
+            void configs() {
+                namespace mmq = strata::prefill::mmq;
+                for (const char* arch : {"gfx1201","gfx1201:sramecc-:xnack-","gfx1100","gfx1151","gfx1200","gfx906","gfx12010","sm_120"}) {
+                    const auto q4=mmq::hip_config(GGML_PREC_Q4,arch,129,256,17,4,true);
+                    const bool g12=strata::kernels::gfx_arch_is(arch,"gfx1201");
+                    const bool g11=strata::kernels::gfx_arch_is(arch,"gfx1100") || strata::kernels::gfx_arch_is(arch,"gfx1151");
+                    r8::require((q4.entry!=mmq::HipEntry::None)==(g12||g11),"IU4 exact-arch config admission drift");
+                    if (g12||g11)
+                        r8::require(q4.precision==GGML_PREC_Q4 && q4.k_step==(g12?32:16) &&
+                                    q4.lds==(g12?20480:30720),"IU4 positional config mismatch");
+                    r8::require(mmq::hip_config(GGML_PREC_Q4,arch,129,256,17,6,true).entry==mmq::HipEntry::None,
+                                "W6 must not enter IU4");
+                }
+                for (int entry=0;entry<24;++entry) {
+                    const auto q8=mmq::hip_config(GGML_PREC_Q8,"gfx1201",65,256,5,4,true,entry);
+                    const auto t=strata::prefill::iu8::kNarrowTiles[entry];
+                    r8::require(q8.entry==mmq::HipEntry::Iu8Narrow && q8.precision==GGML_PREC_Q8 &&
+                                q8.rows==t.rows && q8.tokens==t.tokens && q8.split==t.split && q8.bf16==t.bf16 &&
+                                q8.threads==t.rows/16*32 && q8.narrow==entry,"narrow positional config mismatch");
+                }
+                r8::require(mmq::hip_config(GGML_PREC_Q8,"gfx1201",65,256,49,4,true).entry==mmq::HipEntry::None &&
+                            mmq::hip_config(GGML_PREC_Q8,"gfx1201",65,256,64,4,false).entry==mmq::HipEntry::Iu8Prefill &&
+                            mmq::hip_config(GGML_PREC_Q4,"gfx1200",65,256,64,4,false).entry==mmq::HipEntry::None &&
+                            mmq::hip_config(GGML_PREC_DEFAULT,"gfx1201",65,256,17,4,true).entry==mmq::HipEntry::None &&
+                            mmq::hip_config(GGML_PREC_Q4,"gfx1201",65,1088,17,4,true).entry==mmq::HipEntry::None,
+                            "precision/K128/window refusal drift");
             }
         }
     }
@@ -59,6 +87,7 @@ int main() {
         }
         r8::require(blocks[0].d == 1.0f && blocks[0].s == 0, "A4 zero block reference policy");
         products();
+        configs();
         std::puts("PASS moe_iu4_parity (CPU A4 eight-candidate oracle; no KLD/performance claim)");
         return 0;
     } catch (const std::exception& e) {

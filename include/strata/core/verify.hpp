@@ -33,6 +33,7 @@
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/moe_iu8_gfx.hpp"
 #include "strata/prefill/moe_iu8_pack.hpp"
+#include "strata/prefill/moe_iu4_gfx.hpp"
 #endif
 
 #include <cuda_runtime.h>
@@ -780,7 +781,9 @@ private:
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
     std::vector<strata::prefill::iu8::Layer> hip_tiles_;
     std::vector<strata::prefill::iu8::WindowWeights> hip_tables_;
+    std::vector<strata::prefill::iu4::WindowWeights> hip4_tables_;
     strata::prefill::iu8::Block *hip_x_ = nullptr, *hip_d_ = nullptr;
+    strata::prefill::iu4::Block *hip4_x_ = nullptr, *hip4_d_ = nullptr;
     float *hip_gu_ = nullptr, *hip_h_ = nullptr;
 #endif
     float* nat_xr_ = nullptr;     // APR: the Hadamard-rotated expert input (the shared expert and the CPU keep xm); nullptr

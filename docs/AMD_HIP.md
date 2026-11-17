@@ -27,6 +27,20 @@ runs are not supported. Use the [package table](#ready-made-packages) to match y
 
 ## Supported cards
 
+**Experimental MoE tiles (source builds with `STRATA_PREFILL_MMQ=ON`).**
+`STRATA_HIP_MOE_IU8=1` also enables narrow verify-window tiles, up to 48 tokens,
+on gfx1100, gfx1151, gfx1200 and gfx1201. `STRATA_HIP_MOE_IU4=1` enables a
+separate W4A4 verify route on gfx1100, gfx1151 and gfx1201, not gfx1200. Both
+are off by default. Layers need exact symmetric weight packs and K divisible
+by 128; rotated or separately scaled experts keep their existing route.
+Set the flags before starting the process: solo and batch graphs keep the
+route selected at initialization. If both are set, eligible W4 layers use IU4.
+IU8 narrow tiles must match the IU8 prefill tile byte for byte. IU4 changes
+activation precision; its CPU parity check does not establish model quality.
+It still needs logit-KL and hardware timing measurements. No speedup is claimed.
+The IU4 kernel API exposes banded raster ordering separately; it is not enabled
+by the environment flag.
+
 | Card | Architecture | Status |
 | --- | --- | --- |
 | RX 7900 XT / XTX | gfx1100 | Maintainer-tested |

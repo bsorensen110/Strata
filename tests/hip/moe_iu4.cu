@@ -84,6 +84,65 @@ void producers(hipStream_t stream) {
                         r8::require(std::memcmp(want.data(),got.data(),words*4)==0,
                                     "IU4 device differs from own exact-fold CPU/canaries");
                     }
+                    void window_groups(hipStream_t stream) {
+                        namespace i8=strata::prefill::iu8;
+                        constexpr int n=24,k=256,m=65,ld=68,cap=48,prefix=2,ne=3;
+                        const int counts[ne]={1,5,24};
+                        std::vector<int32_t> starts{prefix},tok(cap),dst(cap),route(cap);
+                        for (int e=0;e<ne;++e) {
+                            for (int j=0;j<counts[e];++j) {
+                                const int s=starts.back()+j;
+                                tok[s]=(j*5+e)%n; dst[s]=cap-1-(s-prefix); route[dst[s]]=e;
+                            }
+                            starts.push_back(starts.back()+counts[e]);
+                        }
+                        i8::Layer layer;
+                        std::vector<i8::Pack> packs(ne);
+                        for (int e=0;e<ne;++e) {
+                            const auto src=r8::source(GGML_TYPE_Q4_0,m,k,71+e);
+                            std::string why;
+                            r8::require(i8::pack_exact(GGML_TYPE_Q4_0,src.data(),src.size(),m,k,packs[e],why),why.c_str());
+                            i8::Expert expert;
+                            r8::require(i8::upload(packs[e],expert.gu,why),why.c_str());
+                            r8::require(i8::upload(packs[e],expert.down,why),why.c_str());
+                            layer.experts.push_back(std::move(expert));
+                        }
+                        i4::WindowWeights table; r8::require(table.upload(layer),"IU4 exact W4 table refused");
+                        const auto x=r4::quantize(r8::activations(k,n).data(),k,n);
+                        Buffer dtok(cap*4),ddst(cap*4),droute(cap*4),dstart(starts.size()*4),dcount(4);
+                        upload(dtok,tok); upload(ddst,dst); upload(droute,route); upload(dstart,starts); upload(dcount,std::vector<int32_t>{ne});
+                        strata::prefill::mmq::Context context;
+                        for (bool sorted_x : {false,true})
+                        for (bool sorted_y : {false,true}) {
+                            std::vector<i4::Block> input=sorted_x?std::vector<i4::Block>((k/128)*cap):x;
+                            if (sorted_x)
+                                for (int kb=0;kb<k/128;++kb)
+                                for (int s=prefix;s<starts.back();++s) input[kb*cap+s]=x[kb*n+tok[s]];
+                            Buffer dx(input.size()*sizeof(i4::Block)),dy(((size_t)cap*ld+17)*4);
+                            upload(dx,input);
+                            std::vector<float> want((size_t)cap*ld+17),got(want.size());
+                            std::memset(want.data(),0xa5,want.size()*4);
+                            for (int e=0;e<ne;++e)
+                            for (int s=starts[e];s<starts[e+1];++s)
+                            for (int r=0;r<m;++r) want[(size_t)(sorted_y?s:dst[s])*ld+r]=r4::fold(packs[e],x.data(),n,tok[s],r,true);
+                            i4::Product p;
+                            p.table=table.gu; p.count=(const int32_t*)dcount.p; p.starts=(const int32_t*)dstart.p;
+                            p.tok=(const int32_t*)dtok.p; p.dst=(const int32_t*)ddst.p; p.route=(const int32_t*)droute.p;
+                            p.x=(const i4::Block*)dx.p; p.y=(float*)dy.p; p.rows=m; p.cols=k; p.tokens=n;
+                            p.x_rows=sorted_x?cap:n; p.groups=cap; p.ld=ld; p.sorted_x=sorted_x; p.sorted_y=sorted_y;
+                            check(hipMemsetAsync(dy.p,0xa5,want.size()*4,stream),"IU4 group poison");
+                            hipGraph_t graph=nullptr;
+                            check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"IU4 group capture");
+                            strata::prefill::mmq::Product call; call.hip_iu4=&p; context.run(call,stream);
+                            check(hipStreamEndCapture(stream,&graph),"IU4 group end capture");
+                            hipGraphExec_t exec=nullptr;
+                            check(hipGraphInstantiate(&exec,graph,nullptr,nullptr,0),"IU4 group instantiate");
+                            check(hipGraphLaunch(exec,stream),"IU4 group replay"); check(hipStreamSynchronize(stream),"IU4 group done");
+                            download(dy,got);
+                            r8::require(std::memcmp(want.data(),got.data(),want.size()*4)==0,"IU4 dynamic expert/token/destination map drift");
+                            check(hipGraphExecDestroy(exec),"IU4 group free exec"); check(hipGraphDestroy(graph),"IU4 group free graph");
+                        }
+                    }
                     check(hipGraphExecDestroy(exec),"IU4 exec free");
                     check(hipGraphDestroy(graph),"IU4 graph free");
                 }
@@ -145,6 +204,7 @@ int main() {
             check(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
             producers(stream);
             products(stream);
+            window_groups(stream);
             check(hipStreamDestroy(stream), "free stream"); ++tested;
         }
         if (!tested) { std::puts("SKIP hip_moe_iu4_test: exact gfx wave32 required"); return 77; }

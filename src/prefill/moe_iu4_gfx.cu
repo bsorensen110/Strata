@@ -6,6 +6,7 @@
 #include "strata/prefill/moe_iu4_gfx.hpp"
 #if defined(__HIPCC__)
 #include "strata/core/arch_defaults.hpp"
+#include "strata/prefill/moe_hip_config.hpp"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <climits>
@@ -261,8 +262,11 @@ extern "C" __global__ __launch_bounds__(256) void strata_gemm_i4_k16_gfx11(Produ
 }
 
 bool usable() {
-    const char* env = std::getenv(strata::core::kHipMoeIu4Env);
-    if (!env || std::strcmp(env, "1") != 0) return false;
+    static const bool requested = [] {
+        const char* env = std::getenv(strata::core::kHipMoeIu4Env);
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    if (!requested) return false;
     int device = -1;
     check(hipGetDevice(&device), "device");
     hipDeviceProp_t prop{};
@@ -284,9 +288,12 @@ void run(const Product& p, void* stream) {
     if (!p.count && p.weight.device != device) invalid("weight device");
     hipDeviceProp_t prop{};
     check(hipGetDeviceProperties(&prop, device), "launch properties");
-    if (strata::kernels::gfx_arch_is(prop.gcnArchName, "gfx1201"))
+    const auto config = mmq::hip_config(GGML_PREC_Q4, prop.gcnArchName,p.rows,p.cols,p.tokens,4,p.count!=nullptr);
+    if (config.entry == mmq::HipEntry::Iu4K32)
         strata_gemm_i4_k32_gfx1201<<<(unsigned) grid, 256, 0, (hipStream_t) stream>>>(p);
-    else strata_gemm_i4_k16_gfx11<<<(unsigned) grid, 256, 0, (hipStream_t) stream>>>(p);
+    else if (config.entry == mmq::HipEntry::Iu4K16)
+        strata_gemm_i4_k16_gfx11<<<(unsigned) grid, 256, 0, (hipStream_t) stream>>>(p);
+    else invalid("Q4 config");
     check(hipGetLastError(), "GEMM launch");
 }
 }  // namespace strata::prefill::iu4

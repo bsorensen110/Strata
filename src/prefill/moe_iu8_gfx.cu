@@ -8,6 +8,7 @@
 #include "strata/prefill/moe_iu8_pack.hpp"
 #include "strata/prefill/moe_iu4_quant.cuh"
 #include "strata/core/arch_defaults.hpp"
+#include "strata/prefill/moe_hip_config.hpp"
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <climits>
@@ -141,17 +142,17 @@ __global__ void __launch_bounds__(256) grouped_prefill(Product p) {
 }
 
 // A owns tokens, B owns weight rows, exactly as P1's prefill entry. No
-// weight LDS: each wave owns 16 rows, each lane half loads one K64 epoch.
+// weight LDS: each wave owns 16 rows. gfx12 splits K64 between lane halves;
+// gfx11 fetches a K128 epoch per half, exchanging it for its duplicate twin.
 template<int Rows, int Tokens, bool Split, bool BF16>
 __device__ __forceinline__ void narrow_body(Window p) {
 #if defined(__gfx1100__) || defined(__gfx1151__) || defined(__gfx1200__) || defined(__gfx1201__)
     constexpr int NT = Rows / 16 * 32;
     constexpr int TG = Tokens / 16;
     const int mt = (p.rows + Rows - 1) / Rows;
-    const int slices = Split ? (p.tokens + Tokens - 1) / Tokens : 1;
-    const int group = blockIdx.x / (mt * slices);
+    const int group = blockIdx.x / mt;
     if (p.count && group >= *p.count) return;
-    const int slice = (blockIdx.x / mt) % slices;
+    const int slice = Split ? blockIdx.y : 0;
     const int row0 = (blockIdx.x % mt) * Rows;
     const int begin = p.count ? p.starts[group] : 0;
     const int end = p.count ? p.starts[group + 1] : p.tokens;
@@ -161,6 +162,9 @@ __device__ __forceinline__ void narrow_body(Window p) {
     const int row = row0 + (tid >> 5) * 16 + lo;
     __shared__ __align__(16) Block xs[Tokens];
     F8 acc[TG] = {};
+#if defined(__gfx1100__) || defined(__gfx1151__)
+    I4 wr[8];
+#endif
     for (int kb = 0; kb < p.cols / 128; ++kb) {
         for (int t = tid; t < Tokens * 34; t += NT) {
             const int token = token0 + t / 34;
@@ -179,15 +183,16 @@ __device__ __forceinline__ void narrow_body(Window p) {
             wr[step] = v;
         }
 #else
-        I4 wr[4];
-        for (int step = 0; step < 4; ++step) {
-            I4 v{};
-            for (int j = 0; j < 16; ++j) {
-                const int k = hi * 64 + step * 16 + j;
-                ((int8_t*) &v)[byte_index(j)] = row < p.rows
-                    ? (int8_t) decode(w, (size_t) row * p.cols + kb * 128 + k) : 0;
+        if ((kb & 1) == 0) {
+            const int epoch = kb + hi;
+            for (int step = 0; step < 8; ++step) {
+                I4 v{};
+                for (int j = 0; j < 16; ++j) {
+                    ((int8_t*) &v)[byte_index(j)] = row < p.rows && epoch < p.cols / 128
+                        ? (int8_t) decode(w, (size_t) row * p.cols + epoch * 128 + step * 16 + j) : 0;
+                }
+                wr[step] = v;
             }
-            wr[step] = v;
         }
 #endif
         barrier();
@@ -201,10 +206,10 @@ __device__ __forceinline__ void narrow_body(Window p) {
                     true, a, true, b, dot[tg], false);
             }
 #else
-            I4 b = wr[step & 3];
+            I4 b = wr[step];
             for (int j = 0; j < 4; ++j) {
                 const int peer = __builtin_amdgcn_permlanex16(b[j], b[j], 0x76543210u, 0xfedcba98u, false, false);
-                if (hi != step / 4) b[j] = peer;
+                if (hi != (kb & 1)) b[j] = peer;
             }
             for (int tg = 0; tg < TG; ++tg) {
                 const I4 a = *(const I4*) (xs[tg * 16 + lo].qs + step * 16);
@@ -273,13 +278,21 @@ void run_narrow(const Window& p, int entry, void* stream) {
                 : (!p.weight.symmetric_verified || !p.weight.codes || !p.weight.scales ||
                    p.weight.rows != p.rows || p.weight.cols != p.cols || p.x_rows != p.tokens))
         invalid("narrow operands");
-    const auto t = kNarrowTiles[entry];
-    if (!t.split && p.tokens > t.tokens) invalid("narrow token capacity");
-    const int64_t grid = ((int64_t) p.rows + t.rows - 1) / t.rows * p.groups *
-        (t.split ? (p.tokens + t.tokens - 1) / t.tokens : 1);
+    int device = -1;
+    check(hipGetDevice(&device), "narrow device");
+    hipDeviceProp_t prop{};
+    check(hipGetDeviceProperties(&prop, device), "narrow properties");
+    if (!p.count && (p.weight.device != device || (p.weight.bits != 4 && p.weight.bits != 6)))
+        invalid("narrow verified weight device/encoding");
+    const auto config = mmq::hip_config(GGML_PREC_Q8, prop.gcnArchName, p.rows,p.cols,p.tokens,
+                                        p.count ? 4 : p.weight.bits, true, entry);
+    if (config.entry != mmq::HipEntry::Iu8Narrow) invalid("Q8 narrow config");
+    const auto t = kNarrowTiles[config.narrow];
+    const int64_t grid = ((int64_t) p.rows + t.rows - 1) / t.rows * p.groups;
     if (grid <= 0 || grid > INT_MAX) invalid("narrow folded grid");
+    const dim3 blocks((unsigned) grid, t.split ? (p.tokens + t.tokens - 1) / t.tokens : 1, 1);
 #define LAUNCH_CASE(I, R, N, S) case I: strata_gemm_sym_i8_set_m##R##n##N##S##_gfx12 \
-    <<<(unsigned) grid, R / 16 * 32, 0, (hipStream_t) stream>>>(p); break
+    <<<blocks, R / 16 * 32, 0, (hipStream_t) stream>>>(p); break
 #define LAUNCH_FAMILY(I, S) \
     LAUNCH_CASE(I,32,16,S); LAUNCH_CASE(I+1,32,32,S); LAUNCH_CASE(I+2,32,48,S); \
     LAUNCH_CASE(I+3,64,16,S); LAUNCH_CASE(I+4,64,32,S); LAUNCH_CASE(I+5,64,48,S)

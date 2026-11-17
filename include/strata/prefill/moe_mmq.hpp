@@ -11,6 +11,8 @@
 #include "strata/prefill/mmq_ids_margin.hpp"
 #if (defined(STRATA_USE_HIP) || defined(__HIPCC__)) && !defined(STRATA_HIP_GFX906)
 namespace strata::prefill::iu8 { struct Product; }
+namespace strata::prefill::iu8 { struct Window; }
+namespace strata::prefill::iu4 { struct Product; }
 #endif
 
 namespace strata::prefill::mmq {
@@ -73,6 +75,8 @@ struct WeightTab {
 struct Product {
 #if (defined(STRATA_USE_HIP) || defined(__HIPCC__)) && !defined(STRATA_HIP_GFX906)
     const iu8::Product* hip_iu8 = nullptr;
+    const iu8::Window* hip_window = nullptr;
+    const iu4::Product* hip_iu4 = nullptr;
 #endif
     const void* w = nullptr;
     int type = -1;

@@ -13,6 +13,7 @@
 #include "strata/prefill/moe_iq4_w4a8.hpp"
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
 #include "strata/prefill/moe_iu8_gfx.hpp"
+#include "strata/prefill/moe_iu4_gfx.hpp"
 #endif
 
 #include "strata/prefill/mmq_kq_abi.hpp"
@@ -481,7 +482,15 @@ void Context::run(const Product& p, void* stream) {
 #if defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     // Port note: hipfire gemm_mq6sym_i8.gfx1201.hip. Explicit sidecar ABI only;
     // never reinterpret the incumbent q8_1 payload as block_i8_128.
+    if ((int) (p.hip_iu8 != nullptr) + (int) (p.hip_window != nullptr) + (int) (p.hip_iu4 != nullptr) > 1) {
+        std::fputs("prefill mmq: conflicting HIP activation precision sidecars\n", stderr); std::exit(1);
+    }
     if (p.hip_iu8) { iu8::run(*p.hip_iu8, stream); return; }
+    if (p.hip_window) {
+        iu8::run_narrow(*p.hip_window, iu8::narrow_entry(p.hip_window->rows, p.hip_window->tokens), stream);
+        return;
+    }
+    if (p.hip_iu4) { iu4::run(*p.hip_iu4, stream); return; }
 #endif
     if (p.n <= 0 || p.max_rows <= 0) return;
 #if !defined(GGML_USE_HIP)

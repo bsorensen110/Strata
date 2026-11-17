@@ -118,6 +118,7 @@ bool pack_exact(int type, const void* source, size_t bytes, int rows, int cols, 
 #if defined(__HIPCC__) || defined(STRATA_USE_HIP)
 #include "strata/core/arch_defaults.hpp"
 #include "strata/prefill/moe_iu8_gfx.hpp"
+#include "strata/prefill/moe_iu4_gfx.hpp"
 #include <hip/hip_runtime.h>
 #include <cstdlib>
 
@@ -249,4 +250,45 @@ bool load_layer(int gt, int dt, int embd, int ff, int ne, size_t bytes, size_t u
     return true;
 }
 }  // namespace strata::prefill::iu8
+
+namespace strata::prefill::iu4 {
+namespace {
+void check4(hipError_t e, const char* what) {
+    if (e != hipSuccess) {
+        std::fprintf(stderr, "HIP MoE IU4: %s: %s\n", what, hipGetErrorString(e)); std::exit(1);
+    }
+}
+}
+WindowWeights::~WindowWeights() {
+    if (!allocation) return;
+    int previous = -1;
+    check4(hipGetDevice(&previous), "table device"); check4(hipSetDevice(device), "table owner");
+    check4(hipFree(allocation), "free table"); check4(hipSetDevice(previous), "restore table device");
+}
+WindowWeights::WindowWeights(WindowWeights&& other) noexcept { *this = std::move(other); }
+WindowWeights& WindowWeights::operator=(WindowWeights&& other) noexcept {
+    if (this == &other) return *this;
+    if (allocation) { std::fputs("HIP MoE IU4: replacing a live table\n", stderr); std::abort(); }
+    allocation=other.allocation; gu=other.gu; down=other.down; device=other.device;
+    other.allocation=nullptr; other.gu=nullptr; other.down=nullptr;
+    return *this;
+}
+bool WindowWeights::upload(const iu8::Layer& layer) {
+    if (allocation || layer.experts.empty()) {
+        std::fputs("HIP MoE IU4: invalid table upload\n", stderr); std::abort();
+    }
+    std::vector<WeightView> views;
+    for (int role=0;role<2;++role)
+    for (const auto& e : layer.experts) {
+        const auto& w=role==0?e.gu:e.down;
+        if (w.bits!=4 || !w.symmetric_verified) return false;
+        views.push_back({w.codes,w.scales,nullptr,w.rows,w.cols,w.device,true});
+    }
+    check4(hipGetDevice(&device),"upload device");
+    check4(hipMalloc(&allocation,views.size()*sizeof(WeightView)),"allocate table");
+    check4(hipMemcpy(allocation,views.data(),views.size()*sizeof(WeightView),hipMemcpyHostToDevice),"upload table");
+    gu=(const WeightView*)allocation; down=gu+layer.experts.size();
+    return true;
+}
+}  // namespace strata::prefill::iu4
 #endif

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <type_traits>
 
+namespace strata::prefill::iu8 { struct Layer; }
 namespace strata::prefill::iu4 {
 #if defined(__HIPCC__) || defined(STRATA_USE_HIP) || defined(STRATA_MOE_IU4_CPU_ORACLE)
 struct Block { float d; int32_t s; uint8_t qs[64]; };
@@ -36,6 +37,18 @@ struct Product {
     bool sorted_x = false, sorted_y = false, symmetric = true, banded = false;
 };
 inline constexpr int kGfx12Lds = 20480, kGfx11Lds = 30720;
+struct WindowWeights {
+    void* allocation = nullptr;
+    const WeightView *gu = nullptr, *down = nullptr;
+    int device = -1;
+    WindowWeights() = default;
+    ~WindowWeights();
+    WindowWeights(WindowWeights&& other) noexcept;
+    WindowWeights& operator=(WindowWeights&& other) noexcept;
+    WindowWeights(const WindowWeights&) = delete;
+    WindowWeights& operator=(const WindowWeights&) = delete;
+    bool upload(const iu8::Layer& layer);
+};
 bool usable();
 void run(const Product& p, void* stream);
 void quantize(const float* x, Block* out, int cols, int rows, void* stream);

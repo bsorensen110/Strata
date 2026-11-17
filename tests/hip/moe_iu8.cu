@@ -121,8 +121,10 @@ void grouped(int type, int m, int k, hipStream_t stream, strata::prefill::mmq::C
         p.weights[e] = iu8::view(weights[e]);
     }
     void narrow_tiles(hipStream_t stream) {
-        for (int type : {GGML_TYPE_Q4_0, GGML_TYPE_Q6_K}) {
-            constexpr int m = 65, k = 512, ld = 68;
+        for (const auto& spec : {std::pair{GGML_TYPE_Q4_0,128}, std::pair{GGML_TYPE_Q4_0,384},
+                                 std::pair{GGML_TYPE_Q6_K,512}}) {
+            constexpr int m = 65, ld = 68;
+            const int type = spec.first, k = spec.second;
             const auto src = ref::source(type, m, k);
             iu8::Pack w;
             iu8::DeviceWeight dw;
@@ -148,6 +150,63 @@ void grouped(int type, int m, int k, hipStream_t stream, strata::prefill::mmq::C
                 for (int r = 0; r < m; ++r) {
                     const float f = ref::fold(w, x.data(), n, t, r);
                     ref::require(std::memcmp(&f, &expected[(size_t) t * ld + r], 4) == 0, "prefill cross-arm CPU mismatch");
+                }
+                void window_groups(hipStream_t stream, strata::prefill::mmq::Context& context) {
+                    constexpr int n=24,k=256,m=65,ld=68,cap=48,prefix=2,ne=3;
+                    const int counts[ne]={1,5,24};
+                    std::vector<int32_t> starts{prefix},tok(cap),dst(cap),route(cap);
+                    for (int e=0;e<ne;++e) {
+                        for (int j=0;j<counts[e];++j) {
+                            const int s=starts.back()+j;
+                            tok[s]=(j*5+e)%n; dst[s]=cap-1-(s-prefix); route[dst[s]]=e;
+                        }
+                        starts.push_back(starts.back()+counts[e]);
+                    }
+                    iu8::Layer layer;
+                    std::vector<iu8::Pack> packs(ne);
+                    for (int e=0;e<ne;++e) {
+                        const auto src=ref::source(GGML_TYPE_Q4_0,m,k,71+e);
+                        std::string why;
+                        ref::require(iu8::pack_exact(GGML_TYPE_Q4_0,src.data(),src.size(),m,k,packs[e],why),why.c_str());
+                        iu8::Expert expert;
+                        ref::require(iu8::upload(packs[e],expert.gu,why),why.c_str());
+                        ref::require(iu8::upload(packs[e],expert.down,why),why.c_str());
+                        layer.experts.push_back(std::move(expert));
+                    }
+                    iu8::WindowWeights table; table.upload(layer);
+                    const auto x=ref::quantize(ref::activations(k,n).data(),k,n);
+                    Buffer dtok(cap*4),ddst(cap*4),droute(cap*4),dstart(starts.size()*4),dcount(4);
+                    upload(dtok,tok); upload(ddst,dst); upload(droute,route); upload(dstart,starts); upload(dcount,std::vector<int32_t>{ne});
+                    for (bool sorted_x : {false,true})
+                    for (bool sorted_y : {false,true}) {
+                        std::vector<iu8::Block> input=sorted_x?std::vector<iu8::Block>((k/128)*cap):x;
+                        if (sorted_x)
+                            for (int kb=0;kb<k/128;++kb)
+                            for (int s=prefix;s<starts.back();++s) input[kb*cap+s]=x[kb*n+tok[s]];
+                        Buffer dx(input.size()*sizeof(iu8::Block)),dy(((size_t)cap*ld+17)*4);
+                        upload(dx,input);
+                        std::vector<float> want((size_t)cap*ld+17),got(want.size());
+                        std::memset(want.data(),0xa5,want.size()*4);
+                        for (int e=0;e<ne;++e)
+                        for (int s=starts[e];s<starts[e+1];++s)
+                        for (int r=0;r<m;++r) want[(size_t)(sorted_y?s:dst[s])*ld+r]=ref::fold(packs[e],x.data(),n,tok[s],r);
+                        iu8::Window p;
+                        p.table=table.gu; p.count=(const int32_t*)dcount.p; p.starts=(const int32_t*)dstart.p;
+                        p.tok=(const int32_t*)dtok.p; p.dst=(const int32_t*)ddst.p; p.route=(const int32_t*)droute.p;
+                        p.x=(const iu8::Block*)dx.p; p.y=dy.p; p.rows=m; p.cols=k; p.tokens=n;
+                        p.x_rows=sorted_x?cap:n; p.groups=cap; p.topk=2; p.ld=ld; p.sorted_x=sorted_x; p.sorted_y=sorted_y;
+                        check(hipMemsetAsync(dy.p,0xa5,want.size()*4,stream),"window-group poison");
+                        hipGraph_t graph=nullptr;
+                        check(hipStreamBeginCapture(stream,hipStreamCaptureModeThreadLocal),"window-group capture");
+                        strata::prefill::mmq::Product call; call.hip_window=&p; context.run(call,stream);
+                        check(hipStreamEndCapture(stream,&graph),"window-group end capture");
+                        hipGraphExec_t exec=nullptr;
+                        check(hipGraphInstantiate(&exec,graph,nullptr,nullptr,0),"window-group instantiate");
+                        check(hipGraphLaunch(exec,stream),"window-group replay"); check(hipStreamSynchronize(stream),"window-group done");
+                        download(dy,got);
+                        ref::require(std::memcmp(want.data(),got.data(),want.size()*4)==0,"IU8 dynamic expert/token/destination map drift");
+                        check(hipGraphExecDestroy(exec),"window-group free exec"); check(hipGraphDestroy(graph),"window-group free graph");
+                    }
                 }
                 for (int entry = 0; entry < 24; ++entry) {
                     const auto tile = iu8::kNarrowTiles[entry];
@@ -241,6 +300,7 @@ int main() {
             producers(stream);
             narrow_tiles(stream);
             strata::prefill::mmq::Context context;
+            window_groups(stream,context);
             for (const auto& shape : {std::pair{17, 128}, std::pair{129, 256},
                                       std::pair{128, 512}, std::pair{33, 1280}}) {
                 grouped(GGML_TYPE_Q4_0, shape.first, shape.second, stream, context);

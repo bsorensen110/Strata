@@ -17,9 +17,11 @@ std::vector<std::pair<std::string, std::string>> arch_opt_in_env(const char* gcn
     static_assert(!kHipBufloadDefaultOn);
     // Port note: hipfire CHANGELOG.md:856. Strata's IU8 route is unmeasured and never a default.
     static_assert(!kHipMoeIu8DefaultOn);
+    static_assert(!kHipMoeIu4DefaultOn);
     std::vector<std::pair<std::string, std::string>> t;
     if (hip_bufload_capable(gcn_arch)) t.push_back({kHipBufloadEnv, "0"});
     if (hip_moe_iu8_capable(gcn_arch)) t.push_back({kHipMoeIu8Env, "0"});
+    if (hip_moe_iu4_capable(gcn_arch)) t.push_back({kHipMoeIu4Env, "0"});
     return t;
 }
 
