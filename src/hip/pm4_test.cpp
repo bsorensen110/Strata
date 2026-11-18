@@ -475,27 +475,274 @@ void write_u64_le(uint8_t* dst, uint64_t val) {
 }
 
 void test_pm4_tape_and_contracts() {
-    // 1. Static per-kernel-family effect table audit
+    // 1. Static per-kernel-family effect table audit + L4 contract-source parity test
     size_t contract_count = 0;
     const KernelContract* contracts = registered_kernel_contracts(contract_count);
     CHECK(contracts != nullptr);
-    CHECK(contract_count >= 25u);
+    CHECK(contract_count == 25u);
     for (size_t i = 0; i < contract_count; ++i) {
         CHECK(contracts[i].family_name != nullptr && contracts[i].family_name[0] != '\0');
-        CHECK(contracts[i].expected_kernarg_bytes >= 16u);
+        CHECK(contracts[i].expected_kernarg_bytes >= 12u);
         CHECK(lookup_kernel_contract(contracts[i].family_name) == &contracts[i]);
         for (size_t e = 0; e < contracts[i].pointer_effect_count; ++e) {
             CHECK((contracts[i].pointer_effects[e].offset % 8u) == 0u);
             CHECK(static_cast<uint32_t>(contracts[i].pointer_effects[e].offset) + 8u <=
                   contracts[i].expected_kernarg_bytes);
+            if (e > 0u) {
+                CHECK(contracts[i].pointer_effects[e].offset >
+                      contracts[i].pointer_effects[e - 1u].offset);
+            }
         }
     }
-    // Fail-closed on unknown / un-admitted kernel names
+    // Fail-closed on unknown / un-admitted / multi-kernel wrapper / indirect-pointer kernel names
     CHECK(lookup_kernel_contract(nullptr) == nullptr);
     CHECK(lookup_kernel_contract("") == nullptr);
     CHECK(lookup_kernel_contract("wait_flag_ge") == nullptr);
     CHECK(lookup_kernel_contract("doorbell_publish_res") == nullptr);
     CHECK(lookup_kernel_contract("unknown_custom_kernel") == nullptr);
+    CHECK(lookup_kernel_contract("fused_gr_read_multi") == nullptr);
+    CHECK(lookup_kernel_contract("shared_expert_multi") == nullptr);
+    CHECK(lookup_kernel_contract("native_expert_grouped") == nullptr);
+    CHECK(lookup_kernel_contract("kv_append_int8_dev_multi") == nullptr);
+
+    // L4 contract-source parity verification: mirror include/strata/kernels/pdl.hpp:53-66
+    // (detail::align_up_kernarg + detail::pack_kernarg_field) over the exact C++ parameter
+    // type list of every admitted __global__ kernel in src/kernels/cuda/.
+    struct MirrorRopeTab {
+        const float* cos = nullptr;
+        const float* sin = nullptr;
+        int max_pos = 0;
+    };
+    struct MirrorKvStreamMap {
+        int32_t* page_table = nullptr;
+        int32_t* slot_block = nullptr;
+        int32_t* slot_stamp = nullptr;
+        int32_t* slot_ref = nullptr;
+        int32_t* ctl = nullptr;
+        int32_t* miss_block = nullptr;
+        int32_t* miss_slot = nullptr;
+        int64_t n_blocks = 0;
+        int64_t n_slots = 0;
+    };
+    struct MirrorQsaAttnPools {
+        const uint16_t* k_pool = nullptr;
+        const uint16_t* v_pool = nullptr;
+        const int8_t* k_q = nullptr;
+        const int8_t* v_q = nullptr;
+        const uint16_t* k_scale = nullptr;
+        const uint16_t* v_scale = nullptr;
+        const uint8_t* k_q4 = nullptr;
+        const uint8_t* v_q4 = nullptr;
+        const int32_t* page_table = nullptr;
+    };
+    struct MirrorGdnGroups {
+        float* state[8] = {};
+        const int32_t* keep[8] = {};
+        int first[8] = {};
+        int ntok[8] = {};
+        int n = 0;
+    };
+    struct MirrorGdnQ81Il {
+        int* bm = nullptr;
+        int* pm = nullptr;
+        float* d = nullptr;
+        int cp = 0;
+        int nb = 0;
+    };
+
+    auto align_up_field = [](size_t off, size_t align) noexcept -> size_t {
+        return (off + align - 1u) & ~(align - 1u);
+    };
+    auto check_contract_parity = [&](const char* family_name,
+                                     size_t expected_bytes,
+                                     const std::vector<KernelPointerEffect>& expected_effects) {
+        const KernelContract* kc = lookup_kernel_contract(family_name);
+        CHECK(kc != nullptr);
+        if (kc == nullptr) return;
+        CHECK(kc->expected_kernarg_bytes == expected_bytes);
+        CHECK(kc->pointer_effect_count == expected_effects.size());
+        for (size_t i = 0; i < expected_effects.size() && i < kc->pointer_effect_count; ++i) {
+            CHECK(kc->pointer_effects[i].offset == expected_effects[i].offset);
+            CHECK(kc->pointer_effects[i].access == expected_effects[i].access);
+        }
+    };
+    auto pack_sig = [&](std::initializer_list<std::pair<size_t, size_t>> size_align_pairs) -> size_t {
+        size_t off = 0;
+        for (const auto& [sz, al] : size_align_pairs) {
+            off = align_up_field(off, al);
+            off += sz;
+        }
+        return off;
+    };
+#define SA(T) std::pair<size_t, size_t>{sizeof(T), alignof(T)}
+
+    // 1. gpu_stamp_kernel(unsigned long long*, int) -> 12B
+    check_contract_parity(
+        "gpu_stamp_kernel",
+        pack_sig({SA(unsigned long long*), SA(int)}),
+        {{0u, MemAccessKind::VmemStore}});
+    // 2. copy_i32_from_mapped_kernel(int32_t*, const volatile int32_t*, int64_t) -> 24B
+    check_contract_parity(
+        "copy_i32_from_mapped_kernel",
+        pack_sig({SA(int32_t*), SA(const volatile int32_t*), SA(int64_t)}),
+        {{0u, MemAccessKind::VmemStore}, {8u, MemAccessKind::VmemLoad}});
+    // 3. copy_step_pos_from_mapped_kernel(int32_t*, int32_t*, const volatile int32_t*, int, int, int, int, int) -> 44B
+    check_contract_parity(
+        "copy_step_pos_from_mapped_kernel",
+        pack_sig({SA(int32_t*), SA(int32_t*), SA(const volatile int32_t*), SA(int), SA(int), SA(int), SA(int), SA(int)}),
+        {{0u, MemAccessKind::VmemStore}, {8u, MemAccessKind::VmemStore}, {16u, MemAccessKind::VmemLoad}});
+    // 4. embedding_gather_dev_kernel -> 80B
+    check_contract_parity(
+        "embedding_gather_dev_kernel",
+        pack_sig({SA(const uint8_t*), SA(const float*), SA(const float*), SA(const int32_t*),
+                  SA(int64_t), SA(int), SA(int), SA(int), SA(unsigned long long), SA(unsigned long long), SA(float*)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::VmemLoad},
+         {24u, MemAccessKind::VmemLoad}, {72u, MemAccessKind::VmemStore}});
+    // 5. broadcast_streams_kernel -> 28B
+    check_contract_parity(
+        "broadcast_streams_kernel",
+        pack_sig({SA(const float*), SA(float*), SA(int64_t), SA(int)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemStore}});
+    // 6. native_quantize_q8_1_kernel -> 20B
+    check_contract_parity(
+        "native_quantize_q8_1_kernel",
+        pack_sig({SA(const float*), SA(void*), SA(int)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemStore}});
+    // 7. native_mmvq_multi_kernel -> 56B
+    check_contract_parity(
+        "native_mmvq_multi_kernel",
+        pack_sig({SA(const void*), SA(const void*), SA(float*), SA(int), SA(int),
+                  SA(const void*), SA(float*), SA(const int32_t*)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::VmemStore},
+         {32u, MemAccessKind::VmemLoad}, {40u, MemAccessKind::VmemStore}, {48u, MemAccessKind::VmemLoad}});
+    // 8. bf16_f32_mmvf_multi_kernel -> 80B
+    check_contract_parity(
+        "bf16_f32_mmvf_multi_kernel",
+        pack_sig({SA(const float*), SA(int64_t), SA(const uint16_t*), SA(float*), SA(int64_t),
+                  SA(int), SA(int), SA(int), SA(const uint16_t*), SA(float*), SA(int64_t)}),
+        {{0u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::VmemLoad}, {24u, MemAccessKind::VmemStore},
+         {56u, MemAccessKind::VmemLoad}, {64u, MemAccessKind::VmemStore}});
+    // 9. gdn_conv_l2_multi_kernel -> 49B
+    check_contract_parity(
+        "gdn_conv_l2_multi_kernel",
+        pack_sig({SA(float*), SA(const float*), SA(const float*), SA(float*),
+                  SA(int), SA(int), SA(float), SA(int), SA(bool)}),
+        {{0u, MemAccessKind::VmemStore}, {8u, MemAccessKind::VmemLoad},
+         {16u, MemAccessKind::VmemLoad}, {24u, MemAccessKind::VmemStore}});
+    // 10. gdn_ab_multi_kernel -> 72B
+    check_contract_parity(
+        "gdn_ab_multi_kernel",
+        pack_sig({SA(const float*), SA(const uint16_t*), SA(const uint16_t*), SA(const float*),
+                  SA(const float*), SA(float*), SA(float*), SA(int), SA(int), SA(int), SA(int)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::VmemLoad},
+         {24u, MemAccessKind::SmemLoad}, {32u, MemAccessKind::SmemLoad},
+         {40u, MemAccessKind::VmemStore}, {48u, MemAccessKind::VmemStore}});
+    // 11. gdn_step_norm_multi_kernel -> 344B
+    CHECK(pack_sig({SA(float*), SA(const float*), SA(int), SA(const float*), SA(const float*),
+                    SA(const float*), SA(const float*), SA(float), SA(float*), SA(int), SA(int), SA(int),
+                    SA(const int32_t*), SA(int), SA(void*), SA(MirrorGdnGroups), SA(MirrorGdnQ81Il)}) ==
+          lookup_kernel_contract("gdn_step_norm_multi_kernel")->expected_kernarg_bytes);
+    // 12. norm_rope_kernel -> 112B
+    check_contract_parity(
+        "norm_rope_kernel",
+        pack_sig({SA(const float*), SA(int), SA(const float*), SA(float*), SA(int), SA(int),
+                  SA(float), SA(float), SA(float), SA(float), SA(float), SA(float), SA(float),
+                  SA(const int*), SA(const int32_t*), SA(MirrorRopeTab)}),
+        {{0u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::SmemLoad}, {24u, MemAccessKind::VmemStore},
+         {72u, MemAccessKind::VmemLoad}, {80u, MemAccessKind::VmemLoad},
+         {88u, MemAccessKind::VmemLoad}, {96u, MemAccessKind::VmemLoad}});
+    // 13. fwht256_pair_kernel -> 28B
+    check_contract_parity(
+        "fwht256_pair_kernel",
+        pack_sig({SA(float*), SA(float*), SA(int64_t), SA(float)}),
+        {{0u, MemAccessKind::VmemStore}, {8u, MemAccessKind::VmemStore}});
+    // 14. append -> 144B
+    check_contract_parity(
+        "append",
+        pack_sig({SA(const float*), SA(const int32_t*), SA(int), SA(int), SA(int), SA(const float*),
+                  SA(float), SA(float*), SA(float*), SA(float*), SA(int32_t*), SA(int),
+                  SA(float), SA(float), SA(float), SA(float), SA(float), SA(float),
+                  SA(const int32_t*), SA(MirrorRopeTab)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemLoad}, {32u, MemAccessKind::SmemLoad},
+         {48u, MemAccessKind::VmemStore}, {56u, MemAccessKind::VmemStore},
+         {64u, MemAccessKind::VmemStore}, {72u, MemAccessKind::VmemStore},
+         {112u, MemAccessKind::VmemLoad}, {120u, MemAccessKind::VmemLoad}, {128u, MemAccessKind::VmemLoad}});
+    // 15. block_scores_kernel -> 48B
+    check_contract_parity(
+        "block_scores_kernel",
+        pack_sig({SA(const float*), SA(const float*), SA(const float*), SA(const int32_t*), SA(int64_t), SA(float*)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::VmemLoad},
+         {24u, MemAccessKind::VmemLoad}, {40u, MemAccessKind::VmemStore}});
+    // 16. block_topk_kernel -> 40B
+    check_contract_parity(
+        "block_topk_kernel",
+        pack_sig({SA(const float*), SA(const int32_t*), SA(int64_t), SA(int64_t), SA(int32_t*)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemLoad}, {32u, MemAccessKind::VmemStore}});
+    // 17. resolve_kernel -> 100B
+    check_contract_parity(
+        "resolve_kernel",
+        pack_sig({SA(MirrorKvStreamMap), SA(const int32_t*), SA(const int32_t*), SA(int), SA(int), SA(int)}),
+        {{0u, MemAccessKind::VmemStore}, {8u, MemAccessKind::VmemStore}, {16u, MemAccessKind::VmemStore},
+         {24u, MemAccessKind::VmemStore}, {32u, MemAccessKind::VmemStore}, {40u, MemAccessKind::VmemStore},
+         {48u, MemAccessKind::VmemStore}, {72u, MemAccessKind::VmemLoad}, {80u, MemAccessKind::VmemLoad}});
+    // 18. attn_chunk_kernel -> 152B
+    check_contract_parity(
+        "attn_chunk_kernel",
+        pack_sig({SA(const float*), SA(MirrorQsaAttnPools), SA(const int32_t*), SA(const int32_t*),
+                  SA(int), SA(int), SA(float), SA(float*), SA(float*), SA(float*),
+                  SA(int), SA(int), SA(long long)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::VmemLoad},
+         {24u, MemAccessKind::VmemLoad}, {32u, MemAccessKind::VmemLoad}, {40u, MemAccessKind::VmemLoad},
+         {48u, MemAccessKind::VmemLoad}, {56u, MemAccessKind::VmemLoad}, {64u, MemAccessKind::VmemLoad},
+         {72u, MemAccessKind::VmemLoad}, {80u, MemAccessKind::VmemLoad}, {88u, MemAccessKind::VmemLoad},
+         {112u, MemAccessKind::VmemStore}, {120u, MemAccessKind::VmemStore}, {128u, MemAccessKind::VmemStore}});
+    // 19. gate_quantize_q8_1_kernel -> 64B
+    check_contract_parity(
+        "gate_quantize_q8_1_kernel",
+        pack_sig({SA(const float*), SA(const float*), SA(void*), SA(int), SA(int),
+                  SA(int*), SA(int*), SA(float*), SA(int), SA(int)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::VmemStore},
+         {32u, MemAccessKind::VmemStore}, {40u, MemAccessKind::VmemStore}, {48u, MemAccessKind::VmemStore}});
+    // 20. route_multi -> 28B
+    check_contract_parity(
+        "route_multi",
+        pack_sig({SA(const float*), SA(int32_t*), SA(float*), SA(int)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemStore}, {16u, MemAccessKind::VmemStore}});
+    // 21. resident_plan_kernel -> 96B
+    check_contract_parity(
+        "resident_plan_kernel",
+        pack_sig({SA(const int32_t*), SA(int), SA(int), SA(const int32_t*), SA(int),
+                  SA(const uint8_t*), SA(const unsigned long long*), SA(long long),
+                  SA(int32_t*), SA(long long), SA(uint32_t*), SA(uint32_t), SA(volatile uint32_t*)}),
+        {{0u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::VmemLoad}, {32u, MemAccessKind::VmemLoad},
+         {40u, MemAccessKind::VmemLoad}, {56u, MemAccessKind::VmemStore},
+         {72u, MemAccessKind::VmemStore}, {88u, MemAccessKind::VmemStore}});
+    // 22. quantize_q8_1_kernel -> 24B
+    check_contract_parity(
+        "quantize_q8_1_kernel",
+        pack_sig({SA(const float*), SA(void*), SA(long long)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemStore}});
+    // 23. combine -> 56B
+    check_contract_parity(
+        "combine",
+        pack_sig({SA(const float*), SA(const float*), SA(const float*), SA(float*),
+                  SA(int64_t), SA(int), SA(const float*)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::VmemLoad},
+         {24u, MemAccessKind::VmemStore}, {48u, MemAccessKind::VmemLoad}});
+    // 24. post_multi -> 72B
+    check_contract_parity(
+        "post_multi",
+        pack_sig({SA(const float*), SA(const float*), SA(const float*), SA(float*),
+                  SA(int), SA(int), SA(float), SA(long long), SA(long long), SA(long long)}),
+        {{0u, MemAccessKind::VmemLoad}, {8u, MemAccessKind::VmemLoad},
+         {16u, MemAccessKind::VmemLoad}, {24u, MemAccessKind::VmemStore}});
+    // 25. argmax_rows_kernel -> 40B
+    check_contract_parity(
+        "argmax_rows_kernel",
+        pack_sig({SA(const float*), SA(int), SA(int), SA(void*), SA(int32_t*), SA(uint32_t*)}),
+        {{0u, MemAccessKind::VmemLoad}, {16u, MemAccessKind::VmemStore},
+         {24u, MemAccessKind::VmemStore}, {32u, MemAccessKind::VmemStore}});
+#undef SA
 
     // 2. KernargArena 64B slot alignment + overflow refusal without reallocation
     KernargArena arena(128u);
@@ -530,8 +777,8 @@ void test_pm4_tape_and_contracts() {
     tape.set_resolver(&AllocationTable::resolver_thunk, &allocs);
     CHECK(tape.begin_recording(ReplayQuiescence::Proven));
 
-    // Launch 0: native_quantize_q8_1_kernel (24B: read(0), write(8))
-    uint8_t quant_args[24] = {};
+    // Launch 0: native_quantize_q8_1_kernel (20B: read(0), write(8), int(16))
+    uint8_t quant_args[20] = {};
     write_u64_le(quant_args + 0, 0x100080ULL);  // interior of alloc 0 (0x100000)
     write_u64_le(quant_args + 8, 0x200100ULL);  // interior of alloc 1 (0x200000)
     CHECK(tape.record_launch(
@@ -539,8 +786,8 @@ void test_pm4_tape_and_contracts() {
         {16u, 1u, 1u}, {256u, 1u, 1u}, 0u,
         quant_args, sizeof(quant_args)));
 
-    // Launch 1: native_mmvq_multi_kernel (40B: read(0), read(8), write(16))
-    uint8_t mmvq_args[40] = {};
+    // Launch 1: native_mmvq_multi_kernel (56B: read(0), read(8), write(16), int(24), int(28), read(32), write(40), read(48))
+    uint8_t mmvq_args[56] = {};
     write_u64_le(mmvq_args + 0, 0x300000ULL);   // alloc 2 (weights)
     write_u64_le(mmvq_args + 8, 0x200200ULL);   // another interior pointer into alloc 1!
     write_u64_le(mmvq_args + 16, 0x100400ULL);  // another interior pointer into alloc 0!
@@ -1065,7 +1312,7 @@ void test_pm4_eligibility_gate() {
     Pm4WindowCaptureSlot captured_slot(4096u);
     captured_slot.tape().set_resolver(&AllocationTable::resolver_thunk, &allocs);
     CHECK(captured_slot.begin_capture());
-    uint8_t q_args[24] = {};
+    uint8_t q_args[20] = {};
     write_u64_le(q_args + 0, 0x100000ULL);
     write_u64_le(q_args + 8, 0x200000ULL);
     CHECK(captured_slot.tape().record_launch(

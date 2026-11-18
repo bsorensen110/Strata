@@ -59,171 +59,219 @@ constexpr KernelPointerEffect sload(uint16_t offset) noexcept {
 }
 
 // ---- Static per-kernel-family pointer effect arrays for Strata verify/decode ----
+// Re-derived from the real __global__ kernel definitions in src/kernels/cuda/ and
+// include/strata/kernels/pdl.hpp:53-76 (detail::pack_kernarg_field).
 // Non-const or read-modify-write device pointers are conservatively classified as
 // VmemStore (matching hipfire crates/rdna-compute/src/replay.rs:878-880).
+// Multi-kernel host wrappers or kernels with indirect pointer-to-pointer tables
+// (fused_gr_read_multi, shared_expert_multi, native_expert_grouped, kv_append_int8_dev_multi)
+// are intentionally omitted so lookup_kernel_contract() refuses them (fail-closed).
 
-// gpu_stamp_kernel(uint64_t* dst, uint64_t a, uint64_t b) -> 24B
+// 1. gpu_stamp_kernel (src/kernels/cuda/verify_kernels.cu:1913)
+//    (unsigned long long* buf, int i) -> 12B
 constexpr KernelPointerEffect kStampEffects[] = {
     vstore(0),
 };
 
-// copy_i32_from_mapped(int32_t* dst, const int32_t* src, int64_t n) -> 24B
+// 2. copy_i32_from_mapped_kernel (src/kernels/cuda/elementwise.cu:458)
+//    (int32_t* dst, const volatile int32_t* src, int64_t n) -> 24B
 constexpr KernelPointerEffect kCopyI32Effects[] = {
     vstore(0),
     vload(8),
 };
 
-// copy_step_pos_from_mapped(int32_t* step_d, int32_t* pos_d, const int32_t* step_m, int T, int n_head) -> 32B
+// 3. copy_step_pos_from_mapped_kernel (src/kernels/cuda/verify_kernels.cu:1837-1839)
+//    (int32_t* step, int32_t* pos, const volatile int32_t* m_step, int T, int MT, int NH, int NKV, int IQ) -> 44B
 constexpr KernelPointerEffect kCopyStepPosEffects[] = {
     vstore(0),
     vstore(8),
     vload(16),
 };
 
-// embedding_gather_dev(const void* table, const int32_t* tok, float* out, int64_t d, int T) -> 40B
+// 4. embedding_gather_dev_kernel (src/kernels/cuda/verify_kernels.cu:671-675)
+//    (const uint8_t* codes, const float* scales, const float* offsets, const int32_t* tokens,
+//     int64_t n, int code_bits, int code_bias, int group_elems,
+//     unsigned long long row_codes, unsigned long long row_groups, float* out) -> 80B
 constexpr KernelPointerEffect kEmbeddingGatherEffects[] = {
     vload(0),
     vload(8),
-    vstore(16),
+    vload(16),
+    vload(24),
+    vstore(72),
 };
 
-// broadcast_streams(const float* x, float* R, int64_t n_embd, int64_t hc, int T) -> 32B
+// 5. broadcast_streams_kernel (src/kernels/cuda/verify_kernels.cu:691)
+//    (const float* x, float* R, int64_t n, int hc) -> 28B
 constexpr KernelPointerEffect kBroadcastStreamsEffects[] = {
     vload(0),
     vstore(8),
 };
 
-// native_quantize_q8_1_kernel(const float* x, void* vy, int kx, int kx_padded) -> 24B
+// 6. native_quantize_q8_1_kernel (src/kernels/cuda/native_mmvq.cu:162)
+//    (const float* x_, Q81Block* y_, int n_in) -> 20B
 constexpr KernelPointerEffect kQuantizeQ81Effects[] = {
     vload(0),
     vstore(8),
 };
 
-// native_mmvq_multi_kernel(const void* vx, const void* vy, float* dst, int ncols_x, int nrows_y, int s_x, int s_dst) -> 40B
+// 7. native_mmvq_multi_kernel (src/kernels/cuda/native_mmvq.cu:1431-1434)
+//    (const F::Block* w, const Q81Block* x_, float* y_, int n_in, int n_out,
+//     const F::Block* w2, float* y2, const int32_t* row_ids) -> 56B
 constexpr KernelPointerEffect kNativeMmvqMultiEffects[] = {
     vload(0),
     vload(8),
     vstore(16),
-};
-
-// bf16_gemv_fp32_mmvf_multi(const float* x, const uint16_t* w, float* y, int K, int N, int ncols) -> 40B
-constexpr KernelPointerEffect kBf16GemvMultiEffects[] = {
-    vload(0),
-    vload(8),
-    vstore(16),
-};
-
-// fused_gr_read_multi(const float* R, const float* w_norm, const uint16_t* w_down, const uint16_t* w_up,
-//                     float* R_out, float* lo, float* rs, float* mixed, void* q8_mixed, float eps, int T) -> 80B
-constexpr KernelPointerEffect kFusedGrReadMultiEffects[] = {
-    vload(0),
-    sload(8),
-    vload(16),
-    vload(24),
-    vstore(32),
+    vload(32),
     vstore(40),
-    vstore(48),
-    vstore(56),
+    vload(48),
+};
+
+// 8. bf16_f32_mmvf_multi_kernel (src/kernels/cuda/native_bf16.cu:119-122)
+//    (const float* x_, int64_t ldx, const uint16_t* w, float* y_, int64_t ldy,
+//     int n_in, int n_tok, int fast, const uint16_t* w_aux, float* y_aux, int64_t ldy_aux) -> 80B
+constexpr KernelPointerEffect kBf16MmvfMultiEffects[] = {
+    vload(0),
+    vload(16),
+    vstore(24),
+    vload(56),
     vstore(64),
 };
 
-// gdn_conv_l2_multi(const float* qkv, float* conv_state, const float* conv_w, float* qkv_out, float* h_out, int C, int T) -> 48B
+// 9. gdn_conv_l2_multi_kernel (src/kernels/cuda/verify_kernels.cu:87-89)
+//    (float* hist, const float* qkv, const float* w, float* h, int C, int qk_heads, float eps, int t_begin, bool commit) -> 49B
 constexpr KernelPointerEffect kGdnConvL2MultiEffects[] = {
-    vload(0),
-    vstore(8),
+    vstore(0),
+    vload(8),
     vload(16),
     vstore(24),
-    vstore(32),
 };
 
-// gdn_ab_multi(const float* a_raw, const float* b_raw, const float* a_log, const float* dt_bias,
-//              float* gate_out, float* beta_out, int HV, int T) -> 56B
+// 10. gdn_ab_multi_kernel (src/kernels/cuda/verify_kernels.cu:199-203)
+//     (const float* x, const uint16_t* wa, const uint16_t* wb, const float* dt,
+//      const float* ssm_a, float* gate, float* beta, int n, int h_v, int T, int fast) -> 72B
 constexpr KernelPointerEffect kGdnAbMultiEffects[] = {
     vload(0),
     vload(8),
-    sload(16),
-    sload(24),
-    vstore(32),
-    vstore(40),
-};
-
-// gdn_step_norm_multi(float* state, const float* qkv, const float* gate, const float* beta,
-//                     const float* z, const float* norm_w, float* y_out, float eps, int HK, int HV, int T) -> 72B
-constexpr KernelPointerEffect kGdnStepNormMultiEffects[] = {
-    vstore(0),
-    vload(8),
     vload(16),
-    vload(24),
-    vload(32),
-    sload(40),
+    sload(24),
+    sload(32),
+    vstore(40),
     vstore(48),
 };
 
-// native_qsa_rms_norm_rope(float* x, const float* gamma, const int32_t* pos, int n_heads, int head_dim, int rope_dim, float eps, float theta, int T) -> 48B
-constexpr KernelPointerEffect kQsaRmsNormRopeEffects[] = {
+// 11. gdn_step_norm_multi_kernel (src/kernels/cuda/verify_kernels.cu:369-378,
+//     include/strata/kernels/verify_kernels.hpp:53-59, src/kernels/cuda/verify_kernels.cu:324-330)
+//     (float* state, const float* hbuf, int C, const float* gate, const float* beta,
+//      const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
+//      const int32_t* n_keep, int t_out_begin, GdnQ81* xq, GdnGroups grp, GdnQ81Il xq_il) -> 344B
+constexpr KernelPointerEffect kGdnStepNormMultiEffects[] = {
     vstore(0),
-    sload(8),
-    vload(16),
+    vload(8),
+    vload(24),
+    vload(32),
+    vload(40),
+    sload(48),
+    vstore(64),
+    vload(88),
+    vstore(104),
+    vstore(112),
+    vstore(120),
+    vstore(128),
+    vstore(136),
+    vstore(144),
+    vstore(152),
+    vstore(160),
+    vstore(168),
+    vload(176),
+    vload(184),
+    vload(192),
+    vload(200),
+    vload(208),
+    vload(216),
+    vload(224),
+    vload(232),
+    vstore(312),
+    vstore(320),
+    vstore(328),
 };
 
-// fwht256_pair_inplace_cuda(float* a, float* b, int64_t n_a, int64_t n_b) -> 32B
+// 12. norm_rope_kernel (src/kernels/cuda/native_rope.cu:71-75, include/strata/kernels/mrope.hpp:35-39)
+//     (const float* x, int in_stride, const float* gamma, float* out, int n_cols, int n_rot,
+//      float epsilon, float theta_scale, float freq_scale, float corr_low, float corr_high,
+//      float ext_factor, float mscale, const int* positions, const int32_t* mtab, RopeTab rt) -> 112B
+constexpr KernelPointerEffect kQsaRmsNormRopeEffects[] = {
+    vload(0),
+    sload(16),
+    vstore(24),
+    vload(72),
+    vload(80),
+    vload(88),
+    vload(96),
+};
+
+// 13. fwht256_pair_kernel (src/kernels/cuda/kv_q4.cu:75)
+//     (float* a, float* b, int64_t n_rows, float scale) -> 28B
 constexpr KernelPointerEffect kFwhtPairEffects[] = {
     vstore(0),
     vstore(8),
 };
 
-// kv_append_int8_dev_multi(int8_t* k_pool, float* ks_pool, int8_t* v_pool, float* vs_pool,
-//                          const float* k_in, const float* v_in, const int32_t* step, int max_cells, int T) -> 64B
-constexpr KernelPointerEffect kKvAppendInt8Effects[] = {
-    vstore(0),
-    vstore(8),
-    vstore(16),
-    vstore(24),
-    vload(32),
-    vload(40),
-    vload(48),
-};
-
-// native_qsa_indexer_append_steps(const float* idx_raw, const int32_t* step, const float* gamma,
-//                                 float* idx_tail, float* idx_dead, float* idx_pooled, int32_t* idx_block_pos, int T, float eps) -> 64B
+// 14. append (src/kernels/cuda/native_qsa_indexer.cu:120-127, include/strata/kernels/mrope.hpp:35-39)
+//     (const float* raw, const int32_t* pos_dev, int pos_stride, int n_steps, int pos_base,
+//      const float* gamma, float epsilon, float* tail, float* dead, float* pooled, int32_t* block_pos,
+//      int max_cells, float theta_scale, float freq_scale, float corr_low, float corr_high,
+//      float ext_factor, float mscale, const int32_t* mtab, RopeTab rt) -> 144B
 constexpr KernelPointerEffect kQsaIndexerAppendEffects[] = {
     vload(0),
     vload(8),
-    sload(16),
-    vstore(24),
-    vstore(32),
-    vstore(40),
+    sload(32),
     vstore(48),
+    vstore(56),
+    vstore(64),
+    vstore(72),
+    vload(112),
+    vload(120),
+    vload(128),
 };
 
-// qsa_block_scores(const float* qidx, const float* idx_pooled, const float* idx_tail,
-//                  const int32_t* idx_block_pos, const int32_t* step, float* scores, int max_blocks, int T) -> 56B
+// 15. block_scores_kernel (src/kernels/cuda/qsa_select.cu:114-118)
+//     (const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
+//      int64_t max_blocks, float* out) -> 48B
 constexpr KernelPointerEffect kQsaBlockScoresEffects[] = {
     vload(0),
     vload(8),
     vload(16),
     vload(24),
-    vload(32),
     vstore(40),
 };
 
-// qsa_block_topk(const float* scores, const int32_t* step, int32_t* sel, int max_blocks, int k_blocks, int T) -> 40B
+// 16. block_topk_kernel (src/kernels/cuda/qsa_select.cu:158-160)
+//     (const float* scores, const int32_t* steps, int64_t max_blocks, int64_t cap, int32_t* ids) -> 40B
 constexpr KernelPointerEffect kQsaBlockTopkEffects[] = {
     vload(0),
     vload(8),
-    vstore(16),
+    vstore(32),
 };
 
-// qsa_kv_resolve(const int32_t* sel_blocks, const int32_t* step, int32_t* sel_cells, int cap, int T) -> 32B
+// 17. resolve_kernel (src/kernels/cuda/kv_stream.cu:191-192, include/strata/kernels/kv_stream.hpp:123-133)
+//     (KvStreamMap m, const int32_t* ids, const int32_t* steps, int n_q, int cap, int page_size) -> 100B
 constexpr KernelPointerEffect kQsaKvResolveEffects[] = {
-    vload(0),
-    vload(8),
+    vstore(0),
+    vstore(8),
     vstore(16),
+    vstore(24),
+    vstore(32),
+    vstore(40),
+    vstore(48),
+    vload(72),
+    vload(80),
 };
 
-// qsa_decode_attn_batch_int8(const float* q, const int8_t* k_pool, const float* ks_pool,
-//                            const int8_t* v_pool, const float* vs_pool, const int32_t* sel,
-//                            const int32_t* step, float* scratch, float* out, int cap, int T) -> 80B
+// 18. attn_chunk_kernel (src/kernels/cuda/qsa_decode_attn.cu:350-355,
+//     include/strata/kernels/qsa_decode_attn.hpp:23-33)
+//     (const float* q, QsaAttnPools p, const int32_t* ids, const int32_t* step, int n_kv_heads,
+//      int page_size, float scale, float* part_acc, float* part_m, float* part_l,
+//      int n_chunks, int cap, long long scratch_stride) -> 152B
 constexpr KernelPointerEffect kQsaDecodeAttnBatchEffects[] = {
     vload(0),
     vload(8),
@@ -232,76 +280,71 @@ constexpr KernelPointerEffect kQsaDecodeAttnBatchEffects[] = {
     vload(32),
     vload(40),
     vload(48),
-    vstore(56),
-    vstore(64),
+    vload(56),
+    vload(64),
+    vload(72),
+    vload(80),
+    vload(88),
+    vstore(112),
+    vstore(120),
+    vstore(128),
 };
 
-// native_qsa_gate_quantize_q8_1(const float* attn, const float* qfull, void* xq_out, int n_heads, int head_dim) -> 32B
+// 19. gate_quantize_q8_1_kernel (src/kernels/cuda/native_qsa.cu:107-110)
+//     (const float* attn, const float* q_full, QsaQ81Block* xq, int n_head, int head_dim,
+//      int* bm, int* pm, float* dl, int n_in, int cp) -> 64B
 constexpr KernelPointerEffect kQsaGateQuantizeEffects[] = {
     vload(0),
     vload(8),
     vstore(16),
+    vstore(32),
+    vstore(40),
+    vstore(48),
 };
 
-// native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int T) -> 32B
+// 20. route_multi (src/kernels/cuda/native_router.cu:100-101)
+//     (const float* logits, int32_t* ids, float* weights, int n_tok) -> 28B
 constexpr KernelPointerEffect kRouterTop10Effects[] = {
     vload(0),
     vstore(8),
     vstore(16),
 };
 
-// resident_plan_all_resident(const int32_t* ids, const int32_t* d_res, const uint8_t* cache_base,
-//                            const uint64_t* slot_off, int32_t* plan_out, int n_items, int k) -> 48B
+// 21. resident_plan_kernel (src/kernels/cuda/verify_kernels.cu:1580-1583)
+//     (const int32_t* ids, int n, int k, const int32_t* res, int n_expert,
+//      const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+//      int32_t* pl, long long capx, uint32_t* skip, uint32_t ring, volatile uint32_t* plan_err) -> 96B
 constexpr KernelPointerEffect kResidentPlanArEffects[] = {
     vload(0),
-    vload(8),
     vload(16),
-    vload(24),
-    vstore(32),
-};
-
-// shared_expert_multi(const void* xq, const void* w_gate, const void* w_up, const void* w_down,
-//                     const uint16_t* w_gate_inp, const float* xm, float* sh_out, int N, int n_ff, int T) -> 72B
-constexpr KernelPointerEffect kSharedExpertMultiEffects[] = {
-    vload(0),
-    vload(8),
-    vload(16),
-    vload(24),
     vload(32),
     vload(40),
-    vstore(48),
+    vstore(56),
+    vstore(72),
+    vstore(88),
 };
 
-// quantize_q8_1_rows(const float* x, void* vy, int n_rows, int n_cols) -> 24B
+// 22. quantize_q8_1_kernel (src/kernels/cuda/iq_kernels.cu:2885)
+//     (const float* x, block_q8_1* y, long long n) -> 24B
 constexpr KernelPointerEffect kQuantizeRowsEffects[] = {
     vload(0),
     vstore(8),
 };
 
-// native_expert_grouped(const uint64_t* gp, const int32_t* gs, const int32_t* gn,
-//                       const int32_t* p_dst, const int32_t* p_tok, const void* xq,
-//                       void* hit_scratch, float* parts_out, int cap, int N, int n_ff) -> 80B
-constexpr KernelPointerEffect kNativeExpertGroupedEffects[] = {
-    vload(0),
-    vload(8),
-    vload(16),
-    vload(24),
-    vload(32),
-    vload(40),
-    vstore(48),
-    vstore(56),
-};
-
-// native_moe_combine_multi(const float* parts, const float* weights, const float* shared,
-//                          float* bo_out, int N, int K, int T) -> 48B
+// 23. combine (src/kernels/cuda/native_moe.cu:42-44)
+//     (const float* parts, const float* weights, const float* shared, float* output,
+//      int64_t n_embd, int k, const float* sg) -> 56B
 constexpr KernelPointerEffect kNativeMoeCombineEffects[] = {
     vload(0),
     vload(8),
     vload(16),
     vstore(24),
+    vload(48),
 };
 
-// gr_write_multi(const float* R_in, const float* bo, const float* inj, float* R_out, int N, int HC, int T) -> 48B
+// 24. post_multi (src/kernels/cuda/native_gr_postops.cu:85-87)
+//     (const float* residual, const float* block_out, const float* inject, float* output,
+//      int n_embd, int hc, float scale, long long r_stride, long long b_stride, long long i_stride) -> 72B
 constexpr KernelPointerEffect kGrWriteMultiEffects[] = {
     vload(0),
     vload(8),
@@ -309,46 +352,44 @@ constexpr KernelPointerEffect kGrWriteMultiEffects[] = {
     vstore(24),
 };
 
-// argmax_rows(const float* logits, uint8_t* scratch, int32_t* out_ids, int T, int V) -> 32B
+// 25. argmax_rows_kernel (src/kernels/cuda/verify_kernels.cu:1010-1011)
+//     (const float* logits, int n, int per_block, ArgRow* rows, int32_t* out, uint32_t* nf_flags) -> 40B
 constexpr KernelPointerEffect kArgmaxRowsEffects[] = {
     vload(0),
-    vstore(8),
     vstore(16),
+    vstore(24),
+    vstore(32),
 };
 
 #define CONTRACT_ROW(name_lit, bytes, arr, dyn_grid) \
     KernelContract{name_lit, bytes, arr, sizeof(arr) / sizeof((arr)[0]), dyn_grid}
 
 constexpr KernelContract kStrataVerifyContracts[] = {
-    CONTRACT_ROW("gpu_stamp_kernel", 24u, kStampEffects, false),
-    CONTRACT_ROW("copy_i32_from_mapped", 24u, kCopyI32Effects, false),
-    CONTRACT_ROW("copy_step_pos_from_mapped", 32u, kCopyStepPosEffects, false),
-    CONTRACT_ROW("embedding_gather_dev", 40u, kEmbeddingGatherEffects, false),
-    CONTRACT_ROW("broadcast_streams", 32u, kBroadcastStreamsEffects, false),
-    CONTRACT_ROW("native_quantize_q8_1_kernel", 24u, kQuantizeQ81Effects, false),
-    CONTRACT_ROW("native_mmvq_multi_kernel", 40u, kNativeMmvqMultiEffects, false),
-    CONTRACT_ROW("bf16_gemv_fp32_mmvf_multi", 40u, kBf16GemvMultiEffects, false),
-    CONTRACT_ROW("fused_gr_read_multi", 80u, kFusedGrReadMultiEffects, false),
-    CONTRACT_ROW("gdn_conv_l2_multi", 48u, kGdnConvL2MultiEffects, false),
-    CONTRACT_ROW("gdn_ab_multi", 56u, kGdnAbMultiEffects, false),
-    CONTRACT_ROW("gdn_step_norm_multi", 72u, kGdnStepNormMultiEffects, false),
-    CONTRACT_ROW("native_qsa_rms_norm_rope", 48u, kQsaRmsNormRopeEffects, false),
-    CONTRACT_ROW("fwht256_pair_inplace_cuda", 32u, kFwhtPairEffects, false),
-    CONTRACT_ROW("kv_append_int8_dev_multi", 64u, kKvAppendInt8Effects, false),
-    CONTRACT_ROW("native_qsa_indexer_append_steps", 64u, kQsaIndexerAppendEffects, false),
-    CONTRACT_ROW("qsa_block_scores", 56u, kQsaBlockScoresEffects, true),
-    CONTRACT_ROW("qsa_block_topk", 40u, kQsaBlockTopkEffects, false),
-    CONTRACT_ROW("qsa_kv_resolve", 32u, kQsaKvResolveEffects, false),
-    CONTRACT_ROW("qsa_decode_attn_batch_int8", 80u, kQsaDecodeAttnBatchEffects, true),
-    CONTRACT_ROW("native_qsa_gate_quantize_q8_1", 32u, kQsaGateQuantizeEffects, false),
-    CONTRACT_ROW("native_router_top10_multi", 32u, kRouterTop10Effects, false),
-    CONTRACT_ROW("resident_plan_all_resident", 48u, kResidentPlanArEffects, false),
-    CONTRACT_ROW("shared_expert_multi", 72u, kSharedExpertMultiEffects, false),
-    CONTRACT_ROW("quantize_q8_1_rows", 24u, kQuantizeRowsEffects, false),
-    CONTRACT_ROW("native_expert_grouped", 80u, kNativeExpertGroupedEffects, false),
-    CONTRACT_ROW("native_moe_combine_multi", 48u, kNativeMoeCombineEffects, false),
-    CONTRACT_ROW("gr_write_multi", 48u, kGrWriteMultiEffects, false),
-    CONTRACT_ROW("argmax_rows", 32u, kArgmaxRowsEffects, false),
+    CONTRACT_ROW("gpu_stamp_kernel", 12u, kStampEffects, false),
+    CONTRACT_ROW("copy_i32_from_mapped_kernel", 24u, kCopyI32Effects, false),
+    CONTRACT_ROW("copy_step_pos_from_mapped_kernel", 44u, kCopyStepPosEffects, false),
+    CONTRACT_ROW("embedding_gather_dev_kernel", 80u, kEmbeddingGatherEffects, false),
+    CONTRACT_ROW("broadcast_streams_kernel", 28u, kBroadcastStreamsEffects, false),
+    CONTRACT_ROW("native_quantize_q8_1_kernel", 20u, kQuantizeQ81Effects, false),
+    CONTRACT_ROW("native_mmvq_multi_kernel", 56u, kNativeMmvqMultiEffects, false),
+    CONTRACT_ROW("bf16_f32_mmvf_multi_kernel", 80u, kBf16MmvfMultiEffects, false),
+    CONTRACT_ROW("gdn_conv_l2_multi_kernel", 49u, kGdnConvL2MultiEffects, false),
+    CONTRACT_ROW("gdn_ab_multi_kernel", 72u, kGdnAbMultiEffects, false),
+    CONTRACT_ROW("gdn_step_norm_multi_kernel", 344u, kGdnStepNormMultiEffects, false),
+    CONTRACT_ROW("norm_rope_kernel", 112u, kQsaRmsNormRopeEffects, false),
+    CONTRACT_ROW("fwht256_pair_kernel", 28u, kFwhtPairEffects, false),
+    CONTRACT_ROW("append", 144u, kQsaIndexerAppendEffects, false),
+    CONTRACT_ROW("block_scores_kernel", 48u, kQsaBlockScoresEffects, true),
+    CONTRACT_ROW("block_topk_kernel", 40u, kQsaBlockTopkEffects, false),
+    CONTRACT_ROW("resolve_kernel", 100u, kQsaKvResolveEffects, false),
+    CONTRACT_ROW("attn_chunk_kernel", 152u, kQsaDecodeAttnBatchEffects, true),
+    CONTRACT_ROW("gate_quantize_q8_1_kernel", 64u, kQsaGateQuantizeEffects, false),
+    CONTRACT_ROW("route_multi", 28u, kRouterTop10Effects, false),
+    CONTRACT_ROW("resident_plan_kernel", 96u, kResidentPlanArEffects, false),
+    CONTRACT_ROW("quantize_q8_1_kernel", 24u, kQuantizeRowsEffects, false),
+    CONTRACT_ROW("combine", 56u, kNativeMoeCombineEffects, false),
+    CONTRACT_ROW("post_multi", 72u, kGrWriteMultiEffects, false),
+    CONTRACT_ROW("argmax_rows_kernel", 40u, kArgmaxRowsEffects, false),
 };
 
 #undef CONTRACT_ROW
@@ -391,43 +432,43 @@ constexpr KernelContract kStrataVerifyContracts[] = {
     MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "16")
 
 #define BF16_MMVF_ROWS_FOR_BLOCK(B_STR) \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 1, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 2, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 3, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 4, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 5, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 6, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 8, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 9, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 10, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 11, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 12, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 13, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 14, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 15, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 16, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 1, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 2, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 3, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 4, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 5, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 6, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 8, false, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 9, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 10, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 11, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 12, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 13, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 14, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 15, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 16, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 1, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 2, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 3, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 4, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 5, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 6, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 8, false, true>", "bf16_gemv_fp32_mmvf_multi")
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 1, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 2, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 3, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 4, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 5, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 6, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 8, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 9, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 10, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 11, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 12, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 13, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 14, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 15, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 16, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 1, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 2, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 3, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 4, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 5, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 6, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 8, false, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 9, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 10, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 11, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 12, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 13, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 14, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 15, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 16, true, false>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 1, true, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 2, true, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 3, true, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 4, true, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 5, true, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 6, true, true>", "bf16_f32_mmvf_multi_kernel"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 8, false, true>", "bf16_f32_mmvf_multi_kernel")
 
 constexpr KernelSymbolAlias kStrataKernelSymbolAliases[] = {
     // 1. gpu_stamp_kernel (src/kernels/cuda/verify_kernels.cu:1913, launched via launch_pdl at :1934)
@@ -455,8 +496,8 @@ constexpr KernelSymbolAlias kStrataKernelSymbolAliases[] = {
     MMVQ_TRAIT_ROWS("SmallTraits<IQ4NLBlock, 4>"),
 
     // 4. bf16_f32_mmvf_multi_kernel (src/kernels/cuda/native_bf16.cu:119, launched via launch_pdl at :498-504,545,560-566)
-    ALIAS_ROW("bf16_f32_mmvf_multi_kernel", "bf16_gemv_fp32_mmvf_multi"),
-    ALIAS_ROW("bf16_gemv_fp32_mmvf_multi", "bf16_gemv_fp32_mmvf_multi"),
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel", "bf16_f32_mmvf_multi_kernel"),
+    ALIAS_ROW("bf16_gemv_fp32_mmvf_multi", "bf16_f32_mmvf_multi_kernel"),
     BF16_MMVF_ROWS_FOR_BLOCK("32"),
     BF16_MMVF_ROWS_FOR_BLOCK("64"),
     BF16_MMVF_ROWS_FOR_BLOCK("96"),
@@ -467,71 +508,71 @@ constexpr KernelSymbolAlias kStrataKernelSymbolAliases[] = {
     BF16_MMVF_ROWS_FOR_BLOCK("256"),
 
     // 5. Real __global__ kernel symbols across src/kernels/cuda/ mapped to their contract families
-    ALIAS_ROW("copy_i32_from_mapped_kernel", "copy_i32_from_mapped"),
-    ALIAS_ROW("copy_i32_from_mapped", "copy_i32_from_mapped"),
-    ALIAS_ROW("copy_step_pos_from_mapped_kernel", "copy_step_pos_from_mapped"),
-    ALIAS_ROW("copy_step_pos_from_mapped", "copy_step_pos_from_mapped"),
-    ALIAS_ROW("embedding_gather_dev_kernel", "embedding_gather_dev"),
-    ALIAS_ROW("embedding_gather_dev", "embedding_gather_dev"),
-    ALIAS_ROW("broadcast_streams_kernel", "broadcast_streams"),
-    ALIAS_ROW("broadcast_streams", "broadcast_streams"),
-    ALIAS_ROW("gdn_conv_l2_multi_kernel", "gdn_conv_l2_multi"),
-    ALIAS_ROW("gdn_conv_l2_multi", "gdn_conv_l2_multi"),
-    ALIAS_ROW("gdn_ab_multi_kernel", "gdn_ab_multi"),
-    ALIAS_ROW("gdn_ab_multi_kernel<1, true>", "gdn_ab_multi"),
-    ALIAS_ROW("gdn_ab_multi_kernel<2, true>", "gdn_ab_multi"),
-    ALIAS_ROW("gdn_ab_multi_kernel<3, true>", "gdn_ab_multi"),
-    ALIAS_ROW("gdn_ab_multi_kernel<4, true>", "gdn_ab_multi"),
-    ALIAS_ROW("gdn_ab_multi_kernel<5, true>", "gdn_ab_multi"),
-    ALIAS_ROW("gdn_ab_multi_kernel<6, true>", "gdn_ab_multi"),
-    ALIAS_ROW("gdn_ab_multi_kernel<8, false>", "gdn_ab_multi"),
-    ALIAS_ROW("gdn_ab_multi_kernel<16, false>", "gdn_ab_multi"),
-    ALIAS_ROW("gdn_ab_multi", "gdn_ab_multi"),
-    ALIAS_ROW("gdn_step_norm_multi_kernel", "gdn_step_norm_multi"),
-    ALIAS_ROW("gdn_step_norm_multi_kernel<false, false>", "gdn_step_norm_multi"),
-    ALIAS_ROW("gdn_step_norm_multi_kernel<true, false>", "gdn_step_norm_multi"),
-    ALIAS_ROW("gdn_step_norm_multi_kernel<true, true>", "gdn_step_norm_multi"),
-    ALIAS_ROW("gdn_step_norm_multi", "gdn_step_norm_multi"),
-    ALIAS_ROW("norm_rope_kernel", "native_qsa_rms_norm_rope"),
-    ALIAS_ROW("norm_rope_kernel<false>", "native_qsa_rms_norm_rope"),
-    ALIAS_ROW("norm_rope_kernel<true>", "native_qsa_rms_norm_rope"),
-    ALIAS_ROW("native_qsa_rms_norm_rope", "native_qsa_rms_norm_rope"),
-    ALIAS_ROW("fwht256_pair_kernel", "fwht256_pair_inplace_cuda"),
-    ALIAS_ROW("fwht256_pair_inplace_cuda", "fwht256_pair_inplace_cuda"),
-    ALIAS_ROW("append", "native_qsa_indexer_append_steps"),
-    ALIAS_ROW("append<false>", "native_qsa_indexer_append_steps"),
-    ALIAS_ROW("append<true>", "native_qsa_indexer_append_steps"),
-    ALIAS_ROW("native_qsa_indexer_append_steps", "native_qsa_indexer_append_steps"),
-    ALIAS_ROW("block_scores_kernel", "qsa_block_scores"),
-    ALIAS_ROW("qsa_block_scores", "qsa_block_scores"),
-    ALIAS_ROW("block_topk_kernel", "qsa_block_topk"),
-    ALIAS_ROW("qsa_block_topk", "qsa_block_topk"),
-    ALIAS_ROW("resolve_kernel", "qsa_kv_resolve"),
-    ALIAS_ROW("qsa_kv_resolve", "qsa_kv_resolve"),
-    ALIAS_ROW("attn_chunk_kernel", "qsa_decode_attn_batch_int8"),
-    ALIAS_ROW("attn_chunk_kernel<1, false, false, false>", "qsa_decode_attn_batch_int8"),
-    ALIAS_ROW("attn_chunk_kernel<1, true, false, false>", "qsa_decode_attn_batch_int8"),
-    ALIAS_ROW("qsa_decode_attn_batch_int8", "qsa_decode_attn_batch_int8"),
-    ALIAS_ROW("gate_quantize_q8_1_kernel", "native_qsa_gate_quantize_q8_1"),
-    ALIAS_ROW("native_qsa_gate_quantize_q8_1", "native_qsa_gate_quantize_q8_1"),
-    ALIAS_ROW("route_multi", "native_router_top10_multi"),
-    ALIAS_ROW("native_router_top10_multi", "native_router_top10_multi"),
-    ALIAS_ROW("resident_plan_kernel", "resident_plan_all_resident"),
-    ALIAS_ROW("resident_plan_kernel<128>", "resident_plan_all_resident"),
-    ALIAS_ROW("resident_plan_kernel<256>", "resident_plan_all_resident"),
-    ALIAS_ROW("resident_plan_all_resident", "resident_plan_all_resident"),
-    ALIAS_ROW("quantize_q8_1_kernel", "quantize_q8_1_rows"),
-    ALIAS_ROW("quantize_q8_1_rows", "quantize_q8_1_rows"),
-    ALIAS_ROW("combine", "native_moe_combine_multi"),
-    ALIAS_ROW("combine<false, false>", "native_moe_combine_multi"),
-    ALIAS_ROW("combine<true, false>", "native_moe_combine_multi"),
-    ALIAS_ROW("combine<false, true>", "native_moe_combine_multi"),
-    ALIAS_ROW("combine<true, true>", "native_moe_combine_multi"),
-    ALIAS_ROW("native_moe_combine_multi", "native_moe_combine_multi"),
-    ALIAS_ROW("post_multi", "gr_write_multi"),
-    ALIAS_ROW("gr_write_multi", "gr_write_multi"),
-    ALIAS_ROW("argmax_rows_kernel", "argmax_rows"),
-    ALIAS_ROW("argmax_rows", "argmax_rows"),
+    ALIAS_ROW("copy_i32_from_mapped_kernel", "copy_i32_from_mapped_kernel"),
+    ALIAS_ROW("copy_i32_from_mapped", "copy_i32_from_mapped_kernel"),
+    ALIAS_ROW("copy_step_pos_from_mapped_kernel", "copy_step_pos_from_mapped_kernel"),
+    ALIAS_ROW("copy_step_pos_from_mapped", "copy_step_pos_from_mapped_kernel"),
+    ALIAS_ROW("embedding_gather_dev_kernel", "embedding_gather_dev_kernel"),
+    ALIAS_ROW("embedding_gather_dev", "embedding_gather_dev_kernel"),
+    ALIAS_ROW("broadcast_streams_kernel", "broadcast_streams_kernel"),
+    ALIAS_ROW("broadcast_streams", "broadcast_streams_kernel"),
+    ALIAS_ROW("gdn_conv_l2_multi_kernel", "gdn_conv_l2_multi_kernel"),
+    ALIAS_ROW("gdn_conv_l2_multi", "gdn_conv_l2_multi_kernel"),
+    ALIAS_ROW("gdn_ab_multi_kernel", "gdn_ab_multi_kernel"),
+    ALIAS_ROW("gdn_ab_multi_kernel<1, true>", "gdn_ab_multi_kernel"),
+    ALIAS_ROW("gdn_ab_multi_kernel<2, true>", "gdn_ab_multi_kernel"),
+    ALIAS_ROW("gdn_ab_multi_kernel<3, true>", "gdn_ab_multi_kernel"),
+    ALIAS_ROW("gdn_ab_multi_kernel<4, true>", "gdn_ab_multi_kernel"),
+    ALIAS_ROW("gdn_ab_multi_kernel<5, true>", "gdn_ab_multi_kernel"),
+    ALIAS_ROW("gdn_ab_multi_kernel<6, true>", "gdn_ab_multi_kernel"),
+    ALIAS_ROW("gdn_ab_multi_kernel<8, false>", "gdn_ab_multi_kernel"),
+    ALIAS_ROW("gdn_ab_multi_kernel<16, false>", "gdn_ab_multi_kernel"),
+    ALIAS_ROW("gdn_ab_multi", "gdn_ab_multi_kernel"),
+    ALIAS_ROW("gdn_step_norm_multi_kernel", "gdn_step_norm_multi_kernel"),
+    ALIAS_ROW("gdn_step_norm_multi_kernel<false, false>", "gdn_step_norm_multi_kernel"),
+    ALIAS_ROW("gdn_step_norm_multi_kernel<true, false>", "gdn_step_norm_multi_kernel"),
+    ALIAS_ROW("gdn_step_norm_multi_kernel<true, true>", "gdn_step_norm_multi_kernel"),
+    ALIAS_ROW("gdn_step_norm_multi", "gdn_step_norm_multi_kernel"),
+    ALIAS_ROW("norm_rope_kernel", "norm_rope_kernel"),
+    ALIAS_ROW("norm_rope_kernel<false>", "norm_rope_kernel"),
+    ALIAS_ROW("norm_rope_kernel<true>", "norm_rope_kernel"),
+    ALIAS_ROW("native_qsa_rms_norm_rope", "norm_rope_kernel"),
+    ALIAS_ROW("fwht256_pair_kernel", "fwht256_pair_kernel"),
+    ALIAS_ROW("fwht256_pair_inplace_cuda", "fwht256_pair_kernel"),
+    ALIAS_ROW("append", "append"),
+    ALIAS_ROW("append<false>", "append"),
+    ALIAS_ROW("append<true>", "append"),
+    ALIAS_ROW("native_qsa_indexer_append_steps", "append"),
+    ALIAS_ROW("block_scores_kernel", "block_scores_kernel"),
+    ALIAS_ROW("qsa_block_scores", "block_scores_kernel"),
+    ALIAS_ROW("block_topk_kernel", "block_topk_kernel"),
+    ALIAS_ROW("qsa_block_topk", "block_topk_kernel"),
+    ALIAS_ROW("resolve_kernel", "resolve_kernel"),
+    ALIAS_ROW("qsa_kv_resolve", "resolve_kernel"),
+    ALIAS_ROW("attn_chunk_kernel", "attn_chunk_kernel"),
+    ALIAS_ROW("attn_chunk_kernel<1, false, false, false>", "attn_chunk_kernel"),
+    ALIAS_ROW("attn_chunk_kernel<1, true, false, false>", "attn_chunk_kernel"),
+    ALIAS_ROW("qsa_decode_attn_batch_int8", "attn_chunk_kernel"),
+    ALIAS_ROW("gate_quantize_q8_1_kernel", "gate_quantize_q8_1_kernel"),
+    ALIAS_ROW("native_qsa_gate_quantize_q8_1", "gate_quantize_q8_1_kernel"),
+    ALIAS_ROW("route_multi", "route_multi"),
+    ALIAS_ROW("native_router_top10_multi", "route_multi"),
+    ALIAS_ROW("resident_plan_kernel", "resident_plan_kernel"),
+    ALIAS_ROW("resident_plan_kernel<128>", "resident_plan_kernel"),
+    ALIAS_ROW("resident_plan_kernel<256>", "resident_plan_kernel"),
+    ALIAS_ROW("resident_plan_all_resident", "resident_plan_kernel"),
+    ALIAS_ROW("quantize_q8_1_kernel", "quantize_q8_1_kernel"),
+    ALIAS_ROW("quantize_q8_1_rows", "quantize_q8_1_kernel"),
+    ALIAS_ROW("combine", "combine"),
+    ALIAS_ROW("combine<false, false>", "combine"),
+    ALIAS_ROW("combine<true, false>", "combine"),
+    ALIAS_ROW("combine<false, true>", "combine"),
+    ALIAS_ROW("combine<true, true>", "combine"),
+    ALIAS_ROW("native_moe_combine_multi", "combine"),
+    ALIAS_ROW("post_multi", "post_multi"),
+    ALIAS_ROW("gr_write_multi", "post_multi"),
+    ALIAS_ROW("argmax_rows_kernel", "argmax_rows_kernel"),
+    ALIAS_ROW("argmax_rows", "argmax_rows_kernel"),
 };
 
 #undef BF16_MMVF_ROWS_FOR_BLOCK
