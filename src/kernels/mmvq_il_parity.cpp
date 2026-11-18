@@ -27,6 +27,7 @@
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -200,9 +201,18 @@ int run_case(const Case& c, bool bench, cudaStream_t s) {
     int bad = 0;
     if (bench && g_persist && !g_ab) persist_window(s, dw[0], wbytes, true);
     g_gap_now = g_gap_bytes;
-    const int t_max = std::getenv("MMVQ_IL_TMAX") ? std::atoi(std::getenv("MMVQ_IL_TMAX")) : 8;   // 147-verify: 5-8 columns
-    const int t_min = std::getenv("MMVQ_IL_TMIN") ? std::atoi(std::getenv("MMVQ_IL_TMIN")) : 1;
-    for (int T = t_min; T <= t_max; ++T) {
+    const char* tmax_env = std::getenv("MMVQ_IL_TMAX");
+    const char* tmin_env = std::getenv("MMVQ_IL_TMIN");
+    std::vector<int> t_list;
+    if (tmax_env || tmin_env) {
+        const int t_max = tmax_env ? std::atoi(tmax_env) : kWindowMaxT;
+        const int t_min = tmin_env ? std::atoi(tmin_env) : 1;
+        for (int T = t_min; T <= t_max; ++T) t_list.push_back(T);
+    } else {
+        for (int T : {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 14, 16})
+            if (T <= kWindowMaxT) t_list.push_back(T);
+    }
+    for (int T : t_list) {
         std::vector<float> x((std::size_t) T * c.n_in);
         std::normal_distribution<float> nd(0.f, 1.f);
         for (auto& v : x) v = nd(rng);
@@ -479,9 +489,21 @@ int check_tables() {
         }
     }
     if (native_mmvq_il_rows_for(89, 99, 2, 2560) != 0 || native_mmvq_il_rows_for(89, 12, 5, 2560) != 0 ||
-        native_mmvq_il_rows_for(86, 12, 5, 2560) != 0 || native_mmvq_il_rows_for(120, 12, 9, 2560) != 0) {
+        native_mmvq_il_rows_for(86, 12, 5, 2560) != 0 || native_mmvq_il_rows_for(120, 12, 9, 2560) != 0 ||
+        native_mmvq_il_rows_for(1202, 12, 17, 2560) != 0) {
         ++bad;
         std::printf("FAIL table: an unknown type or ncols must be 0\n");
+    }
+    for (int type : {23, 12, 13, 14, 11, 21, 18}) {
+        for (int nc : {9, 10, 12, 14, 16}) {
+            for (int n_out : {512, 2560, 6144, 10240, 248320}) {
+                const int r = native_mmvq_il_rows_for(1202, type, nc, n_out);
+                if (r != 1) {
+                    ++bad;
+                    std::printf("FAIL table: 1202 type=%d nc=%d n_out=%d expected 1 got %d\n", type, nc, n_out, r);
+                }
+            }
+        }
     }
     // gfx12 AMD (il_cc's 1202, the key a HIP 12.0 card answers): spot checks read off the R9700's tables -
     // Q5_K at 2 columns / 512 rows = kIlRows_1202 {1, 0, 2, 2, 2}[class 0] = 1; Q6_K at 3 columns / 2560 rows
@@ -554,6 +576,7 @@ int main(int argc, char** argv) {
     for (const Case& c : CASES)
         if (only == nullptr || std::strstr(c.name, only) != nullptr) bad += run_case(c, bench, s);
     if (emit) emit_table();
-    std::printf("%s\n", bad ? "mmvq_il_parity: FAIL" : "mmvq_il_parity: OK (every case, T 1-8, rows 1/2/4 and the table, bitwise)");
+    std::printf("%s (T <= %d, rows 1/2/4 and the table, bitwise)\n",
+                bad ? "mmvq_il_parity: FAIL" : "mmvq_il_parity: OK", kWindowMaxT);
     return bad ? 1 : 0;
 }

@@ -59,6 +59,9 @@ std::size_t native_q8_1_bytes(int n_in, int ncols) {
 }
 std::size_t native_q8_1_il_bytes(int n_in, int ncols) { return native_q8_1_bytes(n_in, ncols) * 2; }
 bool native_mmvq_il_supported(int, int, int) { return false; }
+bool native_mmvq_multi_segs(int, const NativeMmvqSeg*, int, const void*, const void*, int, int, void*, bool) {
+    return false;
+}
 bool native_q8_0_packed_eligible(int, int) { return false; }
 bool native_q8_0_packed_enabled() { return false; }
 bool native_q6_k_packed_enabled() { return false; }

@@ -38,7 +38,7 @@ struct NativeSharedWeights {
     const void* up_data = nullptr;
     const void* down_data = nullptr;
     void* q8_1 = nullptr;
-    void* q8_il = nullptr;          // optional interleaved Q8_1 scratch for native_mmvq_il (2..8 cols)
+    void* q8_il = nullptr;          // optional interleaved Q8_1 scratch for native_mmvq_il (2..16 cols)
     const void* x_q8_1 = nullptr;   // optional pre-quantized Q8_1 input for gate/up in shared_expert_multi
 };
 
@@ -81,7 +81,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
 void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, const void* x_q8_1_ready = nullptr,
-                         int lfuse = 0);   // S26 STRATA_LFUSE: bit 0 gate computed + applied by the caller, bit 1 gate/up pair
+                         int lfuse = 0);   // S26 STRATA_LFUSE: bit 0 gate deferred, bit 1 gate/up pair, bit 2 gate precomputed, bit 3 q8_il ready
 
 /// The MoE block's final combination, `ref/moe.py::moe` L156:
 ///

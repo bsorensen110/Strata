@@ -1,0 +1,105 @@
+{
+ "arm": "trt_aa_floor_mt16",
+ "round": "r1",
+ "ts": "2026-11-13T13:49:47",
+ "exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "commit": "7a7deac9e",
+ "engine_pid": 21990,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-17-win16/results/trt_aa_floor_mt16.manifest.json",
+  "STRATA_BATCH_DF2_MAX_T": "16"
+ },
+ "parallel": 2,
+ "smoke": {
+  "prompt_tokens": 37,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.334,
+  "wall_tok_s": 8.99
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 5.958,
+  "wall_tok_s": 42.97
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.532,
+   "wall_tok_s": 112.96,
+   "hash": "01388646b8d45bba939a425b8fc64ab5761301a60902c59276f7a0e76272a4e3"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.876,
+   "wall_tok_s": 132.09,
+   "hash": "810272e6a2aac868a9dcc50f7f18d92bd7cbe6004e85cf2369a08c9903197e52"
+  }
+ ],
+ "burst": {
+  "wall_s": 3.819,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 134.08,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.549,
+    "wall_tok_s": 72.13,
+    "hash": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.817,
+    "wall_tok_s": 67.06,
+    "hash": "9b903cb65eff0764fe767fad44e7f67ed90e764c04bf6c4976751fbd981d5717"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "01388646b8d45bba939a425b8fc64ab5761301a60902c59276f7a0e76272a4e3",
+  "greedy_warm": "810272e6a2aac868a9dcc50f7f18d92bd7cbe6004e85cf2369a08c9903197e52",
+  "burst_a": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574",
+  "burst_b": "9b903cb65eff0764fe767fad44e7f67ed90e764c04bf6c4976751fbd981d5717"
+ },
+ "engine_decode_512": [
+  "118.1",
+  "134.3"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 62 ms (48.2 tok/s), drafts accepted 1 of 2, 1 checkpoints",
+   "generated in 3090 ms (82.8 tok/s), drafts accepted 161 of 304, 1 checkpoints",
+   "generated in 4334 ms (118.1 tok/s), drafts accepted 401 of 613, 1 checkpoints",
+   "generated in 3812 ms (134.3 tok/s), drafts accepted 407 of 558, 1 checkpoints",
+   "generated in 16 ms (61.5 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 16 ms (62.3 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 239 ms (138.0 tok/s), drafts accepted 27 of 38, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 37 tokens = 0 reused + 37 read in 269 ms (137.8 tok/s), 3 generated in 62 ms (48.2 tok/s), drafts accepted 1 of 2, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 2864 ms (1378.4 tok/s), 256 generated in 3090 ms (82.8 tok/s), drafts accepted 161 of 304, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 197 ms (178.0 tok/s), 512 generated in 4334 ms (118.1 tok/s), drafts accepted 401 of 613, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 62 ms (112.4 tok/s), 512 generated in 3812 ms (134.3 tok/s), drafts accepted 407 of 558, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 206 ms (169.7 tok/s), 1 generated in 16 ms (61.5 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 186 ms (188.3 tok/s), 1 generated in 16 ms (62.3 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 258 tokens = 257 reused + 1 read in 2 ms (639.2 tok/s), 33 generated in 239 ms (138.0 tok/s), drafts accepted 27 of 38, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 2",
+   "drafts accepted 161 of 304",
+   "drafts accepted 401 of 613",
+   "drafts accepted 407 of 558",
+   "drafts accepted 0 of 0",
+   "drafts accepted 0 of 0",
+   "drafts accepted 27 of 38"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 9504 slots, 21.75 GiB of VRAM; policy is"
+ ]
+}

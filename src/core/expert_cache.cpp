@@ -1,26 +1,29 @@
 // src/core/expert_cache.cpp - R4's slot storage and residency table.  Read the header first.
 #include "strata/core/expert_cache.hpp"
+#include "strata/core/expert_cache_refuse.hpp"
 
-// #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
-// the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+// The gfx906 compatibility layer and Metal do not expose the VMM driver API. STRATA_EC_NO_VMM remains
+// an explicit build-time kill switch; HIP VMM-capable devices use the shared Vmm implementation.
+#if (defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL) || defined(SYCL_LANGUAGE_VERSION)) && \
+    !defined(STRATA_EC_NO_VMM)
 #define STRATA_EC_NO_VMM 1
 #endif
 
 #include <thread>
 #include <mutex>
 #include <cuda_runtime.h>
-#if !defined(STRATA_EC_NO_VMM)
-#include <cuda.h>   // #533: the virtual memory management types (the functions come through the runtime's entry points)
-#endif
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
 #include <filesystem>
 #include <cstdlib>
 #include <utility>
 #include <cstring>
+#include <cmath>
+#include <functional>
+#include <limits>
 
 // (not in a SYCL build: its CUDA names are a compatibility layer without the PCI ids NVML is matched by)
 #if defined(_WIN32) && !defined(STRATA_EC_NO_VMM) && !defined(SYCL_LANGUAGE_VERSION)
@@ -313,177 +316,861 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
     return true;
 }
 
+bool read_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t n_expert,
+                              std::vector<double>& heat, std::string& err) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) {
+        err = "read_expert_profile_heat: cannot open " + path;
+        return false;
+    }
+    char magic[4] = {};
+    uint32_t hdr[3] = {};
+    if (std::fread(magic, 1, 4, f) != 4 || std::fread(hdr, 4, 3, f) != 3 ||
+        std::memcmp(magic, "STRH", 4) != 0 || hdr[0] != 1 ||
+        (int64_t) hdr[1] != n_layers || (int64_t) hdr[2] != n_expert ||
+        n_layers <= 0 || n_expert <= 0 || n_layers > 65535 || n_expert > 65535 ||
+        (size_t) n_layers > std::numeric_limits<size_t>::max() / (size_t) n_expert ||
+        (size_t) n_layers * (size_t) n_expert > std::numeric_limits<size_t>::max() / sizeof(double)) {
+        std::fclose(f);
+        err = "read_expert_profile_heat: invalid header or model dimensions in " + path;
+        return false;
+    }
+    const size_t count = (size_t) n_layers * (size_t) n_expert;
+    std::vector<double> values(count);
+    if (std::fread(values.data(), sizeof(double), count, f) != count || std::fgetc(f) != EOF || std::ferror(f)) {
+        std::fclose(f);
+        err = "read_expert_profile_heat: truncated or oversized heat file " + path;
+        return false;
+    }
+    std::fclose(f);
+    if (std::any_of(values.begin(), values.end(), [](double v) { return !std::isfinite(v) || v < 0.0; })) {
+        err = "read_expert_profile_heat: invalid heat value in " + path;
+        return false;
+    }
+    heat = std::move(values);
+    return true;
+}
+
+namespace ec_test {   // strata/core/expert_cache_refuse.hpp: tests only, null in the engine
+bool (*refuse_segment_call)(const char* call, int64_t seg) = nullptr;
+}  // namespace ec_test
+
+bool write_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t n_expert,
+                               const std::vector<double>& heat, std::string& err) {
+    if (n_layers <= 0 || n_expert <= 0 || n_layers > 65535 || n_expert > 65535 ||
+        (size_t) n_layers > std::numeric_limits<size_t>::max() / (size_t) n_expert ||
+        (size_t) n_layers * (size_t) n_expert > std::numeric_limits<size_t>::max() / sizeof(double) ||
+        heat.size() != (size_t) n_layers * (size_t) n_expert ||
+        std::any_of(heat.begin(), heat.end(), [](double v) { return !std::isfinite(v) || v < 0.0; })) {
+        err = "write_expert_profile_heat: invalid model dimensions or heat";
+        return false;
+    }
+    const uint32_t hdr[3] = {1u, (uint32_t) n_layers, (uint32_t) n_expert};
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "wb");
+    if (f == nullptr) {
+        err = "write_expert_profile_heat: cannot create " + tmp;
+        return false;
+    }
+    bool ok = std::fwrite("STRH", 1, 4, f) == 4 && std::fwrite(hdr, 4, 3, f) == 3 &&
+              std::fwrite(heat.data(), sizeof(double), heat.size(), f) == heat.size();
+    ok = (std::fclose(f) == 0) && ok;
+    std::error_code ec;
+    if (ok) std::filesystem::rename(tmp, path, ec);
+    if (!ok || ec) {
+        std::filesystem::remove(tmp, ec);
+        err = "write_expert_profile_heat: cannot write " + path;
+        return false;
+    }
+    return true;
+}
+
+std::vector<int64_t> uniform_expert_cache_quotas(const std::vector<int64_t>& slot_bytes, int64_t n_expert,
+                                                uint64_t byte_budget) {
+    if (slot_bytes.empty() || n_expert <= 0) return {};
+    uint64_t bytes_per_round = 0;
+    for (const int64_t bytes : slot_bytes) {
+        if (bytes <= 0 || (uint64_t) bytes > std::numeric_limits<uint64_t>::max() - bytes_per_round) return {};
+        bytes_per_round += (uint64_t) bytes;
+    }
+    const int64_t q = std::min<int64_t>(n_expert, (int64_t) std::min<uint64_t>(
+                                                           byte_budget / bytes_per_round,
+                                                           (uint64_t) std::numeric_limits<int64_t>::max()));
+    return q > 0 ? std::vector<int64_t>(slot_bytes.size(), q) : std::vector<int64_t>{};
+}
+
+std::vector<int64_t> learned_expert_cache_quotas(const std::vector<double>& heat,
+                                                 const std::vector<int64_t>& slot_bytes, int64_t n_expert,
+                                                 uint64_t byte_budget) {
+    if (slot_bytes.empty() || n_expert <= 0 ||
+        (size_t) n_expert > std::numeric_limits<size_t>::max() / slot_bytes.size() ||
+        heat.size() != slot_bytes.size() * (size_t) n_expert ||
+        std::any_of(slot_bytes.begin(), slot_bytes.end(), [](int64_t b) { return b <= 0; }) ||
+        std::any_of(heat.begin(), heat.end(), [](double v) { return !std::isfinite(v) || v < 0.0; }))
+        return {};
+    const std::vector<int64_t> uniform = uniform_expert_cache_quotas(slot_bytes, n_expert, byte_budget);
+    if (uniform.empty() || std::none_of(heat.begin(), heat.end(), [](double v) { return v > 0.0; })) return uniform;
+    int64_t slot_limit = 0;
+    for (const int64_t quota : uniform) {
+        if (quota > std::numeric_limits<int64_t>::max() - slot_limit) return {};
+        slot_limit += quota;
+    }
+
+    std::vector<std::vector<double>> ranked(slot_bytes.size());
+    uint64_t used = 0;
+    for (size_t layer = 0; layer < slot_bytes.size(); ++layer) {
+        const uint64_t cost = (uint64_t) slot_bytes[layer];
+        if (cost > std::numeric_limits<uint64_t>::max() - used) return {};
+        used += cost;   // floor each layer at one slot
+        ranked[layer].assign(heat.begin() + (ptrdiff_t) (layer * (size_t) n_expert),
+                             heat.begin() + (ptrdiff_t) ((layer + 1) * (size_t) n_expert));
+        std::sort(ranked[layer].begin(), ranked[layer].end(), std::greater<double>());
+    }
+    if (used > byte_budget) return {};
+    std::vector<int64_t> quotas(slot_bytes.size(), 1);
+    int64_t assigned = (int64_t) quotas.size();
+    for (;;) {
+        if (assigned >= slot_limit) break;
+        size_t best = slot_bytes.size();
+        long double best_value = 0.0L;
+        for (size_t layer = 0; layer < slot_bytes.size(); ++layer) {
+            const int64_t next = quotas[layer];
+            if (next >= n_expert || (uint64_t) slot_bytes[layer] > byte_budget - used) continue;
+            const long double value = (long double) ranked[layer][(size_t) next] / (long double) slot_bytes[layer];
+            if (value > best_value ||
+                (value == best_value && best != slot_bytes.size() && quotas[layer] < quotas[best])) {
+                best = layer;
+                best_value = value;
+            }
+        }
+        if (best == slot_bytes.size()) break;
+        ++quotas[best];
+        ++assigned;
+        used += (uint64_t) slot_bytes[best];
+    }
+    return quotas;
+}
+
+const char* expert_heat_provenance_name(ExpertHeatProvenance p) {
+    switch (p) {
+        case ExpertHeatProvenance::None: return "none";
+        case ExpertHeatProvenance::Runtime: return "runtime";
+        case ExpertHeatProvenance::LegacyUnmarked: return "legacy-unmarked";
+        case ExpertHeatProvenance::ProfileRankPrior: return "profile-rank prior";
+        case ExpertHeatProvenance::Malformed: return "malformed";
+    }
+    return "unknown";
+}
+
+std::string expert_profile_heat_meta_path(const std::string& heat_path) {
+    return heat_path.empty() ? std::string{} : heat_path + ".meta";
+}
+
+namespace {
+
+constexpr uint64_t kHeatFnvOffset = 14695981039346656037ull;
+constexpr uint64_t kHeatFnvPrime  = 1099511628211ull;
+
+bool valid_heat_dimensions(int64_t n_layers, int64_t n_expert) {
+    return n_layers > 0 && n_expert > 0 && n_layers <= 65535 && n_expert <= 65535 &&
+           (size_t) n_layers <= std::numeric_limits<size_t>::max() / (size_t) n_expert &&
+           (size_t) n_layers * (size_t) n_expert <= std::numeric_limits<size_t>::max() / sizeof(double);
+}
+
+bool valid_heat_values(const std::vector<double>& heat, int64_t n_layers, int64_t n_expert) {
+    return valid_heat_dimensions(n_layers, n_expert) &&
+           heat.size() == (size_t) n_layers * (size_t) n_expert &&
+           std::none_of(heat.begin(), heat.end(), [](double v) { return !std::isfinite(v) || v < 0.0; });
+}
+
+uint64_t heat_payload_fnv1a64(const std::vector<double>& heat) {
+    uint64_t h = kHeatFnvOffset;
+    const auto* bytes = reinterpret_cast<const uint8_t*>(heat.data());
+    const size_t nbytes = heat.size() * sizeof(double);
+    for (size_t i = 0; i < nbytes; ++i) {
+        h ^= (uint64_t) bytes[i];
+        h *= kHeatFnvPrime;
+    }
+    return h;
+}
+
+std::string format_hex64(uint64_t v) {
+    char buf[17];
+    std::snprintf(buf, sizeof buf, "%016llx", (unsigned long long) v);
+    return std::string(buf, 16);
+}
+
+std::string sanitize_meta_value(std::string s) {
+    for (char& c : s) {
+        if (c == '\r' || c == '\n' || c == '\0') c = ' ';
+    }
+    return s;
+}
+
+bool parse_strict_i64(const std::string& s, int64_t& out) {
+    if (s.empty()) return false;
+    size_t idx = 0;
+    if (s[0] == '+' || s[0] == '-') {
+        if (s[0] == '+' || s.size() == 1) return false;
+    }
+    char* end = nullptr;
+    errno = 0;
+    const long long val = std::strtoll(s.c_str(), &end, 10);
+    if (errno != 0 || end == s.c_str() || *end != '\0') return false;
+    (void) idx;
+    out = (int64_t) val;
+    return true;
+}
+
+bool parse_strict_hex64(const std::string& s, uint64_t& out) {
+    if (s.size() != 16) return false;
+    uint64_t acc = 0;
+    for (unsigned char ch : s) {
+        acc <<= 4;
+        if (ch >= '0' && ch <= '9') acc |= (uint64_t) (ch - '0');
+        else if (ch >= 'a' && ch <= 'f') acc |= (uint64_t) (10 + (ch - 'a'));
+        else if (ch >= 'A' && ch <= 'F') acc |= (uint64_t) (10 + (ch - 'A'));
+        else return false;
+    }
+    out = acc;
+    return true;
+}
+
+bool stage_heat_tmp(const std::string& tmp_path, int64_t n_layers, int64_t n_expert,
+                    const std::vector<double>& heat, std::string& err) {
+    const uint32_t hdr[3] = {1u, (uint32_t) n_layers, (uint32_t) n_expert};
+    std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    if (f == nullptr) {
+        err = "write_expert_profile_heat_with_provenance: cannot create " + tmp_path;
+        return false;
+    }
+    bool ok = std::fwrite("STRH", 1, 4, f) == 4 && std::fwrite(hdr, 4, 3, f) == 3 &&
+              (heat.empty() || std::fwrite(heat.data(), sizeof(double), heat.size(), f) == heat.size());
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok) {
+        std::error_code ec;
+        std::filesystem::remove(tmp_path, ec);
+        err = "write_expert_profile_heat_with_provenance: cannot write " + tmp_path;
+        return false;
+    }
+    return true;
+}
+
+bool stage_meta_tmp(const std::string& tmp_path, int64_t n_layers, int64_t n_expert,
+                    ExpertHeatProvenance provenance, const std::string& source_profile,
+                    const std::string& source_kind, int64_t ranked_pairs, uint64_t heat_hash,
+                    std::string& err) {
+    const char* prov_str = provenance == ExpertHeatProvenance::Runtime ? "runtime" : "profile-rank-prior";
+    const std::string body =
+        "strata_heat_meta=1\n"
+        "provenance=" + std::string(prov_str) + "\n"
+        "source_kind=" + sanitize_meta_value(source_kind) + "\n"
+        "source_profile=" + sanitize_meta_value(source_profile) + "\n"
+        "n_layers=" + std::to_string((long long) n_layers) + "\n"
+        "n_expert=" + std::to_string((long long) n_expert) + "\n"
+        "ranked_pairs=" + std::to_string((long long) ranked_pairs) + "\n"
+        "heat_fnv1a64=" + format_hex64(heat_hash) + "\n";
+
+    std::FILE* f = std::fopen(tmp_path.c_str(), "wb");
+    if (f == nullptr) {
+        err = "write_expert_profile_heat_with_provenance: cannot create " + tmp_path;
+        return false;
+    }
+    bool ok = std::fwrite(body.data(), 1, body.size(), f) == body.size();
+    ok = (std::fclose(f) == 0) && ok;
+    if (!ok) {
+        std::error_code ec;
+        std::filesystem::remove(tmp_path, ec);
+        err = "write_expert_profile_heat_with_provenance: cannot write " + tmp_path;
+        return false;
+    }
+    return true;
+}
+
+bool read_heat_meta_file(const std::string& meta_path, int64_t n_layers, int64_t n_expert,
+                         ExpertHeatProvenance& provenance, std::string& source_profile,
+                         uint64_t& recorded_hash, std::string& err) {
+    std::error_code ec;
+    if (std::filesystem::is_directory(meta_path, ec) || ec) {
+        err = "read_expert_profile_heat_with_provenance: invalid metadata path " + meta_path;
+        return false;
+    }
+    const uintmax_t fsize = std::filesystem::file_size(meta_path, ec);
+    if (ec || fsize > 8192) {
+        err = "read_expert_profile_heat_with_provenance: unreadable or oversized metadata file " + meta_path;
+        return false;
+    }
+    std::FILE* f = std::fopen(meta_path.c_str(), "rb");
+    if (f == nullptr) {
+        err = "read_expert_profile_heat_with_provenance: cannot open metadata file " + meta_path;
+        return false;
+    }
+    std::string content((size_t) fsize, '\0');
+    const size_t nread = content.empty() ? 0 : std::fread(content.data(), 1, content.size(), f);
+    const int extra = std::fgetc(f);
+    const bool io_err = std::ferror(f) != 0;
+    std::fclose(f);
+    if (nread != content.size() || extra != EOF || io_err) {
+        err = "read_expert_profile_heat_with_provenance: truncated metadata file " + meta_path;
+        return false;
+    }
+
+    bool have_ver = false;
+    bool have_prov = false;
+    bool have_nl = false;
+    bool have_ne = false;
+    bool have_hash = false;
+    ExpertHeatProvenance parsed_prov = ExpertHeatProvenance::None;
+    std::string parsed_src;
+    uint64_t parsed_hash = 0;
+
+    size_t pos = 0;
+    while (pos < content.size()) {
+        const size_t nl = content.find('\n', pos);
+        std::string line = (nl == std::string::npos) ? content.substr(pos) : content.substr(pos, nl - pos);
+        pos = (nl == std::string::npos) ? content.size() : nl + 1;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty()) continue;
+
+        const size_t eq = line.find('=');
+        if (eq == std::string::npos || eq == 0) {
+            err = "read_expert_profile_heat_with_provenance: malformed metadata line in " + meta_path;
+            return false;
+        }
+        const std::string key = line.substr(0, eq);
+        const std::string val = line.substr(eq + 1);
+        if (key == "strata_heat_meta") {
+            if (have_ver || val != "1") {
+                err = "read_expert_profile_heat_with_provenance: unsupported metadata version in " + meta_path;
+                return false;
+            }
+            have_ver = true;
+        } else if (key == "provenance") {
+            if (have_prov) {
+                err = "read_expert_profile_heat_with_provenance: duplicate provenance in " + meta_path;
+                return false;
+            }
+            if (val == "runtime") parsed_prov = ExpertHeatProvenance::Runtime;
+            else if (val == "profile-rank-prior") parsed_prov = ExpertHeatProvenance::ProfileRankPrior;
+            else {
+                err = "read_expert_profile_heat_with_provenance: unknown provenance '" + val + "' in " + meta_path;
+                return false;
+            }
+            have_prov = true;
+        } else if (key == "n_layers") {
+            int64_t v = 0;
+            if (have_nl || !parse_strict_i64(val, v) || v != n_layers) {
+                err = "read_expert_profile_heat_with_provenance: metadata n_layers mismatch in " + meta_path;
+                return false;
+            }
+            have_nl = true;
+        } else if (key == "n_expert") {
+            int64_t v = 0;
+            if (have_ne || !parse_strict_i64(val, v) || v != n_expert) {
+                err = "read_expert_profile_heat_with_provenance: metadata n_expert mismatch in " + meta_path;
+                return false;
+            }
+            have_ne = true;
+        } else if (key == "heat_fnv1a64") {
+            if (have_hash || !parse_strict_hex64(val, parsed_hash)) {
+                err = "read_expert_profile_heat_with_provenance: invalid heat checksum in " + meta_path;
+                return false;
+            }
+            have_hash = true;
+        } else if (key == "source_profile") {
+            parsed_src = val;
+        } else if (key == "source_kind" || key == "ranked_pairs") {
+            if (key == "ranked_pairs") {
+                int64_t rp = -1;
+                if (!parse_strict_i64(val, rp) || rp < 0) {
+                    err = "read_expert_profile_heat_with_provenance: invalid ranked_pairs in " + meta_path;
+                    return false;
+                }
+            }
+        }
+    }
+
+    if (!have_ver || !have_prov || !have_nl || !have_ne || !have_hash) {
+        err = "read_expert_profile_heat_with_provenance: incomplete metadata in " + meta_path;
+        return false;
+    }
+    provenance = parsed_prov;
+    source_profile = std::move(parsed_src);
+    recorded_hash = parsed_hash;
+    return true;
+}
+
+bool same_profile_target(const std::string& a, const std::string& b) {
+    if (a.empty() || b.empty()) return false;
+    const std::filesystem::path pa = std::filesystem::path(a).lexically_normal();
+    const std::filesystem::path pb = std::filesystem::path(b).lexically_normal();
+    if (pa == pb) return true;
+    std::error_code ec;
+    const std::filesystem::path ca = std::filesystem::weakly_canonical(pa, ec);
+    if (!ec) {
+        std::error_code ec2;
+        const std::filesystem::path cb = std::filesystem::weakly_canonical(pb, ec2);
+        if (!ec2 && ca == cb) return true;
+    }
+    const std::filesystem::path ha(a + ".heat");
+    const std::filesystem::path hb(b + ".heat");
+    if (std::filesystem::exists(ha, ec) && !ec && std::filesystem::exists(hb, ec) && !ec) {
+        const bool eq = std::filesystem::equivalent(ha, hb, ec);
+        if (!ec && eq) return true;
+    }
+    return false;
+}
+
+ExpertHeatResolution inspect_heat_candidate(const std::string& profile_path, int64_t n_layers, int64_t n_expert) {
+    ExpertHeatResolution res;
+    if (profile_path.empty()) return res;
+    res.path = profile_path + ".heat";
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(res.path, ec);
+    if (ec) {
+        res.found = true;
+        res.valid = false;
+        res.provenance = ExpertHeatProvenance::Malformed;
+        res.detail = "cannot check expert heat file " + res.path + ": " + ec.message();
+        return res;
+    }
+    if (!exists) return res;
+
+    res.found = true;
+    std::string err;
+    if (!read_expert_profile_heat_with_provenance(res.path, n_layers, n_expert, res.heat, res.provenance,
+                                                  res.source_profile, err)) {
+        res.valid = false;
+        res.provenance = ExpertHeatProvenance::Malformed;
+        res.detail = err;
+        res.heat.clear();
+        return res;
+    }
+    res.valid = true;
+    return res;
+}
+
+bool is_measured_provenance(ExpertHeatProvenance p) {
+    return p == ExpertHeatProvenance::Runtime || p == ExpertHeatProvenance::LegacyUnmarked;
+}
+
+}  // namespace
+
+bool profile_rank_prior_heat(int64_t n_layers, int64_t n_expert,
+                             const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                             std::vector<double>& heat, std::string& err) {
+    if (!valid_heat_dimensions(n_layers, n_expert)) {
+        err = "profile_rank_prior_heat: invalid model dimensions";
+        return false;
+    }
+    if (ranked.empty()) {
+        err = "profile_rank_prior_heat: ranked profile list is empty";
+        return false;
+    }
+    const size_t total = (size_t) n_layers * (size_t) n_expert;
+    std::vector<double> weights(total, 0.0);
+    const size_t n_ranked = ranked.size();
+    for (size_t r = 0; r < n_ranked; ++r) {
+        const auto [l, e] = ranked[r];
+        if (l < 0 || l >= n_layers || e < 0 || e >= n_expert) {
+            err = "profile_rank_prior_heat: ranked pair is out of range for model dimensions";
+            return false;
+        }
+        const size_t idx = (size_t) l * (size_t) n_expert + (size_t) e;
+        if (weights[idx] == 0.0) weights[idx] = (double) (n_ranked - r);
+    }
+    heat = std::move(weights);
+    return true;
+}
+
+bool read_expert_profile_heat_with_provenance(const std::string& heat_path, int64_t n_layers, int64_t n_expert,
+                                              std::vector<double>& heat, ExpertHeatProvenance& provenance,
+                                              std::string& source_profile, std::string& err) {
+    heat.clear();
+    source_profile.clear();
+    if (heat_path.empty()) {
+        provenance = ExpertHeatProvenance::None;
+        err = "read_expert_profile_heat_with_provenance: empty path";
+        return false;
+    }
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(heat_path, ec);
+    if (ec) {
+        provenance = ExpertHeatProvenance::Malformed;
+        err = "read_expert_profile_heat_with_provenance: cannot stat " + heat_path + ": " + ec.message();
+        return false;
+    }
+    if (!exists) {
+        provenance = ExpertHeatProvenance::None;
+        err = "read_expert_profile_heat_with_provenance: missing " + heat_path;
+        return false;
+    }
+    if (std::filesystem::is_directory(heat_path, ec) || ec) {
+        provenance = ExpertHeatProvenance::Malformed;
+        err = "read_expert_profile_heat_with_provenance: invalid heat file path " + heat_path;
+        return false;
+    }
+
+    std::vector<double> values;
+    if (!read_expert_profile_heat(heat_path, n_layers, n_expert, values, err)) {
+        provenance = ExpertHeatProvenance::Malformed;
+        return false;
+    }
+
+    const std::string meta_path = expert_profile_heat_meta_path(heat_path);
+    const bool has_meta = std::filesystem::exists(meta_path, ec);
+    if (ec) {
+        provenance = ExpertHeatProvenance::Malformed;
+        err = "read_expert_profile_heat_with_provenance: cannot stat metadata " + meta_path + ": " + ec.message();
+        return false;
+    }
+    if (!has_meta) {
+        provenance = ExpertHeatProvenance::LegacyUnmarked;
+        heat = std::move(values);
+        return true;
+    }
+
+    ExpertHeatProvenance meta_prov = ExpertHeatProvenance::None;
+    std::string meta_src;
+    uint64_t meta_hash = 0;
+    if (!read_heat_meta_file(meta_path, n_layers, n_expert, meta_prov, meta_src, meta_hash, err)) {
+        provenance = ExpertHeatProvenance::Malformed;
+        return false;
+    }
+    const uint64_t actual_hash = heat_payload_fnv1a64(values);
+    if (meta_prov == ExpertHeatProvenance::Runtime && meta_hash != actual_hash) {
+        provenance = ExpertHeatProvenance::Malformed;
+        err = "read_expert_profile_heat_with_provenance: runtime heat checksum mismatch with " + meta_path;
+        return false;
+    }
+    // Note: if meta_prov == ProfileRankPrior and meta_hash != actual_hash (e.g. a crash occurred after
+    // renaming runtime .heat before renaming .meta), provenance intentionally stays ProfileRankPrior so a
+    // failed/interrupted write never silently upgrades a prior to Runtime.
+    provenance = meta_prov;
+    source_profile = std::move(meta_src);
+    heat = std::move(values);
+    return true;
+}
+
+bool write_expert_profile_heat_with_provenance(const std::string& heat_path, int64_t n_layers, int64_t n_expert,
+                                               const std::vector<double>& heat, ExpertHeatProvenance provenance,
+                                               const std::string& source_profile, const std::string& source_kind,
+                                               int64_t ranked_pairs, std::string& err) {
+    if (heat_path.empty() || !valid_heat_values(heat, n_layers, n_expert) || ranked_pairs < 0) {
+        err = "write_expert_profile_heat_with_provenance: invalid arguments, dimensions, or heat values";
+        return false;
+    }
+    if (provenance != ExpertHeatProvenance::Runtime && provenance != ExpertHeatProvenance::ProfileRankPrior) {
+        err = "write_expert_profile_heat_with_provenance: provenance must be Runtime or ProfileRankPrior";
+        return false;
+    }
+
+    const std::string meta_path = expert_profile_heat_meta_path(heat_path);
+    const std::string heat_tmp = heat_path + ".tmp";
+    const std::string meta_tmp = meta_path + ".tmp";
+    const uint64_t heat_hash = heat_payload_fnv1a64(heat);
+
+    std::error_code ec;
+    const bool had_heat = std::filesystem::exists(heat_path, ec);
+    if (ec) {
+        err = "write_expert_profile_heat_with_provenance: cannot inspect " + heat_path;
+        return false;
+    }
+    const bool had_meta = std::filesystem::exists(meta_path, ec);
+    if (ec) {
+        err = "write_expert_profile_heat_with_provenance: cannot inspect " + meta_path;
+        return false;
+    }
+
+    auto cleanup_tmps = [&] {
+        std::error_code rm_ec;
+        std::filesystem::remove(heat_tmp, rm_ec);
+        std::filesystem::remove(meta_tmp, rm_ec);
+    };
+
+    if (provenance == ExpertHeatProvenance::ProfileRankPrior) {
+        if (!stage_meta_tmp(meta_tmp, n_layers, n_expert, provenance, source_profile, source_kind, ranked_pairs,
+                            heat_hash, err) ||
+            !stage_heat_tmp(heat_tmp, n_layers, n_expert, heat, err)) {
+            cleanup_tmps();
+            return false;
+        }
+        std::filesystem::rename(meta_tmp, meta_path, ec);
+        if (ec) {
+            cleanup_tmps();
+            err = "write_expert_profile_heat_with_provenance: cannot commit metadata " + meta_path + ": " + ec.message();
+            return false;
+        }
+        std::filesystem::rename(heat_tmp, heat_path, ec);
+        if (ec) {
+            cleanup_tmps();
+            if (!had_heat && !had_meta) {
+                std::error_code rm_ec;
+                std::filesystem::remove(meta_path, rm_ec);
+            }
+            err = "write_expert_profile_heat_with_provenance: cannot commit heat " + heat_path + ": " + ec.message();
+            return false;
+        }
+        return true;
+    }
+
+    // Runtime write: stage BOTH temp files first so staging failures leave existing heat & metadata intact,
+    // then commit .heat before .meta so a failure or crash between renames never upgrades a prior to Runtime.
+    if (!stage_heat_tmp(heat_tmp, n_layers, n_expert, heat, err) ||
+        !stage_meta_tmp(meta_tmp, n_layers, n_expert, provenance, source_profile, source_kind, ranked_pairs,
+                        heat_hash, err)) {
+        cleanup_tmps();
+        return false;
+    }
+    std::filesystem::rename(heat_tmp, heat_path, ec);
+    if (ec) {
+        cleanup_tmps();
+        err = "write_expert_profile_heat_with_provenance: cannot commit runtime heat " + heat_path + ": " +
+              ec.message();
+        return false;
+    }
+    std::filesystem::rename(meta_tmp, meta_path, ec);
+    if (ec) {
+        cleanup_tmps();
+        err = "write_expert_profile_heat_with_provenance: cannot commit runtime metadata " + meta_path + ": " +
+              ec.message();
+        return false;
+    }
+    return true;
+}
+
+ExpertHeatResolution resolve_expert_profile_heat(const std::string& save_profile_path,
+                                                 const std::string& input_profile_path,
+                                                 int64_t n_layers, int64_t n_expert) {
+    if (!valid_heat_dimensions(n_layers, n_expert)) {
+        ExpertHeatResolution bad;
+        bad.found = false;
+        bad.valid = false;
+        bad.detail = "invalid model dimensions";
+        return bad;
+    }
+    ExpertHeatResolution save = inspect_heat_candidate(save_profile_path, n_layers, n_expert);
+    ExpertHeatResolution input;
+    if (!same_profile_target(save_profile_path, input_profile_path)) {
+        input = inspect_heat_candidate(input_profile_path, n_layers, n_expert);
+    }
+
+    if (save.found && !save.valid) return save;
+    if (save.valid && is_measured_provenance(save.provenance)) return save;
+    if (input.found && !input.valid) return input;
+    if (input.valid && is_measured_provenance(input.provenance)) return input;
+    if (save.valid) return save;
+    if (input.found) return input;
+    return {};
+}
+
+ExpertHeatBootstrapResult bootstrap_expert_profile_heat(
+    const std::string& save_profile_path, const std::string& input_profile_path,
+    const std::vector<std::pair<int32_t, int32_t>>& loaded_input_profile,
+    int64_t n_layers, int64_t n_expert) {
+    ExpertHeatBootstrapResult out;
+    if (save_profile_path.empty()) {
+        out.action = ExpertHeatBootstrapResult::Action::SkippedNoProfile;
+        out.detail = "no --expert-profile-save path configured";
+        return out;
+    }
+    out.heat_path = save_profile_path + ".heat";
+    if (!valid_heat_dimensions(n_layers, n_expert)) {
+        out.action = ExpertHeatBootstrapResult::Action::Failed;
+        out.detail = "invalid model dimensions";
+        return out;
+    }
+
+    const ExpertHeatResolution save = inspect_heat_candidate(save_profile_path, n_layers, n_expert);
+    ExpertHeatResolution input;
+    if (!same_profile_target(save_profile_path, input_profile_path)) {
+        input = inspect_heat_candidate(input_profile_path, n_layers, n_expert);
+    }
+
+    if (save.found && !save.valid) {
+        out.action = ExpertHeatBootstrapResult::Action::MalformedLeftUntouched;
+        out.heat_path = save.path;
+        out.provenance = ExpertHeatProvenance::Malformed;
+        out.detail = save.detail;
+        return out;
+    }
+    if (save.valid && is_measured_provenance(save.provenance)) {
+        out.action = ExpertHeatBootstrapResult::Action::RetainedValid;
+        out.heat_path = save.path;
+        out.provenance = save.provenance;
+        out.source_profile = save.source_profile;
+        return out;
+    }
+    if (input.found && !input.valid) {
+        out.action = ExpertHeatBootstrapResult::Action::MalformedLeftUntouched;
+        out.heat_path = input.path;
+        out.provenance = ExpertHeatProvenance::Malformed;
+        out.detail = input.detail;
+        return out;
+    }
+    if (input.valid && is_measured_provenance(input.provenance)) {
+        out.action = ExpertHeatBootstrapResult::Action::RetainedValid;
+        out.heat_path = input.path;
+        out.provenance = input.provenance;
+        out.source_profile = input.source_profile;
+        return out;
+    }
+    if (save.valid) {
+        out.action = ExpertHeatBootstrapResult::Action::RetainedValid;
+        out.heat_path = save.path;
+        out.provenance = save.provenance;
+        out.source_profile = save.source_profile;
+        return out;
+    }
+
+    std::vector<std::pair<int32_t, int32_t>> chosen_ranked;
+    std::string chosen_source_profile;
+    std::string chosen_source_kind;
+    std::string fallback_note;
+
+    {
+        std::vector<std::pair<int32_t, int32_t>> saved_ranked;
+        int64_t saved_slots = 0;
+        std::string read_err;
+        if (read_expert_profile(save_profile_path, n_layers, n_expert, saved_ranked, saved_slots, read_err) &&
+            !saved_ranked.empty()) {
+            chosen_ranked = std::move(saved_ranked);
+            chosen_source_profile = save_profile_path;
+            chosen_source_kind = "saved-profile";
+        } else {
+            std::error_code ec;
+            if (std::filesystem::exists(save_profile_path, ec)) {
+                fallback_note = read_err.empty() ? "saved profile has empty ranking" : read_err;
+            }
+        }
+    }
+
+    if (chosen_ranked.empty()) {
+        if (!loaded_input_profile.empty()) {
+            chosen_ranked = loaded_input_profile;
+            chosen_source_profile = input_profile_path.empty() ? "<input-profile>" : input_profile_path;
+            chosen_source_kind = "input-profile";
+        } else if (!input_profile_path.empty()) {
+            std::vector<std::pair<int32_t, int32_t>> input_ranked;
+            int64_t input_slots = 0;
+            std::string read_err;
+            if (read_expert_profile(input_profile_path, n_layers, n_expert, input_ranked, input_slots, read_err) &&
+                !input_ranked.empty()) {
+                chosen_ranked = std::move(input_ranked);
+                chosen_source_profile = input_profile_path;
+                chosen_source_kind = "input-profile";
+            }
+        }
+    }
+
+    if (chosen_ranked.empty()) {
+        out.action = ExpertHeatBootstrapResult::Action::SkippedNoProfile;
+        out.detail = fallback_note.empty() ? "no valid saved or input expert profile available for heat prior"
+                                           : fallback_note;
+        return out;
+    }
+
+    std::vector<double> prior_heat;
+    std::string prior_err;
+    if (!profile_rank_prior_heat(n_layers, n_expert, chosen_ranked, prior_heat, prior_err)) {
+        out.action = ExpertHeatBootstrapResult::Action::Failed;
+        out.detail = prior_err;
+        return out;
+    }
+
+    std::string write_err;
+    if (!write_expert_profile_heat_with_provenance(out.heat_path, n_layers, n_expert, prior_heat,
+                                                   ExpertHeatProvenance::ProfileRankPrior,
+                                                   chosen_source_profile, chosen_source_kind,
+                                                   (int64_t) chosen_ranked.size(), write_err)) {
+        out.action = ExpertHeatBootstrapResult::Action::Failed;
+        out.detail = write_err;
+        return out;
+    }
+
+    out.action = ExpertHeatBootstrapResult::Action::DerivedPrior;
+    out.provenance = ExpertHeatProvenance::ProfileRankPrior;
+    out.source_profile = std::move(chosen_source_profile);
+    out.source_kind = std::move(chosen_source_kind);
+    out.ranked_pairs = chosen_ranked.size();
+    out.detail = std::move(fallback_note);
+    return out;
+}
+
+bool save_runtime_expert_profile_heat(const std::string& save_profile_path, int64_t n_layers, int64_t n_expert,
+                                      const std::vector<double>& heat, int64_t ranked_pairs,
+                                      bool& skipped_zero_heat, std::string& err) {
+    skipped_zero_heat = false;
+    if (save_profile_path.empty() || !valid_heat_values(heat, n_layers, n_expert)) {
+        err = "save_runtime_expert_profile_heat: invalid path, dimensions, or heat values";
+        return false;
+    }
+    const bool has_observed_routing = std::any_of(heat.begin(), heat.end(), [](double v) { return v > 0.0; });
+    if (!has_observed_routing) {
+        skipped_zero_heat = true;
+        return true;
+    }
+    const std::string heat_path = save_profile_path + ".heat";
+    return write_expert_profile_heat_with_provenance(heat_path, n_layers, n_expert, heat,
+                                                     ExpertHeatProvenance::Runtime, save_profile_path,
+                                                     "runtime-routing", ranked_pairs, err);
+}
+
 ExpertCache::~ExpertCache() { close(); }
 
-// ---- #533: the segmented arena (--vram-elastic).  The driver API's virtual memory functions, looked up through the
-// runtime (no link against the driver library): one address range for the whole arena, backed by physical segments,
-// and the tail's segments unmapped / mapped again later.  Nothing here runs unless a segment size was set.
 #if !defined(STRATA_EC_NO_VMM)
-namespace {
-struct Vmm {
-    CUresult (CUDAAPI* device_get)(CUdevice*, int) = nullptr;
-    CUresult (CUDAAPI* attribute)(int*, CUdevice_attribute, CUdevice) = nullptr;
-    CUresult (CUDAAPI* granularity)(size_t*, const CUmemAllocationProp*, CUmemAllocationGranularity_flags) = nullptr;
-    CUresult (CUDAAPI* reserve)(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long) = nullptr;
-    CUresult (CUDAAPI* address_free)(CUdeviceptr, size_t) = nullptr;
-    CUresult (CUDAAPI* create)(CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*,
-                               unsigned long long) = nullptr;
-    CUresult (CUDAAPI* release)(CUmemGenericAllocationHandle) = nullptr;
-    CUresult (CUDAAPI* map)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long) = nullptr;
-    CUresult (CUDAAPI* unmap)(CUdeviceptr, size_t) = nullptr;
-    CUresult (CUDAAPI* set_access)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t) = nullptr;
-    bool ok = false;
-};
-
-template <class F> bool entry(const char* name, F& f) {
-    void* p = nullptr;
-    cudaDriverEntryPointQueryResult q{};
-#if CUDART_VERSION >= 12050
-    const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q);
-#else
-    const cudaError_t e = cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q);
-#endif
-    if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || p == nullptr) {
-        (void) cudaGetLastError();
-        return false;
-    }
-    f = reinterpret_cast<F>(p);
-    return true;
-}
-
-const Vmm& vmm() {
-    static const Vmm v = [] {
-        Vmm x;
-        x.ok = entry("cuDeviceGet", x.device_get) && entry("cuDeviceGetAttribute", x.attribute) &&
-               entry("cuMemGetAllocationGranularity", x.granularity) && entry("cuMemAddressReserve", x.reserve) &&
-               entry("cuMemAddressFree", x.address_free) && entry("cuMemCreate", x.create) &&
-               entry("cuMemRelease", x.release) && entry("cuMemMap", x.map) && entry("cuMemUnmap", x.unmap) &&
-               entry("cuMemSetAccess", x.set_access);
-        return x;
-    }();
-    return v;
-}
-
-CUmemAllocationProp device_prop(int dev) {
-    CUmemAllocationProp prop{};
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = dev;
-    return prop;
-}
-
-// one segment: a physical allocation mapped at `va`, readable and writable by this device
-bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned long long& handle) {
-    const CUmemAllocationProp prop = device_prop(dev);
-    CUmemGenericAllocationHandle h = 0;
-    if (v.create(&h, bytes, &prop, 0) != CUDA_SUCCESS) return false;
-    if (v.map(va, bytes, 0, h, 0) != CUDA_SUCCESS) {
-        v.release(h);
-        return false;
-    }
-    CUmemAccessDesc access{};
-    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    access.location.id = dev;
-    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    if (v.set_access(va, bytes, &access, 1) != CUDA_SUCCESS) {
-        v.unmap(va, bytes);
-        v.release(h);
-        return false;
-    }
-    handle = (unsigned long long) h;
-    return true;
-}
-}  // namespace
-#endif
-
-#if !defined(STRATA_EC_NO_VMM)
-// the driver and this GPU offer the virtual memory functions the segmented arena needs (the check open_segmented makes first)
-static bool segmented_supported() {
-    const Vmm& v = vmm();
-    int dev = 0, supported = 0;
-    CUdevice cu = 0;
-    return v.ok && cudaGetDevice(&dev) == cudaSuccess && v.device_get(&cu, dev) == CUDA_SUCCESS &&
-           v.attribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) == CUDA_SUCCESS && supported;
-}
+static bool segmented_supported() { return vmm_available() && vmm_granularity() > 0; }
 #endif
 
 bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 #if defined(STRATA_EC_NO_VMM)
     (void) want;
-    err = "ExpertCache: --vram-elastic (a segmented expert cache) is CUDA-only for now";
+    err = "ExpertCache: --vram-elastic needs the driver's virtual memory management, which this build does not offer";
     return false;
 #else
-    const Vmm& v = vmm();
-    int dev = 0, supported = 0;
-    CUdevice cu = 0;
-    if (!v.ok || cudaGetDevice(&dev) != cudaSuccess || v.device_get(&cu, dev) != CUDA_SUCCESS ||
-        v.attribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) != CUDA_SUCCESS ||
-        !supported) {
+    const uint64_t gran = vmm_granularity();
+    if (!vmm_available() || gran == 0) {
         err = "ExpertCache: --vram-elastic needs the driver's virtual memory management, which this GPU or driver "
               "does not offer";
         return false;
     }
-    const CUmemAllocationProp prop = device_prop(dev);
-    size_t gran = 0;
-    if (v.granularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS || gran == 0) {
-        err = "ExpertCache: cannot read the driver's allocation granularity";
-        return false;
-    }
-    const uint64_t g = (uint64_t) gran;
-    const uint64_t total = (want + g - 1) / g * g;
-    seg_ = (int64_t) (((uint64_t) seg_req_ + g - 1) / g * g);
-    CUdeviceptr va = 0;
-    if (v.reserve(&va, (size_t) total, 0, 0, 0) != CUDA_SUCCESS) {
+    seg_ = (int64_t) (((uint64_t) seg_req_ + gran - 1) / gran * gran);
+    auto range = std::make_unique<VmmRange>();
+    if (!range->reserve(want)) {
         err = "ExpertCache: cannot reserve the address range of the segmented expert cache";
+        seg_ = 0;
         return false;
     }
-    base_ = reinterpret_cast<uint8_t*>(va);
-    reserved_ = total;
-    for (uint64_t at = 0; at < total; at += (uint64_t) seg_) {
-        segs_.push_back(0);
-        seg_size_.push_back((int64_t) std::min<uint64_t>((uint64_t) seg_, total - at));
+    if (!range->map_range(0, range->chunks(), [] { return (VmmChunk) 0; })) {
+        err = "ExpertCache: cudaMalloc failed: a physical segment of the segmented cache could not be allocated";
+        range.reset();
+        seg_ = 0;
+        return false;
     }
-    for (size_t i = 0; i < segs_.size(); ++i) {
-        if (!map_segment(v, dev, va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i],
-                         segs_[i])) {
-            char buf[200];
-            std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc failed: segment %zu of %zu (%.2f GiB) of the "
-                          "segmented cache could not be allocated", i + 1, segs_.size(),
-                          (double) seg_size_[i] / 1073741824.0);
-            err = buf;   // "cudaMalloc failed": the auto cache's smaller-retry path reads it as an allocation failure
-            release_segmented();
-            return false;
-        }
-        mapped_segs_ = (int64_t) i + 1;
-    }
+    base_ = range->base();
+    reserved_ = (uint64_t) range->chunks() * gran;
+    segmented_vmm_ = std::move(range);
     return true;
 #endif
 }
 
 void ExpertCache::release_segmented() {
 #if !defined(STRATA_EC_NO_VMM)
-    const Vmm& v = vmm();
     if (base_ != nullptr) cudaDeviceSynchronize();
-    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
-    for (size_t i = 0; i < segs_.size(); ++i)
-        if (segs_[i] != 0) {
-            v.unmap(va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i]);
-            v.release((CUmemGenericAllocationHandle) segs_[i]);
-        }
-    if (base_ != nullptr && reserved_ > 0) v.address_free(va, (size_t) reserved_);
+    for (VmmChunk h : unmapped_vmm_chunks_)
+        if (h != 0) vmm_chunk_free(h);
+    unmapped_vmm_chunks_.clear();
 #endif
-    segs_.clear();
-    seg_size_.clear();
-    mapped_segs_ = 0;
+    segmented_vmm_.reset();
     reserved_ = 0;
+    seg_ = 0;
     base_ = nullptr;
 }
 
 int64_t ExpertCache::mapped_bytes() const {
-    if (segs_.empty()) return base_ != nullptr ? full_bytes() : 0;
-    int64_t b = 0;
-    for (int64_t i = 0; i < mapped_segs_; ++i) b += seg_size_[(size_t) i];
-    return b;
+    if (segmented_vmm_)
+        return segmented_vmm_->mapped_count() * (int64_t) vmm_granularity();
+    return base_ != nullptr ? full_bytes() : 0;
 }
 
 int64_t ExpertCache::slots_within(int64_t bytes) const {
@@ -495,7 +1182,7 @@ int64_t ExpertCache::slots_within(int64_t bytes) const {
 }
 
 bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
-    if (segs_.empty()) {
+    if (!segmented_vmm_) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
     }
@@ -503,25 +1190,44 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     (void) keep_bytes;
     return false;
 #else
-    const Vmm& v = vmm();
-    int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
-    while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
-    if (keep >= mapped_segs_) return true;
+    const uint64_t gran = vmm_granularity();
+    const int64_t total_chunks = segmented_vmm_->chunks();
+    int64_t keep_chunks = 0;
+    if (keep_bytes > 0) {
+        const uint64_t segment_count = ((uint64_t) keep_bytes + (uint64_t) seg_ - 1) / (uint64_t) seg_;
+        const uint64_t total_segments = ((uint64_t) reserved_ + (uint64_t) seg_ - 1) / (uint64_t) seg_;
+        keep_chunks = segment_count >= total_segments
+                          ? total_chunks
+                          : (int64_t) (segment_count * (uint64_t) seg_ / gran);
+    }
+    const int64_t mapped_chunks = segmented_vmm_->mapped_count();
+    if (keep_chunks >= mapped_chunks) return true;
     if (cudaDeviceSynchronize() != cudaSuccess) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
-    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
-    for (int64_t i = mapped_segs_ - 1; i >= keep; --i) {
-        const CUdeviceptr p = va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_);
-        if (v.unmap(p, (size_t) seg_size_[(size_t) i]) != CUDA_SUCCESS ||
-            v.release((CUmemGenericAllocationHandle) segs_[(size_t) i]) != CUDA_SUCCESS) {
+    auto refused = [](const char* call, int64_t seg) {
+        return ec_test::refuse_segment_call != nullptr && ec_test::refuse_segment_call(call, seg);
+    };
+    for (int64_t i = mapped_chunks - 1; i >= keep_chunks; --i) {
+        if (refused("unmap", i)) {
             err = "the driver refused to release an expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
             return false;
         }
-        segs_[(size_t) i] = 0;
-        mapped_segs_ = i;
+        const VmmChunk h = segmented_vmm_->unmap(i);
+        if (h == 0) {
+            err = "the driver refused to release an expert-cache segment";
+            live_slots_ = slots_within(mapped_bytes());   // segment i is still mapped: [0, i] stay
+            return false;
+        }
+        if (refused("release", i)) {
+            unmapped_vmm_chunks_.push_back(h);
+            err = "the driver refused to release an expert-cache segment";
+            live_slots_ = slots_within(mapped_bytes());
+            return false;
+        }
+        vmm_chunk_free(h);
     }
     live_slots_ = slots_within(mapped_bytes());
     return true;
@@ -529,7 +1235,7 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
 }
 
 bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
-    if (segs_.empty()) {
+    if (!segmented_vmm_) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
     }
@@ -537,22 +1243,23 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
     (void) want_bytes;
     return false;
 #else
-    const Vmm& v = vmm();
-    int dev = 0;
-    cudaGetDevice(&dev);
-    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
-    int64_t at = mapped_bytes();
-    while (mapped_segs_ < (int64_t) segs_.size() && at + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
-        const size_t i = (size_t) mapped_segs_;
-        if (!map_segment(v, dev, va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i],
-                         segs_[i])) {
-            (void) cudaGetLastError();
-            err = "the driver has no VRAM for another expert-cache segment";
-            live_slots_ = slots_within(mapped_bytes());
-            return false;
-        }
-        at += seg_size_[i];
-        ++mapped_segs_;
+    const uint64_t gran = vmm_granularity();
+    const uint64_t capped = want_bytes > 0 ? std::min<uint64_t>((uint64_t) want_bytes, reserved_) : 0;
+    const int64_t target_chunks = capped >= reserved_
+                                      ? segmented_vmm_->chunks()
+                                      : (int64_t) ((capped / (uint64_t) seg_) * (uint64_t) seg_ / gran);
+    const int64_t mapped_chunks = segmented_vmm_->mapped_count();
+    if (target_chunks > mapped_chunks &&
+        !segmented_vmm_->map_range(mapped_chunks, target_chunks, [this] {
+            if (unmapped_vmm_chunks_.empty()) return (VmmChunk) 0;
+            const VmmChunk h = unmapped_vmm_chunks_.back();
+            unmapped_vmm_chunks_.pop_back();
+            return h;
+        })) {
+        (void) cudaGetLastError();
+        err = "the driver has no VRAM for another expert-cache segment";
+        live_slots_ = slots_within(mapped_bytes());
+        return false;
     }
     live_slots_ = slots_within(mapped_bytes());
     return true;
@@ -725,7 +1432,7 @@ void ExpertCache::close() {
 #endif
     off_.clear();
     guard_ = 0;
-    if (!segs_.empty()) {
+    if (segmented_vmm_) {
         release_segmented();
     } else if (vmm_) {
         vmm_.reset();   // unmaps and frees every chunk it still holds
@@ -746,6 +1453,8 @@ void ExpertCache::close() {
     sealed_ = false;
     layer_next_.clear();
     layer_count_.clear();
+    layer_quotas_.clear();
+    layer_begin_.clear();
 }
 
 /// R4.2g.  Layer `l` owns `[l*q, (l+1)*q)` with `q = slots_ / n_layers_`; the LAST layer takes whatever is
@@ -754,21 +1463,53 @@ void ExpertCache::layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) cons
     lo = 0;
     hi = 0;
     if (n_layers_ <= 0 || slots_ <= 0 || layer < 0 || layer >= n_layers_) return;
+    if (layer_quotas_.size() == (size_t) n_layers_ && layer_begin_.size() == (size_t) n_layers_ + 1) {
+        lo = layer_begin_[(size_t) layer];
+        hi = layer_begin_[(size_t) layer + 1];
+        return;
+    }
     const int64_t q = slots_ / n_layers_;
     lo = layer * q;
     hi = (layer == n_layers_ - 1) ? slots_ : (layer + 1) * q;
 }
 
+bool ExpertCache::set_layer_quotas(const std::vector<int64_t>& quotas, std::string& err) {
+    if (quotas.size() != (size_t) n_layers_ || n_layers_ <= 0 || slots_ <= 0) {
+        err = "ExpertCache::set_layer_quotas: quota count does not match the opened cache";
+        return false;
+    }
+    std::vector<int64_t> begins(quotas.size() + 1, 0);
+    for (size_t i = 0; i < quotas.size(); ++i) {
+        if (quotas[i] <= 0 || quotas[i] > n_expert_ || quotas[i] > slots_ - begins[i]) {
+            err = "ExpertCache::set_layer_quotas: a quota is out of range";
+            return false;
+        }
+        begins[i + 1] = begins[i] + quotas[i];
+    }
+    if (begins.back() != slots_) {
+        err = "ExpertCache::set_layer_quotas: quotas do not cover the opened cache";
+        return false;
+    }
+    layer_quotas_ = quotas;
+    layer_begin_ = std::move(begins);
+    layer_next_.resize(quotas.size());
+    layer_count_.assign(quotas.size(), 0);
+    for (size_t i = 0; i < quotas.size(); ++i) layer_next_[i] = (int32_t) layer_begin_[i];
+    return true;
+}
+
 int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
-    return residency_[(size_t) (layer * n_expert_ + expert)];
+    const int32_t slot = residency_[(size_t) (layer * n_expert_ + expert)];
+    return is_live_slot(slot, live_slots_) ? slot : kNotResident;
 }
 
 int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
     if (sealed_) return kNotResident;   // STRATA_EXPERT_NIBBLE: nothing is admitted (and so filled) after the startup fill
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     const size_t at = (size_t) (layer * n_expert_ + expert);
-    if (residency_[at] != kNotResident) return residency_[at];
+    if (residency_[at] != kNotResident)
+        return is_live_slot(residency_[at], live_slots_) ? residency_[at] : kNotResident;
     // R4.2g: THE PER-LAYER PATH.  Same "no eviction" rule, but the ceiling is this layer's own range rather
     // than one counter shared by all 48 - which is what confined the measured hit rate to 2.97%.
     if (per_layer_) {
@@ -784,6 +1525,7 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
             } else {
                 return kNotResident;
             }
+            if (!is_live_slot(slot, live_slots_)) return kNotResident;
             ++layer_count_[(size_t) layer];
             residency_[at] = (int32_t) slot;
             ++admitted_;
@@ -793,23 +1535,25 @@ int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
         int64_t lo = 0, hi = 0;
         layer_slot_range(layer, lo, hi);
         if ((int64_t) layer_next_[(size_t) layer] >= hi) return kNotResident;   // this layer's quota is full
+        const int32_t slot = layer_next_[(size_t) layer];
+        if (!is_live_slot(slot, live_slots_)) return kNotResident;
         residency_[at] = layer_next_[(size_t) layer]++;
         ++admitted_;
         return residency_[at];
     }
-    if (next_free_ >= slots_) return kNotResident;   // full: no eviction, deliberately - see the header
+    if (next_free_ >= live_slots_) return kNotResident;   // full: no eviction, deliberately - see the header
     residency_[at] = (int32_t) next_free_;
     return (int32_t) next_free_++;
 }
 
 uint8_t* ExpertCache::device_slot(int32_t slot) {
-    if (slot < 0 || slot >= slots_) return nullptr;
+    if (!is_live_slot(slot, live_slots_)) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }
 
 const uint8_t* ExpertCache::device_slot(int32_t slot) const {
-    if (slot < 0 || slot >= slots_) return nullptr;
+    if (!is_live_slot(slot, live_slots_)) return nullptr;
     if (!off_.empty()) return base_ + off_[(size_t) slot];
     return base_ + (size_t) slot * (size_t) blob_;
 }

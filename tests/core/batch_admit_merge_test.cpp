@@ -127,6 +127,22 @@ int main() {
     check(!dflash2_tail_shift_overlaps(8, 8), "adm_rows == 16 (head_n=8, tail_m=8) is disjoint [8,16) -> [0,8)");
     check(!dflash2_tail_shift_overlaps(9, 8), "head_n > tail_m is disjoint");
 
+    // 10b. dflash2_plan_tap_rows chunks 9..16 committed rows (lookup-max-t 16 / deferred df2) into head context + tail draft.
+    for (int n = 1; n <= 8; ++n) {
+        const auto p = dflash2_plan_tap_rows(n, 8);
+        check(p.head_n == 0 && p.tail_m == n && !p.overlap_shift, "n <= 8 needs no prefix context or shift");
+    }
+    for (int n = 9; n <= 15; ++n) {
+        const auto p = dflash2_plan_tap_rows(n, 8);
+        check(p.head_n == n - 8 && p.tail_m == 8 && p.overlap_shift, "n in 9..15 requires overlap-safe shift");
+    }
+    {
+        const auto p16 = dflash2_plan_tap_rows(16, 8);
+        check(p16.head_n == 8 && p16.tail_m == 8 && !p16.overlap_shift, "n == 16 shifts disjoint [8,16) -> [0,8)");
+        const auto p0 = dflash2_plan_tap_rows(0, 8);
+        check(p0.head_n == 0 && p0.tail_m == 0 && !p0.overlap_shift, "n <= 0 yields empty plan");
+    }
+
     // 11. dflash2_clone_eager_single_graphs skips 16 per-slot single-slot graph captures when batch_body_on is true.
     check(dflash2_clone_eager_single_graphs(false, true),
           "main drafter (!blob_shared) always captures single-slot graphs");

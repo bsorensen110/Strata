@@ -1,0 +1,193 @@
+{
+  "campaign": "Campaign 7 (3-round confirmation): 16-row EXPDEC mitigation on fork-68872b2d1 and build-hip (WS1-WS7) vs fork-68872b2d1, 2026-11-17",
+  "default_exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+  "arms": [
+    {
+      "id": "aa_floor_mt16",
+      "group": "A",
+      "ctl_port": 8300,
+      "trt_port": 8301,
+      "ctl_env": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "trt_env": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "bits": "same",
+      "src": "none",
+      "why": "A/A floor on fork-68872b2d1 at STRATA_BATCH_DF2_MAX_T=16 on both sides, to measure launch-to-launch noise at 16 rows"
+    },
+    {
+      "id": "expdec_rb_d20_mt16",
+      "group": "A",
+      "ctl_port": 8302,
+      "trt_port": 8303,
+      "ctl_env": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "trt_env": {
+        "STRATA_BATCH_DF2_MAX_T": "16",
+        "STRATA_EXPDEC_RB": "128",
+        "STRATA_EXPDEC_DRB": "256",
+        "STRATA_EXPDEC_D20": "1"
+      },
+      "bits": "same",
+      "src": "existing",
+      "why": "Group A winner: EXPDEC RB=128, DRB=256, and STRATA_EXPDEC_D20=1 (IQ4_NL down) on fork-68872b2d1 at MAX_T=16"
+    },
+    {
+      "id": "newbuild_mt16_vs_old16",
+      "group": "B",
+      "ctl_port": 8304,
+      "trt_port": 8305,
+      "ctl_exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+      "trt_exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+      "ctl_env": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "trt_env": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "direct window-cost comparison of build-hip (WS1-WS7) vs fork-68872b2d1 at MAX_T=16 on both sides"
+    },
+    {
+      "id": "newbuild_mt16_vs_prod8",
+      "group": "B",
+      "ctl_port": 8306,
+      "trt_port": 8307,
+      "ctl_exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+      "trt_exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+      "ctl_env": {
+        "STRATA_BATCH_DF2_MAX_T": "8"
+      },
+      "trt_env": {
+        "STRATA_BATCH_DF2_MAX_T": "16"
+      },
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "build-hip (WS1-WS7) at MAX_T=16 vs current production (fork-68872b2d1 at MAX_T=8)"
+    },
+    {
+      "id": "newbuild_mt16_pcie8_vs_prod8",
+      "group": "B",
+      "ctl_port": 8308,
+      "trt_port": 8309,
+      "ctl_exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+      "trt_exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+      "ctl_env": {
+        "STRATA_BATCH_DF2_MAX_T": "8"
+      },
+      "trt_env": {
+        "STRATA_BATCH_DF2_MAX_T": "16",
+        "STRATA_RESIDENT_PIN": "1",
+        "STRATA_PARTIAL_PIN": "1",
+        "STRATA_PARTIAL_PIN_GIB": "8",
+        "STRATA_PCIE_BALANCE": "1"
+      },
+      "args_arm": [
+        "--resident-budget-gib",
+        "36"
+      ],
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "build-hip (WS1-WS7) at MAX_T=16 + 8 GiB partial-pin PCIe Gen5 x16 DMA (STRATA_RESIDENT_PIN=1, STRATA_PARTIAL_PIN=1, STRATA_PARTIAL_PIN_GIB=8, STRATA_PCIE_BALANCE=1, --resident-budget-gib 36) vs production MAX_T=8"
+    },
+    {
+      "id": "newbuild_mt12_vs_prod8",
+      "group": "B",
+      "ctl_port": 8310,
+      "trt_port": 8311,
+      "ctl_exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+      "trt_exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+      "ctl_env": {
+        "STRATA_BATCH_DF2_MAX_T": "8"
+      },
+      "trt_env": {
+        "STRATA_BATCH_DF2_MAX_T": "12"
+      },
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "build-hip (WS1-WS7) at MAX_T=12 vs current production (fork-68872b2d1 at MAX_T=8)"
+    },
+    {
+      "id": "newbuild_mt8_pcie24_vs_prod8",
+      "group": "B",
+      "ctl_port": 8312,
+      "trt_port": 8313,
+      "ctl_exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+      "trt_exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+      "ctl_env": {
+        "STRATA_BATCH_DF2_MAX_T": "8"
+      },
+      "trt_env": {
+        "STRATA_BATCH_DF2_MAX_T": "8",
+        "STRATA_RESIDENT_PIN": "1",
+        "STRATA_PARTIAL_PIN": "1",
+        "STRATA_PARTIAL_PIN_GIB": "24"
+      },
+      "args_arm": [
+        "--resident-budget-gib",
+        "36",
+        "--pcie-frac",
+        "0.35"
+      ],
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "build-hip (WS1-WS7) at MAX_T=8 + 24 GiB partial-pin PCIe Gen5 x16 DMA + --pcie-frac 0.35 vs production MAX_T=8"
+    },
+    {
+      "id": "newbuild_mt12_pcie24_vs_prod8",
+      "group": "B",
+      "ctl_port": 8314,
+      "trt_port": 8315,
+      "ctl_exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+      "trt_exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+      "ctl_env": {
+        "STRATA_BATCH_DF2_MAX_T": "8"
+      },
+      "trt_env": {
+        "STRATA_BATCH_DF2_MAX_T": "12",
+        "STRATA_RESIDENT_PIN": "1",
+        "STRATA_PARTIAL_PIN": "1",
+        "STRATA_PARTIAL_PIN_GIB": "24"
+      },
+      "args_arm": [
+        "--resident-budget-gib",
+        "36",
+        "--pcie-frac",
+        "0.35"
+      ],
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "build-hip (WS1-WS7) at MAX_T=12 + 24 GiB partial-pin PCIe Gen5 x16 DMA + --pcie-frac 0.35 vs production MAX_T=8"
+    },
+    {
+      "id": "newbuild_mt16_pcie24_vs_prod8",
+      "group": "B",
+      "ctl_port": 8316,
+      "trt_port": 8317,
+      "ctl_exe": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-68872b2d1/strata",
+      "trt_exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+      "ctl_env": {
+        "STRATA_BATCH_DF2_MAX_T": "8"
+      },
+      "trt_env": {
+        "STRATA_BATCH_DF2_MAX_T": "16",
+        "STRATA_RESIDENT_PIN": "1",
+        "STRATA_PARTIAL_PIN": "1",
+        "STRATA_PARTIAL_PIN_GIB": "24"
+      },
+      "args_arm": [
+        "--resident-budget-gib",
+        "36",
+        "--pcie-frac",
+        "0.35"
+      ],
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "build-hip (WS1-WS7) at MAX_T=16 + 24 GiB partial-pin PCIe Gen5 x16 DMA + --pcie-frac 0.35 vs production MAX_T=8"
+    }
+  ]
+}

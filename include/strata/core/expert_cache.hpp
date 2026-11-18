@@ -71,6 +71,101 @@ std::vector<std::pair<int32_t, int32_t>> rank_learned_profile(int64_t n_layers, 
 /// so a reader (the next start) never sees half a file.  False with `err` when it could not be written.
 bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_expert,
                           const std::vector<std::pair<int32_t, int32_t>>& ranked, std::string& err);
+bool read_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t n_expert,
+                              std::vector<double>& heat, std::string& err);
+bool write_expert_profile_heat(const std::string& path, int64_t n_layers, int64_t n_expert,
+                               const std::vector<double>& heat, std::string& err);
+
+enum class ExpertHeatProvenance {
+    None,
+    Runtime,
+    LegacyUnmarked,
+    ProfileRankPrior,
+    Malformed,
+};
+
+const char* expert_heat_provenance_name(ExpertHeatProvenance p);
+
+struct ExpertHeatResolution {
+    bool found = false;
+    bool valid = false;
+    std::string path;
+    ExpertHeatProvenance provenance = ExpertHeatProvenance::None;
+    std::string source_profile;
+    std::string detail;
+    std::vector<double> heat;
+};
+
+struct ExpertHeatBootstrapResult {
+    enum class Action {
+        RetainedValid,
+        DerivedPrior,
+        SkippedNoProfile,
+        MalformedLeftUntouched,
+        Failed,
+    };
+    Action action = Action::SkippedNoProfile;
+    std::string heat_path;
+    ExpertHeatProvenance provenance = ExpertHeatProvenance::None;
+    std::string source_profile;
+    std::string source_kind;
+    size_t ranked_pairs = 0;
+    std::string detail;
+};
+
+/// Convert ranked `(layer, expert)` pairs to deterministic, finite, nonnegative per-layer/per-expert weights
+/// consumable by `learned_expert_cache_quotas`. Ranked entries get strictly decreasing weight
+/// `ranked.size() - rank` on first occurrence; unranked entries get `0.0`. Rejects invalid dimensions, empty
+/// rankings, or out-of-range pairs.
+bool profile_rank_prior_heat(int64_t n_layers, int64_t n_expert,
+                             const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                             std::vector<double>& heat, std::string& err);
+
+/// Return the `.heat.meta` provenance sidecar path paired with `heat_path`.
+std::string expert_profile_heat_meta_path(const std::string& heat_path);
+
+/// Read and validate `<heat_path>` together with `<heat_path>.meta` when present.
+/// Without `.meta`, a valid STRH v1 file has `LegacyUnmarked` provenance for compatibility with prior builds.
+bool read_expert_profile_heat_with_provenance(const std::string& heat_path, int64_t n_layers, int64_t n_expert,
+                                              std::vector<double>& heat, ExpertHeatProvenance& provenance,
+                                              std::string& source_profile, std::string& err);
+
+/// Atomically write `<heat_path>` (STRH v1) and `<heat_path>.meta` provenance metadata.
+/// Only `Runtime` and `ProfileRankPrior` provenance are accepted. Prior writes `.meta` first; runtime stages
+/// both `.tmp` files first, then renames `.heat` before `.meta` so failures cannot silently upgrade provenance.
+bool write_expert_profile_heat_with_provenance(const std::string& heat_path, int64_t n_layers, int64_t n_expert,
+                                               const std::vector<double>& heat, ExpertHeatProvenance provenance,
+                                               const std::string& source_profile, const std::string& source_kind,
+                                               int64_t ranked_pairs, std::string& err);
+
+/// Read-only resolution of the sidecar expected by `--expert-cache-quota auto`.
+/// Precedence when distinct paths exist:
+/// 1. `<save_profile_path>.heat` if valid `Runtime` or `LegacyUnmarked` (or fail closed if malformed).
+/// 2. `<input_profile_path>.heat` if valid `Runtime` or `LegacyUnmarked`.
+/// 3. `<save_profile_path>.heat` if valid `ProfileRankPrior`.
+/// 4. `<input_profile_path>.heat` if malformed (fail closed) or valid `ProfileRankPrior`.
+ExpertHeatResolution resolve_expert_profile_heat(const std::string& save_profile_path,
+                                                 const std::string& input_profile_path,
+                                                 int64_t n_layers, int64_t n_expert);
+
+/// Startup bootstrap for `--expert-profile-save`: ensures a valid heat sidecar is available when saving is enabled.
+/// Retains existing valid runtime/legacy/prior heat and leaves malformed/incompatible sidecars untouched.
+ExpertHeatBootstrapResult bootstrap_expert_profile_heat(
+    const std::string& save_profile_path, const std::string& input_profile_path,
+    const std::vector<std::pair<int32_t, int32_t>>& loaded_input_profile,
+    int64_t n_layers, int64_t n_expert);
+
+/// Save measured runtime routing heat atomically with `Runtime` provenance, skipping the overwrite when
+/// no positive routing counts were observed (`heat` all <= 0.0) so existing heat or priors are preserved.
+bool save_runtime_expert_profile_heat(const std::string& save_profile_path, int64_t n_layers, int64_t n_expert,
+                                      const std::vector<double>& heat, int64_t ranked_pairs,
+                                      bool& skipped_zero_heat, std::string& err);
+
+std::vector<int64_t> uniform_expert_cache_quotas(const std::vector<int64_t>& slot_bytes, int64_t n_expert,
+                                                uint64_t byte_budget);
+std::vector<int64_t> learned_expert_cache_quotas(const std::vector<double>& heat,
+                                                 const std::vector<int64_t>& slot_bytes, int64_t n_expert,
+                                                 uint64_t byte_budget);
 
 /// Free device memory for the expert cache.  On a unified memory system - one memory for the CPU and the GPU, such as
 /// the DGX Spark (GB10); CUDA reports it as cudaDevAttrIntegrated - cudaMemGetInfo counts only MemFree, not the page cache - which, with the experts read from the GGUF in place, is mostly those
@@ -103,6 +198,8 @@ public:
     void close();
 
     bool valid() const { return base_ != nullptr; }
+    /// True only for a slot wholly inside the currently mapped prefix.
+    static constexpr bool is_live_slot(int64_t slot, int64_t live_slots) { return slot >= 0 && slot < live_slots; }
     /// The slots usable now: all of them, unless `shrink` gave the tail's VRAM back (#533) - then the ones wholly
     /// inside the VRAM still backed, always a prefix.  The prompt path's loan (the last slots) and every report
     /// follow this; `full_slots()` is what `open` allocated.
@@ -121,8 +218,8 @@ public:
     /// management) instead of one cudaMalloc, so `shrink` can give the tail's VRAM back to the driver - for another
     /// program - and `grow` can take it again, while every slot keeps its address (the captured graphs, the verify
     /// plan's pointers and the prompt path's loan all hold addresses into it).  0 (the default): one cudaMalloc, as
-    /// always.  CUDA only: a HIP build refuses it at open.  The slots past `slots()` after a shrink must hold no
-    /// resident expert and no loan: the CALLER evicts them first (they become CPU misses).
+    /// always.  CUDA and VMM-capable HIP only: other builds refuse it at open.  The slots past `slots()` after a shrink
+    /// must hold no resident expert and no loan: the CALLER evicts them first (they become CPU misses).
     void set_segment_bytes(int64_t seg_bytes) { seg_req_ = seg_bytes > 0 ? seg_bytes : 0; }
     /// STRATA_MMQ_DIRECT: `open_sized` leaves at least `g` bytes of room after each slot's blob (the prompt MMQ
     /// reads a little past a down matrix when it reads an expert in its slot).  Set before opening, like
@@ -134,7 +231,7 @@ public:
     int64_t slot_guard() const { return guard_; }
     /// A sized slot's arena bytes: the blob plus the guard, 256-byte aligned.
     static int64_t slot_stride(int64_t blob, int64_t guard = 0) { return (blob + guard + 255) / 256 * 256; }
-    bool segmented() const { return !segs_.empty(); }
+    bool segmented() const { return segmented_vmm_ != nullptr; }
     int64_t segment_bytes() const { return seg_; }
     /// Bytes of the arena backed by VRAM now (a whole number of segments; the arena when not segmented).
     int64_t mapped_bytes() const;
@@ -184,6 +281,8 @@ public:
     /// caller that predates this flag is bit-for-bit unaffected.
     void set_per_layer_admission(bool on) { per_layer_ = on; }
     bool per_layer_admission() const { return per_layer_; }
+    /// Install startup-only contiguous layer ranges whose slot counts sum to the opened cache.
+    bool set_layer_quotas(const std::vector<int64_t>& quotas, std::string& err);
     /// Interleaves per-layer slots rank-major (`slot = rank * n_layers + layer`) so prefill tail loans (`[slots() - need, slots())`)
     /// borrow the coldest ranks evenly across all layers rather than wiping out the highest-numbered layers.
     void set_per_layer_rank_major(bool on) { per_layer_rank_major_ = on; }
@@ -243,7 +342,7 @@ public:
     /// STRATA_MMQ_DIRECT: the address `blob` bytes into slot `s` when the slot has room for `need` more bytes there
     /// (null otherwise, or for a bad slot).  Uniform slots too: their stride is the largest blob.
     uint8_t* slot_tail(int32_t s, uint64_t blob, uint64_t need) const {
-        if (s < 0 || s >= slots_ || base_ == nullptr) return nullptr;
+        if (!is_live_slot(s, live_slots_) || base_ == nullptr) return nullptr;
         return slot_room(s) >= blob + need ? base_ + slot_offset(s) + blob : nullptr;
     }
 
@@ -263,9 +362,8 @@ private:
     int64_t guard_ = 0;                 ///< ...the guard open_sized applied to the open slots (0: none)
     int64_t seg_ = 0;                   ///< #533: the segment size used (a multiple of the driver's granularity)
     uint64_t reserved_ = 0;             ///< #533: the reserved address range's size
-    std::vector<unsigned long long> segs_;   ///< #533: each segment's physical handle (0: unmapped)
-    std::vector<int64_t> seg_size_;     ///< #533: each segment's size (the last one may be shorter)
-    int64_t mapped_segs_ = 0;           ///< #533: segments [0, mapped_segs_) are backed
+    std::unique_ptr<VmmRange> segmented_vmm_;   ///< #533: segmented cache range, eager-mapped on open
+    std::vector<VmmChunk> unmapped_vmm_chunks_;  ///< Unmapped handles kept when a release is refused.
     std::unique_ptr<VmmRange> vmm_;    ///< the arena's range when it is in VMM (set_vmm)
     std::vector<int32_t> residency_;   ///< [n_layers * n_expert] -> slot or kNotResident
     int64_t slots_ = 0;
@@ -280,6 +378,8 @@ private:
     bool per_layer_rank_major_ = false;
     std::vector<int32_t> layer_next_;   ///< [n_layers] -> that layer's next free slot
     std::vector<int32_t> layer_count_;  ///< [n_layers] -> count admitted in that layer (rank-major mode)
+    std::vector<int64_t> layer_quotas_; ///< optional non-uniform, layer-major startup ranges
+    std::vector<int64_t> layer_begin_;  ///< exclusive prefix of layer_quotas_
     std::vector<uint64_t> off_;         ///< plan v0.3 P6: slot offsets (slots + 1 entries) when sized
     int64_t admitted_ = 0;
     bool sealed_ = false;               ///< STRATA_EXPERT_NIBBLE: `seal` was called (no slot is written after it)

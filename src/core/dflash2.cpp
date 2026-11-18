@@ -38,6 +38,95 @@ bool mapped(size_t bytes, void** h, void** d) {
 
 constexpr int GGML_Q8_0 = 8;
 
+// Batch d_meta_ layout (ints, non-colliding for up to kBatchMaxSlots = 8 slots / 64 rows; solo paths use [0..64] sequentially):
+constexpr int kMetaCtx        = 32;    // [32..95]   64 ctx positions (contiguous with kMetaBlkPos for 128-row rope)
+constexpr int kMetaBlkPos     = 96;    // [96..159]  64 block positions
+constexpr int kMetaBlkTok     = 160;   // [160..223] 64 block tokens
+constexpr int kMetaAnchor     = 224;   // [224..231] 8 slot anchors
+constexpr int kMetaEpoch      = 232;   // [232..239] 8 slot epochs
+constexpr int kMetaSlotInfo   = 240;   // [240..271] 8 * 4 (slot_idx, c0, n_new, anchor)
+constexpr int kMetaPrecompPos = 272;   // [272..335] 64 precomp positions
+constexpr int kMetaInts       = 512;
+
+int df2_beam() {
+    static const int b = [] {
+        const char* e = std::getenv("STRATA_DF2_BEAM");
+        if (e && (e[0] == '0' || e[0] == '1')) return 1;
+        return 4;
+    }();
+    return b;
+}
+
+bool df2_precomp_graph_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_DF2_PRECOMP_GRAPH");
+        return !e || !e[0] || e[0] != '0';
+    }();
+    return on;
+}
+
+// STRATA_DF2_SELECT_TABLE=0: the selector walks with its one-block steps (the walk's scores computed in one parallel launch first is the default: bitwise the same drafts)
+bool df2_select_table() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_DF2_SELECT_TABLE"); return !(e && e[0] == '0'); }();
+    return on;
+}
+
+int df2_head_il_mode() {
+    static const int mode = [] {
+        const char* e = std::getenv("STRATA_DF2_HEAD_IL");
+        if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
+        if (e && e[0]) return e[0] != '0' ? 1 : 0;
+#if defined(STRATA_USE_HIP)
+        return 1;
+#else
+        return -1;
+#endif
+    }();
+    return mode;
+}
+
+int df2_head_il_rows() {
+    static const int r = [] {
+        const char* e = std::getenv("STRATA_DF2_HEAD_IL_ROWS");
+        if (e && e[0]) {
+            const int v = std::atoi(e);
+            if (v == 1 || v == 2 || v == 4) return v;
+        }
+        return 4;
+    }();
+    return r;
+}
+
+int df2_head_chunk(int head_type, int head_rows) {
+    static const int env_c = [] {
+        const char* e = std::getenv("STRATA_DF2_HEAD_CHUNK");
+        return (e && e[0]) ? std::clamp(std::atoi(e), 1, 16) : 0;
+    }();
+    if (env_c > 0) return env_c;
+#if defined(STRATA_USE_HIP)
+    return (df2_head_il_mode() != 0 && kernels::native_mmvq_il_supported(head_type, 14, head_rows)) ? 16 : 8;
+#else
+    return (df2_head_il_mode() != 0 && kernels::native_mmvq_il_supported(head_type, 14, head_rows))
+        ? 16
+        : (int) (2 * Dflash2Drafter::kDrafts);
+#endif
+}
+
+bool df2_head_use_il(int head_type, int nc, int n_dvocab, int head_il) {
+    if (nc < 2 || nc > 16 || head_il == 0) return false;
+    if (!kernels::native_mmvq_il_supported(head_type, 2, n_dvocab)) return false;   // gate out non-IL quant types (Q8_0, F16, ...)
+    if (nc > 8) return kernels::native_mmvq_il_supported(head_type, nc, n_dvocab);
+    return head_il == 1 || (head_il < 0 && kernels::native_mmvq_il_supported(head_type, nc, n_dvocab));
+}
+
+template <class Entry>
+void destroy_graph_cache(std::vector<Entry>& cache) {
+    for (Entry& e : cache) {
+        if (e.exec) cudaGraphExecDestroy(e.exec);
+    }
+    cache.clear();
+}
+
 }  // namespace
 
 Dflash2Drafter::~Dflash2Drafter() {
@@ -45,19 +134,17 @@ Dflash2Drafter::~Dflash2Drafter() {
     prof_report();
     prof_free();
     const OnDevice on_device(device_);
-    if (cs_) cudaStreamSynchronize(cs_);
+    if (cs_) (void) cudaStreamSynchronize(cs_);
+    if (cs2_) (void) cudaStreamSynchronize(cs2_);
+    if (cs_pre_) (void) cudaStreamSynchronize(cs_pre_);
     for (cudaGraphExec_t& e : exec_)
-        if (e) cudaGraphExecDestroy(e);
+        if (e) (void) cudaGraphExecDestroy(e);
     for (cudaGraphExec_t& e : body_exec_)
-        if (e) cudaGraphExecDestroy(e);
-    for (int i = 0; i <= kRows; ++i)
-        for (int j = 0; j <= kRows; ++j)
-            if (batch_body_exec_[i][j]) cudaGraphExecDestroy(batch_body_exec_[i][j]);
-    for (auto& e : batch_full_exec_)
-        if (e) cudaGraphExecDestroy(e);
-    for (int s = 0; s < 2; ++s)
-        for (auto& e : batch_full_1_exec_[s])
-            if (e) cudaGraphExecDestroy(e);
+        if (e) (void) cudaGraphExecDestroy(e);
+    for (cudaGraphExec_t& e : precomp_exec_)
+        if (e) (void) cudaGraphExecDestroy(e);
+    destroy_graph_cache(batch_body_graphs_);
+    destroy_graph_cache(batch_full_graphs_);
     auto fr = [](void* p) { if (p) cudaFree(p); };
     if (h_logq_) cudaFreeHost(h_logq_);
     if (h_logd_) cudaFreeHost(h_logd_);
@@ -66,7 +153,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     fr(landing_); if (dpend_) cudaFreeHost(dpend_); fr(tag_); fr(d_meta_); fr(xq_); fr(xil_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rt_bctx_); fr(rope_inv_);
     for (int l = 0; l < 8; ++l) { fr(kring_[l]); fr(vring_[l]); }
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
-    fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(fn_batch_); fr(hsel_batch_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
+    fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(fn_batch_); fr(hsel_batch_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_); fr(seltab_);
     if (!dhead_shared_ && !blob_shared_) {
         if (dhead_ != nullptr && head_type_ == 14) kernels::native_q6_k_unpack(dhead_);
         fr(dvocab_);
@@ -76,13 +163,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     if (h_out_) cudaFreeHost(h_out_);
     if (h_bmeta_) cudaFreeHost(h_bmeta_);
     if (h_bout_) cudaFreeHost(h_bout_);
-    if (cs_) cudaStreamDestroy(cs_);
-    if (cs2_) cudaStreamDestroy(cs2_);
-    if (ev_fork_) cudaEventDestroy(ev_fork_);
-    if (ev_join_) cudaEventDestroy(ev_join_);
-    for (cudaEvent_t e : ev_ctx_) if (e) cudaEventDestroy(e);
-    if (ev_a_) cudaEventDestroy(ev_a_);
-    if (ev_b_) cudaEventDestroy(ev_b_);
+    destroy_streams();
 }
 
 // STRATA_DF2_PROFILE=1 (measurement only): the round runs without its graph and an event follows every stage; the per-stage averages print at exit
@@ -143,7 +224,10 @@ const Dflash2Drafter::Tensor& Dflash2Drafter::find(const std::string& name) cons
     throw std::runtime_error("dflash2: tensor " + name + " is missing from the pack");
 }
 
-bool Dflash2Drafter::load(const std::string& path, int device, std::string& err) {
+bool Dflash2Drafter::load(const std::string& path, int device, std::string& err, int max_batch_slots) {
+    blob_shared_ = false;
+    alloc_slots_ = effective_batch_slots(max_batch_slots, false);
+    alloc_rows_ = row_count(max_batch_slots, false);
     device_ = device;
     const OnDevice on_device(device_);
     std::FILE* f = std::fopen(path.c_str(), "rb");
@@ -233,25 +317,39 @@ bool Dflash2Drafter::make_streams(std::string& err) {
     int prio_lo = 0, prio_hi = 0;
 #if defined(STRATA_USE_HIP)
     static const bool hi_prio = [] { const char* e = std::getenv("STRATA_DF2_PRIO"); return e && e[0] == '1'; }();
-    if (hi_prio) hipDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+    static const bool lo_prio_pre = [] { const char* e = std::getenv("STRATA_DF2_PRECOMP_LOPRIO"); return !e || !e[0] || e[0] != '0'; }();
+    if (hi_prio || lo_prio_pre) (void) hipDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
     if (hipStreamCreateWithPriority(&cs_, hipStreamNonBlocking, hi_prio ? prio_hi : 0) != cudaSuccess ||
-        hipStreamCreateWithPriority(&cs2_, hipStreamNonBlocking, hi_prio ? prio_hi : 0) != cudaSuccess) {
+        hipStreamCreateWithPriority(&cs2_, hipStreamNonBlocking, hi_prio ? prio_hi : 0) != cudaSuccess ||
+        hipStreamCreateWithPriority(&cs_pre_, hipStreamNonBlocking, lo_prio_pre ? prio_lo : 0) != cudaSuccess) {
 #else
     static const bool hi_prio = [] { const char* e = std::getenv("STRATA_DF2_PRIO"); return !(e && e[0] == '0'); }();
-    cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
+    static const bool lo_prio_pre = [] { const char* e = std::getenv("STRATA_DF2_PRECOMP_LOPRIO"); return e && e[0] == '1'; }();
+    (void) cudaDeviceGetStreamPriorityRange(&prio_lo, &prio_hi);
     if (cudaStreamCreateWithPriority(&cs_, cudaStreamNonBlocking, hi_prio ? prio_hi : 0) != cudaSuccess ||
-        cudaStreamCreateWithPriority(&cs2_, cudaStreamNonBlocking, hi_prio ? prio_hi : 0) != cudaSuccess) {
+        cudaStreamCreateWithPriority(&cs2_, cudaStreamNonBlocking, hi_prio ? prio_hi : 0) != cudaSuccess ||
+        cudaStreamCreateWithPriority(&cs_pre_, cudaStreamNonBlocking, lo_prio_pre ? prio_lo : 0) != cudaSuccess) {
 #endif
+        destroy_streams();
         err = "dflash2: stream";
         return false;
     }
-    for (auto& e : ev_hs_) cudaEventCreateWithFlags(&e, cudaEventDisableTiming);
-    if (cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess || cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
+    for (auto& e : ev_hs_) {
+        if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) {
+            destroy_streams();
+            err = "dflash2: events";
+            return false;
+        }
+    }
+    if (cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&ev_pre_, cudaEventDisableTiming) != cudaSuccess) {
+        destroy_streams();
         err = "dflash2: events";
         return false;
     }
     for (int l = 0; l < 8; ++l)
-        if (cudaEventCreateWithFlags(&ev_ctx_[l], cudaEventDisableTiming) != cudaSuccess) { err = "dflash2: events"; return false; }
+        if (cudaEventCreateWithFlags(&ev_ctx_[l], cudaEventDisableTiming) != cudaSuccess) { destroy_streams(); err = "dflash2: events"; return false; }
     if (const char* e = std::getenv("STRATA_DF2_FP16_RING"); e && e[0]) fp16_ring_ = e[0] != '0';
     if (const char* e = std::getenv("STRATA_DF2_PROFILE"); e && e[0] == '1') prof_ = new Prof();
     if (const char* e = std::getenv("STRATA_DF2_TIMING"); e && e[0] == '1') {
@@ -262,6 +360,147 @@ bool Dflash2Drafter::make_streams(std::string& err) {
     return true;
 }
 
+void Dflash2Drafter::destroy_streams() {
+    for (cudaEvent_t& e : ev_hs_) if (e) { (void) cudaEventDestroy(e); e = nullptr; }
+    if (ev_pre_) { (void) cudaEventDestroy(ev_pre_); ev_pre_ = nullptr; }
+    if (ev_fork_) { (void) cudaEventDestroy(ev_fork_); ev_fork_ = nullptr; }
+    if (ev_join_) { (void) cudaEventDestroy(ev_join_); ev_join_ = nullptr; }
+    for (cudaEvent_t& e : ev_ctx_) if (e) { (void) cudaEventDestroy(e); e = nullptr; }
+    if (ev_a_) { (void) cudaEventDestroy(ev_a_); ev_a_ = nullptr; }
+    if (ev_b_) { (void) cudaEventDestroy(ev_b_); ev_b_ = nullptr; }
+    if (cs_pre_) { (void) cudaStreamDestroy(cs_pre_); cs_pre_ = nullptr; }
+    if (cs2_) { (void) cudaStreamDestroy(cs2_); cs2_ = nullptr; }
+    if (cs_) { (void) cudaStreamDestroy(cs_); cs_ = nullptr; }
+    precomp_pending_ = false;
+}
+
+bool Dflash2Drafter::wait_precomp_on_cs(cudaStream_t cs) {
+    if (!precomp_pending_) return true;
+    precomp_pending_ = false;
+    if (cs != nullptr && cs != cs_pre_ && ev_pre_ != nullptr) {
+        return cudaStreamWaitEvent(cs, ev_pre_, 0) == cudaSuccess;
+    }
+    return true;
+}
+
+std::size_t Dflash2Drafter::effective_batch_slots(int requested_batch_slots, bool blob_shared) noexcept {
+    // Batch body graphs index kBatchMaxSlots * kRows (= 64) offsets in rt_bctx_ / kc_ / xqc_, so multi-slot batch keeps 8 slots while solo uses 1.
+    return (blob_shared || requested_batch_slots <= 1) ? 1 : (std::size_t) kBatchMaxSlots;
+}
+
+std::size_t Dflash2Drafter::row_count(int requested_batch_slots, bool blob_shared) noexcept {
+    return effective_batch_slots(requested_batch_slots, blob_shared) * (std::size_t) kRows;
+}
+
+std::size_t Dflash2Drafter::logits_row_count(int requested_batch_slots, bool blob_shared) noexcept {
+    const std::size_t eff = effective_batch_slots(requested_batch_slots, blob_shared);
+    return (!blob_shared && eff > 1) ? std::max<std::size_t>(16, (std::size_t) (2 * kDrafts)) : (std::size_t) kDrafts;
+}
+
+Dflash2Drafter::VramBreakdown Dflash2Drafter::alloc_breakdown(const BufferShape& shape, std::size_t ring_elem_size) {
+    const std::size_t eff = effective_batch_slots(shape.batch_slots, shape.blob_shared);
+    const bool multi_batch = !shape.blob_shared && eff > 1;
+    const std::size_t B = eff * (std::size_t) kRows;
+    const std::size_t HMax = logits_row_count(shape.batch_slots, shape.blob_shared);
+    const int il_max = multi_batch ? 16 : (int) kRows;
+    const std::size_t top_rows = multi_batch ? (std::size_t) kBatchMaxRows : (std::size_t) kDrafts;
+    const std::size_t N = (std::size_t) shape.N;
+    const std::size_t L = (std::size_t) shape.L;
+    const std::size_t NH = (std::size_t) shape.NH;
+    const std::size_t NKV = (std::size_t) shape.NKV;
+    const std::size_t HD = (std::size_t) shape.HD;
+    const std::size_t I = (std::size_t) shape.I;
+    const std::size_t rank = (std::size_t) shape.rank;
+    const std::size_t nt = std::max<std::size_t>((std::size_t) shape.n_taps, 1);
+
+    const std::size_t xil_bytes = std::max(
+        kernels::native_q8_1_il_bytes((int) N, kRows),
+        (N / 32) * (std::size_t) il_max * (8 * sizeof(int) + 8 * sizeof(int) + sizeof(float))) + 4096;
+
+    VramBreakdown v{};
+    v.row_buffers =
+        (uint64_t) kMetaInts * sizeof(int32_t) +
+        (uint64_t) (kernels::native_q8_1_bytes((int) N, kRows) * (multi_batch ? 2 : 1) + 4096) +
+        (uint64_t) xil_bytes +
+        (uint64_t) (5 * N * B + 4096) +
+        (uint64_t) (5 * N / 32 * B + 64) * sizeof(float) +
+        (uint64_t) (5 * N * B + 4096) +
+        (uint64_t) (5 * N / 32 * B + 64) * sizeof(float) +
+        (uint64_t) (2 * (std::size_t) kRows * 128) * sizeof(float) +
+        (uint64_t) 64 * sizeof(double) +
+        (uint64_t) (8 * B * N) * sizeof(float) +                                 // fcy, hctx, h, xn, xc, o, mlp, fn
+        (uint64_t) (2 * L * B * NKV * HD) * sizeof(float) +                      // kc, vc
+        (uint64_t) (B * 640) * sizeof(float) +                                   // dyn
+        (uint64_t) (3 * B * NH * HD) * sizeof(float) +                           // q, qn, ao
+        (uint64_t) (3 * B * NKV * HD) * sizeof(float) +                          // k, v, kblk
+        (uint64_t) (2 * B * I) * sizeof(float) +                                 // gate, up
+        (uint64_t) ((B / (std::size_t) kRows) * (std::size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) * sizeof(float) +
+        (uint64_t) (top_rows * 16) * sizeof(float) +
+        (uint64_t) (top_rows * 16) * sizeof(int32_t) +
+        (uint64_t) (B * rank) * sizeof(float) +
+        (uint64_t) (HMax * (std::size_t) kernels::kDf2TopBlocks * (std::size_t) kernels::kDf2TopK * 2) * sizeof(uint32_t) +
+        (uint64_t) ((std::size_t) kRows * kernels::kDf2TopK * kernels::kDf2TopK) * sizeof(float);
+
+    if (multi_batch) {
+        v.batch_only =
+            (uint64_t) (2 * B * 128) * sizeof(float) +                           // rt_bctx
+            (uint64_t) ((std::size_t) kBatchMaxRows * N) * sizeof(float) +       // fn_batch
+            (uint64_t) ((std::size_t) kBatchMaxRows * rank) * sizeof(float);     // hsel_batch
+    }
+
+    const uint64_t ring_bytes = (uint64_t) kRing * NKV * HD * (uint64_t) ring_elem_size;
+    v.ring_buffers =
+        (uint64_t) ((std::size_t) kRows * nt * N) * sizeof(float) +              // landing_
+        2ull * (uint64_t) L * ring_bytes +                                       // kring_, vring_
+        (uint64_t) kRing * sizeof(uint64_t);                                     // tag_
+
+    v.total_alloc = v.row_buffers + v.batch_only + v.ring_buffers;
+    return v;
+}
+
+int64_t Dflash2Drafter::resolve_dvocab(int64_t n_vocab, const std::string& vocab_file, bool same_head_device) {
+    const bool use_native = head_native() && same_head_device;
+    if (!vocab_file.empty() && !use_native) {
+        if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
+            std::fseek(vf, 0, SEEK_END);
+            const long size = std::ftell(vf);
+            std::fclose(vf);
+            if (size >= 4 && size % 4 == 0) return (int64_t) (size / 4);
+        }
+    }
+    return n_vocab;
+}
+
+uint64_t Dflash2Drafter::logits_bytes(int requested_batch_slots, bool blob_shared, int64_t n_dvocab) {
+    if (n_dvocab <= 0) return 0;
+    return (uint64_t) logits_row_count(requested_batch_slots, blob_shared) * (uint64_t) n_dvocab * sizeof(float);
+}
+
+uint64_t Dflash2Drafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file,
+                                    bool head_shared, bool same_head_device) const {
+    const bool use_native = head_native() && same_head_device;
+    int64_t ndvocab = n_vocab;
+    uint64_t bytes = 0;
+    if (!vocab_file.empty() && !use_native) {
+        if (std::FILE* vf = std::fopen(vocab_file.c_str(), "rb")) {
+            std::fseek(vf, 0, SEEK_END);
+            const long size = std::ftell(vf);
+            std::fclose(vf);
+            if (size >= 4 && size % 4 == 0) {
+                ndvocab = (int64_t) (size / 4);
+                if (!head_shared) bytes += (uint64_t) ndvocab * head_row_bytes + (uint64_t) size;
+            }
+        }
+    }
+    bytes += logits_bytes((int) alloc_slots_, blob_shared_, ndvocab);
+    return bytes;
+}
+
+uint64_t Dflash2Drafter::clone_bind_bytes(int64_t n_vocab, const std::string& vocab_file, bool same_head_device) const {
+    const int64_t ndvocab = resolve_dvocab(n_vocab, vocab_file, same_head_device);
+    return logits_bytes(1, /*blob_shared=*/true, ndvocab);
+}
+
 bool Dflash2Drafter::alloc(std::string& err) {
     auto dev = [&](auto** p, size_t n) {
         using T = std::remove_pointer_t<std::remove_reference_t<decltype(*p)>>;
@@ -269,17 +508,29 @@ bool Dflash2Drafter::alloc(std::string& err) {
         vram_ += n * sizeof(T);
         return true;
     };
-    const size_t B = blob_shared_ ? (size_t) kRows : (size_t) (4 * kRows);
-    const size_t HMax = blob_shared_ ? (size_t) kDrafts : (size_t) (2 * kDrafts);
-    bool ok = dev(&d_meta_, 256) && dev(&xq_, kernels::native_q8_1_bytes(N_, blob_shared_ ? kRows : 16) + 4096) && dev(&xil_, kernels::native_q8_1_il_bytes(N_, blob_shared_ ? kRows : 16) + 4096) && dev(&xqp_, (size_t) 5 * N_ * B + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * B + 64) && dev(&xqc_, (size_t) 5 * N_ * B + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * B + 64) && dev(&rt_ctx_, 2 * kRows * 128) && (blob_shared_ || dev(&rt_bctx_, 64 * 128)) && dev(&rope_inv_, 64) &&
+    const size_t eff = effective_batch_slots((int) alloc_slots_, blob_shared_);
+    alloc_slots_ = eff;
+    const bool multi_batch = !blob_shared_ && eff > 1;
+    const size_t B = eff * (size_t) kRows;
+    alloc_rows_ = B;
+    const size_t HMax = logits_row_count((int) eff, blob_shared_);
+    const int il_max = multi_batch ? 16 : (int) kRows;
+    const size_t top_rows = multi_batch ? (size_t) kBatchMaxRows : (size_t) kDrafts;
+    // Keep 16-column capacity without calling helpers outside an 8-column build's legal window.
+    const size_t xq_bytes = kernels::native_q8_1_bytes(N_, kRows) * (multi_batch ? 2 : 1);
+    const size_t xil_bytes = std::max(
+        kernels::native_q8_1_il_bytes(N_, kRows),
+        (size_t) (N_ / 32) * (size_t) il_max * (8 * sizeof(int) + 8 * sizeof(int) + sizeof(float))) + 4096;
+    bool ok = dev(&d_meta_, kMetaInts) && dev(&xq_, xq_bytes + 4096) && dev(&xil_, xil_bytes) && dev(&xqp_, (size_t) 5 * N_ * B + 4096) && dev(&xdp_, (size_t) 5 * N_ / 32 * B + 64) && dev(&xqc_, (size_t) 5 * N_ * B + 4096) && dev(&xdc_, (size_t) 5 * N_ / 32 * B + 64) && dev(&rt_ctx_, 2 * kRows * 128) && (!multi_batch || dev(&rt_bctx_, 2 * B * 128)) && dev(&rope_inv_, 64) &&
               dev(&fcy_, B * N_) && dev(&hctx_, B * N_) && dev(&kc_, (size_t) L_ * B * NKV_ * HD_) && dev(&vc_, (size_t) L_ * B * NKV_ * HD_) && dev(&h_, B * N_) && dev(&xn_, B * N_) &&
               dev(&xc_, B * N_) && dev(&dyn_, B * 640) && dev(&q_, B * NH_ * HD_) && dev(&qn_, B * NH_ * HD_) && dev(&k_, B * NKV_ * HD_) && dev(&v_, B * NKV_ * HD_) &&
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
               dev(&part_, (B / kRows) * (size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) && dev(&fn_, B * N_) &&
-              dev(&topval_, (size_t) (blob_shared_ ? kDrafts : kBatchMaxRows) * 16) &&
-              dev(&toptok_, (size_t) (blob_shared_ ? kDrafts : kBatchMaxRows) * 16) &&
-              dev(&hsel_, B * rank_) && dev(&topscratch_, HMax * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
-    if (!blob_shared_) {
+              dev(&topval_, top_rows * 16) &&
+              dev(&toptok_, top_rows * 16) &&
+              dev(&hsel_, B * rank_) && dev(&topscratch_, HMax * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2) &&
+              dev(&seltab_, (size_t) kRows * kernels::kDf2TopK * kernels::kDf2TopK);
+    if (multi_batch) {
         ok = ok && dev(&fn_batch_, (size_t) kBatchMaxRows * N_) && dev(&hsel_batch_, (size_t) kBatchMaxRows * rank_);
     }
     ok = ok && dev(&landing_, (size_t) kRows * std::max<size_t>(taps_.size(), 1) * (size_t) N_);
@@ -295,14 +546,14 @@ bool Dflash2Drafter::alloc(std::string& err) {
     if (!ok) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
     void* hd = nullptr;
     void* dd = nullptr;
-    if (!mapped(256 * 4, (void**) &hd, &dd)) { err = "dflash2: mapped staging"; return false; }
+    if (!mapped(kMetaInts * 4, (void**) &hd, &dd)) { err = "dflash2: mapped staging"; return false; }
     h_meta_ = (int32_t*) hd;
     m_meta_ = (int32_t*) dd;
     if (!mapped(64 * 4, &hd, &dd)) { err = "dflash2: mapped output"; return false; }
     h_out_ = (int32_t*) hd;
     out_tok_ = (int32_t*) dd;            // the select kernel writes the 7 picks here (host-visible) ...
     out_prob_ = (float*) dd + 16;        // ... and their probabilities at +16 ints
-    if (!blob_shared_) {
+    if (multi_batch) {
         if (!mapped((kBatchMaxSlots * 4) * 4, &hd, &dd)) { err = "dflash2: mapped batch staging"; return false; }
         h_bmeta_ = (int32_t*) hd;
         m_bmeta_ = (int32_t*) dd;
@@ -314,8 +565,8 @@ bool Dflash2Drafter::alloc(std::string& err) {
     rt_blk_ = rt_ctx_ + kRows * 128;
     cudaMemset(rt_ctx_, 0, 2 * kRows * 128 * 4);
     if (rt_bctx_) {
-        rt_bblk_ = rt_bctx_ + 32 * 128;
-        cudaMemset(rt_bctx_, 0, 64 * 128 * 4);
+        rt_bblk_ = rt_bctx_ + B * 128;
+        cudaMemset(rt_bctx_, 0, 2 * B * 128 * 4);
     }
     kernels::df2_rope_inv(theta_, rope_inv_, nullptr);
     if (cudaMalloc((void**) &tag_, (size_t) kRing * 8) != cudaSuccess) { err = "dflash2: ring tags"; return false; }
@@ -348,7 +599,7 @@ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, 
         }
     }
     if ((n_dvocab_ + kernels::kDf2TopBlocks - 1) / kernels::kDf2TopBlocks > 4096) { err = "dflash2: the head has too many rows for the top-k"; return false; }
-    const size_t hmax = blob_shared_ ? (size_t) kDrafts : (size_t) (2 * kDrafts);
+    const size_t hmax = logits_rows();
     if (!logits_ && cudaMalloc((void**) &logits_, hmax * (size_t) n_dvocab_ * 4) != cudaSuccess) { err = "dflash2: the draft logits do not fit"; return false; }
     vram_ += (uint64_t) hmax * (uint64_t) n_dvocab_ * 4;
     bound_ = true;
@@ -475,7 +726,7 @@ bool Dflash2Drafter::record_kv(int n, cudaStream_t cs, const uint8_t* xq, const 
     try {
         const float* rt = rt_override != nullptr ? rt_override : rt_ctx_;
         const int32_t* ep = epoch_override != nullptr ? epoch_override : (d_meta_ + 18);
-        const size_t B = blob_shared_ ? (size_t) kRows : (size_t) (4 * kRows);
+        const size_t B = alloc_rows_;
         const size_t l_stride = B * NKV_ * HD_;
         if (!fork_ && (L_ == 5 || L_ == 8)) {
             if (L_ == 5) {
@@ -637,6 +888,11 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         stamp("embed_");
         df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, B, N_, eps_, xqp_, xdp_, cs);
         stamp("df2_rms_quant");
+        const int head_il = df2_head_il_mode();
+        const bool use_il = !skip_part("head") && df2_head_use_il(head_type_, ndraft_, (int) n_dvocab_, head_il);
+        const bool want_final_q8 = !skip_part("head") && ndraft_ >= 1 && ndraft_ <= 8;
+        const bool want_final_il = want_final_q8 && use_il && ndraft_ >= 2;
+        bool did_fuse_q8 = false;
         for (int l = 0; l < L_; ++l) {
             const std::string p = "layers." + std::to_string(l) + ".";
             const float* base_a = f32(p + "attention_conv.base_kernel");
@@ -677,26 +933,24 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
             stamp("gemm:mlp.down_proj");
             // the next layer's input norm, or after the last layer the final norm (-> fn_, the rows the head and the selector read)
             const std::string next_gamma = l + 1 < L_ ? "layers." + std::to_string(l + 1) + ".input_layernorm.weight" : std::string("norm.weight");
-            if (!skip_part("small")) df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), l + 1 < L_ ? xn_ : fn_, B, N_, group_, eps_, xqp_, xdp_, cs);
+            if (!skip_part("small")) {
+                const bool last = l + 1 == L_;
+                df2_conv_rms_quant(mlp_, dyn_ + 320, 640, base_m + 2 * N_, h_, f32(next_gamma), last ? fn_ : xn_,
+                                   B, N_, group_, eps_, xqp_, xdp_, cs,
+                                   (last && want_final_q8) ? xq_ : nullptr,
+                                   (last && want_final_il) ? xil_ : nullptr, 1, ndraft_);
+                if (last && want_final_q8) did_fuse_q8 = true;
+            }
             stamp("df2_conv_rms_quant");
         }
-        static const int head_il = [] {
-            const char* e = std::getenv("STRATA_DF2_HEAD_IL");
-            if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
-            if (e && e[0]) return e[0] != '0' ? 1 : 0;
-#if defined(STRATA_USE_HIP)
-            return 1;
-#else
-            return -1;
-#endif
-        }();
-        const bool use_il = !skip_part("head") && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)));
-        if (use_il && ndraft_ >= 2 && ndraft_ <= 8)
-            native_quantize_q8_1_il(fn_ + N_, xq_, xil_, N_, ndraft_, cs);
-        else {
-            native_quantize_q8_1(fn_ + N_, xq_, N_, ndraft_, cs);   // rows 1..7, the head's format
-            if (use_il && ndraft_ > 8)
-                native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
+        if (!did_fuse_q8) {
+            if (use_il && ndraft_ >= 2 && ndraft_ <= 8)
+                native_quantize_q8_1_il(fn_ + N_, xq_, xil_, N_, ndraft_, cs);
+            else {
+                native_quantize_q8_1(fn_ + N_, xq_, N_, ndraft_, cs);   // rows 1..7, the head's format
+                if (use_il && ndraft_ > 8)
+                    native_q8_1_interleave(xq_, xil_, N_, ndraft_, cs);
+            }
         }
         // df2_conv_rms_quant on the final layer has already quantized fn_ rows 1..7 into xqp_ + N_ and xdp_ + N_ / 32
         if (skip_part("small")) df2_quant_rows(fn_ + N_, N_, ndraft_, xqp_ + N_, xdp_ + N_ / 32, cs);
@@ -710,13 +964,10 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         if (!skip_part("head")) {
             // the verify window's head kernel (interleaved activations, rows a warp by the card's table): bitwise native_mmvq's output, so the drafts are the same
             if (use_il) {
-                if (head_il == 1 && !native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_)) {
-                    native_mmvq_il_tune(4);
-                    native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
-                    native_mmvq_il_tune(0);
-                } else {
-                    native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
-                }
+                const bool force_rows = (std::getenv("STRATA_DF2_HEAD_IL_ROWS") != nullptr) || !native_mmvq_il_supported(head_type_, ndraft_, (int) n_dvocab_);
+                if (force_rows) native_mmvq_il_tune(df2_head_il_rows());
+                native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
+                if (force_rows) native_mmvq_il_tune(0);
             } else
                 native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, ndraft_, cs);
         }
@@ -728,7 +979,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         stamp("gemm:candidate_selector.hidden_projection");
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, out_tok_,
-                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0");
+                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0", df2_beam(), df2_select_table() ? seltab_ : nullptr);
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -738,6 +989,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
 
 bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     if (exec_[n]) return true;
+    (void) cudaStreamSynchronize(cs_);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin capture"; return false; }
     kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
     kernels::df2_rope_table_inv(d_meta_, 16, rope_inv_, rt_ctx_, cs_);   // the context rows' and the block rows' tables in one launch, before the branches split
@@ -775,6 +1027,7 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
 
 bool Dflash2Drafter::capture_body(int n, const float* taps, std::string& err) {
     if (body_exec_[n]) return true;
+    (void) cudaStreamSynchronize(cs_);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin capture_body"; return false; }
     kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
     kernels::df2_rope_table_inv(d_meta_, 16, rope_inv_, rt_ctx_, cs_);
@@ -816,6 +1069,8 @@ bool Dflash2Drafter::clone_alloc(const Dflash2Drafter& parent, std::string& err)
     group_ = parent.group_; rank_ = parent.rank_; mask_token_ = parent.mask_token_; theta_ = parent.theta_; eps_ = parent.eps_;
     taps_ = parent.taps_; vocab_ = parent.vocab_; q4_ = parent.q4_; tensors_ = parent.tensors_;
     blob_ = parent.blob_; blob_shared_ = true;
+    alloc_slots_ = 1;
+    alloc_rows_ = kRows;
     return make_streams(err) && alloc(err);
 }
 
@@ -913,14 +1168,8 @@ void Dflash2Drafter::set_max_drafts(int n) {
         if (e) { cudaGraphExecDestroy(e); e = nullptr; }
     for (auto& e : body_exec_)
         if (e) { cudaGraphExecDestroy(e); e = nullptr; }
-    for (int i = 0; i <= kRows; ++i)
-        for (int j = 0; j <= kRows; ++j)
-            if (batch_body_exec_[i][j]) { cudaGraphExecDestroy(batch_body_exec_[i][j]); batch_body_exec_[i][j] = nullptr; }
-    for (auto& e : batch_full_exec_)
-        if (e) { cudaGraphExecDestroy(e); e = nullptr; }
-    for (int s = 0; s < 2; ++s)
-        for (auto& e : batch_full_1_exec_[s])
-            if (e) { cudaGraphExecDestroy(e); e = nullptr; }
+    destroy_graph_cache(batch_body_graphs_);
+    destroy_graph_cache(batch_full_graphs_);
     clear_precomputed_context();
     graph_taps_ = nullptr;
     ndraft_ = n;
@@ -935,6 +1184,8 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
     }();
     if (!dflash2_clone_eager_single_graphs(blob_shared_, batch_body_on)) return true;
     const OnDevice on_device(device_);
+    if (!wait_precomp_on_cs(cs_)) { err = "dflash2: precomp sync"; return false; }
+    clear_precomputed_context();
     const Clock::time_point t0 = Clock::now();
     for (int i = 0; i < 8; ++i) h_meta_[i] = i;
     for (int n = 1; n <= kRows; ++n) {
@@ -955,10 +1206,15 @@ bool Dflash2Drafter::prewarm_batch_slots(Dflash2Drafter* const* slots, int n_slo
     }();
     if (!batch_body_on) return true;
     const OnDevice on_device(device_);
+    if (precomp_pending_ && ev_pre_ != nullptr) {
+        (void) cudaEventSynchronize(ev_pre_);
+        precomp_pending_ = false;
+    }
+    clear_precomputed_context();
     const Clock::time_point t0 = Clock::now();
-    std::memset(h_meta_, 0, 256 * sizeof(int32_t));
-    for (int i = 0; i < 16; ++i) h_bmeta_[i] = 0;
-    const int n1 = std::min(n_slots, 2);
+    std::memset(h_meta_, 0, kMetaInts * sizeof(int32_t));
+    for (int i = 0; i < (int) kBatchMaxSlots * 4; ++i) h_bmeta_[i] = 0;
+    const int n1 = std::min(n_slots, (int) kBatchMaxSlots);
     for (int b = 0; b < n1; ++b) {
         if (slots[b] == nullptr || !slots[b]->bound_ || slots[b]->device_ != device_) continue;
         const int kw = std::max(1, std::min((int) kDrafts, slots[b]->max_drafts()));
@@ -968,7 +1224,8 @@ bool Dflash2Drafter::prewarm_batch_slots(Dflash2Drafter* const* slots, int n_slo
         it.k_want = kw;
         h_bmeta_[0] = 0;
         h_bmeta_[1] = kw;
-        if (!capture_batch_full(&it, 1, kw, err)) return false;
+        cudaGraphExec_t exec = nullptr;
+        if (!capture_batch_full(&it, 1, kw, exec, err)) return false;
     }
     ms_capture += ms_since(t0);
     return true;
@@ -1245,14 +1502,16 @@ void Dflash2Drafter::log_stage(int64_t pos0, int n) {
     for (int i = 0; i < n; ++i) slot_pos_[(size_t) ((pos0 + i) % kRing)] = ((int64_t) epoch_ << 32) | (pos0 + i);
 }
 
-void Dflash2Drafter::log_flush() {
+void Dflash2Drafter::log_flush(int row_off, const int8_t* q_src, const float* d_src) {
     if (!log_on_ || pend_pos0_ < 0) return;
+    const int8_t* qp = q_src != nullptr ? q_src : h_logq_;
+    const float* dp = d_src != nullptr ? d_src : h_logd_;
     for (int i = 0; i < pend_n_; ++i) {
         const int64_t pos = pend_pos0_ + i;
         LogChunk& ch = cur_.writable((size_t) (pos / kLogChunk));
         const size_t r = (size_t) (pos % kLogChunk);
-        std::memcpy(&ch.q[r * 2560], h_logq_ + (size_t) i * 2560, 2560);
-        std::memcpy(&ch.d[r * 80], h_logd_ + (size_t) i * 80, 80 * sizeof(float));
+        std::memcpy(&ch.q[r * 2560], qp + (size_t) (row_off + i) * 2560, 2560);
+        std::memcpy(&ch.d[r * 80], dp + (size_t) (row_off + i) * 80, 80 * sizeof(float));
         ch.ok[r] = 1;
     }
     pend_pos0_ = -1;
@@ -1271,6 +1530,8 @@ bool Dflash2Drafter::rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* 
     }
     if (pos.empty()) return true;
     const OnDevice on_device(device_);
+    if (!wait_precomp_on_cs(cs_)) { err = "dflash2: precomp sync"; return false; }
+    clear_precomputed_context();
     const size_t rows = pos.size();
     const size_t cap = (size_t) kRing;   // a window is at most 2048 rows
     if (rb_q_ == nullptr) {
@@ -1439,10 +1700,11 @@ void Dflash2Drafter::note_rows(const int32_t* toks, int64_t n, int64_t pos0) {
 bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::string& err) {
     if (!context_wait(err)) return false;
     const OnDevice on_device(device_);
+    if (!wait_precomp_on_cs(cs_)) { err = "dflash2: precomp sync"; return false; }
     const int tap_n = (int) taps_.size() * N_;
     const int64_t stage_cap = (int64_t) kRows * 8;
     int precomp_off = 0;
-    if (!blob_shared_ && rt_bctx_ != nullptr && !prof_ && !skip_part("ctx") && n >= 1 && n <= 4 * kRows &&
+    if (!blob_shared_ && rt_bctx_ != nullptr && !prof_ && !skip_part("ctx") && n >= 1 && n <= (int64_t) alloc_rows_ &&
         has_precomputed_context(taps, (int) n, pos0, &precomp_off)) {
         if (precomp_off + (int) n >= precomp_rows_) clear_precomputed_context();
         try {
@@ -1450,18 +1712,18 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
             h_meta_[18] = epoch_;
             std::atomic_thread_fence(std::memory_order_seq_cst);
             kernels::copy_i32_from_mapped(d_meta_ + 18, m_meta_ + 18, 1, cs_);
-            const size_t l_stride = (size_t) (4 * kRows) * NKV_ * HD_;
+            const size_t l_stride = alloc_rows_ * NKV_ * HD_;
             const size_t row_kv = (size_t) precomp_off * NKV_ * HD_;
             for (int l = 0; l < L_; ++l) {
                 const std::string p = "layers." + std::to_string(l) + ".";
                 if (fp16_ring_)
                     kernels::df2_kv_ring_f16(kc_ + l * l_stride + row_kv, vc_ + l * l_stride + row_kv,
-                                             f32(p + "self_attn.k_norm.weight"), d_meta_ + 192 + precomp_off,
+                                             f32(p + "self_attn.k_norm.weight"), d_meta_ + kMetaPrecompPos + precomp_off,
                                              rt_bctx_ + (size_t) precomp_off * 128, kring_[l], vring_[l],
                                              kRing, (int) n, NKV_, eps_, cs_, tag_, d_meta_ + 18);
                 else
                     kernels::df2_kv_ring(kc_ + l * l_stride + row_kv, vc_ + l * l_stride + row_kv,
-                                         f32(p + "self_attn.k_norm.weight"), d_meta_ + 192 + precomp_off,
+                                         f32(p + "self_attn.k_norm.weight"), d_meta_ + kMetaPrecompPos + precomp_off,
                                          rt_bctx_ + (size_t) precomp_off * 128, kring_[l], vring_[l],
                                          kRing, (int) n, NKV_, eps_, cs_, tag_, d_meta_ + 18);
             }
@@ -1470,11 +1732,7 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
             return false;
         }
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
-        if (log_on_ && precomp_off > 0) {
-            std::memmove(h_logq_, h_logq_ + (size_t) precomp_off * N_, (size_t) n * N_);
-            std::memmove(h_logd_, h_logd_ + (size_t) precomp_off * (N_ / 32), (size_t) n * (N_ / 32) * sizeof(float));
-        }
-        log_flush();
+        log_flush(precomp_off);
         have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
         ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n);
         return true;
@@ -1545,6 +1803,8 @@ bool Dflash2Drafter::context_async(const float* taps, int64_t n, int64_t pos0, s
     if (n < 1 || n > kRows) { err = "dflash2: context_async rows out of range"; return false; }
     if (!context_wait(err)) return false;   // h_meta_ is read by the queued copy: the previous call must be done
     const OnDevice on_device(device_);
+    if (!wait_precomp_on_cs(cs_)) { err = "dflash2: precomp sync"; return false; }
+    clear_precomputed_context();
     for (int i = 0; i < (int) n; ++i) h_meta_[i] = (int32_t) (pos0 + i);
     h_meta_[18] = epoch_;
     std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -1575,6 +1835,8 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     if (!context_wait(err)) return false;
     if (n_new < 1 || n_new > kRows) { err = "dflash2: draft rows out of range"; return false; }
     const OnDevice on_device(device_);
+    if (!wait_precomp_on_cs(cs_)) { err = "dflash2: precomp sync"; return false; }
+    clear_precomputed_context();
     const Clock::time_point t0 = Clock::now();
     if (graph_taps_ != nullptr && graph_taps_ != taps) { err = "dflash2: the taps buffer moved after capture"; return false; }
     if (!prof_ && !exec_[n_new]) {
@@ -1654,67 +1916,178 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
     return true;
 }
 
+void Dflash2Drafter::record_precompute_batch_context(const float* taps, int n_rows, bool want_log, cudaStream_t cs) {
+    using namespace kernels;
+    copy_i32_from_mapped(d_meta_ + kMetaPrecompPos, m_meta_ + kMetaPrecompPos, n_rows, cs);
+    df2_rope_table_inv(d_meta_ + kMetaPrecompPos, n_rows, rope_inv_, rt_bctx_, cs);
+    const int tap_n = (int) taps_.size() * N_;
+    df2_quant_rows(taps, tap_n, n_rows, xqc_, xdc_, cs);
+    gemm({"fc.weight"}, {fcy_}, n_rows, cs, xqc_, xdc_);
+    df2_rms_quant(fcy_, f32("hidden_norm.weight"), nullptr, n_rows, N_, eps_, xqc_, xdc_, cs);
+    const size_t l_stride = alloc_rows_ * NKV_ * HD_;
+    if (L_ == 5) {
+        gemm({"layers.0.self_attn.k_proj.weight", "layers.0.self_attn.v_proj.weight",
+              "layers.1.self_attn.k_proj.weight", "layers.1.self_attn.v_proj.weight",
+              "layers.2.self_attn.k_proj.weight", "layers.2.self_attn.v_proj.weight",
+              "layers.3.self_attn.k_proj.weight", "layers.3.self_attn.v_proj.weight",
+              "layers.4.self_attn.k_proj.weight", "layers.4.self_attn.v_proj.weight"},
+             {kc_ + 0 * l_stride, vc_ + 0 * l_stride,
+              kc_ + 1 * l_stride, vc_ + 1 * l_stride,
+              kc_ + 2 * l_stride, vc_ + 2 * l_stride,
+              kc_ + 3 * l_stride, vc_ + 3 * l_stride,
+              kc_ + 4 * l_stride, vc_ + 4 * l_stride},
+             n_rows, cs, xqc_, xdc_);
+    } else if (L_ == 8) {
+        gemm({"layers.0.self_attn.k_proj.weight", "layers.0.self_attn.v_proj.weight",
+              "layers.1.self_attn.k_proj.weight", "layers.1.self_attn.v_proj.weight",
+              "layers.2.self_attn.k_proj.weight", "layers.2.self_attn.v_proj.weight",
+              "layers.3.self_attn.k_proj.weight", "layers.3.self_attn.v_proj.weight",
+              "layers.4.self_attn.k_proj.weight", "layers.4.self_attn.v_proj.weight",
+              "layers.5.self_attn.k_proj.weight", "layers.5.self_attn.v_proj.weight",
+              "layers.6.self_attn.k_proj.weight", "layers.6.self_attn.v_proj.weight",
+              "layers.7.self_attn.k_proj.weight", "layers.7.self_attn.v_proj.weight"},
+             {kc_ + 0 * l_stride, vc_ + 0 * l_stride,
+              kc_ + 1 * l_stride, vc_ + 1 * l_stride,
+              kc_ + 2 * l_stride, vc_ + 2 * l_stride,
+              kc_ + 3 * l_stride, vc_ + 3 * l_stride,
+              kc_ + 4 * l_stride, vc_ + 4 * l_stride,
+              kc_ + 5 * l_stride, vc_ + 5 * l_stride,
+              kc_ + 6 * l_stride, vc_ + 6 * l_stride,
+              kc_ + 7 * l_stride, vc_ + 7 * l_stride},
+             n_rows, cs, xqc_, xdc_);
+    } else {
+        for (int l = 0; l < L_; ++l) {
+            const std::string p = "layers." + std::to_string(l) + ".";
+            const std::string kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
+            gemm({kp.c_str(), vp.c_str()}, {kc_ + l * l_stride, vc_ + l * l_stride}, n_rows, cs, xqc_, xdc_);
+        }
+    }
+    if (want_log) {
+        (void) cudaMemcpyAsync(h_logq_, xqc_, (size_t) n_rows * N_, cudaMemcpyDeviceToHost, cs);
+        (void) cudaMemcpyAsync(h_logd_, xdc_, (size_t) n_rows * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs);
+    }
+}
+
+void Dflash2Drafter::reset_precomp_graph(int n_rows, cudaStream_t cs, bool mark_failed) noexcept {
+    if (n_rows < 1 || n_rows > kPrecompGraphMax) return;
+    if (precomp_exec_[n_rows] != nullptr) {
+        if (cs != nullptr) (void) cudaStreamSynchronize(cs);
+        (void) cudaGraphExecDestroy(precomp_exec_[n_rows]);
+        precomp_exec_[n_rows] = nullptr;
+    }
+    precomp_exec_taps_[n_rows] = nullptr;
+    precomp_exec_log_[n_rows] = false;
+    precomp_graph_failed_[n_rows] = mark_failed;
+}
+
+bool Dflash2Drafter::capture_precompute_batch_context(const float* taps, int n_rows, bool want_log, cudaStream_t cs) {
+    if (n_rows < 1 || n_rows > kPrecompGraphMax || cs == nullptr) return false;
+    if (precomp_exec_[n_rows] != nullptr) {
+        if (precomp_exec_taps_[n_rows] == taps && precomp_exec_log_[n_rows] == want_log) return true;
+        reset_precomp_graph(n_rows, cs, false);
+    }
+    if (cudaStreamBeginCapture(cs, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    bool ok = false;
+    try {
+        record_precompute_batch_context(taps, n_rows, want_log, cs);
+        ok = true;
+    } catch (...) {
+        ok = false;
+    }
+    cudaGraph_t graph = nullptr;
+    const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
+    if (!ok) {
+        if (graph) (void) cudaGraphDestroy(graph);
+        (void) cudaGetLastError();
+        return false;
+    }
+    cudaGraphExec_t new_exec = nullptr;
+    const cudaError_t ie = (ce == cudaSuccess) ? cudaGraphInstantiate(&new_exec, graph, 0) : ce;
+    if (graph) (void) cudaGraphDestroy(graph);
+    if (ce != cudaSuccess || ie != cudaSuccess || new_exec == nullptr) {
+        if (new_exec) (void) cudaGraphExecDestroy(new_exec);
+        (void) cudaGetLastError();
+        return false;
+    }
+    precomp_exec_[n_rows] = new_exec;
+    precomp_exec_taps_[n_rows] = taps;
+    precomp_exec_log_[n_rows] = want_log;
+    return true;
+}
+
+void Dflash2Drafter::prewarm_precompute(const float* taps, int max_rows) {
+    if (!df2_precomp_graph_on() || prof_ != nullptr || !bound_ || blob_shared_ || rt_bctx_ == nullptr ||
+        taps == nullptr || max_rows < 1 || skip_part("ctx")) return;
+    const OnDevice on_device(device_);
+    if (precomp_pending_ && ev_pre_ != nullptr) {
+        (void) cudaEventSynchronize(ev_pre_);
+        precomp_pending_ = false;
+    }
+    cudaStream_t pre_cs = cs_pre_ ? cs_pre_ : cs_;
+    if (pre_cs == nullptr) return;
+    const int lim = std::min(max_rows, (int) kPrecompGraphMax);
+    const bool want_log = log_on_ && h_logq_ != nullptr && h_logd_ != nullptr;
+    if (h_meta_ != nullptr) std::memset(h_meta_ + kMetaPrecompPos, 0, (size_t) lim * sizeof(int32_t));
+    const Clock::time_point t0 = Clock::now();
+    for (int r = 1; r <= lim; ++r) {
+        if (!precomp_graph_failed_[r] && precomp_exec_[r] == nullptr &&
+            !capture_precompute_batch_context(taps, r, want_log, pre_cs)) {
+            precomp_graph_failed_[r] = true;
+        }
+    }
+    (void) cudaStreamSynchronize(pre_cs);
+    clear_precomputed_context();
+    precomp_pending_ = false;
+    ms_capture += ms_since(t0);
+}
+
 void Dflash2Drafter::precompute_batch_context(const float* taps, int n_rows, const int64_t* pos) noexcept {
     if (!bound_ || blob_shared_ || skip_part("ctx") || taps == nullptr || pos == nullptr ||
-        n_rows < 1 || n_rows > 4 * kRows || rt_bctx_ == nullptr) return;
+        n_rows < 1 || n_rows > (int) alloc_rows_ || rt_bctx_ == nullptr) return;
     try {
-        using namespace kernels;
         const OnDevice on_device(device_);
+        cudaStream_t pre_cs = cs_pre_ ? cs_pre_ : cs_;
+        if (precomp_pending_ && ev_pre_ != nullptr) {
+            (void) cudaEventSynchronize(ev_pre_);
+            precomp_pending_ = false;
+        }
         for (int r = 0; r < n_rows; ++r) {
-            h_meta_[192 + r] = (int32_t) pos[r];
+            h_meta_[kMetaPrecompPos + r] = (int32_t) pos[r];
             precomp_pos_[r] = (int32_t) pos[r];
         }
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        copy_i32_from_mapped(d_meta_ + 192, m_meta_ + 192, n_rows, cs_);
-        df2_rope_table_inv(d_meta_ + 192, n_rows, rope_inv_, rt_bctx_, cs_);
-        const int tap_n = (int) taps_.size() * N_;
-        df2_quant_rows(taps, tap_n, n_rows, xqc_, xdc_, cs_);
-        gemm({"fc.weight"}, {fcy_}, n_rows, cs_, xqc_, xdc_);
-        df2_rms_quant(fcy_, f32("hidden_norm.weight"), nullptr, n_rows, N_, eps_, xqc_, xdc_, cs_);
-        const size_t l_stride = (size_t) (4 * kRows) * NKV_ * HD_;
-        if (L_ == 5) {
-            gemm({"layers.0.self_attn.k_proj.weight", "layers.0.self_attn.v_proj.weight",
-                  "layers.1.self_attn.k_proj.weight", "layers.1.self_attn.v_proj.weight",
-                  "layers.2.self_attn.k_proj.weight", "layers.2.self_attn.v_proj.weight",
-                  "layers.3.self_attn.k_proj.weight", "layers.3.self_attn.v_proj.weight",
-                  "layers.4.self_attn.k_proj.weight", "layers.4.self_attn.v_proj.weight"},
-                 {kc_ + 0 * l_stride, vc_ + 0 * l_stride,
-                  kc_ + 1 * l_stride, vc_ + 1 * l_stride,
-                  kc_ + 2 * l_stride, vc_ + 2 * l_stride,
-                  kc_ + 3 * l_stride, vc_ + 3 * l_stride,
-                  kc_ + 4 * l_stride, vc_ + 4 * l_stride},
-                 n_rows, cs_, xqc_, xdc_);
-        } else if (L_ == 8) {
-            gemm({"layers.0.self_attn.k_proj.weight", "layers.0.self_attn.v_proj.weight",
-                  "layers.1.self_attn.k_proj.weight", "layers.1.self_attn.v_proj.weight",
-                  "layers.2.self_attn.k_proj.weight", "layers.2.self_attn.v_proj.weight",
-                  "layers.3.self_attn.k_proj.weight", "layers.3.self_attn.v_proj.weight",
-                  "layers.4.self_attn.k_proj.weight", "layers.4.self_attn.v_proj.weight",
-                  "layers.5.self_attn.k_proj.weight", "layers.5.self_attn.v_proj.weight",
-                  "layers.6.self_attn.k_proj.weight", "layers.6.self_attn.v_proj.weight",
-                  "layers.7.self_attn.k_proj.weight", "layers.7.self_attn.v_proj.weight"},
-                 {kc_ + 0 * l_stride, vc_ + 0 * l_stride,
-                  kc_ + 1 * l_stride, vc_ + 1 * l_stride,
-                  kc_ + 2 * l_stride, vc_ + 2 * l_stride,
-                  kc_ + 3 * l_stride, vc_ + 3 * l_stride,
-                  kc_ + 4 * l_stride, vc_ + 4 * l_stride,
-                  kc_ + 5 * l_stride, vc_ + 5 * l_stride,
-                  kc_ + 6 * l_stride, vc_ + 6 * l_stride,
-                  kc_ + 7 * l_stride, vc_ + 7 * l_stride},
-                 n_rows, cs_, xqc_, xdc_);
-        } else {
-            for (int l = 0; l < L_; ++l) {
-                const std::string p = "layers." + std::to_string(l) + ".";
-                const std::string kp = p + "self_attn.k_proj.weight", vp = p + "self_attn.v_proj.weight";
-                gemm({kp.c_str(), vp.c_str()}, {kc_ + l * l_stride, vc_ + l * l_stride}, n_rows, cs_, xqc_, xdc_);
+        const bool want_log = log_on_ && h_logq_ != nullptr && h_logd_ != nullptr;
+        bool launched_graph = false;
+        if (df2_precomp_graph_on() && prof_ == nullptr && n_rows <= kPrecompGraphMax) {
+            if (precomp_exec_[n_rows] != nullptr &&
+                (precomp_exec_taps_[n_rows] != taps || precomp_exec_log_[n_rows] != want_log)) {
+                reset_precomp_graph(n_rows, pre_cs, false);
+            }
+            if (!precomp_graph_failed_[n_rows]) {
+                if (precomp_exec_[n_rows] == nullptr &&
+                    !capture_precompute_batch_context(taps, n_rows, want_log, pre_cs)) {
+                    precomp_graph_failed_[n_rows] = true;
+                }
+                if (precomp_exec_[n_rows] != nullptr) {
+                    if (cudaGraphLaunch(precomp_exec_[n_rows], pre_cs) == cudaSuccess) {
+                        launched_graph = true;
+                    } else {
+                        (void) cudaGetLastError();
+                        reset_precomp_graph(n_rows, pre_cs, true);
+                    }
+                }
             }
         }
-        if (log_on_ && h_logq_ != nullptr && h_logd_ != nullptr) {
-            cudaMemcpyAsync(h_logq_, xqc_, (size_t) n_rows * N_, cudaMemcpyDeviceToHost, cs_);
-            cudaMemcpyAsync(h_logd_, xdc_, (size_t) n_rows * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs_);
-            if (ev_join_ != nullptr) cudaEventRecord(ev_join_, cs_);
+        if (!launched_graph) {
+            record_precompute_batch_context(taps, n_rows, want_log, pre_cs);
         }
-        (void) cudaStreamQuery(cs_);
+        if (ev_pre_ != nullptr && cudaEventRecord(ev_pre_, pre_cs) == cudaSuccess) {
+            precomp_pending_ = true;
+        }
+        (void) cudaStreamQuery(pre_cs);
         precomp_taps_ = taps;
         precomp_rows_ = n_rows;
     } catch (...) {
@@ -1743,7 +2116,7 @@ bool Dflash2Drafter::record_batch_body(const BatchSlotItem* items, int n_items, 
         int total_ctx = 0;
         for (int idx = 0; idx < n_items; ++idx) total_ctx += items[idx].n_new;
         const int total_B = n_items * kRows;
-        df2_rope_table_inv(d_meta_ + 32, 64, rope_inv_, rt_bctx_, cs);
+        df2_rope_table_inv(d_meta_ + kMetaCtx, (int) alloc_rows_ + total_B, rope_inv_, rt_bctx_, cs);
         if (!skip_part("ctx") && total_ctx > 0) {
             const int tap_n = (int) taps_.size() * N_;
             int c0 = 0;
@@ -1764,7 +2137,7 @@ bool Dflash2Drafter::record_batch_body(const BatchSlotItem* items, int n_items, 
                 for (int r = 0; r < n; ++r) bkv.row_slot[c0 + r] = (uint8_t) idx;
                 c0 += n;
             }
-            const size_t l_stride = (size_t) (4 * kRows) * NKV_ * HD_;
+            const size_t l_stride = alloc_rows_ * NKV_ * HD_;
             if (L_ == 5) {
                 gemm({"layers.0.self_attn.k_proj.weight", "layers.0.self_attn.v_proj.weight",
                       "layers.1.self_attn.k_proj.weight", "layers.1.self_attn.v_proj.weight",
@@ -1807,11 +2180,11 @@ bool Dflash2Drafter::record_batch_body(const BatchSlotItem* items, int n_items, 
                     bkv.vring[idx] = items[idx].slot->vring_[l];
                 }
                 if (fp16_ring_)
-                    df2_kv_ring_batch_f16(kc_ + l * l_stride, vc_ + l * l_stride, f32(p + "self_attn.k_norm.weight"), d_meta_ + 32, rt_bctx_,
-                                          bkv, kRing, total_ctx, NKV_, eps_, cs, d_meta_ + 132);
+                    df2_kv_ring_batch_f16(kc_ + l * l_stride, vc_ + l * l_stride, f32(p + "self_attn.k_norm.weight"), d_meta_ + kMetaCtx, rt_bctx_,
+                                          bkv, kRing, total_ctx, NKV_, eps_, cs, d_meta_ + kMetaEpoch);
                 else
-                    df2_kv_ring_batch(kc_ + l * l_stride, vc_ + l * l_stride, f32(p + "self_attn.k_norm.weight"), d_meta_ + 32, rt_bctx_,
-                                      bkv, kRing, total_ctx, NKV_, eps_, cs, d_meta_ + 132);
+                    df2_kv_ring_batch(kc_ + l * l_stride, vc_ + l * l_stride, f32(p + "self_attn.k_norm.weight"), d_meta_ + kMetaCtx, rt_bctx_,
+                                      bkv, kRing, total_ctx, NKV_, eps_, cs, d_meta_ + kMetaEpoch);
             }
             c0 = 0;
             for (int idx = 0; idx < n_items; ++idx) {
@@ -1824,7 +2197,7 @@ bool Dflash2Drafter::record_batch_body(const BatchSlotItem* items, int n_items, 
                 c0 += n;
             }
         }
-        embed_(d_meta_ + 96, total_B, h_, cs);
+        embed_(d_meta_ + kMetaBlkTok, total_B, h_, cs);
         df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, total_B, N_, eps_, xqp_, xdp_, cs);
         for (int l = 0; l < L_; ++l) {
             const std::string p = "layers." + std::to_string(l) + ".";
@@ -1847,9 +2220,9 @@ bool Dflash2Drafter::record_batch_body(const BatchSlotItem* items, int n_items, 
             }
             if (!skip_part("attn")) {
                 if (fp16_ring_)
-                    df2_attention_batch_f16(qn_, ba, kblk_, v_, d_meta_ + 128, kRing, window_, part_, xqp_, xdp_, n_items, cs, d_meta_ + 132);
+                    df2_attention_batch_f16(qn_, ba, kblk_, v_, d_meta_ + kMetaAnchor, kRing, window_, part_, xqp_, xdp_, n_items, cs, d_meta_ + kMetaEpoch);
                 else
-                    df2_attention_batch(qn_, ba, kblk_, v_, d_meta_ + 128, kRing, window_, part_, xqp_, xdp_, n_items, cs, d_meta_ + 132);
+                    df2_attention_batch(qn_, ba, kblk_, v_, d_meta_ + kMetaAnchor, kRing, window_, part_, xqp_, xdp_, n_items, cs, d_meta_ + kMetaEpoch);
             }
             if (!skip_part("qkvo")) gemm({op.c_str()}, {o_}, total_B, cs, xqp_, xdp_);
             if (!skip_part("small")) df2_conv_rms_quant(o_, dyn_ + 320, 640, base_a + 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_, total_B, N_, group_, eps_, xqp_, xdp_, cs);
@@ -1886,18 +2259,18 @@ bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n
         for (int l = 0; l < L_; ++l) {
             bkv.gk[l] = f32("layers." + std::to_string(l) + ".self_attn.k_norm.weight");
         }
-        const size_t l_stride = (size_t) (4 * kRows) * NKV_ * HD_;
+        const size_t l_stride = alloc_rows_ * NKV_ * HD_;
         if (!skip_part("ctx")) {
             if (fp16_ring_)
-                df2_kv_ring_batch_precomp_f16(kc_, vc_, l_stride, d_meta_ + 192, rt_bctx_, bkv, d_meta_ + 144, d_meta_ + 132,
-                                              n_items, L_, kRing, NKV_, eps_, cs, rope_inv_, d_meta_ + 64, rt_bblk_, total_B);
+                df2_kv_ring_batch_precomp_f16(kc_, vc_, l_stride, d_meta_ + kMetaPrecompPos, rt_bctx_, bkv, d_meta_ + kMetaSlotInfo, d_meta_ + kMetaEpoch,
+                                              n_items, L_, kRing, NKV_, eps_, cs, rope_inv_, d_meta_ + kMetaBlkPos, rt_bblk_, total_B);
             else
-                df2_kv_ring_batch_precomp(kc_, vc_, l_stride, d_meta_ + 192, rt_bctx_, bkv, d_meta_ + 144, d_meta_ + 132,
-                                          n_items, L_, kRing, NKV_, eps_, cs, rope_inv_, d_meta_ + 64, rt_bblk_, total_B);
+                df2_kv_ring_batch_precomp(kc_, vc_, l_stride, d_meta_ + kMetaPrecompPos, rt_bctx_, bkv, d_meta_ + kMetaSlotInfo, d_meta_ + kMetaEpoch,
+                                          n_items, L_, kRing, NKV_, eps_, cs, rope_inv_, d_meta_ + kMetaBlkPos, rt_bblk_, total_B);
         } else {
-            df2_rope_table_inv(d_meta_ + 64, total_B, rope_inv_, rt_bblk_, cs);
+            df2_rope_table_inv(d_meta_ + kMetaBlkPos, total_B, rope_inv_, rt_bblk_, cs);
         }
-        embed_(d_meta_ + 96, total_B, h_, cs);
+        embed_(d_meta_ + kMetaBlkTok, total_B, h_, cs);
         df2_rms_quant(h_, f32("layers.0.input_layernorm.weight"), xn_, total_B, N_, eps_, xqp_, xdp_, cs);
         for (int l = 0; l < L_; ++l) {
             const std::string p = "layers." + std::to_string(l) + ".";
@@ -1920,9 +2293,9 @@ bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n
             }
             if (!skip_part("attn")) {
                 if (fp16_ring_)
-                    df2_attention_batch_f16(qn_, ba, kblk_, v_, d_meta_ + 128, kRing, window_, part_, xqp_, xdp_, n_items, cs, d_meta_ + 132);
+                    df2_attention_batch_f16(qn_, ba, kblk_, v_, d_meta_ + kMetaAnchor, kRing, window_, part_, xqp_, xdp_, n_items, cs, d_meta_ + kMetaEpoch);
                 else
-                    df2_attention_batch(qn_, ba, kblk_, v_, d_meta_ + 128, kRing, window_, part_, xqp_, xdp_, n_items, cs, d_meta_ + 132);
+                    df2_attention_batch(qn_, ba, kblk_, v_, d_meta_ + kMetaAnchor, kRing, window_, part_, xqp_, xdp_, n_items, cs, d_meta_ + kMetaEpoch);
             }
             if (!skip_part("qkvo")) gemm({op.c_str()}, {o_}, total_B, cs, xqp_, xdp_);
             if (!skip_part("small")) df2_conv_rms_quant(o_, dyn_ + 320, 640, base_a + 2 * N_, h_, f32(p + "post_attention_layernorm.weight"), xn_, total_B, N_, group_, eps_, xqp_, xdp_, cs);
@@ -1938,7 +2311,15 @@ bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n
         if (total_rows > 0 && total_rows <= total_B) {
             uint8_t* xqp_pack = xqp_ + (size_t) total_B * N_;
             float* xdp_pack = xdp_ + (size_t) total_B * (N_ / 32);
-            df2_pack_head_rows_batch(fn_, nullptr, fn_batch_, nullptr, m_bmeta_, n_items, N_, rank_, cs, xqp_, xdp_, xqp_pack, xdp_pack);
+            const int nc0 = std::min(df2_head_chunk(head_type_, (int) n_dvocab_), total_rows);
+            const bool fuse_q8 = !skip_part("head") && xq_ != nullptr;
+            const bool use_il0 = fuse_q8 && df2_head_use_il(head_type_, nc0, (int) n_dvocab_, df2_head_il_mode());
+            df2_pack_head_rows_batch(fn_, nullptr, fn_batch_, nullptr, m_bmeta_, n_items, N_, rank_, cs,
+                                     xqp_, xdp_, xqp_pack, xdp_pack,
+                                     fuse_q8 ? xq_ : nullptr,
+                                     (use_il0 && nc0 >= 2) ? xil_ : nullptr,
+                                     (use_il0 && nc0 >= 2) ? nc0 : 0,
+                                     fuse_q8 ? nc0 : 0);
             gemm({"candidate_selector.hidden_projection.weight"}, {hsel_batch_}, total_rows, cs, xqp_pack, xdp_pack);
         } else {
             gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, total_B, cs, xqp_, xdp_);
@@ -1951,47 +2332,30 @@ bool Dflash2Drafter::record_batch_body_precomp(const BatchSlotItem* items, int n
     return true;
 }
 
-bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t cs, std::string& err) {
+bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t cs, std::string& err, bool q81_prepacked) {
     try {
         using namespace kernels;
-        static const int head_il = [] {
-            const char* e = std::getenv("STRATA_DF2_HEAD_IL");
-            if (!e || !e[0]) e = std::getenv("STRATA_DFLASH_HEAD_IL");
-            if (e && e[0]) return e[0] != '0' ? 1 : 0;
-#if defined(STRATA_USE_HIP)
-            return 1;
-#else
-            return -1;
-#endif
-        }();
-        static const int head_chunk = [] {
-            const char* e = std::getenv("STRATA_DF2_HEAD_CHUNK");
-            if (e && e[0]) return std::max(1, std::min(14, std::atoi(e)));
-#if defined(STRATA_USE_HIP)
-            return 8;
-#else
-            return (int) (2 * kDrafts);
-#endif
-        }();
+        const int head_il = df2_head_il_mode();
+        const int head_chunk = df2_head_chunk(head_type_, (int) n_dvocab_);
+        const bool force_il_rows_env = std::getenv("STRATA_DF2_HEAD_IL_ROWS") != nullptr;
         for (int c0 = 0; c0 < total_rows; c0 += head_chunk) {
             const int nc = std::min(head_chunk, total_rows - c0);
-            const bool use_il = !skip_part("head") && nc <= 8 && (head_il == 1 || (head_il < 0 && native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)));
-            if (use_il && nc >= 2 && nc <= 8)
-                native_quantize_q8_1_il(fn_batch_ + (size_t) c0 * N_, xq_, xil_, N_, nc, cs);
-            else {
-                native_quantize_q8_1(fn_batch_ + (size_t) c0 * N_, xq_, N_, nc, cs);
-                if (use_il && nc > 8)
-                    native_q8_1_interleave(xq_, xil_, N_, nc, cs);
+            const bool use_il = !skip_part("head") && df2_head_use_il(head_type_, nc, (int) n_dvocab_, head_il);
+            if (!(q81_prepacked && c0 == 0)) {
+                if (use_il && nc >= 2 && nc <= 16)
+                    native_quantize_q8_1_il(fn_batch_ + (size_t) c0 * N_, xq_, xil_, N_, nc, cs);
+                else {
+                    native_quantize_q8_1(fn_batch_ + (size_t) c0 * N_, xq_, N_, nc, cs);
+                    if (use_il && nc > 16)
+                        native_q8_1_interleave(xq_, xil_, N_, nc, cs);
+                }
             }
             if (!skip_part("head")) {
                 if (use_il) {
-                    if (head_il == 1 && !native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_)) {
-                        native_mmvq_il_tune(4);
-                        native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, nc, cs);
-                        native_mmvq_il_tune(0);
-                    } else {
-                        native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, nc, cs);
-                    }
+                    const bool force_rows = force_il_rows_env || !native_mmvq_il_supported(head_type_, nc, (int) n_dvocab_);
+                    if (force_rows) native_mmvq_il_tune(df2_head_il_rows());
+                    native_mmvq_il(head_type_, head_w_, xq_, xil_, logits_, N_, (int) n_dvocab_, nc, cs);
+                    if (force_rows) native_mmvq_il_tune(0);
                 } else {
                     native_mmvq(head_type_, head_w_, xq_, logits_, N_, (int) n_dvocab_, nc, cs);
                 }
@@ -2003,7 +2367,7 @@ bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t
                          reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                          reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off),
                          rank_, m_bmeta_, n_items, out_btok_, out_bprob_, cs,
-                         find("candidate_selector.predecessor_codebook").dtype == "q4_0");
+                         find("candidate_selector.predecessor_codebook").dtype == "q4_0", df2_beam());
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -2011,95 +2375,101 @@ bool Dflash2Drafter::record_batch_head(int n_items, int total_rows, cudaStream_t
     return true;
 }
 
-bool Dflash2Drafter::capture_batch_body(const BatchSlotItem* items, int n_items, std::string& err) {
-    if (n_items != 2) return false;
-    const int n0 = items[0].n_new, n1 = items[1].n_new;
-    if (batch_slots_[0] != items[0].slot || batch_slots_[1] != items[1].slot ||
-        batch_taps_[0] != items[0].taps || batch_taps_[1] != items[1].taps) {
-        for (int i = 0; i <= kRows; ++i)
-            for (int j = 0; j <= kRows; ++j)
-                if (batch_body_exec_[i][j]) { cudaGraphExecDestroy(batch_body_exec_[i][j]); batch_body_exec_[i][j] = nullptr; }
-        batch_slots_[0] = items[0].slot;
-        batch_slots_[1] = items[1].slot;
-        batch_taps_[0] = items[0].taps;
-        batch_taps_[1] = items[1].taps;
+bool Dflash2Drafter::capture_batch_body(const BatchSlotItem* items, int n_items, cudaGraphExec_t& exec_out, std::string& err) {
+    if (!is_multi_batch() || rt_bctx_ == nullptr || n_items < 2 || n_items > kBatchMaxSlots) return false;
+    BatchBodyGraphKey key{};
+    key.n_items = n_items;
+    for (int idx = 0; idx < n_items; ++idx) {
+        key.slots[idx] = items[idx].slot;
+        key.taps[idx] = items[idx].taps;
+        key.n_new[idx] = items[idx].n_new;
     }
-    if (batch_body_exec_[n0][n1]) return true;
+    ++batch_graph_tick_;
+    for (BatchBodyGraphEntry& e : batch_body_graphs_) {
+        if (e.key == key) {
+            e.last_use = batch_graph_tick_;
+            exec_out = e.exec;
+            return true;
+        }
+    }
+    (void) cudaStreamSynchronize(cs_);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin batch body capture"; return false; }
-    kernels::copy_i32_from_mapped(d_meta_ + 32, m_meta_ + 32, 112, cs_);
+    kernels::copy_i32_from_mapped(d_meta_ + kMetaCtx, m_meta_ + kMetaCtx, kMetaSlotInfo - kMetaCtx, cs_);
     const bool ok = record_batch_body(items, n_items, cs_, err);
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&batch_body_exec_[n0][n1], graph, 0) != cudaSuccess) {
+    cudaGraphExec_t new_exec = nullptr;
+    if (ce != cudaSuccess || cudaGraphInstantiate(&new_exec, graph, 0) != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("dflash2: capture_batch_body: ") + cudaGetErrorString(ce);
         return false;
     }
     cudaGraphDestroy(graph);
-    cudaGraphUpload(batch_body_exec_[n0][n1], cs_);
+    cudaGraphUpload(new_exec, cs_);
     cudaStreamSynchronize(cs_);
+    if (batch_body_graphs_.size() >= kBatchGraphCacheMax) {
+        auto victim = std::min_element(batch_body_graphs_.begin(), batch_body_graphs_.end(),
+                                       [](const BatchBodyGraphEntry& a, const BatchBodyGraphEntry& b) { return a.last_use < b.last_use; });
+        if (victim->exec) cudaGraphExecDestroy(victim->exec);
+        *victim = BatchBodyGraphEntry{key, new_exec, batch_graph_tick_};
+    } else {
+        batch_body_graphs_.push_back(BatchBodyGraphEntry{key, new_exec, batch_graph_tick_});
+    }
+    exec_out = new_exec;
     return true;
 }
 
-bool Dflash2Drafter::capture_batch_full(const BatchSlotItem* items, int n_items, int total_rows, std::string& err) {
-    if ((n_items != 1 && n_items != 2) || total_rows < 1 || total_rows > n_items * kDrafts) return false;
-    cudaGraphExec_t* target_exec = nullptr;
-    if (n_items == 1) {
-        int s_idx = 0;
-        if (batch_full_1_slots_[0] == items[0].slot) {
-            s_idx = 0;
-        } else if (batch_full_1_slots_[1] == items[0].slot) {
-            s_idx = 1;
-        } else if (batch_full_1_slots_[0] == nullptr) {
-            s_idx = 0;
-            batch_full_1_slots_[0] = items[0].slot;
-        } else if (batch_full_1_slots_[1] == nullptr) {
-            s_idx = 1;
-            batch_full_1_slots_[1] = items[0].slot;
-        } else {
-            s_idx = 0;
-            for (auto& e : batch_full_1_exec_[0])
-                if (e) { cudaGraphExecDestroy(e); e = nullptr; }
-            batch_full_1_slots_[0] = items[0].slot;
+bool Dflash2Drafter::capture_batch_full(const BatchSlotItem* items, int n_items, int total_rows, cudaGraphExec_t& exec_out, std::string& err) {
+    if (!is_multi_batch() || rt_bctx_ == nullptr || n_items < 1 || n_items > kBatchMaxSlots || total_rows < 1 || total_rows > n_items * kDrafts) return false;
+    BatchFullGraphKey key{};
+    key.n_items = n_items;
+    key.total_rows = total_rows;
+    for (int idx = 0; idx < n_items; ++idx) key.slots[idx] = items[idx].slot;
+    ++batch_graph_tick_;
+    for (BatchFullGraphEntry& e : batch_full_graphs_) {
+        if (e.key == key) {
+            e.last_use = batch_graph_tick_;
+            exec_out = e.exec;
+            return true;
         }
-        target_exec = &batch_full_1_exec_[s_idx][total_rows];
-    } else {
-        if (batch_slots_[0] != items[0].slot || batch_slots_[1] != items[1].slot) {
-            for (auto& e : batch_full_exec_)
-                if (e) { cudaGraphExecDestroy(e); e = nullptr; }
-            batch_slots_[0] = items[0].slot;
-            batch_slots_[1] = items[1].slot;
-        }
-        target_exec = &batch_full_exec_[total_rows];
     }
-    if (*target_exec) return true;
-    kernels::native_mmvq_il_tune(4);
-    kernels::native_mmvq_il_tune(0);
+    (void) cudaStreamSynchronize(cs_);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "dflash2: begin batch full capture"; return false; }
-    kernels::copy_i32_from_mapped(d_meta_ + 64, m_meta_ + 64, 96, cs_);
+    kernels::copy_i32_from_mapped(d_meta_ + kMetaBlkPos, m_meta_ + kMetaBlkPos, kMetaPrecompPos - kMetaBlkPos, cs_);
     const bool ok = record_batch_body_precomp(items, n_items, cs_, err, total_rows) &&
-                    record_batch_head(n_items, total_rows, cs_, err);
+                    record_batch_head(n_items, total_rows, cs_, err, /*q81_prepacked=*/!skip_part("head"));
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
     if (!ok) { if (graph) cudaGraphDestroy(graph); return false; }
-    if (ce != cudaSuccess || cudaGraphInstantiate(target_exec, graph, 0) != cudaSuccess) {
+    cudaGraphExec_t new_exec = nullptr;
+    if (ce != cudaSuccess || cudaGraphInstantiate(&new_exec, graph, 0) != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("dflash2: capture_batch_full: ") + cudaGetErrorString(ce);
         return false;
     }
     cudaGraphDestroy(graph);
-    cudaGraphUpload(*target_exec, cs_);
+    cudaGraphUpload(new_exec, cs_);
     cudaStreamSynchronize(cs_);
+    if (batch_full_graphs_.size() >= kBatchGraphCacheMax) {
+        auto victim = std::min_element(batch_full_graphs_.begin(), batch_full_graphs_.end(),
+                                       [](const BatchFullGraphEntry& a, const BatchFullGraphEntry& b) { return a.last_use < b.last_use; });
+        if (victim->exec) cudaGraphExecDestroy(victim->exec);
+        *victim = BatchFullGraphEntry{key, new_exec, batch_graph_tick_};
+    } else {
+        batch_full_graphs_.push_back(BatchFullGraphEntry{key, new_exec, batch_graph_tick_});
+    }
+    exec_out = new_exec;
     return true;
 }
 
 bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_items, std::string& err) {
-    if (!bound_ || blob_shared_) { err = "dflash2: draft_batch_slots requires bound parent drafter"; return false; }
+    if (!bound_ || blob_shared_ || !is_multi_batch()) { err = "dflash2: draft_batch_slots requires multi-slot batch parent drafter"; return false; }
     if (n_items == 0) return true;
     if (items == nullptr || n_items < 0 || n_items > kBatchMaxSlots) { err = "dflash2: invalid batch slot items"; return false; }
     if (!context_wait(err)) return false;
     const OnDevice on_device(device_);
+    if (!wait_precomp_on_cs(cs_)) { err = "dflash2: precomp sync"; return false; }
     const Clock::time_point t0 = Clock::now();
     static const bool batch_body_on = [] {
         const char* e = std::getenv("STRATA_DF2_BATCHBODY");
@@ -2108,7 +2478,7 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
     const bool use_batch_body = batch_body_on && (n_items >= 2 || (n_items == 1 && precomp_taps_ != nullptr && precomp_rows_ > 0)) && rt_bctx_ != nullptr;
 
     int precomp_offs[kBatchMaxSlots] = {};
-    bool can_use_precomp = use_batch_body && (n_items == 1 || n_items == 2) && precomp_taps_ != nullptr && precomp_rows_ > 0;
+    bool can_use_precomp = use_batch_body && precomp_taps_ != nullptr && precomp_rows_ > 0;
     int total_rows = 0;
     for (int idx = 0; idx < n_items; ++idx) {
         const BatchSlotItem& it = items[idx];
@@ -2136,7 +2506,6 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
         }
         total_rows += it.k_want;
     }
-    clear_precomputed_context();
 
     int row_off = 0;
     int c0_meta = 0;
@@ -2147,18 +2516,18 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
         if (use_batch_body) {
             const int c0_slot = can_use_precomp ? precomp_offs[idx] : c0_meta;
             if (!can_use_precomp) {
-                for (int i = 0; i < it.n_new; ++i) h_meta_[32 + c0_meta + i] = (int32_t) (it.pos0 + i);
+                for (int i = 0; i < it.n_new; ++i) h_meta_[kMetaCtx + c0_meta + i] = (int32_t) (it.pos0 + i);
             }
             c0_meta += it.n_new;
-            for (int i = 0; i < 8; ++i) h_meta_[64 + idx * 8 + i] = (int32_t) (s + i);
-            h_meta_[96 + idx * 8 + 0] = it.anchor;
-            for (int i = 1; i < 8; ++i) h_meta_[96 + idx * 8 + i] = sl.mask_token_;
-            h_meta_[128 + idx] = (int32_t) s;
-            h_meta_[132 + idx] = sl.epoch_;
-            h_meta_[144 + idx * 4 + 0] = idx;
-            h_meta_[144 + idx * 4 + 1] = c0_slot;
-            h_meta_[144 + idx * 4 + 2] = it.n_new;
-            h_meta_[144 + idx * 4 + 3] = (int32_t) s;
+            for (int i = 0; i < 8; ++i) h_meta_[kMetaBlkPos + idx * 8 + i] = (int32_t) (s + i);
+            h_meta_[kMetaBlkTok + idx * 8 + 0] = it.anchor;
+            for (int i = 1; i < 8; ++i) h_meta_[kMetaBlkTok + idx * 8 + i] = sl.mask_token_;
+            h_meta_[kMetaAnchor + idx] = (int32_t) s;
+            h_meta_[kMetaEpoch + idx] = sl.epoch_;
+            h_meta_[kMetaSlotInfo + idx * 4 + 0] = idx;
+            h_meta_[kMetaSlotInfo + idx * 4 + 1] = c0_slot;
+            h_meta_[kMetaSlotInfo + idx * 4 + 2] = it.n_new;
+            h_meta_[kMetaSlotInfo + idx * 4 + 3] = (int32_t) s;
         } else {
             for (int i = 0; i < 8; ++i) {
                 sl.h_meta_[i] = (int32_t) (it.pos0 + std::min(i, it.n_new - 1));
@@ -2181,12 +2550,13 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
 
     if (timing_) cudaEventRecord(ev_a_, cs_);
     bool head_recorded_in_graph = false;
+    pend_precomp_logs_.clear();
     if (use_batch_body) {
         if (can_use_precomp) {
-            if (!prof_ && (n_items == 1 || n_items == 2)) {
-                if (!capture_batch_full(items, n_items, total_rows, err)) return false;
-                cudaGraphExec_t g_exec = n_items == 2 ? batch_full_exec_[total_rows]
-                                                      : batch_full_1_exec_[batch_full_1_slots_[1] == items[0].slot ? 1 : 0][total_rows];
+            if (!prof_) {
+                cudaGraphExec_t g_exec = nullptr;
+                if (!capture_batch_full(items, n_items, total_rows, g_exec, err)) { clear_precomputed_context(); return false; }
+                clear_precomputed_context();
                 if (cudaGraphLaunch(g_exec, cs_) != cudaSuccess) {
                     err = std::string("dflash2 draft_batch_slots (batch_full): ") + cudaGetErrorString(cudaGetLastError());
                     return false;
@@ -2194,34 +2564,32 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
                 head_recorded_in_graph = true;
                 (void) cudaStreamQuery(cs_);
             } else {
-                kernels::copy_i32_from_mapped(d_meta_ + 64, m_meta_ + 64, 96, cs_);
+                clear_precomputed_context();
+                kernels::copy_i32_from_mapped(d_meta_ + kMetaBlkPos, m_meta_ + kMetaBlkPos, kMetaPrecompPos - kMetaBlkPos, cs_);
                 if (!record_batch_body_precomp(items, n_items, cs_, err)) return false;
             }
-        } else if (!prof_ && n_items == 2) {
-            if (!capture_batch_body(items, n_items, err)) return false;
-            if (cudaGraphLaunch(batch_body_exec_[items[0].n_new][items[1].n_new], cs_) != cudaSuccess) {
+        } else if (!prof_ && n_items >= 2) {
+            clear_precomputed_context();
+            cudaGraphExec_t g_exec = nullptr;
+            if (!capture_batch_body(items, n_items, g_exec, err)) return false;
+            if (cudaGraphLaunch(g_exec, cs_) != cudaSuccess) {
                 err = std::string("dflash2 draft_batch_slots (batch_body): ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
         } else {
-            kernels::copy_i32_from_mapped(d_meta_ + 32, m_meta_ + 32, 112, cs_);
+            clear_precomputed_context();
+            kernels::copy_i32_from_mapped(d_meta_ + kMetaCtx, m_meta_ + kMetaCtx, kMetaSlotInfo - kMetaCtx, cs_);
             if (!record_batch_body(items, n_items, cs_, err)) return false;
         }
-        bool precomp_ev_synced = false;
         for (int idx = 0; idx < n_items; ++idx) {
             const BatchSlotItem& it = items[idx];
             Dflash2Drafter& sl = *it.slot;
             if (can_use_precomp && sl.log_on_) {
                 const int c0 = precomp_offs[idx];
                 if (log_on_ && h_logq_ != nullptr && h_logd_ != nullptr) {
-                    if (!precomp_ev_synced && ev_join_ != nullptr) {
-                        cudaEventSynchronize(ev_join_);
-                        precomp_ev_synced = true;
-                    }
-                    std::memcpy(sl.h_logq_, h_logq_ + (size_t) c0 * N_, (size_t) it.n_new * N_);
-                    std::memcpy(sl.h_logd_, h_logd_ + (size_t) c0 * (N_ / 32), (size_t) it.n_new * (N_ / 32) * 4);
+                    // Defer ev_pre_ sync + ring log flush to draft_batch_slots_finish() so launch() stays 100% async.
                     sl.log_stage(it.pos0, it.n_new);
-                    sl.log_flush();
+                    pend_precomp_logs_.push_back(PendingPrecompLog{&sl, it.pos0, it.n_new, c0});
                 } else {
                     cudaMemcpyAsync(sl.h_logq_, xqc_ + (size_t) c0 * N_, (size_t) it.n_new * N_, cudaMemcpyDeviceToHost, cs_);
                     cudaMemcpyAsync(sl.h_logd_, xdc_ + (size_t) c0 * (N_ / 32), (size_t) it.n_new * (N_ / 32) * 4, cudaMemcpyDeviceToHost, cs_);
@@ -2236,6 +2604,7 @@ bool Dflash2Drafter::draft_batch_slots_launch(const BatchSlotItem* items, int n_
             sl.launched_ = true;
         }
     } else {
+        clear_precomputed_context();
         row_off = 0;
         for (int idx = 0; idx < n_items; ++idx) {
             const BatchSlotItem& it = items[idx];
@@ -2307,6 +2676,13 @@ bool Dflash2Drafter::draft_batch_slots_finish(const BatchSlotItem* items, int n_
             err = std::string("dflash2 draft_batch_slots: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
+    }
+    if (!pend_precomp_logs_.empty()) {
+        if (ev_pre_ != nullptr) (void) cudaEventSynchronize(ev_pre_);
+        for (const PendingPrecompLog& pl : pend_precomp_logs_) {
+            pl.slot->log_flush(pl.off, h_logq_, h_logd_);
+        }
+        pend_precomp_logs_.clear();
     }
     for (int idx = 0; idx < n_items; ++idx) {
         const BatchSlotItem& it = items[idx];

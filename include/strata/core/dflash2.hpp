@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -59,14 +60,19 @@ public:
     Dflash2Drafter(const Dflash2Drafter&) = delete;
     Dflash2Drafter& operator=(const Dflash2Drafter&) = delete;
 
-    /// Reads the pack (tools/dflash2_pack.py) to the GPU `device` and allocates the ring and the buffers (about 0.8 GB).
-    bool load(const std::string& pack_path, int device, std::string& err);
+    /// Reads the pack (tools/dflash2_pack.py) to the GPU `device` and allocates the ring and the buffers.
+    /// `max_batch_slots` <= 1 sizes row buffers for solo use (8 rows, 7 logit rows); > 1 keeps the 64-row multi-slot batch buffers.
+    bool load(const std::string& pack_path, int device, std::string& err, int max_batch_slots = 1);
     /// The target's embedding and head (and the draft vocabulary file, "" or missing: the whole head).
     /// `head_device` >= 0 and not this card's: the head sits on another card (a layer split's last stage); the draft vocabulary's rows are gathered there and
     /// copied over once, so the drafter can sit on the first stage's card.
     bool bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err, int head_device = -1);
-    /// STRATA_DF2_HEAD=native (CUDA / HIP): bind() ignores the vocabulary file and runs the draft head on the target's whole head (no pruned copy).
-    static bool head_native() { const char* e = std::getenv("STRATA_DF2_HEAD"); return e != nullptr && e[0] == 'n'; }
+    /// STRATA_DF2_HEAD=native (default; opt-out with pruned/0/off): bind() ignores the vocabulary file and runs the draft head on the target's whole head (no pruned copy).
+    static bool head_native() {
+        const char* e = std::getenv("STRATA_DF2_HEAD");
+        if (e == nullptr || e[0] == '\0') return true;
+        return e[0] != '0' && e[0] != 'p' && e[0] != 'P' && e[0] != 'o' && e[0] != 'O' && e[0] != 'f' && e[0] != 'F';
+    }
     /// DF-05: before bind, the MTP drafter's gathered draft-head rows and vocabulary (device pointers it keeps owning) when they are the same bytes this
     /// drafter would gather; bind then uses them instead of a second copy (about 213 MiB on Flash-Next) and checks the vocabulary against the file.
     struct SharedHead { const uint8_t* rows = nullptr; const int32_t* vocab_dev = nullptr; const std::vector<int32_t>* vocab_host = nullptr; int64_t n = 0; int type = -1; };
@@ -181,7 +187,7 @@ public:
     bool draft_batch_slots_finish(const BatchSlotItem* items, int n_items, std::string& err);
 
     /// Precomputes the context projections (rope table, tap quantize, fc.weight, hidden_norm, and all layers' K/V
-    /// projections) on cs_ for `n_rows` verify rows while the target model finishes layers 46..47.
+    /// projections) on cs_pre_ for `n_rows` verify rows while the target model finishes layers 44..47.
     void precompute_batch_context(const float* taps_dev, int n_rows, const int64_t* pos) noexcept;
     bool has_precomputed_context(const float* taps, int n_rows, int64_t pos0, int* out_off = nullptr) const noexcept;
     void clear_precomputed_context() noexcept { precomp_taps_ = nullptr; precomp_rows_ = 0; }
@@ -191,6 +197,9 @@ public:
     /// Pre-captures the 1-slot (`batch_full_1_exec_`) precomputed batch graphs on the parent drafter
     /// for `slots[0..n_slots-1]` so the first BGEN admission does not stall in `capture_batch_full`.
     bool prewarm_batch_slots(Dflash2Drafter* const* slots, int n_slots, std::string& err);
+    /// Pre-captures `precomp_exec_[1..min(max_rows, kPrecompGraphMax)]` at startup so runtime
+    /// `taps_ready_cb_` precompute never triggers lazy graph capture during timed bursts.
+    void prewarm_precompute(const float* taps, int max_rows);
 
     /// The most drafts a window will use (the engine's widest window - 1, 1..kDrafts; default kDrafts).  The head, the top-k and the selector's walk run for that
     /// many rows only: the first `n` drafts and probabilities are bitwise the ones a full block makes (every row is its own column, the walk goes left to right);
@@ -204,6 +213,38 @@ public:
     std::size_t ring_elem_bytes() const { return fp16_ring_ ? 2 : 4; }
 
     uint64_t vram_bytes() const { return vram_; }
+    std::size_t alloc_slots() const noexcept { return alloc_slots_; }
+    std::size_t alloc_rows() const noexcept { return alloc_rows_; }
+    std::size_t logits_rows() const noexcept { return logits_row_count((int) alloc_slots_, blob_shared_); }
+    bool is_multi_batch() const noexcept { return !blob_shared_ && alloc_slots_ > 1; }
+
+    struct BufferShape {
+        int N = 2560;
+        int L = 5;
+        int NH = 32;
+        int NKV = 8;
+        int HD = 128;
+        int I = 7680;
+        int rank = 256;
+        int n_taps = 5;
+        int batch_slots = 1;    ///< <= 1: solo/clones (kRows = 8, kDrafts = 7); > 1: multi-slot batch (64 rows, 16 logit rows)
+        bool blob_shared = false;
+    };
+    struct VramBreakdown {
+        uint64_t row_buffers = 0;   ///< activations, RoPE, quant/head buffers sized by B / HMax (excludes batch_only)
+        uint64_t batch_only = 0;    ///< rt_bctx_, fn_batch_, hsel_batch_ (0 when batch_slots <= 1 or blob_shared)
+        uint64_t ring_buffers = 0;  ///< kring_, vring_, tag_, landing_
+        uint64_t total_alloc = 0;   ///< exact bytes allocated in Dflash2Drafter::alloc()
+    };
+    static std::size_t effective_batch_slots(int requested_batch_slots, bool blob_shared) noexcept;
+    static std::size_t row_count(int requested_batch_slots, bool blob_shared) noexcept;
+    static std::size_t logits_row_count(int requested_batch_slots, bool blob_shared) noexcept;
+    static VramBreakdown alloc_breakdown(const BufferShape& shape, std::size_t ring_elem_size = 4);
+    static int64_t resolve_dvocab(int64_t n_vocab, const std::string& vocab_file, bool same_head_device = true);
+    static uint64_t logits_bytes(int requested_batch_slots, bool blob_shared, int64_t n_dvocab);
+    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file,
+                        bool head_shared, bool same_head_device = true) const;
+    uint64_t clone_bind_bytes(int64_t n_vocab, const std::string& vocab_file, bool same_head_device = true) const;
     int64_t n_draft_vocab() const { return n_dvocab_; }
     int n_embd() const { return N_; }
     int mask_token() const { return mask_token_; }   ///< the token whose embedding fills the block's 7 mask rows (the split engine stages the block's embeddings itself)
@@ -230,11 +271,11 @@ private:
     bool record_block(cudaStream_t cs, std::string& err, bool rope = true);
     bool record_batch_body(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err);
     bool record_batch_body_precomp(const BatchSlotItem* items, int n_items, cudaStream_t cs, std::string& err, int total_rows = 0);
-    bool record_batch_head(int n_items, int total_rows, cudaStream_t cs, std::string& err);
+    bool record_batch_head(int n_items, int total_rows, cudaStream_t cs, std::string& err, bool q81_prepacked = false);
     bool capture(int n, const float* taps, std::string& err);
     bool capture_body(int n, const float* taps, std::string& err);
-    bool capture_batch_body(const BatchSlotItem* items, int n_items, std::string& err);
-    bool capture_batch_full(const BatchSlotItem* items, int n_items, int total_rows, std::string& err);
+    bool capture_batch_body(const BatchSlotItem* items, int n_items, cudaGraphExec_t& exec_out, std::string& err);
+    bool capture_batch_full(const BatchSlotItem* items, int n_items, int total_rows, cudaGraphExec_t& exec_out, std::string& err);
     bool alloc(std::string& err);
     struct Prof;
     Prof* prof_ = nullptr;
@@ -248,10 +289,17 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* blob_ = nullptr;
     bool blob_shared_ = false;      ///< blob_ (and the bound head) belong to the parent drafter (clone_for_slot)
+    std::size_t alloc_slots_ = 1;   ///< effective batch slots sized in alloc() (1 solo/clones, kBatchMaxSlots multi-slot batch)
+    std::size_t alloc_rows_ = kRows; ///< row capacity in alloc() (alloc_slots_ * kRows: 8 solo/clones, 64 batch)
     float* landing_ = nullptr;
     float* dpend_ = nullptr;        ///< pinned host: deferred taps, row = position % kRing2048
     int64_t dpend_lo_ = 0, dpend_hi_ = 0;
     bool make_streams(std::string& err);
+    void destroy_streams();
+    bool wait_precomp_on_cs(cudaStream_t cs);
+    void reset_precomp_graph(int n_rows, cudaStream_t cs, bool mark_failed) noexcept;
+    void record_precompute_batch_context(const float* taps, int n_rows, bool want_log, cudaStream_t cs);
+    bool capture_precompute_batch_context(const float* taps, int n_rows, bool want_log, cudaStream_t cs);
     uint64_t vram_ = 0;
     bool q4_ = false;   // the pack's matrices are Q4_0 (tools/dflash2_pack.py --q4_0)
     int N_ = 2560, L_ = 5, NH_ = 32, NKV_ = 8, HD_ = 128, I_ = 7680, window_ = 2048, group_ = 16, rank_ = 256, mask_token_ = 0;
@@ -278,7 +326,7 @@ private:
     float* hp_out_ = nullptr;
     float *kring_[8] = {}, *vring_[8] = {};
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;   ///< rope tables of the context rows and of the block rows: one allocation, rt_blk_ = rt_ctx_ + 8 * 128
-    float *rt_bctx_ = nullptr, *rt_bblk_ = nullptr; ///< multi-slot batch rope tables: rt_bblk_ = rt_bctx_ + 32 * 128
+    float *rt_bctx_ = nullptr, *rt_bblk_ = nullptr; ///< multi-slot batch rope tables: rt_bblk_ = rt_bctx_ + (kBatchMaxSlots * kRows) * 128
     double* rope_inv_ = nullptr;   ///< theta^(-2 i / 128), once
     cudaEvent_t ev_hs_[2] = {};     ///< the selector's projection runs beside the head
     uint8_t* xq_ = nullptr;         ///< the head's q8_1 activations
@@ -288,7 +336,8 @@ private:
     uint8_t* xqc_ = nullptr;        ///< the same for the context update, which runs beside the block
     float* xdc_ = nullptr;
     cudaStream_t cs2_ = nullptr;    ///< the context update's branch of the round graph
-    cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr, ev_ctx_[8] = {};
+    cudaStream_t cs_pre_ = nullptr; ///< low-priority non-blocking stream for overlap during verifier layers 44..47
+    cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr, ev_pre_ = nullptr, ev_ctx_[8] = {};
     bool fork_ = false;             ///< recording the forked graph: layer l's attention waits for ev_ctx_[l]
     float *fcy_ = nullptr, *hctx_ = nullptr, *kc_ = nullptr, *vc_ = nullptr;
     float *h_ = nullptr, *xn_ = nullptr, *xc_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *qn_ = nullptr, *k_ = nullptr, *v_ = nullptr, *kblk_ = nullptr;
@@ -300,17 +349,43 @@ private:
     int32_t *h_bout_ = nullptr, *out_btok_ = nullptr;
     float *out_bprob_ = nullptr;
     uint32_t* topscratch_ = nullptr;
+    float* seltab_ = nullptr;   // the selector's step scores, [kRows][16][16] (df2_select's table)
     cudaGraphExec_t exec_[kRows + 1] = {};
     cudaGraphExec_t body_exec_[kRows + 1] = {};
-    cudaGraphExec_t batch_body_exec_[kRows + 1][kRows + 1] = {};
-    cudaGraphExec_t batch_full_exec_[2 * kDrafts + 1] = {};
-    cudaGraphExec_t batch_full_1_exec_[2][kDrafts + 1] = {};
-    Dflash2Drafter* batch_slots_[2] = {};
-    Dflash2Drafter* batch_full_1_slots_[2] = {};
-    const float* batch_taps_[2] = {};
+    struct BatchBodyGraphKey {
+        int n_items = 0;
+        std::array<Dflash2Drafter*, kBatchMaxSlots> slots = {};
+        std::array<const float*, kBatchMaxSlots> taps = {};
+        std::array<int, kBatchMaxSlots> n_new = {};
+        bool operator==(const BatchBodyGraphKey& o) const {
+            return n_items == o.n_items && slots == o.slots && taps == o.taps && n_new == o.n_new;
+        }
+    };
+    struct BatchFullGraphKey {
+        int n_items = 0;
+        int total_rows = 0;
+        std::array<Dflash2Drafter*, kBatchMaxSlots> slots = {};
+        bool operator==(const BatchFullGraphKey& o) const {
+            return n_items == o.n_items && total_rows == o.total_rows && slots == o.slots;
+        }
+    };
+    struct BatchBodyGraphEntry { BatchBodyGraphKey key; cudaGraphExec_t exec = nullptr; uint64_t last_use = 0; };
+    struct BatchFullGraphEntry { BatchFullGraphKey key; cudaGraphExec_t exec = nullptr; uint64_t last_use = 0; };
+    static constexpr size_t kBatchGraphCacheMax = 64;
+    std::vector<BatchBodyGraphEntry> batch_body_graphs_;
+    std::vector<BatchFullGraphEntry> batch_full_graphs_;
+    uint64_t batch_graph_tick_ = 0;
+    static constexpr int kPrecompGraphMax = 16;
+    cudaGraphExec_t precomp_exec_[kPrecompGraphMax + 1] = {};
+    const float* precomp_exec_taps_[kPrecompGraphMax + 1] = {};
+    bool precomp_exec_log_[kPrecompGraphMax + 1] = {};
+    bool precomp_graph_failed_[kPrecompGraphMax + 1] = {};
+    bool precomp_pending_ = false;
     const float* precomp_taps_ = nullptr;
     int precomp_rows_ = 0;
-    int32_t precomp_pos_[4 * kRows] = {};
+    int32_t precomp_pos_[kBatchMaxSlots * kRows] = {};
+    struct PendingPrecompLog { Dflash2Drafter* slot = nullptr; int64_t pos0 = 0; int n = 0; int off = 0; };
+    std::vector<PendingPrecompLog> pend_precomp_logs_;
     const float* graph_taps_ = nullptr;
     int ndraft_ = kDrafts;          ///< drafts a window can use (set_max_drafts)
     int64_t have_ctx_ = 0;
@@ -339,7 +414,7 @@ private:
     int32_t* rb_pos_ = nullptr;
     uint64_t rb_bytes_ = 0;
     void log_stage(int64_t pos0, int n);       ///< an update of rows [pos0, pos0 + n) is queued: remember where its h_log* rows go, mark the slots
-    void log_flush();                          ///< after the stream sync: move the staged rows into the lineage's log
+    void log_flush(int row_off = 0, const int8_t* q_src = nullptr, const float* d_src = nullptr);   ///< after the stream sync: move the staged rows into the lineage's log
     bool log_row(int64_t pos, const int8_t** q, const float** d) const;
     bool rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* missing, std::string& err);
     void stash_push(Lineage&& l);

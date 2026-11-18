@@ -193,6 +193,7 @@ inline bool g_qdedup(bool q8_ffn_ready = false) {
 // fork F4 (Eddoursul): 2-4 token dense projections read an interleaved copy of the q8_1 activations (bitwise the same
 // outputs); STRATA_MMVQ_IL=0 keeps native_mmvq's multi-column kernels
 inline bool g_mmvq_il() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL"); return v == nullptr || v[0] != '0'; }(); return on; }
+inline bool g_mmvq_il_16() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL_16"); return v == nullptr || v[0] != '0'; }(); return on; }
 // STRATA_SELECT_LONG=1 (opt-in): a window graph past select_long_at() cells takes the long-context QSA select
 // (qsa_block_topk_long's multi-CTA top-k through topk_scratch_, qsa_block_scores_long's shuffle-free decode scorer;
 // both compute capability 6.x by default, the same ids and score bits).  Each costs ~6 more kernels a call, which only
@@ -626,6 +627,17 @@ void release_live_verifiers(std::FILE* f) {
                                   : "did not finish within 5 s");
         }
     if (f != nullptr) std::fflush(f);
+}
+// the same, silent, with one bound for all of them (kfd_quiet.hpp, EXIT: an integrated gfx11's stop on a signal)
+bool release_live_verifiers_within(int ms) {
+    const Clock::time_point t0 = Clock::now();
+    bool all = true;
+    for (auto& slot : g_live)
+        if (Verifier* v = slot.load()) {
+            const int64_t left = (int64_t) ms - (int64_t) ms_since(t0);
+            if (!v->release_gpu_waits(left > 0 ? (int) left : 0)) all = false;
+        }
+    return all;
 }
 // #649: the host side of STRATA_VERIFY_TRACE - a ring of the last kTraceN handshake events of every verifier
 struct TraceEv {
@@ -1323,6 +1335,155 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     return true;
 }
 
+int64_t Verifier::plan_i32_count(int max_t, int64_t k_used, int64_t* dst2_off_out) noexcept {
+    const int64_t cap = (int64_t) ((uint64_t) max_t * (uint64_t) k_used);
+    const int64_t i32 = 4 + (cap + 1) + cap + cap;
+    const int64_t ptr_off = (i32 + 1) & ~1ll;
+    const int64_t dst2_off = (ptr_off + 4 * cap + (cap + 1) + 1 + 1) & ~1ll;
+    if (dst2_off_out != nullptr) *dst2_off_out = dst2_off;
+    return dst2_off + 2 * kStagingBlobs;
+}
+
+uint64_t Verifier::carve_arena(Verifier* self, uint8_t* base, const ModelGeometry& g, int64_t max_blocks,
+                               int64_t cap, int64_t attn_scratch_floats, int64_t plan_i32, int64_t n_vocab,
+                               int64_t k_used, uint64_t staging_blob_bytes, bool had_gu_any, int max_t) {
+    const strata::kernels::QsaShapes s = shapes_of(g);
+    const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) k_used;
+    const uint64_t C = (uint64_t) g.ssm_conv_channels, ZV = (uint64_t) g.ssm_value_dim, HV = (uint64_t) g.ssm_v_heads;
+    const uint64_t NH = (uint64_t) g.n_head, HD = (uint64_t) g.head_dim, NKV = (uint64_t) g.n_head_kv;
+    const uint64_t IQ = (uint64_t) g.idx_q_heads, ID = (uint64_t) g.idx_key_dim;
+    const uint64_t nG = (uint64_t) g.n_gdn_layers(), nQ = (uint64_t) g.n_qsa_layers();
+    const uint64_t HS = (uint64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    const uint64_t TS = (uint64_t) (s.idx_block - 1) * ID;
+    const int max_in = (int) std::max<uint64_t>(std::max<uint64_t>(N, ZV), NH * HD);
+
+    Bump b{base, 0};
+#define STRATA_CARVE(field, ElemT, count_expr) \
+    do { ElemT* p_ = b.take<ElemT>(count_expr); if (self != nullptr) self->field = p_; } while (0)
+
+    STRATA_CARVE(tok_, int32_t, T);
+    STRATA_CARVE(step_, int32_t, T * strata::kernels::kStepCount);
+    STRATA_CARVE(pos_, int32_t, T * (NH + NKV + IQ));
+    STRATA_CARVE(commit_, int32_t, 2 + T);
+    STRATA_CARVE(ple_, float, T * N);
+    STRATA_CARVE(emb_, float, T * N);
+    STRATA_CARVE(R_, float, T * HC * N);
+    STRATA_CARVE(mixed_, float, T * N);
+    STRATA_CARVE(bo_, float, T * N);
+    STRATA_CARVE(inj_, float, T * HC);
+    STRATA_CARVE(inj2_, float, T * HC);
+    STRATA_CARVE(lo_, float, T * (uint64_t) g.hc_lr);
+    STRATA_CARVE(rs_, float, T * HC);
+    STRATA_CARVE(xn_, float, T * HC * N);
+    // the q8_1 activations of one token group (or one column chunk of the head): at most kVerifyMaxT columns
+    const int qcols = (int) std::min<uint64_t>(T, (uint64_t) strata::kernels::kVerifyMaxT);
+    STRATA_CARVE(xq_, uint8_t, strata::kernels::native_q8_1_bytes(max_in, qcols));
+    STRATA_CARVE(sh_xq_, uint8_t, strata::kernels::native_q8_1_bytes(max_in, qcols));
+    STRATA_CARVE(xil_, uint8_t, strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));   // 147-verify: 5-8 columns too
+    STRATA_CARVE(sh_xil_, uint8_t, strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));
+    STRATA_CARVE(qkv_L_, float, nG * T * C);
+    STRATA_CARVE(h_L_, float, nG * T * C);
+    STRATA_CARVE(gate_L_, float, nG * T * HV);
+    STRATA_CARVE(beta_L_, float, nG * T * HV);
+    STRATA_CARVE(z_, float, T * ZV);
+    STRATA_CARVE(y_, float, T * ZV);
+    STRATA_CARVE(y_dummy_, float, T * ZV);
+    STRATA_CARVE(qfull_, float, T * NH * 2 * HD);
+    STRATA_CARVE(qcur_, float, T * NH * HD);
+    STRATA_CARVE(kcur_, float, T * NKV * HD);
+    STRATA_CARVE(vcur_, float, T * NKV * HD);
+    STRATA_CARVE(idx_raw_L_, float, nQ * T * ID);
+    STRATA_CARVE(qidx_, float, T * IQ * ID);
+    STRATA_CARVE(scores_, float, T * (uint64_t) max_blocks);
+    STRATA_CARVE(sel_, int32_t, T * (uint64_t) cap);
+    if (select_long_on() && strata::kernels::qsa_topk_multi_scratch_ints(T) > 0)   // STRATA_SELECT_LONG only
+        STRATA_CARVE(topk_scratch_, int32_t, (uint64_t) strata::kernels::qsa_topk_multi_scratch_ints(T));
+    STRATA_CARVE(attn_, float, T * NH * HD);
+    STRATA_CARVE(attn32_, float, T * NH * HD);
+    STRATA_CARVE(attn_scratch_, float, T * (uint64_t) attn_scratch_floats);
+    STRATA_CARVE(tail_snap_, float, nQ * TS);
+    STRATA_CARVE(logits_, float, T * (uint64_t) g.n_expert);
+    STRATA_CARVE(w_, float, T * K);
+    STRATA_CARVE(ids_, int32_t, T * K);
+    STRATA_CARVE(shared_, float, T * N);
+    STRATA_CARVE(parts_, float, T * K * N);
+    STRATA_CARVE(hit_out_, float, T * K * N);
+    STRATA_CARVE(hit_slot_, int32_t, T * K);
+    STRATA_CARVE(hit_dst_, int32_t, T * K);
+    STRATA_CARVE(hit_count_, int32_t, 4);
+    STRATA_CARVE(plan_, int32_t, 2 * ((uint64_t) plan_i32 + 16));
+    STRATA_CARVE(staging_, uint8_t, (uint64_t) kStagingBlobs * staging_blob_bytes);
+    STRATA_CARVE(hit_xq_, uint8_t, T * (N / 32) * 34);
+    STRATA_CARVE(hit_xs_, float, T * (N / 32));
+    STRATA_CARVE(nat_xq_, uint8_t, T * (N / 32) * 36);
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+    // MERGE-SEAM: pre-init sizing reserves requested lanes; init counts and carves the same admitted packs via self.
+    const bool hip8 = self != nullptr
+        ? std::any_of(self->hip_tables_.begin(), self->hip_tables_.end(), [](const auto& t) { return t.gu != nullptr; })
+        : strata::prefill::iu8::usable();
+    const bool hip4 = self != nullptr
+        ? std::any_of(self->hip4_tables_.begin(), self->hip4_tables_.end(), [](const auto& t) { return t.gu != nullptr; })
+        : strata::prefill::iu4::usable();
+    const auto hip_modes = self != nullptr ? self->hip_projection_modes_ : strata::prefill::iu8::projection_modes();
+    const bool hip_proj = self != nullptr ? !self->hip_projection_weights_.empty() : (hip_modes.x4 || hip_modes.dot4);
+    if (hip_proj) {
+        const uint64_t cols = std::max({N, ZV, NH*HD});
+        STRATA_CARVE(hip_proj_x_, strata::prefill::iu8::Block, T * (cols / 128));
+    }
+    if (hip8) {
+        STRATA_CARVE(hip_x_, strata::prefill::iu8::Block, T * (N / 128));
+        STRATA_CARVE(hip_d_, strata::prefill::iu8::Block, T * K * ((uint64_t) g.n_ff / 128));
+    }
+    if (hip4) {
+        STRATA_CARVE(hip4_x_, strata::prefill::iu4::Block, T * (N / 128));
+        STRATA_CARVE(hip4_d_, strata::prefill::iu4::Block, T * K * ((uint64_t) g.n_ff / 128));
+    }
+    if (hip8 || hip4) {
+        STRATA_CARVE(hip_gu_, float, T * K * 2 * (uint64_t) g.n_ff);
+        STRATA_CARVE(hip_h_, float, T * K * (uint64_t) g.n_ff);
+    }
+#endif
+    if (had_gu_any) STRATA_CARVE(nat_xr_, float, T * N);
+    else if (self != nullptr) self->nat_xr_ = nullptr;
+    STRATA_CARVE(hit_scratch_, uint8_t,
+                 std::max<uint64_t>(
+                     strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
+                     strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
+    STRATA_CARVE(head_mixed_, float, T * N);
+    STRATA_CARVE(head_inj_, float, HC);
+    STRATA_CARVE(sh_bf16_, uint16_t, T * N);
+    STRATA_CARVE(sh_gate_, float, T * (uint64_t) g.n_ff);
+    STRATA_CARVE(sh_up_, float, T * (uint64_t) g.n_ff);
+    STRATA_CARVE(sh_g_, float, T + 4);
+    STRATA_CARVE(head_logits_, float, T * (uint64_t) n_vocab);
+    STRATA_CARVE(arg_scratch_, uint8_t, strata::kernels::argmax_rows_scratch_bytes((int) T));
+    STRATA_CARVE(one_, int32_t, 4);
+    STRATA_CARVE(hist_snap_, float, T * HS);
+    STRATA_CARVE(ple_key_, float, T * (uint64_t) strata::kernels::NG_HC_DIM);
+    STRATA_CARVE(ple_val_, float, T * N);
+
+#undef STRATA_CARVE
+    return b.used;
+}
+
+uint64_t Verifier::arena_bytes(const ModelGeometry& g, const SessionState& ss, int64_t n_vocab, int max_t,
+                               int64_t staging_blob_bytes, int had_gu_any) {
+    if (max_t <= 0 || n_vocab <= 0 || g.n_embd <= 0) return 0;
+    const strata::kernels::QsaShapes s = shapes_of(g);
+    const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    const int64_t max_cells = ss.qsa_states == nullptr ? ss.max_cells : ss.qsa_states[ss.qsa_primary()].max_cells;
+    const int64_t max_blocks = s.idx_block > 0 ? max_cells / s.idx_block + 2 : 2;
+    const int64_t attn_scratch_floats = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap, s);
+    const int64_t plan_i32 = plan_i32_count(max_t, ss.k);
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    const uint64_t blob_b = staging_blob_bytes >= 0 ? (uint64_t) staging_blob_bytes : lay.max_blob;
+    bool had_gu = had_gu_any > 0;
+    if (had_gu_any < 0) {
+        for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l) had_gu = had_gu || lay.fmt[l].had_gu;
+    }
+    return carve_arena(nullptr, nullptr, g, max_blocks, cap, attn_scratch_floats, plan_i32, n_vocab, ss.k, blob_b, had_gu, max_t);
+}
+
 bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
                     const NativeHead* head, int max_t, std::string& err) {
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
@@ -1335,6 +1496,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (slot.load() == this || slot.compare_exchange_strong(none, this)) break;
     }
     release_gpu_fn().store(&release_live_verifiers);
+    release_gpu_within_fn().store(&release_live_verifiers_within);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
@@ -1543,9 +1705,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (nt == 0 && tap_path == nullptr) {
             // a stage that holds none of the tapped layers: nothing to keep, nothing captured
         } else
-        if (nt == 0 || cudaMalloc((void**) &tap_dev_, (size_t) T * nt * N * 4) != cudaSuccess ||
+        if (nt == 0 || cudaMalloc((void**) &tap_dev_, (size_t) tap_bytes(tap_layers_, max_t, g.n_embd, 0, g.n_layers, g.n_layers)) != cudaSuccess ||
             (tap_path != nullptr && (cudaMalloc((void**) &tap_scratch_, (size_t) HC * N * 4) != cudaSuccess ||
-                                     !mapped((size_t) T * nt * N * 4, (void**) &h_tap_, (void**) &m_tap_)))) {
+                                     !mapped((size_t) tap_bytes(tap_layers_, max_t, g.n_embd, 0, g.n_layers, g.n_layers), (void**) &h_tap_, (void**) &m_tap_)))) {
             err = "verify: the DFlash2 tap buffers could not be allocated";
             return false;
         }
@@ -1574,10 +1736,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     // | pad | dst2(kStagingBlobs u64)
     {
         const int64_t cap = (int64_t) (T * K);
-        const int64_t i32 = 4 + (cap + 1) + cap + cap;
-        const int64_t ptr_off = (i32 + 1) & ~1ll;
-        dst2_off_ = (ptr_off + 4 * cap + (cap + 1) + 1 + 1) & ~1ll;
-        plan_i32_ = dst2_off_ + 2 * kStagingBlobs;
+        const int64_t ptr_off = ((4 + (cap + 1) + cap + cap) + 1) & ~1ll;
+        plan_i32_ = plan_i32_count(max_t, ss.k, &dst2_off_);
         if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
             err = "verify: mapped plan allocation failed " + strata::core::pin_exhausted_hint();
             return false;
@@ -1598,84 +1758,21 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
 
     // APR: the rotated copy of the expert input (nat_xr_, T x N floats) only where a layer's gate/up is
     // Hadamard-folded; its one reader is that layer's f.had_gu branch in the expert-input step below
+    const auto& lay = strata::kernels::cpu::expert_layout();
     bool had_gu_any = false;
-    {
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l) had_gu_any = had_gu_any || lay.fmt[l].had_gu;
-    }
-    // ---- the device arena: the same sequence counted, then carved
-    auto carve = [&](Bump& b) {
-        tok_ = b.take<int32_t>(T); step_ = b.take<int32_t>(T * strata::kernels::kStepCount);
-        pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
-        ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
-        mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
-        inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
-        lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
-        // the q8_1 activations of one token group (or one column chunk of the head): at most kVerifyMaxT columns
-        const int qcols = (int) std::min<uint64_t>(T, (uint64_t) strata::kernels::kVerifyMaxT);
-        xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
-        sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, qcols));
-        xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));   // 147-verify: 5-8 columns too
-        sh_xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, std::max(4, qcols)));
-        qkv_L_ = b.take<float>(nG * T * C); h_L_ = b.take<float>(nG * T * C);
-        gate_L_ = b.take<float>(nG * T * HV); beta_L_ = b.take<float>(nG * T * HV);
-        z_ = b.take<float>(T * ZV); y_ = b.take<float>(T * ZV); y_dummy_ = b.take<float>(T * ZV);
-        qfull_ = b.take<float>(T * NH * 2 * HD); qcur_ = b.take<float>(T * NH * HD);
-        kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
-        idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
-        scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
-        if (select_long_on() && strata::kernels::qsa_topk_multi_scratch_ints(T) > 0)   // STRATA_SELECT_LONG only
-            topk_scratch_ = b.take<int32_t>((uint64_t) strata::kernels::qsa_topk_multi_scratch_ints(T));
-        attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
-        attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
-        tail_snap_ = b.take<float>(nQ * TS);
-        logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
-        shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
-        hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
-        plan_ = b.take<int32_t>(2 * ((uint64_t) plan_i32_ + 16));
-        staging_ = b.take<uint8_t>((uint64_t) kStagingBlobs * strata::kernels::cpu::expert_layout().max_blob);
-        hit_xq_ = b.take<uint8_t>(T * (N / 32) * 34); hit_xs_ = b.take<float>(T * (N / 32));
-        nat_xq_ = b.take<uint8_t>(T * (N / 32) * 36);
+    for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l) had_gu_any = had_gu_any || lay.fmt[l].had_gu;
+    const uint64_t arena_bytes_needed = carve_arena(
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
-        const bool hip8 = std::any_of(hip_tables_.begin(), hip_tables_.end(), [](const auto& t) { return t.gu != nullptr; });
-        const bool hip4 = std::any_of(hip4_tables_.begin(), hip4_tables_.end(), [](const auto& t) { return t.gu != nullptr; });
-        if (!hip_projection_weights_.empty()) {
-            const uint64_t cols = std::max({N, ZV, NH*HD});
-            hip_proj_x_ = b.take<strata::prefill::iu8::Block>(T * (cols / 128));
-        }
-        if (hip8) {
-            hip_x_ = b.take<strata::prefill::iu8::Block>(T * (N / 128));
-            hip_d_ = b.take<strata::prefill::iu8::Block>(T * K * ((uint64_t) g.n_ff / 128));
-        }
-        if (hip4) {
-            hip4_x_ = b.take<strata::prefill::iu4::Block>(T * (N / 128));
-            hip4_d_ = b.take<strata::prefill::iu4::Block>(T * K * ((uint64_t) g.n_ff / 128));
-        }
-        if (hip8 || hip4) {
-            hip_gu_ = b.take<float>(T * K * 2 * (uint64_t) g.n_ff);
-            hip_h_ = b.take<float>(T * K * (uint64_t) g.n_ff);
-        }
+        this,
+#else
+        nullptr,
 #endif
-        nat_xr_ = had_gu_any ? b.take<float>(T * N) : nullptr;
-        hit_scratch_ = b.take<uint8_t>(std::max<uint64_t>(
-            strata::kernels::moe_hit_grouped_scratch_bytes((int64_t) (T * K), g.n_embd, g.n_ff),
-            strata::kernels::native_expert_scratch_bytes((int64_t) (T * K), g.n_ff)));
-        head_mixed_ = b.take<float>(T * N); head_inj_ = b.take<float>(HC);
-        sh_bf16_ = b.take<uint16_t>(T * N); sh_gate_ = b.take<float>(T * (uint64_t) g.n_ff);
-        sh_up_ = b.take<float>(T * (uint64_t) g.n_ff); sh_g_ = b.take<float>(T + 4);
-        head_logits_ = b.take<float>(T * (uint64_t) n_vocab_);
-        arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
-        one_ = b.take<int32_t>(4);
-        hist_snap_ = b.take<float>(T * HS);
-        ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
-    };
-    Bump count;
-    carve(count);
-    if (cudaMalloc(&arena_, count.used) != cudaSuccess) {
-        err = "verify: the device arena (" + std::to_string(count.used >> 20) + " MiB) does not fit";
+        nullptr, g, max_blocks_, cap_, attn_scratch_floats_, plan_i32_, n_vocab_, ss.k, lay.max_blob, had_gu_any, max_t);
+    if (cudaMalloc(&arena_, arena_bytes_needed) != cudaSuccess) {
+        err = "verify: the device arena (" + std::to_string(arena_bytes_needed >> 20) + " MiB) does not fit";
         return false;
     }
-    cudaMemset(arena_, 0, count.used);
+    cudaMemset(arena_, 0, arena_bytes_needed);
     if (hflag_out_d_ != nullptr && hcount_d_ == nullptr) {   // the overlapped split's hand-off counter
         if (cudaMalloc((void**) &hcount_d_, 64) != cudaSuccess) { err = "verify: hand-off counter allocation failed"; return false; }
         cudaMemset(hcount_d_, 0, 64);
@@ -1716,9 +1813,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (cudaMalloc((void**) &prof_, np * 8) != cudaSuccess) { prof_on_ = false; prof_ = nullptr; cudaGetLastError(); }
         else { cudaMemset(prof_, 0, np * 8); prof_h_.assign(np, 0); }
     }
-    Bump real;
-    real.base = (uint8_t*) arena_;
-    carve(real);
+    (void) carve_arena(this, (uint8_t*) arena_, g, max_blocks_, cap_, attn_scratch_floats_, plan_i32_, n_vocab_, ss.k,
+                       lay.max_blob, had_gu_any, max_t);
     {
         const int32_t one = 1;
         if (cudaMemcpy(one_, &one, sizeof one, cudaMemcpyHostToDevice) != cudaSuccess) {
@@ -1880,7 +1976,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         if (!ok2) { cudaGetLastError(); all_resident_ = false; device_plan_ = false; }
     }
     std::fprintf(stderr, "strata verify: window up to %d tokens, %.1f MiB of device buffers%s\n", max_t,
-                 (double) count.used / 1048576.0,
+                 (double) arena_bytes_needed / 1048576.0,
                  all_resident_ ? " (100% VRAM resident: zero-doorbell graph)" : "");
     return true;
 }
@@ -2147,8 +2243,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             pending = false;
         }
-        const bool want_attn_il = n >= 2 && n <= kFusedGrMaxT && qil_on() && g_mmvq_il();
-        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+        const bool want_attn_il = n >= 2 && n <= kVerifyMaxT && qil_on() && g_mmvq_il() &&
+                                  (n <= kFusedGrMaxT || g_mmvq_il_16());
+        auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out, bool write_ffn_il = false,
+                                 bool* il_out = nullptr) {
+            if (il_out != nullptr) *il_out = false;
             strata::dispatch::notef("hc read: weights Q8_0 copies=%ld (0 = bf16 rows), half=%ld, qfuse=%ld", (long) (wd[half]->hc_q8 != nullptr), (long) half, (long) (qcnt_ != nullptr));
             FusedGrArgs fa[kFusedGrWideT];
             for (int t = tb; t < te; ++t) {
@@ -2168,14 +2267,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         a.q8_mixed = xq_ + (size_t) (t - tb) * (N / 32) * 36;
                         if (t == tb && want_attn_il) a.q8_il = xil_;
                     }
-                    else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
+                    else if (strata::kernels::cpu::expert_layout().native) {
+                        a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
+                        if (t == tb && write_ffn_il) a.q8_il = xil_;
+                    }
                 }
             }
             if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
-                                (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+                                (int) (l * kProfPer + (half == 0 ? 27 : 30)), il_out);
         };
-        const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
+        bool il_attn_wrote = false;
+        const bool q8_attn = gr_read_group(0, pending, inj2_, inj_, false, &il_attn_wrote);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
             for (int d = 0; d < dummy; ++d) gpu_noop(cs);
@@ -2186,7 +2289,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         }
         stamp(l, 1, grp);
         float* xm = mixed_ + tb * N;
-        bool il_ready = q8_attn && want_attn_il;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
+        bool il_ready = q8_attn && want_attn_il && il_attn_wrote;   // xil_ holds xq_'s interleaved copy (reset whenever xq_ is rewritten)
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
         namespace i8 = strata::prefill::iu8;
         const bool hip_projection_lane = hip_proj_x_ && !batch_rec_ && !br && !side_mixer && !side_proj && !prof_on_;
@@ -2239,7 +2342,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             hip_raw_x=x;
             hip_prepared_x=nullptr;
 #endif
-            if (qil_on() && n >= 2 && n <= 8 && g_mmvq_il()) {   // (c): the plain blocks and their interleaved copy, one launch
+            if (qil_on() && n >= 2 && n <= kVerifyMaxT && g_mmvq_il()) {   // (c): the plain blocks and their interleaved copy, one launch
                 strata::kernels::native_quantize_q8_1_il(x, xq_, xil_, n_in, n, cs);
                 il_ready = true;
                 return;
@@ -2264,6 +2367,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             } else {
                 native_mmvq(w->native_type, w->native_data, xq_, out, n_in, n_out, n, cs);
             }
+        };
+        auto mm_segs = [&](int ggml_type, const strata::kernels::NativeMmvqSeg* segs, int n_segs, int n_in) -> bool {
+            bool use_il = g_mmvq_il() && n <= kVerifyMaxT && !((ggml_type == 18 || ggml_type == 21) && n_in > 4096);
+            if (use_il) {
+                for (int i = 0; i < n_segs; ++i) {
+                    if (!strata::kernels::native_mmvq_il_supported(ggml_type, n, segs[i].n_out)) {
+                        use_il = false;
+                        break;
+                    }
+                }
+            }
+            if (use_il && !il_ready && n >= 2) {
+                strata::kernels::native_q8_1_interleave(xq_, xil_, n_in, n, cs);
+                il_ready = true;
+            }
+            return strata::kernels::native_mmvq_multi_segs(ggml_type, segs, n_segs, xq_, xil_, n_in, n, cs, use_il);
         };
         try {
             if (!is_qsa_layer(g, l)) {
@@ -2331,10 +2450,25 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool fuse_ab = fuse_convab_on() && !br && (!batch_rec_ || batch_same_slot) && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
                 strata::dispatch::notef("gdn layer: side_gates=%ld side_proj=%ld df_branch=%ld", (long) sidem, (long) side_proj, (long) br);
                 strata::dispatch::notef("gdn layer: conv+ab fused=%ld batch_rows=%ld", (long) fuse_ab, (long) batch_rec_);
+                bool gdn_z_done = false;
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
                 if (!hip_gdn_fused)
 #endif
-                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                if (!side_proj) {
+                    // MERGE-SEAM: native segmented projections must not bypass an opted-in HIP dot4 member.
+                    if (!br && wqkv->native_type == wg->native_type
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                        && !hip_dot4_member(wqkv) && !hip_dot4_member(wg)
+#endif
+                    ) {
+                        const strata::kernels::NativeMmvqSeg segs[2] = {
+                            {wqkv->native_data, qkv + (size_t) tb * C, (int) C},
+                            {wg->native_data, z_ + (size_t) tb * ZV, (int) ZV},
+                        };
+                        gdn_z_done = mm_segs(wqkv->native_type, segs, 2, (int) N);
+                    }
+                    if (!gdn_z_done) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                }
                 stamp(l, 2, grp);
                 if (batch_rec_ && !fuse_ab) {   // contiguous rows may be proposals for the same slot
                     strata::kernels::GdnGroups cg;
@@ -2396,7 +2530,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
                 if (!hip_gdn_fused)
 #endif
-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!side_proj && !gdn_z_done) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
@@ -2421,7 +2555,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     const char* e = std::getenv("STRATA_GDN_GROUPS_QFUSE");
                     return !e || e[0] != '0';
                 }();
-                const bool use_quant_il_wout = n >= 2 && n <= 8 && qil_on() && g_mmvq_il() &&
+                const bool use_quant_il_wout = n >= 2 && n <= kVerifyMaxT && qil_on() && g_mmvq_il() &&
                                                strata::kernels::native_mmvq_il_supported(wout->native_type, n, (int) N);
                 bool gdn_q_done = false;
                 if (batch_rec_ && gdn_groups_on && n_gdn_groups >= 1 && n_gdn_groups <= 8) {
@@ -2648,15 +2782,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // split with norm and RoPE, the rotation
                 const bool q_il = side_proj && g_mmvq_il() &&
                                   strata::kernels::native_mmvq_il_supported(wq->native_type, n, (int) (NH * 2 * HD));
+                bool q_proj_done = false;
                 auto q_chain = [&](cudaStream_t ns) -> bool {
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
                     if (!hip_qsa_fused) {
 #endif
-                    if (ns == cs) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
-                    else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
-                                                                   qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
-                    else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
-                                     (int) (NH * 2 * HD), n, ns);
+                    if (!(ns == cs && q_proj_done)) {
+                        if (ns == cs) mm(wq, qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD));
+                        else if (q_il) strata::kernels::native_mmvq_il(wq->native_type, wq->native_data, xq_, xil_,
+                                                                       qfull_ + tb * NH * 2 * HD, (int) N, (int) (NH * 2 * HD), n, ns);
+                        else native_mmvq(wq->native_type, wq->native_data, xq_, qfull_ + tb * NH * 2 * HD, (int) N,
+                                         (int) (NH * 2 * HD), n, ns);
+                    }
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
                     }
 #endif
@@ -2712,8 +2849,37 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
                 if (!hip_qsa_fused) {
 #endif
-                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
-                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                bool kv_proj_done = false;
+                if (!side_proj && !qbr && wq->native_type == wk->native_type && wk->native_type == wv->native_type
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                    && !hip_dot4_member(wq) && !hip_dot4_member(wk) && !hip_dot4_member(wv)
+#endif
+                ) {
+                    const strata::kernels::NativeMmvqSeg segs[3] = {
+                        {wq->native_data, qfull_ + tb * NH * 2 * HD, (int) (NH * 2 * HD)},
+                        {wk->native_data, kcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                        {wv->native_data, vcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                    };
+                    if (mm_segs(wq->native_type, segs, 3, (int) N)) {
+                        q_proj_done = true;
+                        kv_proj_done = true;
+                    }
+                }
+                if (!kv_proj_done && wk->native_type == wv->native_type
+#if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
+                    && !hip_dot4_member(wk) && !hip_dot4_member(wv)
+#endif
+                ) {
+                    const strata::kernels::NativeMmvqSeg segs[2] = {
+                        {wk->native_data, kcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                        {wv->native_data, vcur_ + tb * NKV * HD, (int) (NKV * HD)},
+                    };
+                    kv_proj_done = mm_segs(wk->native_type, segs, 2, (int) N);
+                }
+                if (!kv_proj_done) {
+                    mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                    mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                }
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
                 }
 #endif
@@ -2977,23 +3143,26 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                       s, attn_scratch_ + (size_t) tb * attn_scratch_floats_, attn_ + tb * NH * HD, n, cs);
                 }
                 }
-                stamp(l, 13, grp);
-                if (st.kv_rot || st.kv_hybrid) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
                 static const bool qsa_gate_qfuse = [] {
                     const char* e = std::getenv("STRATA_QSA_GATE_QFUSE");
                     return !e || e[0] != '0';
                 }();
-                const bool use_quant_il_wo = n >= 2 && n <= 8 && qil_on() && g_mmvq_il() &&
+                const bool use_quant_il_wo = n >= 2 && n <= kVerifyMaxT && qil_on() && g_mmvq_il() &&
                                              strata::kernels::native_mmvq_il_supported(wo->native_type, n, (int) N);
                 const bool fuse_gate_q8 = qb && qsa_gate_qfuse && (HD % 32) == 0
 #if defined(STRATA_USE_HIP) && defined(STRATA_PREFILL_MMQ)
                     && !hip_dot4_member(wo)  // dot4 needs the F32 gate output, not q8_1-only scratch
 #endif
                     ;
+                const bool rot_kv = st.kv_rot || st.kv_hybrid;
+                const bool fuse_fwht_gate = fuse_gate_q8 && rot_kv && HD == 256;
+                if (rot_kv && !fuse_fwht_gate) fwht256_inplace_cuda(attn_ + tb * NH * HD, (int64_t) n * NH, cs);   // back: H^-1 = H
+                stamp(l, 13, grp);
                 if (fuse_gate_q8) {
                     native_qsa_gate_quantize_q8_1(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, xq_,
                                                   (int) (n * NH), (int) HD, cs,
-                                                  use_quant_il_wo ? (void*) xil_ : nullptr, use_quant_il_wo ? n : 0);
+                                                  use_quant_il_wo ? (void*) xil_ : nullptr, use_quant_il_wo ? n : 0,
+                                                  fuse_fwht_gate);
                     il_ready = use_quant_il_wo;
                 } else if (qb) {
                     native_qsa_gate_apply(attn_ + tb * NH * HD, qfull_ + tb * NH * 2 * HD, attn32_ + tb * NH * HD,
@@ -3015,7 +3184,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             return false;
         }
         stamp(l, 16, grp);
-        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
+        const bool sh_fork = sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
+        const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
+                        *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
+        if (!wgi || !wsg || !wsu || !wsd) return false;
+        const auto shexp_il_needed = [&](const WeightRef* w) {
+            const int t = w->native_type;
+            return w->native_data != nullptr && strata::kernels::native_mmvq_il_supported(t, n, (int) g.n_ff) &&
+                   ((t != 18 && t != 21) || N <= 4096);
+        };
+        const bool want_ffn_il_wide = !sh_fork && n >= 2 && n <= kVerifyMaxT && g_mmvq_il() && qil_on() &&
+                                      (n <= kFusedGrMaxT || g_mmvq_il_16()) &&
+                                      strata::kernels::cpu::expert_layout().native &&
+                                      (shexp_il_needed(wsg) || shexp_il_needed(wsu));
+        const bool want_ffn_il = want_ffn_il_wide;
+        bool il_ffn_wrote = false;
+        const bool q8_ffn = gr_read_group(1, true, inj_, inj2_, want_ffn_il, &il_ffn_wrote);   // true: nat_xq_ holds the MoE input's q8_1 (STRATA_QFUSE)
         stamp(l, 32, grp);   // the profile only: the FFN-side read ends here, the router starts
         // with CPU experts in the window the shared expert forks off once the doorbell is published (it no longer
         // competes with it for the GPU's first microseconds); STRATA_SH_FORK_LATE=0 forks at the top as before
@@ -3023,7 +3207,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             const char* e = std::getenv("STRATA_SH_FORK_LATE");
             return !e || e[0] != '0';
         }();
-        const bool sh_fork = sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr;
         const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork && !sh_fork_late) {
@@ -3116,9 +3299,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         stamp(l, 17, grp);
         bool qdedup = false;   // STRATA_VERIFY_QDEDUP took effect: the experts' q8_1 image of xm is already made
         {
-            const WeightRef *wgi = need(v, "ffn_gate_inp_shexp.weight", err), *wsg = need(v, "ffn_gate_shexp.weight", err),
-                            *wsu = need(v, "ffn_up_shexp.weight", err), *wsd = need(v, "ffn_down_shexp.weight", err);
-            if (!wgi || !wsg || !wsu || !wsd) return false;
             if (!native_of(wsg, v.name("ffn_gate_shexp.weight"), err) || !native_of(wsu, v.name("ffn_up_shexp.weight"), err) ||
                 !native_of(wsd, v.name("ffn_down_shexp.weight"), err))
                 return false;
@@ -3127,13 +3307,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             nsw.up_type = wsu->native_type; nsw.up_data = wsu->native_data;
             nsw.down_type = wsd->native_type; nsw.down_data = wsd->native_data;
             nsw.q8_1 = sh_fork ? sh_xq_ : xq_;
-            nsw.q8_il = (n >= 2 && n <= 8 && g_mmvq_il()) ? (sh_fork ? sh_xil_ : xil_) : nullptr;
+            nsw.q8_il = (n >= 2 && n <= kVerifyMaxT && g_mmvq_il()) ? (sh_fork ? sh_xil_ : xil_) : nullptr;
             // STRATA_VERIFY_QDEDUP=1 (or by default when STRATA_QFUSE_HC already wrote nat_xq_ in gr_read_group and the
             // shared expert runs on the same stream): the shared expert's gate/up reuse nat_xq_ directly instead of
             // launching a second native_quantize_q8_1(xm) pass per layer (quantize_q8_1_rows and native_quantize_q8_1
             // write the same bytes)
+            bool ffn_il_ready = q8_ffn && want_ffn_il && il_ffn_wrote;
             qdedup = g_qdedup(q8_ffn) && !sh_fork && strata::kernels::cpu::expert_layout().native;
-            if (qdedup && !q8_ffn) quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+            if (qdedup && !q8_ffn) {
+                if (want_ffn_il_wide) {
+                    strata::kernels::native_quantize_q8_1_il(xm, nat_xq_ + (size_t) tb * (N / 32) * 36, xil_, (int) N, n, cs);
+                    ffn_il_ready = true;
+                } else {
+                    quantize_q8_1_rows(xm, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
+                }
+            }
             if (!shared_expert_native_bf16_enabled()) {
                 if (dec_batch) f32_to_bf16_bulk(mixed_ + tb * N, sh_bf16_ + tb * N, (int64_t) n * N, sh_stream);   // contiguous rows
                 else for (int t = tb; t < te; ++t) f32_to_bf16_bulk(mixed_ + t * N, sh_bf16_ + t * N, N, sh_stream);
@@ -3146,7 +3334,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 shared_expert_multi(n, xm, sh_bf16_ + tb * N, nsw, (const uint16_t*) wgi->data, sh_gate_ + (size_t) tb * g.n_ff,
                                     sh_up_ + (size_t) tb * g.n_ff, sh_g_ + tb, shared_ + tb * N, N, g.n_ff, sh_stream,
                                     qdedup ? (const void*) (nat_xq_ + (size_t) tb * (N / 32) * 36) : nullptr,
-                                    (sg_ready ? 1 : 0) | (g_lfuse_pair() ? 2 : 0) | (sg_aux ? 4 : 0));
+                                    (sg_ready ? 1 : 0) | (g_lfuse_pair() ? 2 : 0) | (sg_aux ? 4 : 0) |
+                                        (qdedup && ffn_il_ready ? 8 : 0));
                 sg_gated_[grp] = sg_ready;
             } catch (const std::exception& e) {
                 err = std::string("verify shared expert: ") + e.what();
@@ -3438,17 +3627,23 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const WeightRef *hn = wt.find("output_hc_norm.weight"), *hd = wt.find("output_hc_down.weight"),
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
+        // When T = 9..16 and the interleaved kernel supports T columns, gather all T mixer outputs/q8_1 columns
+        // across kFusedGrMaxT slices first, then run native_mmvq_il ONCE so the head matrix is read once.
+        const bool use_head_il_all = head_ != nullptr && head_->loaded() && g_mmvq_il() &&
+                                     T > kFusedGrMaxT && T <= 16 && T <= kVerifyMaxT &&
+                                     strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_);
+        bool all_q8_head = head_ != nullptr && head_->loaded();
       for (int h0 = 0; h0 < T; h0 += kFusedGrMaxT) {
         const int HT = std::min(T - h0, kFusedGrMaxT);   // this chunk's columns: h0 .. h0 + HT
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
         // (no pending write, no inject)
         const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr && head_ != nullptr && head_->loaded();
-        const bool use_head_il = head_ != nullptr && head_->loaded() && g_mmvq_il() &&
+        const bool use_head_il = !use_head_il_all && head_ != nullptr && head_->loaded() && g_mmvq_il() &&
                                  strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_);
         const bool want_head_il = use_head_il && qil_on() && HT >= 2 && HT <= strata::kernels::kFusedGrMaxT;
         bool q8_head = false;   // the fused read wrote the head's q8_1 activation image (xq_) itself
         strata::dispatch::notef("head: final mixer q8=%ld fuse_head_gr=%ld native_head=%ld", (long) mix_q8, (long) fuse_head_gr, (long) (head_ != nullptr && head_->loaded()));
-        if (head_ != nullptr && head_->loaded())   // the head matrix itself is counted by native_mmvq / native_mmvq_il (n_out = the vocabulary)
+        if (!use_head_il_all && head_ != nullptr && head_->loaded())   // the head matrix itself is counted by native_mmvq / native_mmvq_il (n_out = the vocabulary)
             strata::dispatch::notef("head: type %ld, T=%ld columns, vocabulary %ld", (long) head_->type(), (long) T, (long) n_vocab_);
         if (mix_q8) {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -3463,7 +3658,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.mixed = head_mixed_ + t * N;
                 if (qcnt_ != nullptr) {
                     a.q8_cnt = qcnt_;
-                    a.q8_mixed = xq_ + (size_t) (t - h0) * (N / 32) * 36;
+                    a.q8_mixed = xq_ + (size_t) (use_head_il_all ? t : (t - h0)) * (N / 32) * 36;
                     if (t == h0 && want_head_il) a.q8_il = xil_;
                 }
             }
@@ -3486,7 +3681,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.mixed = head_mixed_ + t * N;
                 if (qcnt_ != nullptr && head_ != nullptr && head_->loaded()) {
                     a.q8_cnt = qcnt_;
-                    a.q8_mixed = xq_ + (size_t) (t - h0) * (N / 32) * 36;
+                    a.q8_mixed = xq_ + (size_t) (use_head_il_all ? t : (t - h0)) * (N / 32) * 36;
                     if (t == h0 && want_head_il) a.q8_il = xil_;
                 }
             }
@@ -3507,7 +3702,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC; a.mixed = head_mixed_ + t * N;
                 if (qcnt_ != nullptr) {
                     a.q8_cnt = qcnt_;
-                    a.q8_mixed = xq_ + (size_t) (t - h0) * (N / 32) * 36;
+                    a.q8_mixed = xq_ + (size_t) (use_head_il_all ? t : (t - h0)) * (N / 32) * 36;
                     if (t == h0 && want_head_il) a.q8_il = xil_;
                 }
             }
@@ -3524,7 +3719,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
             }
         }
-        if (head_ != nullptr && head_->loaded()) {
+        all_q8_head = all_q8_head && q8_head;
+        if (!use_head_il_all && head_ != nullptr && head_->loaded()) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
                 if (!q8_head && use_head_il && qil_on() && HT >= 2 && HT <= 8) {
@@ -3547,6 +3743,22 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
       }   // the head's column chunks
+        if (use_head_il_all) {
+            strata::dispatch::notef("head: type %ld, T=%ld columns, vocabulary %ld", (long) head_->type(), (long) T, (long) n_vocab_);
+            try {
+                if (!all_q8_head && qil_on()) {
+                    strata::kernels::native_quantize_q8_1_il(head_mixed_, xq_, xil_, (int) N, T, cs);
+                } else {
+                    if (!all_q8_head) native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
+                    strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, T, cs);
+                }
+                strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, head_logits_, (int) N,
+                                                (int) n_vocab_, T, cs);
+            } catch (const std::exception& e) {
+                err = std::string("verify head: ") + e.what();
+                return false;
+            }
+        }
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
@@ -4895,6 +5107,16 @@ bool Verifier::commit(int n_keep, std::string& err) {
         }
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit(n_keep, err);
+}
+
+bool Verifier::commit_deferred() const {
+#if defined(STRATA_GPU_METAL)
+    return false;   // the Metal window keeps its own bookkeeping: never dropped
+#else
+    if (last_t_ < 1) return false;
+    const bool self = last_t_ == 1 && !always_publish_ && one_token_self_commit() && !g_qfuse();   // as commit() above
+    return !self && (next_ == nullptr || next_->commit_deferred());
+#endif
 }
 
 bool Verifier::wait_commit(std::string& err) {

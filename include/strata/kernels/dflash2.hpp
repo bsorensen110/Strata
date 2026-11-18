@@ -63,6 +63,8 @@ void df2_rope_table_inv(const int32_t* pos, int rows, const double* inv, float* 
 /// The same table computed on the host (double precision, bitwise the CUDA kernel up to sincosf): table [rows][2][64].  The SYCL port uses this one: a kernel with FP64 operations on an Arc Alchemist (IGC DP emulation) slows every later kernel of the process by 2x or more, so the drafter has no device FP64.
 void df2_rope_table_cpu(const int32_t* pos, int rows, float theta, float* table);
 void df2_gemm_variant(int v);
+/// Tests only: 1 = the one-block top-16, 2 = the ranked one (the same results), 0 = the default (STRATA_DF2_TOPK_RANK).
+void df2_topk_variant(int v);
 /// Bench only: attention variants (bit 0 skips Q K^T, bit 1 skips P V).
 void df2_attention_variant(int v);
 /// Bench only (SYCL): keys per attention work-group, 64 or 128 (0 = the default).
@@ -84,9 +86,11 @@ void df2_q8_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t coun
 void df2_q4_tile(const void* blocks, void* qs, void* dpl, int n_in, int64_t count, void* stream);
 
 /// h += conv(x) (the finish convolution with the residual), then the RMS norm of the new h (weights gamma) -> xn (optional) and the planar quantization.
+/// Optionally also writes Q8_1 (xq_q81) and interleaved Q8_1 (x_il) for rows [row0_q81, row0_q81 + nrows_q81).
 /// rows <= 8, H <= 3072 (H a multiple of 32).
 void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h, const float* gamma, float* xn, int rows, int H, int group,
-                        float eps, void* xq, float* xd, void* stream);
+                        float eps, void* xq, float* xd, void* stream,
+                        void* xq_q81 = nullptr, void* x_il = nullptr, int row0_q81 = 0, int nrows_q81 = 0);
 /// The block's q (q_heads x 128) and k (k_heads x 128) per row: RMS norm and rope with the table of the block's positions -> qo, ko (row-major).
 void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const float* gk, const float* table, float* qo, float* ko, int rows, int q_heads, int k_heads,
                       float eps, void* stream);
@@ -109,36 +113,38 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 /// out_tok[i] and out_prob[i] (the softmax probability of the pick among the 16).  `prev0` is read from *anchor_tok on the device.
 /// `cb_q4`: the codebooks are ggml Q4_0 rows in block order (rank / 32 blocks of 18 bytes a row: fp16 d, 16 bytes, value i in the low nibble of byte i,
 /// value i + 16 in the high nibble; NOT tiled like the matrices), dequantized to fp32 ((q - 8) * d) before the same dot; default: bf16 rows.
+/// `table` (optional, rows * 16 * 16 floats, rows <= 8): score every reachable step in one parallel launch first, then walk the table (bitwise the same picks
+/// and probabilities as without it).
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false);
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false, int beam = 4, float* table = nullptr);
 
 /// Multi-slot candidate selector walk: one threadblock per item (`0 <= s < n_items`).  Item `s` reads
 /// `row_off = batch_meta[s * 4 + 0]`, `rows = batch_meta[s * 4 + 1]`, and `prev0 = batch_meta[s * 4 + 2]`, walks
 /// `rows` rows starting at `row_off` of `hp` / `unary` / `tok`, and writes `out_tok[s * 8 + i]` and `out_prob[s * 8 + i]`.
 void df2_select_multi(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank,
-                      const int32_t* batch_meta, int n_items, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false);
+                      const int32_t* batch_meta, int n_items, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false, int beam = 4);
 
 /// Packs `rows` rows of `fn_in` ([rows][N]) and `hsel_in` ([rows][rank]) into `fn_out` and `hsel_out` in one launch.
 void df2_pack_head_rows(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out, int rows, int N, int rank, void* stream);
 
 struct Df2BatchKvRing {
-    void* kring[4];
-    void* vring[4];
-    int64_t* tag[4];
-    uint8_t row_slot[32];
+    void* kring[8];
+    void* vring[8];
+    int64_t* tag[8];
+    uint8_t row_slot[64];
 };
 
 struct Df2BatchKvRingPrecomp {
-    void* kring[4][8];
-    void* vring[4][8];
+    void* kring[8][8];
+    void* vring[8][8];
     const float* gk[8];
-    int64_t* tag[4];
+    int64_t* tag[8];
 };
 
 struct Df2BatchAttn {
-    const void* kring[4];
-    const void* vring[4];
-    const int64_t* tag[4];
+    const void* kring[8];
+    const void* vring[8];
+    const int64_t* tag[8];
 };
 
 void df2_kv_ring_batch(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table,
@@ -170,7 +176,9 @@ void df2_attention_batch_f16(const float* q, Df2BatchAttn ba, const float* kblk,
 void df2_pack_head_rows_batch(const float* fn_in, const float* hsel_in, float* fn_out, float* hsel_out,
                               const int32_t* batch_meta, int n_items, int N, int rank, void* stream,
                               const void* xq_in = nullptr, const float* xd_in = nullptr,
-                              void* xq_out = nullptr, float* xd_out = nullptr);
+                              void* xq_out = nullptr, float* xd_out = nullptr,
+                              uint8_t* xq_q81_out = nullptr, uint8_t* xil_q81_out = nullptr,
+                              int il_rows = 0, int max_q81_rows = 0);
 
 /// The verify window's tap: out[r][d] = mean over the hc streams c of (R[r][c][d] + bo[r][d] * 2 * sigmoid(inject[r][c] / hc)) - the layer output with
 /// its pending FFN write (gr_write) applied, averaged over the streams.  R rows are `R_stride` floats apart, bo rows `bo_stride`, inject rows

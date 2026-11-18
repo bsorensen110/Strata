@@ -1,0 +1,99 @@
+{
+  "campaign": "Hip-switch-tests.md matrix vs the production engine (fork-df8ee1a30) and the current production env, 2026-11-14",
+  "arms": [
+    {
+      "id": "engine_delta",
+      "switch": null,
+      "baseline": "prod engine",
+      "arm": "new engine",
+      "exe_ctl": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-df8ee1a30/strata",
+      "exe_arm": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "the six DFlash2 optimizations plus the new default-ON `STRATA_DF2_HEAD=native` and `STRATA_DF2_BEAM=4`, at identical argv and production environment"
+    },
+    {
+      "id": "df2_beam1",
+      "switch": "STRATA_DF2_BEAM",
+      "baseline": "",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "ablate the new order-1 Viterbi beam search (default 4) back to greedy \u2014 the doc's S2 run"
+    },
+    {
+      "id": "df2_head_pruned",
+      "switch": "STRATA_DF2_HEAD",
+      "baseline": "",
+      "arm": "pruned",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "ablate the new native drafter head default back to the pruned copy \u2014 the doc's S1 run"
+    },
+    {
+      "id": "df2_attn_f32",
+      "switch": "STRATA_DF2_ATTN_F16_SMEM",
+      "baseline": "",
+      "arm": "0",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "ablate FP16 attention SMEM + parallel 4x2 QK^T tile back to FP32 \u2014 the doc's S3 run"
+    },
+    {
+      "id": "df2_gemm32_off",
+      "switch": "STRATA_DF2_GEMM_32",
+      "baseline": "",
+      "arm": "0",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "ablate the single-pass 17..32 column drafter GEMM back to 16-column splits \u2014 the doc's S4 run"
+    },
+    {
+      "id": "batch_max_t12",
+      "switch": "STRATA_BATCH_DF2_MAX_T",
+      "baseline": "8",
+      "arm": "12",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "raise the batch verify window cap from production's 8 to 12 \u2014 the doc's B1 run"
+    },
+    {
+      "id": "batch_max_t16",
+      "switch": "STRATA_BATCH_DF2_MAX_T",
+      "baseline": "8",
+      "arm": "16",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "raise the batch verify window cap to the full 16 rows this build supports \u2014 the doc's B2 run"
+    },
+    {
+      "id": "aa_floor_1",
+      "switch": "STRATA_DF2_BEAM",
+      "baseline": "",
+      "arm": "",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "A/A floor: identical configuration launched twice"
+    },
+    {
+      "id": "aa_floor_2",
+      "switch": "STRATA_DF2_BEAM",
+      "baseline": "",
+      "arm": "",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "A/A floor: identical configuration launched twice"
+    },
+    {
+      "id": "shipped_candidate",
+      "switch": "STRATA_DF2_BEAM",
+      "baseline": "",
+      "arm": "1",
+      "exe_ctl": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-df8ee1a30/strata",
+      "exe_arm": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+      "bits": "unknown",
+      "src": "newly-ported",
+      "why": "the configuration this round would ship: the new engine with STRATA_DF2_BEAM=1 (which measured +3.7% prefill as an ablation), against the production engine and environment"
+    }
+  ]
+}

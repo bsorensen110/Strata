@@ -1,0 +1,106 @@
+{
+ "arm": "ctl_combo_fork_headil16",
+ "round": "_r2",
+ "ts": "2026-11-13T08:56:50",
+ "exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "commit": "d63d36a9f",
+ "engine_pid": 369949,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-16-window/results/ctl_combo_fork_headil16.manifest.json",
+  "STRATA_BATCH_DF2_MAX_T": "16",
+  "STRATA_DF2_FORK": "0"
+ },
+ "parallel": 2,
+ "smoke": {
+  "prompt_tokens": 38,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.338,
+  "wall_tok_s": 8.88
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 5.879,
+  "wall_tok_s": 43.54
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.139,
+   "wall_tok_s": 123.7,
+   "hash": "b8bde568cf0a1aad1e5849759b949e69e02b79ed1e99d105907a78a2aecbe466"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.942,
+   "wall_tok_s": 129.87,
+   "hash": "f4b6db1d4f63f78b0682bb3911fb34e536cf5623ef9f69821c9eabc5d0421b6f"
+  }
+ ],
+ "burst": {
+  "wall_s": 3.922,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 130.53,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.534,
+    "wall_tok_s": 72.45,
+    "hash": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.921,
+    "wall_tok_s": 65.29,
+    "hash": "19a33656fbbc3f14afba0d7f6e0200d1afa7c58852027fdd20ca5ad54269e79e"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "b8bde568cf0a1aad1e5849759b949e69e02b79ed1e99d105907a78a2aecbe466",
+  "greedy_warm": "f4b6db1d4f63f78b0682bb3911fb34e536cf5623ef9f69821c9eabc5d0421b6f",
+  "burst_a": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574",
+  "burst_b": "19a33656fbbc3f14afba0d7f6e0200d1afa7c58852027fdd20ca5ad54269e79e"
+ },
+ "engine_decode_512": [
+  "129.8",
+  "131.6"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 61 ms (49.2 tok/s), drafts accepted 1 of 2, 1 checkpoints",
+   "generated in 3013 ms (85.0 tok/s), drafts accepted 164 of 297, 1 checkpoints",
+   "generated in 3943 ms (129.8 tok/s), drafts accepted 429 of 506, 1 checkpoints",
+   "generated in 3890 ms (131.6 tok/s), drafts accepted 412 of 576, 1 checkpoints",
+   "generated in 16 ms (62.1 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 16 ms (61.7 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 339 ms (144.4 tok/s), drafts accepted 40 of 51, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 38 tokens = 0 reused + 38 read in 274 ms (138.8 tok/s), 3 generated in 61 ms (49.2 tok/s), drafts accepted 1 of 2, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 2863 ms (1378.8 tok/s), 256 generated in 3013 ms (85.0 tok/s), drafts accepted 164 of 297, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 194 ms (180.8 tok/s), 512 generated in 3943 ms (129.8 tok/s), drafts accepted 429 of 506, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 51 ms (138.6 tok/s), 512 generated in 3890 ms (131.6 tok/s), drafts accepted 412 of 576, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 210 ms (166.3 tok/s), 1 generated in 16 ms (62.1 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 189 ms (185.0 tok/s), 1 generated in 16 ms (61.7 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 242 tokens = 241 reused + 1 read in 2 ms (641.2 tok/s), 49 generated in 339 ms (144.4 tok/s), drafts accepted 40 of 51, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 2",
+   "drafts accepted 164 of 297",
+   "drafts accepted 429 of 506",
+   "drafts accepted 412 of 576",
+   "drafts accepted 0 of 0",
+   "drafts accepted 0 of 0",
+   "drafts accepted 40 of 51"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 9504 slots, 21.75 GiB of VRAM; policy is"
+ ]
+}

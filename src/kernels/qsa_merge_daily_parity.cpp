@@ -71,6 +71,37 @@ uint16_t f16_scale_q4(uint32_t r) { return (uint16_t) ((13u << 10) | (r & 0x3FFu
 constexpr int kFmtF16 = 0, kFmtInt8 = 1, kFmtQ4 = 2, kFmtK8V4 = 3;
 const char* fmt_name(int f) { return f == kFmtF16 ? "fp16" : f == kFmtInt8 ? "int8" : f == kFmtQ4 ? "q4_0" : "k8v4"; }
 
+// INT8 tolerance used only when comparing production/Daily chunk+merge outputs against the upstream chunk reference:
+// values in make_pools have |v| < 4 (codes in [-127, 127], scale in [1/64, 1/32)), and softmax weights sum to 1,
+// so FP32 accumulation-order differences over up to 32768 cells stay well below 1e-4 while wrong scales/masks fail by O(0.1..10).
+constexpr float kInt8AbsTol = 1e-4f;
+constexpr float kInt8RelTol = 1e-4f;
+
+bool within_int8_tol(const std::vector<float>& ref, const std::vector<float>& got,
+                     double& max_abs, double& max_rel, size_t& first_bad, bool& has_bit_diff) {
+    max_abs = 0.0;
+    max_rel = 0.0;
+    first_bad = ref.size();
+    has_bit_diff = std::memcmp(ref.data(), got.data(), ref.size() * sizeof(float)) != 0;
+    bool ok = true;
+    for (size_t i = 0; i < ref.size(); ++i) {
+        if (!std::isfinite(got[i])) {
+            if (first_bad == ref.size()) first_bad = i;
+            ok = false;
+            continue;
+        }
+        const float d = std::fabs(ref[i] - got[i]);
+        const float lim = kInt8AbsTol + kInt8RelTol * std::fabs(ref[i]);
+        max_abs = std::max(max_abs, (double) d);
+        max_rel = std::max(max_rel, (double) d / std::max<double>(std::fabs(ref[i]), 1.0));
+        if (d > lim) {
+            if (first_bad == ref.size()) first_bad = i;
+            ok = false;
+        }
+    }
+    return ok;
+}
+
 struct DevicePools {   // every format's pools over the same physical rows; `view` picks what a KV mode reads
     uint16_t *k16 = nullptr, *v16 = nullptr, *k8s = nullptr, *v8s = nullptr;
     int8_t *k8 = nullptr, *v8 = nullptr;
@@ -214,8 +245,9 @@ struct Harness {
         k::qsa_decode_attn_chunks_only(q, pools.view(c.fmt, table), ids, steps, c.cap, s, scratch, c.n_q, 0, nullptr);
     }
 
-    // true when the two merges' outputs are bit-identical (and the original's has no NaN)
-    bool check(const Case& c, long long& nonzero) {
+    // true when the two merges' outputs are bit-identical (and the original's has no NaN) and the production/Daily
+    // chunk+merge paths match the reference (bitwise for fp16/q4_0/k8v4; within kInt8AbsTol/kInt8RelTol for int8)
+    bool check(const Case& c, long long& nonzero, bool& any_bit_diff, double& worst_abs, double& worst_rel) {
         const int64_t D = s.head_dim, NH = s.n_head;
         const size_t scratch_bytes = (size_t) k::qsa_decode_attn_scratch_floats(c.cap, s) * (size_t) c.n_q * 4;
         const char* flag = std::getenv("STRATA_HIP_BUFLOAD");
@@ -257,7 +289,34 @@ struct Harness {
             if (nan) std::printf(" (%lld nonfinite values in the original's output)", nan);
             std::printf("\n");
         }
-        // Exercise production entry points too: either selected merger must equal the reference partials.
+        // Exercise production entry points too: fp16/q4_0/k8v4 stay strictly bitwise against the reference partials.
+        // For int8 (kv_mode == 1), the 0.1.61 merge (a25ffb54f, carrying fork commits 612b45c7f/8c03a43ed/931ede52b on
+        // qsa_decode_attn.cu; git log -S on fork-main-pre-upstream-0161-20261116..HEAD finds only f0356cb25 for CUDA KV-host
+        // DMA while qsa_decode_attn.cu and kv_q8.cu stayed byte-unchanged across the merge) dispatches wave32 pre75 / V4
+        // accumulation orders on gfx12 that are not bitwise-identical to upstream's attn_chunk_kernel<1> (731528beb),
+        // so int8 compares production/Daily dispatch against the reference within kInt8AbsTol + kInt8RelTol.
+        auto matches_ref = [&](const char* label) -> bool {
+            if (c.fmt != kFmtInt8) {
+                if (std::memcmp(a.data(), b.data(), n * 4) != 0) {
+                    std::printf("FAIL %s differs from merge reference\n", label);
+                    return false;
+                }
+                return true;
+            }
+            double max_abs = 0.0, max_rel = 0.0;
+            size_t first_bad = n;
+            bool bit_diff = false;
+            const bool ok = within_int8_tol(a, b, max_abs, max_rel, first_bad, bit_diff);
+            any_bit_diff = any_bit_diff || bit_diff;
+            worst_abs = std::max(worst_abs, max_abs);
+            worst_rel = std::max(worst_rel, max_rel);
+            if (!ok) {
+                std::printf("FAIL int8 %s exceeds tol (max_abs=%.3e, max_rel=%.3e) at query %lld head %lld dim %lld: "
+                            "%.9g vs %.9g\n", label, max_abs, max_rel, (long long) (first_bad / (NH * D)),
+                            (long long) (first_bad / D % NH), (long long) (first_bad % D), a[first_bad], b[first_bad]);
+            }
+            return ok;
+        };
         bool entry_same = true;
         if (pin_partials) ck(cudaMemset(scratch, 0xFF, scratch_bytes), "production scratch NaN refill");
         k::qsa_decode_attn_batch(q, pools.view(c.fmt, table), ids, steps, c.cap, s, scratch, attn_new, c.n_q, nullptr);
@@ -270,10 +329,7 @@ struct Harness {
             }
         }
         ck(cudaMemcpy(b.data(), attn_new, n * 4, cudaMemcpyDeviceToHost), "batch entry output");
-        if (std::memcmp(a.data(), b.data(), n * 4) != 0) {
-            std::puts("FAIL production batch differs from merge reference");
-            entry_same = false;
-        }
+        if (!matches_ref("production batch")) entry_same = false;
         if (bufload_screen) {
             k::QsaAttnPoolsRows rows;
             rows.n = c.n_q;
@@ -281,19 +337,13 @@ struct Harness {
             k::qsa_decode_attn_batch_rows(q, rows, ids, steps, c.cap, s, scratch, attn_new, c.n_q, nullptr);
             ck(cudaDeviceSynchronize(), "rows entry sync");
             ck(cudaMemcpy(b.data(), attn_new, n * 4, cudaMemcpyDeviceToHost), "rows entry output");
-            if (std::memcmp(a.data(), b.data(), n * 4) != 0) {
-                std::puts("FAIL production rows routing differs from merge reference");
-                entry_same = false;
-            }
+            if (!matches_ref("production rows routing")) entry_same = false;
         }
         if (c.n_q == 1) {
             k::qsa_decode_attn_step(q, pools.view(c.fmt, table), ids, steps, c.cap, s, scratch, attn_new, nullptr);
             ck(cudaDeviceSynchronize(), "step entry sync");
             ck(cudaMemcpy(b.data(), attn_new, n * 4, cudaMemcpyDeviceToHost), "step entry output");
-            if (std::memcmp(a.data(), b.data(), n * 4) != 0) {
-                std::puts("FAIL production step differs from merge reference");
-                entry_same = false;
-            }
+            if (!matches_ref("production step")) entry_same = false;
         }
         // The Daily's chunk kernel on the same inputs, into NaN-filled scratch, merged by both mergers.
         bool daily_same = true;
@@ -304,11 +354,8 @@ struct Harness {
             k::qsa_decode_attn_merge_only(steps, c.cap, s, scratch, attn_new, c.n_q, v2, nullptr);
             ck(cudaDeviceSynchronize(), "daily chunk sync");
             ck(cudaMemcpy(b.data(), attn_new, n * 4, cudaMemcpyDeviceToHost), "daily chunk output");
-            if (std::memcmp(a.data(), b.data(), n * 4) != 0) {
-                std::printf("FAIL Daily chunk kernel + %s differs from upstream reference\n",
-                            v2 ? "attn_merge_v2_kernel" : "attn_merge_kernel");
+            if (!matches_ref(v2 ? "Daily chunk kernel + attn_merge_v2_kernel" : "Daily chunk kernel + attn_merge_kernel"))
                 daily_same = false;
-            }
         }
         return same && nan == 0 && entry_same && daily_same;
     }
@@ -412,7 +459,8 @@ int main(int argc, char** argv) {
     const int n_widths = (int) (sizeof(widths) / sizeof(widths[0]));
     long long cases = 0, failed = 0, nonzero_total = 0;
     for (int fmt = 0; fmt < 4; ++fmt) {
-        long long fmt_cases = 0, fmt_failed = 0;
+        long long fmt_cases = 0, fmt_failed = 0, fmt_bit_diff = 0;
+        double fmt_worst_abs = 0.0, fmt_worst_rel = 0.0;
         for (int64_t cap : {(int64_t) 2051, (int64_t) 2112, (int64_t) 32768}) {
             for (int n_q = 1; n_q <= 6; ++n_q) {
                 // every width for all queries alike, then three batches of mixed widths
@@ -429,16 +477,24 @@ int main(int argc, char** argv) {
                             [cap](int32_t w) { return (int64_t) w > cap; })) continue;
                     hx.prepare(c, rng);
                     long long nz = 0;
-                    const bool ok = hx.check(c, nz);
+                    bool bit_diff = false;
+                    const bool ok = hx.check(c, nz, bit_diff, fmt_worst_abs, fmt_worst_rel);
                     nonzero_total += nz;
                     ++cases;
                     ++fmt_cases;
+                    if (bit_diff) ++fmt_bit_diff;
                     if (!ok) { ++failed; ++fmt_failed; }
                 }
             }
         }
-        std::printf("[%s] %lld cases, %s (%lld differ)\n", fmt_name(fmt), fmt_cases, fmt_failed ? "FAIL" : "bit-identical",
-                    fmt_failed);
+        if (fmt == kFmtInt8) {
+            std::printf("[%s] %lld cases, %s (%lld outside tol 1e-4, %lld bitwise-differ, max_abs=%.3e, max_rel=%.3e)\n",
+                        fmt_name(fmt), fmt_cases, fmt_failed ? "FAIL" : "within tol", fmt_failed, fmt_bit_diff,
+                        fmt_worst_abs, fmt_worst_rel);
+        } else {
+            std::printf("[%s] %lld cases, %s (%lld differ)\n", fmt_name(fmt), fmt_cases,
+                        fmt_failed ? "FAIL" : "bit-identical", fmt_failed);
+        }
     }
     std::printf("qsa_merge_daily_parity: %lld cases, %lld differ, %lld nonzero output values in all -> %s\n", cases, failed,
                 nonzero_total, failed == 0 && nonzero_total > 0 ? "PASS" : "FAIL");

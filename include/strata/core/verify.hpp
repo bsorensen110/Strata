@@ -153,6 +153,19 @@ public:
     static bool nan_guard_on();
     /// The most tokens one window holds (`init`'s `max_t`; 0 before it).
     int max_t() const { return max_t_; }
+    /// Device arena bytes `init` allocates for `max_t` rows, `g`, `ss`, and `n_vocab` (same carve sequence).
+    /// Negative `staging_blob_bytes` / `had_gu_any` read `expert_layout()`; non-negative overrides for offline tests.
+    static uint64_t arena_bytes(const ModelGeometry& g, const SessionState& ss, int64_t n_vocab, int max_t,
+                                int64_t staging_blob_bytes = -1, int had_gu_any = -1);
+    /// Device tap buffer bytes `init` allocates for `tap_layers`, `max_t` rows, and `[stage_lb, stage_le)`.
+    inline static uint64_t tap_bytes(const std::vector<int>& tap_layers, int max_t, int64_t n_embd,
+                                     int64_t stage_lb = 0, int64_t stage_le = -1, int64_t n_layers = 48) noexcept {
+        if (max_t <= 0 || n_embd <= 0) return 0;
+        const int64_t le = stage_le < 0 ? n_layers : stage_le;
+        uint64_t nt = 0;
+        for (int l : tap_layers) if (l >= stage_lb && l < le && l < n_layers - 1) ++nt;
+        return (uint64_t) max_t * nt * (uint64_t) n_embd * 4ull;
+    }
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
@@ -237,6 +250,11 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+
+    /// Is the last window's state change still undone (only `commit` / `pl_commit_async` advances it)?  False for a one-token
+    /// window that advanced the state itself (see commit), and on every stage of a chain.  serve_skip_stopped_window asks this
+    /// before it drops a window nobody will read.
+    bool commit_deferred() const;
 
     // ================================ SEVERAL SEQUENCES IN ONE WINDOW ================================
     //
@@ -809,6 +827,11 @@ private:
     void* taps_ready_user_ = nullptr;
     PostLayersFn post_layers_cb_ = nullptr;
     void* post_layers_user_ = nullptr;
+
+    static int64_t plan_i32_count(int max_t, int64_t k_used, int64_t* dst2_off_out = nullptr) noexcept;
+    static uint64_t carve_arena(Verifier* self, uint8_t* base, const ModelGeometry& g, int64_t max_blocks,
+                                int64_t cap, int64_t attn_scratch_floats, int64_t plan_i32, int64_t n_vocab,
+                                int64_t k_used, uint64_t staging_blob_bytes, bool had_gu_any, int max_t);
 };
 
 }  // namespace strata::core

@@ -1,0 +1,107 @@
+{
+ "arm": "trt_combo_fork_headil16",
+ "round": "_r3",
+ "ts": "2026-11-13T08:59:41",
+ "exe": "/home/soren/Strata-latest-20261112-182859/build-hip/strata",
+ "binary_sha256": "8bd8a4e8741b09fee344e4f3804491cdf6908f7828c657a412cd01d4ba7dc0ce",
+ "commit": "d63d36a9f",
+ "engine_pid": 371070,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/Strata-latest-20261112-182859/bench/ports-ab-2026-11-16-window/results/trt_combo_fork_headil16.manifest.json",
+  "STRATA_BATCH_DF2_MAX_T": "16",
+  "STRATA_DF2_HEAD_IL": "0",
+  "STRATA_DF2_FORK": "1"
+ },
+ "parallel": 2,
+ "smoke": {
+  "prompt_tokens": 39,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.339,
+  "wall_tok_s": 8.85
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 6.093,
+  "wall_tok_s": 42.02
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.407,
+   "wall_tok_s": 116.18,
+   "hash": "bf62fdef9da2e2818ee896c579d53424c16c695d2a935ae24f0f24eed566efd2"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.458,
+   "wall_tok_s": 148.07,
+   "hash": "c258564ae979e45bd322f2e90cd7eb012f0e137743eb16111d7216e91af616ba"
+  }
+ ],
+ "burst": {
+  "wall_s": 3.945,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 129.79,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.701,
+    "wall_tok_s": 69.18,
+    "hash": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 3.943,
+    "wall_tok_s": 64.93,
+    "hash": "4ed49e84ec2bb55e3fe295d66e75108a5ece93e0d14f78cc7eefb4ee7f805d3a"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "bf62fdef9da2e2818ee896c579d53424c16c695d2a935ae24f0f24eed566efd2",
+  "greedy_warm": "c258564ae979e45bd322f2e90cd7eb012f0e137743eb16111d7216e91af616ba",
+  "burst_a": "b49ac033609351063211ae056508e1c9f752b3628fcab20362b9c30172ea7574",
+  "burst_b": "4ed49e84ec2bb55e3fe295d66e75108a5ece93e0d14f78cc7eefb4ee7f805d3a"
+ },
+ "engine_decode_512": [
+  "121.5",
+  "151.2"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 64 ms (46.9 tok/s), drafts accepted 1 of 3, 1 checkpoints",
+   "generated in 3159 ms (81.0 tok/s), drafts accepted 160 of 304, 1 checkpoints",
+   "generated in 4214 ms (121.5 tok/s), drafts accepted 414 of 568, 1 checkpoints",
+   "generated in 3386 ms (151.2 tok/s), drafts accepted 425 of 503, 1 checkpoints",
+   "generated in 28 ms (35.2 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 16 ms (62.7 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "generated in 191 ms (167.9 tok/s), drafts accepted 27 of 33, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 39 tokens = 0 reused + 39 read in 273 ms (142.9 tok/s), 3 generated in 64 ms (46.9 tok/s), drafts accepted 1 of 3, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 2931 ms (1346.8 tok/s), 256 generated in 3159 ms (81.0 tok/s), drafts accepted 160 of 304, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 191 ms (183.1 tok/s), 512 generated in 4214 ms (121.5 tok/s), drafts accepted 414 of 568, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 70 ms (99.8 tok/s), 512 generated in 3386 ms (151.2 tok/s), drafts accepted 425 of 503, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 214 ms (163.8 tok/s), 1 generated in 28 ms (35.2 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 178 ms (196.3 tok/s), 1 generated in 16 ms (62.7 tok/s), drafts accepted 0 of 0, 0 checkpoints",
+   "prompt 259 tokens = 258 reused + 1 read in 2 ms (519.2 tok/s), 32 generated in 191 ms (167.9 tok/s), drafts accepted 27 of 33, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 3",
+   "drafts accepted 160 of 304",
+   "drafts accepted 414 of 568",
+   "drafts accepted 425 of 503",
+   "drafts accepted 0 of 0",
+   "drafts accepted 0 of 0",
+   "drafts accepted 27 of 33"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 9504 slots, 21.75 GiB of VRAM; policy is"
+ ]
+}

@@ -1,0 +1,363 @@
+{
+  "_doc": "Arm table for the RDNA4-Ports switch campaign. baseline = value production effectively runs with (explicit in the control arm so the switch is never implicit); arm = value the treatment arm sets. src = doc section of RDNA4-Ports.md the switch comes from.",
+  "arms": [
+    {
+      "id": "attn_pre75",
+      "switch": "STRATA_ATTN_PRE75",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "gfx12 default uses the wave32 pre75 kernel; ablate to measure it"
+    },
+    {
+      "id": "attn_merge_v2",
+      "switch": "STRATA_ATTN_MERGE_V2",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "gfx12 default merges with attn_merge_v2_kernel; ablate"
+    },
+    {
+      "id": "qil",
+      "switch": "STRATA_QIL",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "q8_1 interleave write fusion, gfx12 default on; ablate"
+    },
+    {
+      "id": "mmvq_il_pf",
+      "switch": "STRATA_MMVQ_IL_PF",
+      "baseline": "0",
+      "arm": "2",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "P1/P2 wave32 prefetch port; sweep starts at variant 2"
+    },
+    {
+      "id": "df2_head_il",
+      "switch": "STRATA_DF2_HEAD_IL",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "DFlash2 draft head interleaved MMVQ, HIP default on; ablate"
+    },
+    {
+      "id": "df2_head_chunk",
+      "switch": "STRATA_DF2_HEAD_CHUNK",
+      "baseline": "8",
+      "arm": "14",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "draft head chunk width, HIP default 8; try 14"
+    },
+    {
+      "id": "df2_fork",
+      "switch": "STRATA_DF2_FORK",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "DFlash2 side-stream fork, off on HIP"
+    },
+    {
+      "id": "df_ple",
+      "switch": "STRATA_DF_PLE",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "batched PLE post-ops for draft windows"
+    },
+    {
+      "id": "lfuse",
+      "switch": "STRATA_LFUSE",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "shared-expert gate / SwiGLU pair / kv_append_q8 fusion"
+    },
+    {
+      "id": "qfuse",
+      "switch": "STRATA_QFUSE",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "adds GDN out-norm q8_1 image fusion on top of QFUSE_HC"
+    },
+    {
+      "id": "mmvq_tsum",
+      "switch": "STRATA_MMVQ_TSUM",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "transposed warp butterfly for multi-column MMVQ; ablate"
+    },
+    {
+      "id": "one_token_commit",
+      "switch": "STRATA_ONE_TOKEN_COMMIT",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "commit-graph elision on 1-token windows (Tier-1 item)"
+    },
+    {
+      "id": "gr_v3",
+      "switch": "STRATA_GR_V3",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "differs",
+      "src": "opt-in",
+      "why": "stream-split HC read, different summation order"
+    },
+    {
+      "id": "side_mixer",
+      "switch": "STRATA_SIDE_MIXER",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "side-stream overlap"
+    },
+    {
+      "id": "sh_stream",
+      "switch": "STRATA_SH_STREAM",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "shared-expert side stream (gfx1151 default)"
+    },
+    {
+      "id": "verify_async",
+      "switch": "STRATA_VERIFY_ASYNC_LAUNCH",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "async graph launch from helper thread (Tier-1 item)"
+    },
+    {
+      "id": "fuse_convab",
+      "switch": "STRATA_FUSE_CONVAB",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "earlier R9700 A/B -0.3%; re-test"
+    },
+    {
+      "id": "fuse_pcie_wait",
+      "switch": "STRATA_FUSE_PCIE_WAIT",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "known regression (-3..4% at c=4); re-test to refresh"
+    },
+    {
+      "id": "qsa_slots",
+      "switch": "STRATA_QSA_SLOTS",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "batch slot consolidation of QSA layer launches"
+    },
+    {
+      "id": "batch_self_commit",
+      "switch": "STRATA_BATCH_SELF_COMMIT",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "opt-in",
+      "why": "one-token batch windows keep their own commit"
+    },
+    {
+      "id": "topk_sample",
+      "switch": "STRATA_TOPK_SAMPLE",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "differs",
+      "src": "newly-ported",
+      "why": "long-context single-read top-k (opt-in on HIP)"
+    },
+    {
+      "id": "tq_sub8",
+      "switch": "STRATA_TQ_SUB8",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "differs",
+      "src": "newly-ported",
+      "why": "TerQuant sub-byte dot, opt-in on HIP"
+    },
+    {
+      "id": "iq_stage_grid",
+      "switch": "STRATA_IQ_STAGE_GRID",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "tier2",
+      "why": "default-ON in this build (`g_stage_grid`: any value but \"0\" keeps it on), so production runs staged tables; ablate them"
+    },
+    {
+      "id": "pf_wmma",
+      "switch": "STRATA_PF_WMMA",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "differs",
+      "src": "newly-ported",
+      "why": "grouped FP16 WMMA prompt experts (needs pf_wmma_parity)"
+    },
+    {
+      "id": "pf_f16",
+      "switch": "STRATA_PF_F16",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "differs",
+      "src": "newly-ported",
+      "why": "FP16 tensor-core prompt experts"
+    },
+    {
+      "id": "mmq_kq",
+      "switch": "STRATA_MMQ_KQ",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "gfx12 default-ON (`gfx12_value_changing_env`) and its banner prints in every arm's startup log, so production runs the K-quant MMQ prompt path; ablate it"
+    },
+    {
+      "id": "dense_mmq",
+      "switch": "STRATA_DENSE_MMQ",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "differs",
+      "src": "opt-in",
+      "why": "dense Q4_K/Q6_K prompt projections through MMQ"
+    },
+    {
+      "id": "multi_block_argmax",
+      "switch": "STRATA_MULTI_BLOCK_ARGMAX",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "tier1",
+      "why": "already engaged on gfx12 by default; ablate to size it (answers the Tier-1 open question)"
+    },
+    {
+      "id": "no_batch_kv_step",
+      "switch": "STRATA_NO_BATCH_KV_STEP",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "revert to per-token KV/indexer appends (ablation of 0b8b0d91f)"
+    },
+    {
+      "id": "batch_attn_rows",
+      "switch": "STRATA_BATCH_ATTN_ROWS",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "batch attention rows kernel, default on every backend; ablate"
+    },
+    {
+      "id": "batch_gdn_groups",
+      "switch": "STRATA_BATCH_GDN_GROUPS",
+      "baseline": "1",
+      "arm": "0",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "multi-slot GDN conv batching, HIP default on; ablate"
+    },
+    {
+      "id": "aa_floor_1",
+      "switch": "STRATA_ATTN_LANECELL",
+      "baseline": "1",
+      "arm": "1",
+      "bits": "same",
+      "src": "aa-floor",
+      "why": "A/A floor, not a switch: both arms run the identical configuration (the pinned switch is already 1 in the production environment), so the spread between them is the launch-to-launch noise of this harness"
+    },
+    {
+      "id": "aa_floor_2",
+      "switch": "STRATA_ATTN_LANECELL",
+      "baseline": "1",
+      "arm": "1",
+      "bits": "same",
+      "src": "aa-floor",
+      "why": "A/A floor, repeat of the same identical-config pair (second independent sample of the launch spread)"
+    },
+    {
+      "id": "mmvq_il_pf_3",
+      "switch": "STRATA_MMVQ_IL_PF",
+      "baseline": "0",
+      "arm": "3",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "sweep of the P1/P2 prefetch variants the file asks for (3); the production setting is unset (=0)"
+    },
+    {
+      "id": "mmvq_il_pf_4",
+      "switch": "STRATA_MMVQ_IL_PF",
+      "baseline": "0",
+      "arm": "4",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "sweep of the P1/P2 prefetch variants the file asks for (4); the production setting is unset (=0)"
+    },
+    {
+      "id": "mmvq_il_pf_6",
+      "switch": "STRATA_MMVQ_IL_PF",
+      "baseline": "0",
+      "arm": "6",
+      "bits": "same",
+      "src": "newly-ported",
+      "why": "sweep of the P1/P2 prefetch variants the file asks for (6); the production setting is unset (=0)"
+    }
+  ],
+  "not_testable": [
+    {
+      "switch": "STRATA_NORM_ROPE",
+      "why": "**blocked by its own parity gate**: `rope_parity` check 6 (`native_qsa_rms_norm_rope hd=128/256`) FAILS on gfx1201 with `STRATA_NORM_ROPE=1` \u2014 3644 of 49152 (hd=128) and 3546 of 98304 (hd=256) elements differ, 7190 failures total (`build-hip/rope_parity`, 2026-11-12). The doc requires that check to pass before enabling this switch on RDNA4, so no throughput A/B was run; the fused kernel needs fixing first."
+    },
+    {
+      "switch": "STRATA_ATTN_DAILY",
+      "why": "name is absent from the built engine: the getenv site sits inside `#if !defined(__HIPCC__)`, so on HIP it is not settable even though docs/commit 8c03a43ed describe a wave32 port"
+    },
+    {
+      "switch": "STRATA_GRAPH_PRIO",
+      "why": "not compiled into the engine (every HIP caller guarded off)"
+    },
+    {
+      "switch": "STRATA_MTP_PRIORITY",
+      "why": "not compiled into the engine"
+    },
+    {
+      "switch": "STRATA_MTP_SHARED_BRANCH",
+      "why": "not compiled into the engine (HIP keeps one stream)"
+    },
+    {
+      "switch": "STRATA_PCIE_AUTO_CANON",
+      "why": "not compiled into the engine (CUDA-only tuning path)"
+    },
+    {
+      "switch": "STRATA_HIP_MMVQ_IL",
+      "why": "not compiled into this engine; already A/B-dropped from production earlier"
+    },
+    {
+      "switch": "STRATA_MMQ_TAB",
+      "why": "build-time CMake option (STRATA_MMQ_TAB=OFF in build-hip); needs a second build before STRATA_MMQ_DIRECT can do anything"
+    }
+  ]
+}

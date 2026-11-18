@@ -1,8 +1,8 @@
 #pragma once
-// CUDA virtual memory (the elastic K/V, --kv-grow): an address range reserved once, whose physical memory is mapped and
-// unmapped in chunks of the device's granularity (2 MiB).  The K/V pools grow with the context by taking chunks the
-// expert cache gives up, and neither moves: every captured graph and stored pointer stays valid.  The driver calls
-// are reached through the runtime's entry-point query, so nothing links the driver library.  Not under HIP.
+// CUDA/HIP virtual memory (the elastic K/V, --kv-grow): reserve an address range once, then map and unmap physical
+// chunks at the device granularity (2 MiB on HIP gfx1201). The K/V pools can take chunks the expert cache gives up;
+// neither moves, so captured graphs and stored pointers stay valid. CUDA driver calls use runtime entry-point lookup,
+// while HIP uses its runtime VMM API.
 
 #include <cstdint>
 #include <vector>
