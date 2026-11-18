@@ -32,13 +32,14 @@
 #define STRATA_FUSED_GEO_N_EMBD 2048
 #define STRATA_FUSED_GEO_N_FF 512
 #define fused fused_q36
+#define STRATA_FUSED_Q36_TU 1   // must precede the include: the moe_fused_iq.cu iu8 block (P5 T3) keys off it
 #include "moe_fused_iq.cu"
 #undef fused
 #undef STRATA_FUSED_GEO_N_EMBD
 #undef STRATA_FUSED_GEO_N_FF
 
-#define STRATA_FUSED_Q36_TU 1
-#include "strata/prefill/moe_fused_q36.hpp"
+#include "strata/prefill/moe_fused_q36.hpp"   // also keys off STRATA_FUSED_Q36_TU: include it while the marker is still defined
+#undef STRATA_FUSED_Q36_TU
 
 // the hand-written API header (moe_fused_q36.hpp) and this copy's types agree
 namespace strata::prefill::fused_q36 {

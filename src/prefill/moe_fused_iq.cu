@@ -3385,7 +3385,12 @@ void experts_native(const WideBatch& b, const NativeGeom& g, int n_expert, int64
 #endif
 }  // namespace strata::prefill::fused
 
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) && !defined(STRATA_FUSED_DECODE_ONLY) && !defined(STRATA_FUSED_Q36_TU)
+// P5 T3 fix (Hermes, 2026-11-17): this namespace sits OUTSIDE the `fused`->`fused_q36` rename of the
+// second copy (moe_fused_iq_q36.cu), so as-is both TUs emitted strata::prefill::iu8::strata_gemv_sym_i8_dot4
+// (duplicate symbol at strata link); the q36 engine never calls into iu8, so the copy excludes the block.
+// The golden test (tests/cuda/prefill_decode_golden.cu) compiles this file for its decode only, so the
+// body's launch_sym_i8_dot4 reference (defined in strata_mmq's moe_iu8_gfx.cu) made that target unlinkable.
 namespace strata::prefill::iu8 {
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Kaden Schutt

@@ -510,6 +510,10 @@ public:
     void clear() { dwords_.clear(); register_state_.clear(); }
     const std::vector<uint32_t>& dwords() const { return dwords_; }
     std::vector<uint8_t> as_bytes() const;
+    // P5/P0 wire-in (mtp.cpp/verify.cpp) sizes the IB arena from the lowered byte length;
+    // the class stores dwords, so the accessor is declared here (Windows-side code was
+    // written against a size_bytes() that never made it into this header).
+    size_t size_bytes() const { return dwords_.size() * sizeof(uint32_t); }
 
 private:
     void emit_set_sh_regs_raw(uint32_t first_reg, const uint32_t* values, size_t count);
