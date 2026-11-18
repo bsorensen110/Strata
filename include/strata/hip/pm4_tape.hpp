@@ -90,6 +90,22 @@ const KernelContract* lookup_kernel_contract_in(
 /// Inspect the built-in static kernel contract table (for audit and unit tests).
 const KernelContract* registered_kernel_contracts(size_t& out_count) noexcept;
 
+/// Explicit mapping from a concrete kernel symbol name in Strata sources
+/// (e.g. "gpu_stamp_kernel<true>", "bf16_f32_mmvf_multi_kernel<256, 4, true, false>",
+/// or a `__global__` kernel identifier) to its canonical `KernelContract::family_name`.
+struct KernelSymbolAlias {
+    const char* symbol_name = nullptr;
+    const char* canonical_family = nullptr;
+};
+
+/// Resolve a concrete kernel symbol name to its canonical contract family name using an
+/// explicit, source-verified lookup table (never a substring or name-mangling guess).
+/// Returns nullptr if `symbol_name` is not in the explicit table or contract list.
+const char* canonicalize_kernel_symbol(const char* symbol_name) noexcept;
+
+/// Inspect the built-in static kernel symbol canonicalization table (for audit and unit tests).
+const KernelSymbolAlias* registered_kernel_symbol_aliases(size_t& out_count) noexcept;
+
 /// One live device allocation range `[base, base + size)`.
 struct AllocationRange {
     uint64_t base = 0;

@@ -1754,6 +1754,13 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     if (!g_multi_exact) {
         constexpr int NW = NCOLS <= 4 ? 4 : 2;
         const unsigned blocks = unsigned((std::size_t(n_out) + 1) / 2);
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+        if (pm4_scope()) {
+            pm4_register_pdl_kernel(
+                reinterpret_cast<const void*>(&native_mmvq_multi_kernel<F, NCOLS, NW, 2, false, false>),
+                "native_mmvq_multi_kernel");
+        }
+#endif
         launch_pdl(native_mmvq_multi_kernel<F, NCOLS, NW, 2, false, false>, dim3(grid_pad(blocks, WARP * NW, NCOLS)), dim3(WARP, NW), 0, s, w, x, y, n_in, n_out,
                    (const typename F::Block*) nullptr, (float*) nullptr, (const int32_t*) nullptr);
         return;
@@ -1770,14 +1777,48 @@ void launch_multi_n(const void* weights, const void* x_q8_1, float* y, int n_in,
     }();
     if ((rows1 || q8_0_rows1<F>(n_in, n_out)) && n_in / F::DIV >= F::BPI) {
         const dim3 grid(grid_pad(unsigned(n_out), WARP * WARPS, NCOLS));
-        if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, false>, grid, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2, (const int32_t*) nullptr);
-        else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, false>, grid, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2, (const int32_t*) nullptr);
+        if (s26_tsum_on()) {
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+            if (pm4_scope()) {
+                pm4_register_pdl_kernel(
+                    reinterpret_cast<const void*>(&native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, false>),
+                    "native_mmvq_multi_kernel");
+            }
+#endif
+            launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, false>, grid, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2, (const int32_t*) nullptr);
+        } else {
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+            if (pm4_scope()) {
+                pm4_register_pdl_kernel(
+                    reinterpret_cast<const void*>(&native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, false>),
+                    "native_mmvq_multi_kernel");
+            }
+#endif
+            launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, false>, grid, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2, (const int32_t*) nullptr);
+        }
         return;
     }
     constexpr int ROWS = 2;
     const dim3 grid(grid_pad(unsigned((std::size_t(n_out) + ROWS - 1) / ROWS), WARP * WARPS, NCOLS));
-    if (s26_tsum_on()) launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true, false>, grid, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2, (const int32_t*) nullptr);
-    else launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, false, false>, grid, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2, (const int32_t*) nullptr);
+    if (s26_tsum_on()) {
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+        if (pm4_scope()) {
+            pm4_register_pdl_kernel(
+                reinterpret_cast<const void*>(&native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true, false>),
+                "native_mmvq_multi_kernel");
+        }
+#endif
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, true, false>, grid, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2, (const int32_t*) nullptr);
+    } else {
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+        if (pm4_scope()) {
+            pm4_register_pdl_kernel(
+                reinterpret_cast<const void*>(&native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, false, false>),
+                "native_mmvq_multi_kernel");
+        }
+#endif
+        launch_pdl(native_mmvq_multi_kernel<F, NCOLS, WARPS, ROWS, false, false>, grid, threads, 0, s, w, x, y, n_in, n_out, no_w2, no_y2, (const int32_t*) nullptr);
+    }
 }
 
 template<typename F>
@@ -3464,6 +3505,13 @@ void native_quantize_q8_1(const float* x, void* x_q8_1, int n_in, int ncols, voi
     // ncols * n_in elements: every 32-element block stays inside one column.
     const int n_total = n_in * ncols;
     const unsigned blocks = unsigned((std::size_t(n_total) + QUANT_THREADS - 1) / QUANT_THREADS);
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+    if (pm4_scope()) {
+        pm4_register_pdl_kernel(
+            reinterpret_cast<const void*>(&native_quantize_q8_1_kernel),
+            "native_quantize_q8_1_kernel");
+    }
+#endif
     launch_pdl(native_quantize_q8_1_kernel, dim3(blocks), dim3(QUANT_THREADS), 0, static_cast<cudaStream_t>(stream), x,
                static_cast<Q81Block*>(x_q8_1), n_total);
     launch_check();

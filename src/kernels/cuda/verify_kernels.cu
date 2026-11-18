@@ -1931,8 +1931,17 @@ __global__ void noop_kernel() {}
 }  // namespace
 void gpu_noop(void* stream) { noop_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(); }
 void gpu_stamp(unsigned long long* buf, int i, void* stream) {
-    if (pdl_scope()) launch_pdl(gpu_stamp_kernel<true>, dim3(1), dim3(1), 0, (cudaStream_t) stream, buf, i);
-    else gpu_stamp_kernel<false><<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
+    if (pdl_scope()) {
+#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+        if (pm4_scope()) {
+            pm4_register_pdl_kernel(
+                reinterpret_cast<const void*>(&gpu_stamp_kernel<true>), "gpu_stamp_kernel");
+        }
+#endif
+        launch_pdl(gpu_stamp_kernel<true>, dim3(1), dim3(1), 0, (cudaStream_t) stream, buf, i);
+    } else {
+        gpu_stamp_kernel<false><<<1, 1, 0, (cudaStream_t) stream>>>(buf, i);
+    }
 }
 
 namespace {
@@ -1975,6 +1984,10 @@ bool pm4_scope() noexcept {
     return strata::hip::pm4::is_pm4_capture_scope_active();
 }
 
+void pm4_register_pdl_kernel(const void* host_kernel, const char* canonical_family) noexcept {
+    strata::hip::pm4::register_host_kernel_family(host_kernel, canonical_family);
+}
+
 void pm4_record_pdl_launch(const void* host_kernel, dim3 grid, dim3 block,
                            size_t smem, cudaStream_t /*stream*/,
                            const void* kernarg_data, size_t kernarg_bytes) noexcept {
@@ -1985,7 +1998,8 @@ void pm4_record_pdl_launch(const void* host_kernel, dim3 grid, dim3 block,
     const char* family = strata::hip::pm4::lookup_host_kernel_family(host_kernel);
 #if !defined(_WIN32)
     if (family == nullptr && host_kernel != nullptr) {
-        family = hipKernelNameRefByPtr(host_kernel, nullptr);
+        family = strata::hip::pm4::canonicalize_kernel_symbol(
+            hipKernelNameRefByPtr(host_kernel, nullptr));
     }
 #endif
     (void) tape->record_launch(

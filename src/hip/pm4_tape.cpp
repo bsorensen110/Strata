@@ -353,6 +353,192 @@ constexpr KernelContract kStrataVerifyContracts[] = {
 
 #undef CONTRACT_ROW
 
+#define ALIAS_ROW(sym_lit, fam_lit) KernelSymbolAlias{sym_lit, fam_lit}
+
+// Explicit, source-verified canonicalization table for concrete kernel symbols in Strata sources:
+// - verify_kernels.cu:1913,1934: gpu_stamp_kernel<{true,false}>
+// - native_mmvq.cu:162,3467: native_quantize_q8_1_kernel
+// - native_mmvq.cu:1431,1757,1773,1774,1779,1780: native_mmvq_multi_kernel<F, NCOLS, NW, ROWS, TS, PAIR>
+// - native_bf16.cu:119,498-504,545,560-566: bf16_f32_mmvf_multi_kernel<BLOCK_SIZE, NT, EXACT_T, AUX>
+// - Real __global__ kernel identifiers across src/kernels/cuda/*.cu
+#define MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, NCOLS_STR) \
+    ALIAS_ROW("native_mmvq_multi_kernel<" F_STR ", " NCOLS_STR ", 4, 1, false, false>", "native_mmvq_multi_kernel"), \
+    ALIAS_ROW("native_mmvq_multi_kernel<" F_STR ", " NCOLS_STR ", 4, 1, true, false>", "native_mmvq_multi_kernel"), \
+    ALIAS_ROW("native_mmvq_multi_kernel<" F_STR ", " NCOLS_STR ", 4, 2, false, false>", "native_mmvq_multi_kernel"), \
+    ALIAS_ROW("native_mmvq_multi_kernel<" F_STR ", " NCOLS_STR ", 4, 2, true, false>", "native_mmvq_multi_kernel"), \
+    ALIAS_ROW("native_mmvq_multi_kernel<" F_STR ", " NCOLS_STR ", 2, 2, false, false>", "native_mmvq_multi_kernel"), \
+    ALIAS_ROW("native_mmvq_multi_kernel<" F_STR ", " NCOLS_STR ", 4, 1, false, false, false, false>", "native_mmvq_multi_kernel"), \
+    ALIAS_ROW("native_mmvq_multi_kernel<" F_STR ", " NCOLS_STR ", 4, 1, true, false, false, false>", "native_mmvq_multi_kernel"), \
+    ALIAS_ROW("native_mmvq_multi_kernel<" F_STR ", " NCOLS_STR ", 4, 2, false, false, false, false>", "native_mmvq_multi_kernel"), \
+    ALIAS_ROW("native_mmvq_multi_kernel<" F_STR ", " NCOLS_STR ", 4, 2, true, false, false, false>", "native_mmvq_multi_kernel"), \
+    ALIAS_ROW("native_mmvq_multi_kernel<" F_STR ", " NCOLS_STR ", 2, 2, false, false, false, false>", "native_mmvq_multi_kernel")
+
+#define MMVQ_TRAIT_ROWS(F_STR) \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "2"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "3"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "4"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "5"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "6"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "7"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "8"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "9"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "10"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "11"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "12"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "13"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "14"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "15"), \
+    MMVQ_TRAIT_ROWS_FOR_NCOLS(F_STR, "16")
+
+#define BF16_MMVF_ROWS_FOR_BLOCK(B_STR) \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 1, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 2, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 3, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 4, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 5, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 6, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 8, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 9, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 10, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 11, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 12, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 13, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 14, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 15, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 16, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 1, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 2, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 3, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 4, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 5, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 6, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 8, false, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 9, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 10, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 11, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 12, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 13, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 14, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 15, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 16, true, false>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 1, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 2, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 3, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 4, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 5, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 6, true, true>", "bf16_gemv_fp32_mmvf_multi"), \
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel<" B_STR ", 8, false, true>", "bf16_gemv_fp32_mmvf_multi")
+
+constexpr KernelSymbolAlias kStrataKernelSymbolAliases[] = {
+    // 1. gpu_stamp_kernel (src/kernels/cuda/verify_kernels.cu:1913, launched via launch_pdl at :1934)
+    ALIAS_ROW("gpu_stamp_kernel", "gpu_stamp_kernel"),
+    ALIAS_ROW("gpu_stamp_kernel<true>", "gpu_stamp_kernel"),
+    ALIAS_ROW("gpu_stamp_kernel<false>", "gpu_stamp_kernel"),
+    ALIAS_ROW("strata::kernels::(anonymous namespace)::gpu_stamp_kernel<true>", "gpu_stamp_kernel"),
+    ALIAS_ROW("strata::kernels::(anonymous namespace)::gpu_stamp_kernel<false>", "gpu_stamp_kernel"),
+
+    // 2. native_quantize_q8_1_kernel (src/kernels/cuda/native_mmvq.cu:162, launched via launch_pdl at :3467)
+    ALIAS_ROW("native_quantize_q8_1_kernel", "native_quantize_q8_1_kernel"),
+    ALIAS_ROW("strata::kernels::(anonymous namespace)::native_quantize_q8_1_kernel", "native_quantize_q8_1_kernel"),
+
+    // 3. native_mmvq_multi_kernel (src/kernels/cuda/native_mmvq.cu:1431, launched via launch_pdl at :1757,1773,1774,1779,1780)
+    ALIAS_ROW("native_mmvq_multi_kernel", "native_mmvq_multi_kernel"),
+    MMVQ_TRAIT_ROWS("Q4KTraits"),
+    MMVQ_TRAIT_ROWS("Q5KTraits"),
+    MMVQ_TRAIT_ROWS("Q6KTraits"),
+    MMVQ_TRAIT_ROWS("Q20Traits"),
+    MMVQ_TRAIT_ROWS("Q3KTraits"),
+    MMVQ_TRAIT_ROWS("IQ4XSTraits"),
+    MMVQ_TRAIT_ROWS("SmallTraits<Q40Block, 4>"),
+    MMVQ_TRAIT_ROWS("SmallTraits<Q50Block, 4>"),
+    MMVQ_TRAIT_ROWS("SmallTraits<Q80Block, 8>"),
+    MMVQ_TRAIT_ROWS("SmallTraits<IQ4NLBlock, 4>"),
+
+    // 4. bf16_f32_mmvf_multi_kernel (src/kernels/cuda/native_bf16.cu:119, launched via launch_pdl at :498-504,545,560-566)
+    ALIAS_ROW("bf16_f32_mmvf_multi_kernel", "bf16_gemv_fp32_mmvf_multi"),
+    ALIAS_ROW("bf16_gemv_fp32_mmvf_multi", "bf16_gemv_fp32_mmvf_multi"),
+    BF16_MMVF_ROWS_FOR_BLOCK("32"),
+    BF16_MMVF_ROWS_FOR_BLOCK("64"),
+    BF16_MMVF_ROWS_FOR_BLOCK("96"),
+    BF16_MMVF_ROWS_FOR_BLOCK("128"),
+    BF16_MMVF_ROWS_FOR_BLOCK("160"),
+    BF16_MMVF_ROWS_FOR_BLOCK("192"),
+    BF16_MMVF_ROWS_FOR_BLOCK("224"),
+    BF16_MMVF_ROWS_FOR_BLOCK("256"),
+
+    // 5. Real __global__ kernel symbols across src/kernels/cuda/ mapped to their contract families
+    ALIAS_ROW("copy_i32_from_mapped_kernel", "copy_i32_from_mapped"),
+    ALIAS_ROW("copy_i32_from_mapped", "copy_i32_from_mapped"),
+    ALIAS_ROW("copy_step_pos_from_mapped_kernel", "copy_step_pos_from_mapped"),
+    ALIAS_ROW("copy_step_pos_from_mapped", "copy_step_pos_from_mapped"),
+    ALIAS_ROW("embedding_gather_dev_kernel", "embedding_gather_dev"),
+    ALIAS_ROW("embedding_gather_dev", "embedding_gather_dev"),
+    ALIAS_ROW("broadcast_streams_kernel", "broadcast_streams"),
+    ALIAS_ROW("broadcast_streams", "broadcast_streams"),
+    ALIAS_ROW("gdn_conv_l2_multi_kernel", "gdn_conv_l2_multi"),
+    ALIAS_ROW("gdn_conv_l2_multi", "gdn_conv_l2_multi"),
+    ALIAS_ROW("gdn_ab_multi_kernel", "gdn_ab_multi"),
+    ALIAS_ROW("gdn_ab_multi_kernel<1, true>", "gdn_ab_multi"),
+    ALIAS_ROW("gdn_ab_multi_kernel<2, true>", "gdn_ab_multi"),
+    ALIAS_ROW("gdn_ab_multi_kernel<3, true>", "gdn_ab_multi"),
+    ALIAS_ROW("gdn_ab_multi_kernel<4, true>", "gdn_ab_multi"),
+    ALIAS_ROW("gdn_ab_multi_kernel<5, true>", "gdn_ab_multi"),
+    ALIAS_ROW("gdn_ab_multi_kernel<6, true>", "gdn_ab_multi"),
+    ALIAS_ROW("gdn_ab_multi_kernel<8, false>", "gdn_ab_multi"),
+    ALIAS_ROW("gdn_ab_multi_kernel<16, false>", "gdn_ab_multi"),
+    ALIAS_ROW("gdn_ab_multi", "gdn_ab_multi"),
+    ALIAS_ROW("gdn_step_norm_multi_kernel", "gdn_step_norm_multi"),
+    ALIAS_ROW("gdn_step_norm_multi_kernel<false, false>", "gdn_step_norm_multi"),
+    ALIAS_ROW("gdn_step_norm_multi_kernel<true, false>", "gdn_step_norm_multi"),
+    ALIAS_ROW("gdn_step_norm_multi_kernel<true, true>", "gdn_step_norm_multi"),
+    ALIAS_ROW("gdn_step_norm_multi", "gdn_step_norm_multi"),
+    ALIAS_ROW("norm_rope_kernel", "native_qsa_rms_norm_rope"),
+    ALIAS_ROW("norm_rope_kernel<false>", "native_qsa_rms_norm_rope"),
+    ALIAS_ROW("norm_rope_kernel<true>", "native_qsa_rms_norm_rope"),
+    ALIAS_ROW("native_qsa_rms_norm_rope", "native_qsa_rms_norm_rope"),
+    ALIAS_ROW("fwht256_pair_kernel", "fwht256_pair_inplace_cuda"),
+    ALIAS_ROW("fwht256_pair_inplace_cuda", "fwht256_pair_inplace_cuda"),
+    ALIAS_ROW("append", "native_qsa_indexer_append_steps"),
+    ALIAS_ROW("append<false>", "native_qsa_indexer_append_steps"),
+    ALIAS_ROW("append<true>", "native_qsa_indexer_append_steps"),
+    ALIAS_ROW("native_qsa_indexer_append_steps", "native_qsa_indexer_append_steps"),
+    ALIAS_ROW("block_scores_kernel", "qsa_block_scores"),
+    ALIAS_ROW("qsa_block_scores", "qsa_block_scores"),
+    ALIAS_ROW("block_topk_kernel", "qsa_block_topk"),
+    ALIAS_ROW("qsa_block_topk", "qsa_block_topk"),
+    ALIAS_ROW("resolve_kernel", "qsa_kv_resolve"),
+    ALIAS_ROW("qsa_kv_resolve", "qsa_kv_resolve"),
+    ALIAS_ROW("attn_chunk_kernel", "qsa_decode_attn_batch_int8"),
+    ALIAS_ROW("attn_chunk_kernel<1, false, false, false>", "qsa_decode_attn_batch_int8"),
+    ALIAS_ROW("attn_chunk_kernel<1, true, false, false>", "qsa_decode_attn_batch_int8"),
+    ALIAS_ROW("qsa_decode_attn_batch_int8", "qsa_decode_attn_batch_int8"),
+    ALIAS_ROW("gate_quantize_q8_1_kernel", "native_qsa_gate_quantize_q8_1"),
+    ALIAS_ROW("native_qsa_gate_quantize_q8_1", "native_qsa_gate_quantize_q8_1"),
+    ALIAS_ROW("route_multi", "native_router_top10_multi"),
+    ALIAS_ROW("native_router_top10_multi", "native_router_top10_multi"),
+    ALIAS_ROW("resident_plan_kernel", "resident_plan_all_resident"),
+    ALIAS_ROW("resident_plan_kernel<128>", "resident_plan_all_resident"),
+    ALIAS_ROW("resident_plan_kernel<256>", "resident_plan_all_resident"),
+    ALIAS_ROW("resident_plan_all_resident", "resident_plan_all_resident"),
+    ALIAS_ROW("quantize_q8_1_kernel", "quantize_q8_1_rows"),
+    ALIAS_ROW("quantize_q8_1_rows", "quantize_q8_1_rows"),
+    ALIAS_ROW("combine", "native_moe_combine_multi"),
+    ALIAS_ROW("combine<false, false>", "native_moe_combine_multi"),
+    ALIAS_ROW("combine<true, false>", "native_moe_combine_multi"),
+    ALIAS_ROW("combine<false, true>", "native_moe_combine_multi"),
+    ALIAS_ROW("combine<true, true>", "native_moe_combine_multi"),
+    ALIAS_ROW("native_moe_combine_multi", "native_moe_combine_multi"),
+    ALIAS_ROW("post_multi", "gr_write_multi"),
+    ALIAS_ROW("gr_write_multi", "gr_write_multi"),
+    ALIAS_ROW("argmax_rows_kernel", "argmax_rows"),
+    ALIAS_ROW("argmax_rows", "argmax_rows"),
+};
+
+#undef BF16_MMVF_ROWS_FOR_BLOCK
+#undef MMVQ_TRAIT_ROWS
+#undef MMVQ_TRAIT_ROWS_FOR_NCOLS
+#undef ALIAS_ROW
+
 constexpr size_t align_up_size(size_t value, size_t alignment) noexcept {
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
@@ -392,6 +578,34 @@ const KernelContract* registered_kernel_contracts(size_t& out_count) noexcept {
     return kStrataVerifyContracts;
 }
 
+const KernelSymbolAlias* registered_kernel_symbol_aliases(size_t& out_count) noexcept {
+    out_count = sizeof(kStrataKernelSymbolAliases) / sizeof(kStrataKernelSymbolAliases[0]);
+    return kStrataKernelSymbolAliases;
+}
+
+const char* canonicalize_kernel_symbol(const char* symbol_name) noexcept {
+    if (symbol_name == nullptr || symbol_name[0] == '\0') {
+        return nullptr;
+    }
+    const size_t alias_count =
+        sizeof(kStrataKernelSymbolAliases) / sizeof(kStrataKernelSymbolAliases[0]);
+    for (size_t i = 0; i < alias_count; ++i) {
+        if (kStrataKernelSymbolAliases[i].symbol_name != nullptr &&
+            std::strcmp(kStrataKernelSymbolAliases[i].symbol_name, symbol_name) == 0) {
+            return kStrataKernelSymbolAliases[i].canonical_family;
+        }
+    }
+    const size_t contract_count =
+        sizeof(kStrataVerifyContracts) / sizeof(kStrataVerifyContracts[0]);
+    for (size_t i = 0; i < contract_count; ++i) {
+        if (kStrataVerifyContracts[i].family_name != nullptr &&
+            std::strcmp(kStrataVerifyContracts[i].family_name, symbol_name) == 0) {
+            return kStrataVerifyContracts[i].family_name;
+        }
+    }
+    return nullptr;
+}
+
 const KernelContract* lookup_kernel_contract_in(
     const char* family_name,
     const KernelContract* custom_table,
@@ -401,12 +615,17 @@ const KernelContract* lookup_kernel_contract_in(
     }
     const KernelContract* table = custom_table;
     size_t count = custom_count;
+    const char* lookup_key = family_name;
     if (table == nullptr) {
         table = registered_kernel_contracts(count);
+        const char* canonical = canonicalize_kernel_symbol(family_name);
+        if (canonical != nullptr) {
+            lookup_key = canonical;
+        }
     }
     for (size_t i = 0; i < count; ++i) {
         if (table[i].family_name != nullptr &&
-            std::strcmp(table[i].family_name, family_name) == 0) {
+            std::strcmp(table[i].family_name, lookup_key) == 0) {
             return &table[i];
         }
     }
@@ -758,18 +977,22 @@ void Pm4WindowCaptureSlot::reset() noexcept {
 // ---- Host kernel family registry & TLS capture scope ----
 
 void register_host_kernel_family(const void* host_function, const char* family_name) {
-    if (host_function == nullptr || family_name == nullptr) {
+    if (host_function == nullptr || family_name == nullptr || family_name[0] == '\0') {
         return;
+    }
+    const char* canonical = canonicalize_kernel_symbol(family_name);
+    if (canonical == nullptr) {
+        return;  // refuse unverified/unknown family names (fail-closed)
     }
     std::lock_guard<std::mutex> lock(host_kernel_mutex());
     auto& reg = host_kernel_registry();
     for (auto& entry : reg) {
         if (entry.func == host_function) {
-            entry.family = family_name;
+            entry.family = canonical;
             return;
         }
     }
-    reg.push_back(HostKernelEntry{host_function, family_name});
+    reg.push_back(HostKernelEntry{host_function, canonical});
 }
 
 const char* lookup_host_kernel_family(const void* host_function) noexcept {

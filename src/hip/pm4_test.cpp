@@ -617,10 +617,21 @@ void test_pm4_tape_and_contracts() {
     {
         // Host kernel family registry & TLS capture scope guard
         int dummy_fn = 0;
+        int dummy_mmvq = 0;
+        int dummy_mmvf = 0;
+        int dummy_unknown = 0;
         clear_host_kernel_families();
-        register_host_kernel_family(&dummy_fn, "gpu_stamp_kernel");
-        CHECK( lookup_host_kernel_family(&dummy_fn) != nullptr &&
-               std::strcmp(lookup_host_kernel_family(&dummy_fn), "gpu_stamp_kernel") == 0 );
+        register_host_kernel_family(&dummy_fn, "gpu_stamp_kernel<true>");
+        register_host_kernel_family(&dummy_mmvq, "native_mmvq_multi_kernel<Q4KTraits, 4, 4, 2, false, false>");
+        register_host_kernel_family(&dummy_mmvf, "bf16_f32_mmvf_multi_kernel<256, 4, true>");
+        register_host_kernel_family(&dummy_unknown, "unverified_kernel_symbol");
+        CHECK(lookup_host_kernel_family(&dummy_fn) != nullptr &&
+              std::strcmp(lookup_host_kernel_family(&dummy_fn), "gpu_stamp_kernel") == 0);
+        CHECK(lookup_host_kernel_family(&dummy_mmvq) != nullptr &&
+              std::strcmp(lookup_host_kernel_family(&dummy_mmvq), "native_mmvq_multi_kernel") == 0);
+        CHECK(lookup_host_kernel_family(&dummy_mmvf) != nullptr &&
+              lookup_kernel_contract(lookup_host_kernel_family(&dummy_mmvf)) != nullptr);
+        CHECK(lookup_host_kernel_family(&dummy_unknown) == nullptr);
         CHECK(!is_pm4_capture_scope_active());
         {
             Pm4TapeScopeGuard guard(&tape);
@@ -629,6 +640,69 @@ void test_pm4_tape_and_contracts() {
         }
         CHECK(!is_pm4_capture_scope_active());
         clear_host_kernel_families();
+
+        // L3 canonicalization table test over the real symbol list in Strata sources
+        size_t alias_count = 0;
+        const KernelSymbolAlias* aliases = registered_kernel_symbol_aliases(alias_count);
+        CHECK(aliases != nullptr && alias_count >= 500u);
+        for (size_t i = 0; i < alias_count; ++i) {
+            CHECK(aliases[i].symbol_name != nullptr && aliases[i].symbol_name[0] != '\0');
+            CHECK(aliases[i].canonical_family != nullptr && aliases[i].canonical_family[0] != '\0');
+            const char* canon = canonicalize_kernel_symbol(aliases[i].symbol_name);
+            CHECK(canon != nullptr && std::strcmp(canon, aliases[i].canonical_family) == 0);
+            const KernelContract* kc = lookup_kernel_contract(aliases[i].symbol_name);
+            CHECK(kc != nullptr && std::strcmp(kc->family_name, aliases[i].canonical_family) == 0);
+        }
+        const char* real_symbols[] = {
+            "gpu_stamp_kernel<true>",
+            "gpu_stamp_kernel<false>",
+            "native_quantize_q8_1_kernel",
+            "native_mmvq_multi_kernel<Q4KTraits, 4, 4, 2, false, false>",
+            "native_mmvq_multi_kernel<Q6KTraits, 8, 4, 1, true, false>",
+            "native_mmvq_multi_kernel<SmallTraits<Q80Block, 8>, 2, 4, 2, false, false>",
+            "bf16_f32_mmvf_multi_kernel<256, 4, true>",
+            "bf16_f32_mmvf_multi_kernel<128, 8, false, true>",
+            "copy_i32_from_mapped_kernel",
+            "copy_step_pos_from_mapped_kernel",
+            "embedding_gather_dev_kernel",
+            "broadcast_streams_kernel",
+            "gdn_conv_l2_multi_kernel",
+            "gdn_ab_multi_kernel<4, true>",
+            "gdn_step_norm_multi_kernel<true, false>",
+            "norm_rope_kernel<false>",
+            "fwht256_pair_kernel",
+            "append<false>",
+            "block_scores_kernel",
+            "block_topk_kernel",
+            "resolve_kernel",
+            "attn_chunk_kernel<1, false, false, false>",
+            "gate_quantize_q8_1_kernel",
+            "route_multi",
+            "resident_plan_kernel<128>",
+            "quantize_q8_1_kernel",
+            "combine<false, false>",
+            "post_multi",
+            "argmax_rows_kernel",
+        };
+        for (const char* sym : real_symbols) {
+            const char* canon = canonicalize_kernel_symbol(sym);
+            CHECK(canon != nullptr);
+            CHECK(lookup_kernel_contract(sym) != nullptr);
+        }
+        // Fail-closed: no substring or name-mangling guesses
+        const char* rejected_symbols[] = {
+            "_Z16gpu_stamp_kernelILb1EEvPyi",
+            "gpu_stamp_kernel_prefix_guess",
+            "native_mmvq_multi_kernel<UnknownTraits, 4, 4, 2, false, false>",
+            "wait_flag_ge_kernel",
+            "doorbell_publish_res_kernel",
+            "",
+        };
+        for (const char* bad_sym : rejected_symbols) {
+            CHECK(canonicalize_kernel_symbol(bad_sym) == nullptr);
+            CHECK(lookup_kernel_contract(bad_sym) == nullptr);
+        }
+        CHECK(canonicalize_kernel_symbol(nullptr) == nullptr);
     }
 }
 

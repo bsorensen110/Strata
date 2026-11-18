@@ -44,6 +44,9 @@ bool pdl_supported();
 /// True when the current thread is capturing a verify/decode window into a PM4 tape.
 bool pm4_scope() noexcept;
 
+/// Bind a concrete host kernel function pointer to its canonical PM4 contract family name.
+void pm4_register_pdl_kernel(const void* host_kernel, const char* canonical_family) noexcept;
+
 /// Record one kernel launch packed by `launch_pdl` into the active thread-local PM4 tape.
 void pm4_record_pdl_launch(const void* host_kernel, dim3 grid, dim3 block,
                            size_t smem, cudaStream_t stream,
