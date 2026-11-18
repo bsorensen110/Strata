@@ -471,6 +471,87 @@ bool PreparedPm4Window::replay(SubmitPm4IbFn submit_fn, void* user_ctx) noexcept
     return true;
 }
 
+const char* pm4_execution_reason_to_string(Pm4ExecutionReason reason) noexcept {
+    switch (reason) {
+        case Pm4ExecutionReason::UsePm4Replay:
+            return "admitted and captured window ready for PM4 IB replay";
+        case Pm4ExecutionReason::FallbackEligibilityRefused:
+            return "eligibility gate refused PM4 replay (fallback to hipGraphLaunch)";
+        case Pm4ExecutionReason::FallbackNoSlot:
+            return "no PM4 capture slot exists for this window (fallback to hipGraphLaunch)";
+        case Pm4ExecutionReason::FallbackSlotNotCaptured:
+            return "PM4 slot is not in Captured state (fallback to hipGraphLaunch)";
+        case Pm4ExecutionReason::FallbackSlotLatched:
+            return "PM4 slot is permanently latched to hipGraphLaunch fallback";
+        case Pm4ExecutionReason::FallbackSlotNonQuiescent:
+            return "PM4 slot has unproven quiescence (fallback to hipGraphLaunch)";
+        case Pm4ExecutionReason::FallbackWindowNotPrepared:
+            return "PreparedPm4Window has not been lowered or is not ready";
+        case Pm4ExecutionReason::FallbackWindowLatched:
+            return "PreparedPm4Window is permanently latched to hipGraphLaunch fallback";
+        case Pm4ExecutionReason::FallbackHsaUnavailable:
+            return "HSA AQL queue executor is unavailable (fallback to hipGraphLaunch)";
+    }
+    return "fallback to hipGraphLaunch";
+}
+
+Pm4ExecutionDecision select_pm4_execution_mode(
+    const Pm4EligibilityInput& elig_input,
+    const Pm4WindowCaptureSlot* slot,
+    const PreparedPm4Window* prepared_window,
+    bool hsa_executor_ready) noexcept {
+    Pm4ExecutionDecision out{};
+    out.eligibility = evaluate_pm4_eligibility(elig_input);
+    if (!out.eligibility.admitted) {
+        out.mode = Pm4ExecutionMode::HipGraphLaunch;
+        out.reason = Pm4ExecutionReason::FallbackEligibilityRefused;
+        return out;
+    }
+    if (slot == nullptr) {
+        out.mode = Pm4ExecutionMode::HipGraphLaunch;
+        out.reason = Pm4ExecutionReason::FallbackNoSlot;
+        return out;
+    }
+    if (slot->quiescence() != ReplayQuiescence::Proven) {
+        out.mode = Pm4ExecutionMode::HipGraphLaunch;
+        out.reason = Pm4ExecutionReason::FallbackSlotNonQuiescent;
+        return out;
+    }
+    if (slot->is_latched_fallback()) {
+        out.mode = Pm4ExecutionMode::HipGraphLaunch;
+        out.reason = Pm4ExecutionReason::FallbackSlotLatched;
+        return out;
+    }
+    if (!slot->is_captured()) {
+        out.mode = Pm4ExecutionMode::HipGraphLaunch;
+        out.reason = Pm4ExecutionReason::FallbackSlotNotCaptured;
+        return out;
+    }
+    if (prepared_window == nullptr) {
+        out.mode = Pm4ExecutionMode::HipGraphLaunch;
+        out.reason = Pm4ExecutionReason::FallbackWindowNotPrepared;
+        return out;
+    }
+    if (prepared_window->is_latched_fallback()) {
+        out.mode = Pm4ExecutionMode::HipGraphLaunch;
+        out.reason = Pm4ExecutionReason::FallbackWindowLatched;
+        return out;
+    }
+    if (!prepared_window->ready()) {
+        out.mode = Pm4ExecutionMode::HipGraphLaunch;
+        out.reason = Pm4ExecutionReason::FallbackWindowNotPrepared;
+        return out;
+    }
+    if (!hsa_executor_ready) {
+        out.mode = Pm4ExecutionMode::HipGraphLaunch;
+        out.reason = Pm4ExecutionReason::FallbackHsaUnavailable;
+        return out;
+    }
+    out.mode = Pm4ExecutionMode::Pm4IndirectBufferReplay;
+    out.reason = Pm4ExecutionReason::UsePm4Replay;
+    return out;
+}
+
 }  // namespace strata::hip::pm4
 
 #endif  // (defined(__linux__) && defined(STRATA_WITH_HSA)) || defined(STRATA_PM4_HOST_TEST)

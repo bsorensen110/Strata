@@ -979,6 +979,96 @@ void test_pm4_eligibility_gate() {
         const auto d = evaluate_pm4_eligibility(in);
         CHECK(!d.admitted && d.reason == Pm4EligibilityReason::RefusedInvalidWindowSize);
     }
+
+    // 4. L2 step-execution decision table test: PM4 replay ONLY when slot Captured AND
+    //    PreparedPm4Window ready AND eligibility gate open AND HSA executor ready;
+    //    otherwise HipGraphLaunch.
+    AllocationTable allocs;
+    CHECK(allocs.insert(0x100000ULL, 0x10000ULL));
+    CHECK(allocs.insert(0x200000ULL, 0x10000ULL));
+
+    Pm4WindowCaptureSlot uninit_slot(4096u);
+    Pm4WindowCaptureSlot captured_slot(4096u);
+    captured_slot.tape().set_resolver(&AllocationTable::resolver_thunk, &allocs);
+    CHECK(captured_slot.begin_capture());
+    uint8_t q_args[24] = {};
+    write_u64_le(q_args + 0, 0x100000ULL);
+    write_u64_le(q_args + 8, 0x200000ULL);
+    CHECK(captured_slot.tape().record_launch(
+        "native_quantize_q8_1_kernel", nullptr,
+        {16u, 1u, 1u}, {256u, 1u, 1u}, 0u, q_args, sizeof(q_args)));
+    CHECK(captured_slot.end_capture(1u));
+    CHECK(captured_slot.is_captured());
+
+    PreparedPm4Window unprep_win;
+    PreparedPm4Window ready_win;
+    CHECK(ready_win.prepare(captured_slot.tape(), Gfx12Arch::Gfx1201));
+    CHECK(ready_win.ready());
+
+    Pm4WindowCaptureSlot latched_slot(4096u);
+    latched_slot.latch_fallback(TapeStatus::InvalidatedUnknownKernel, "latched test");
+    CHECK(latched_slot.is_latched_fallback());
+
+    Pm4WindowCaptureSlot non_quiescent_slot(4096u);
+    non_quiescent_slot.set_quiescence(ReplayQuiescence::Unknown);
+    CHECK(non_quiescent_slot.is_latched_fallback());
+
+    PreparedPm4Window latched_win;
+    CHECK(latched_win.prepare(captured_slot.tape(), Gfx12Arch::Gfx1201));
+    MockSubmitContext fail_submit{};
+    fail_submit.next_quiescence = ReplayQuiescence::Unknown;
+    fail_submit.next_return = false;
+    CHECK(!latched_win.replay(&mock_submit_ib, &fail_submit));
+    CHECK(latched_win.is_latched_fallback());
+
+    Pm4EligibilityInput env_off = base;
+    env_off.env_strata_hip_pm4 = "0";
+    Pm4EligibilityInput non_res = base;
+    non_res.all_experts_resident = false;
+    Pm4EligibilityInput late_ple = base;
+    late_ple.early_ple_flag = false;
+
+    struct ExecDecisionCase {
+        const Pm4EligibilityInput* elig;
+        const Pm4WindowCaptureSlot* slot;
+        const PreparedPm4Window* win;
+        bool hsa_ready;
+        Pm4ExecutionMode expected_mode;
+        Pm4ExecutionReason expected_reason;
+    };
+    const ExecDecisionCase table[] = {
+        {&base, &captured_slot, &ready_win, true,
+         Pm4ExecutionMode::Pm4IndirectBufferReplay, Pm4ExecutionReason::UsePm4Replay},
+        {&env_off, &captured_slot, &ready_win, true,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackEligibilityRefused},
+        {&non_res, &captured_slot, &ready_win, true,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackEligibilityRefused},
+        {&late_ple, &captured_slot, &ready_win, true,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackEligibilityRefused},
+        {&base, nullptr, &ready_win, true,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackNoSlot},
+        {&base, &uninit_slot, &ready_win, true,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackSlotNotCaptured},
+        {&base, &latched_slot, &ready_win, true,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackSlotLatched},
+        {&base, &non_quiescent_slot, &ready_win, true,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackSlotNonQuiescent},
+        {&base, &captured_slot, nullptr, true,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackWindowNotPrepared},
+        {&base, &captured_slot, &unprep_win, true,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackWindowNotPrepared},
+        {&base, &captured_slot, &latched_win, true,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackWindowLatched},
+        {&base, &captured_slot, &ready_win, false,
+         Pm4ExecutionMode::HipGraphLaunch, Pm4ExecutionReason::FallbackHsaUnavailable},
+    };
+    for (const auto& row : table) {
+        const Pm4ExecutionDecision dec =
+            select_pm4_execution_mode(*row.elig, row.slot, row.win, row.hsa_ready);
+        CHECK(dec.mode == row.expected_mode);
+        CHECK(dec.reason == row.expected_reason);
+        CHECK(pm4_execution_reason_to_string(dec.reason)[0] != '\0');
+    }
 }
 
 }  // namespace

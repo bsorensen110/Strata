@@ -144,6 +144,8 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 }  // namespace strata::core
 #include "strata/hip/pm4_tape.hpp"
 #include "strata/hip/pm4_plan.hpp"
+#include "strata/hip/hsa.hpp"
+#define STRATA_PM4_MTP_HOST_ACTIVE 1
 #include <map>
 #include <mutex>
 namespace strata::core {
@@ -162,14 +164,95 @@ struct Pm4MtpSlotKey {
     }
 };
 
+struct Pm4MtpWindowEntry {
+    strata::hip::pm4::Pm4WindowCaptureSlot slot;
+    strata::hip::pm4::PreparedPm4Window prepared;
+    strata::hip::hsa::HsaBuffer kernarg_buf;
+    strata::hip::hsa::HsaBuffer ib_buf;
+    strata::hip::pm4::Gfx12Arch arch = strata::hip::pm4::Gfx12Arch::Gfx1201;
+    int device = 0;
+};
+
+struct Pm4MtpDeviceHsa {
+    bool initialized = false;
+    bool ok = false;
+    std::shared_ptr<strata::hip::hsa::HsaRuntime> runtime;
+    strata::hip::hsa::HsaAqlQueue queue;
+    strata::hip::hsa::HsaCompletionSignal signal;
+    std::string init_error;
+};
+
 std::mutex& pm4_mtp_mutex() {
     static std::mutex m;
     return m;
 }
 
-std::map<Pm4MtpSlotKey, strata::hip::pm4::Pm4WindowCaptureSlot>& pm4_mtp_slots() {
-    static std::map<Pm4MtpSlotKey, strata::hip::pm4::Pm4WindowCaptureSlot> slots;
+std::map<Pm4MtpSlotKey, Pm4MtpWindowEntry>& pm4_mtp_slots() {
+    static std::map<Pm4MtpSlotKey, Pm4MtpWindowEntry> slots;
     return slots;
+}
+
+std::map<int, Pm4MtpDeviceHsa>& pm4_mtp_hsa_devices() {
+    static std::map<int, Pm4MtpDeviceHsa> devs;
+    return devs;
+}
+
+Pm4MtpDeviceHsa& pm4_ensure_mtp_hsa_locked(int dev) {
+    auto& st = pm4_mtp_hsa_devices()[dev];
+    if (st.initialized) {
+        return st;
+    }
+    st.initialized = true;
+    st.runtime = strata::hip::hsa::HsaRuntime::initialize(dev, st.init_error);
+    if (!st.runtime) {
+        return st;
+    }
+    if (!st.runtime->create_queue(0u, st.queue, st.init_error) ||
+        !st.runtime->create_signal(st.signal, st.init_error)) {
+        st.queue = strata::hip::hsa::HsaAqlQueue{};
+        st.signal = strata::hip::hsa::HsaCompletionSignal{};
+        st.runtime.reset();
+        return st;
+    }
+    st.ok = true;
+    return st;
+}
+
+struct Pm4MtpSubmitCtx {
+    Pm4MtpDeviceHsa* hsa = nullptr;
+    strata::hip::hsa::HsaBuffer* ib_buf = nullptr;
+    std::string err;
+};
+
+bool pm4_mtp_submit_ib(
+    const uint32_t* ib_dwords,
+    uint32_t ib_len_dwords,
+    uint64_t /*ib_device_va*/,
+    strata::hip::pm4::ReplayQuiescence& out_quiescence,
+    void* user_ctx) {
+    out_quiescence = strata::hip::pm4::ReplayQuiescence::Unknown;
+    auto* ctx = static_cast<Pm4MtpSubmitCtx*>(user_ctx);
+    if (ctx == nullptr || ctx->hsa == nullptr || !ctx->hsa->ok ||
+        ctx->ib_buf == nullptr || !ctx->ib_buf->valid() || ib_dwords == nullptr || ib_len_dwords == 0u) {
+        if (ctx) ctx->err = "invalid HSA queue or indirect buffer state";
+        return false;
+    }
+    const size_t ib_bytes = static_cast<size_t>(ib_len_dwords) * sizeof(uint32_t);
+    if (ib_bytes > ctx->ib_buf->size()) {
+        ctx->err = "lowered PM4 IB exceeds allocated HSA executable buffer";
+        return false;
+    }
+    std::memcpy(ctx->ib_buf->bytes(), ib_dwords, ib_bytes);
+    if (!ctx->hsa->queue.submit_and_wait_pm4_ib(
+            *ctx->ib_buf,
+            ib_len_dwords,
+            ctx->hsa->signal,
+            strata::hip::hsa::kDefaultWaitTimeoutNs,
+            ctx->err)) {
+        return false;
+    }
+    out_quiescence = strata::hip::pm4::ReplayQuiescence::Proven;
+    return true;
 }
 
 bool hip_mtp_range_resolver(uint64_t device_ptr, strata::hip::pm4::AllocationRange& out_range, void* /*ctx*/) noexcept {
@@ -211,15 +294,94 @@ strata::hip::pm4::Pm4WindowCaptureSlot* pm4_begin_mtp_capture(
         return nullptr;
     }
     std::lock_guard<std::mutex> lock(pm4_mtp_mutex());
-    auto& slot = pm4_mtp_slots()[Pm4MtpSlotKey{d, kind, coupled, idx}];
-    if (!slot.can_attempt_capture()) {
+    auto& entry = pm4_mtp_slots()[Pm4MtpSlotKey{d, kind, coupled, idx}];
+    if (!entry.slot.can_attempt_capture()) {
         return nullptr;
     }
-    slot.tape().set_resolver(&hip_mtp_range_resolver, nullptr);
-    if (!slot.begin_capture()) {
+    entry.arch = decision.arch;
+    entry.device = dev;
+    entry.slot.tape().set_resolver(&hip_mtp_range_resolver, nullptr);
+    if (!entry.slot.begin_capture()) {
         return nullptr;
     }
-    return &slot;
+    return &entry.slot;
+}
+
+void pm4_prepare_mtp_entry_locked(Pm4MtpWindowEntry& entry, const char* what, int idx) {
+    Pm4MtpDeviceHsa& hsa = pm4_ensure_mtp_hsa_locked(entry.device);
+    if (!hsa.ok || !hsa.runtime) {
+        const std::string reason = hsa.init_error.empty() ? "HSA runtime unavailable" : hsa.init_error;
+        entry.slot.latch_fallback(strata::hip::pm4::TapeStatus::InvalidatedUnknownKernel, reason.c_str());
+        std::fprintf(stderr,
+                     "strata mtp: PM4 %s idx=%d HSA init refused (%s); latching fallback to hipGraph\n",
+                     what, idx, reason.c_str());
+        return;
+    }
+
+    auto& tape = entry.slot.tape();
+    for (size_t j = 0; j < tape.launch_count(); ++j) {
+        const auto& disp = tape.dispatches()[j];
+        strata::hip::hsa::HsaResolvedKernel resolved{};
+        std::string resolve_err;
+        if (!hsa.runtime->resolve_hip_kernel(
+                disp.host_function, resolved, resolve_err, disp.kernel_family.c_str()) ||
+            !tape.bind_hsa_metadata(j, resolved.loader, resolved.pm4)) {
+            const std::string msg = resolve_err.empty()
+                                        ? ("failed to bind HSA metadata for " + disp.kernel_family)
+                                        : resolve_err;
+            entry.slot.latch_fallback(strata::hip::pm4::TapeStatus::InvalidatedUnknownKernel, msg.c_str());
+            std::fprintf(stderr,
+                         "strata mtp: PM4 %s idx=%d kernel metadata resolution refused (%s); latching fallback to hipGraph\n",
+                         what, idx, msg.c_str());
+            return;
+        }
+    }
+
+    std::string alloc_err;
+    const size_t arena_bytes = std::max<size_t>(64u, tape.arena().used());
+    if (!hsa.runtime->allocate_kernarg(
+            arena_bytes, strata::hip::pm4::kKernargSlotAlignment, entry.kernarg_buf, alloc_err)) {
+        entry.slot.latch_fallback(strata::hip::pm4::TapeStatus::InvalidatedArenaOverflow, alloc_err.c_str());
+        std::fprintf(stderr,
+                     "strata mtp: PM4 %s idx=%d kernarg allocation refused (%s); latching fallback to hipGraph\n",
+                     what, idx, alloc_err.c_str());
+        return;
+    }
+    if (tape.arena().used() > 0u) {
+        std::memcpy(entry.kernarg_buf.bytes(), tape.arena().data(), tape.arena().used());
+        entry.kernarg_buf.publish_host_writes();
+    }
+    tape.arena().set_device_base_va(entry.kernarg_buf.gpu_address());
+
+    const size_t est_ib_bytes = std::max<size_t>(4096u, tape.launch_count() * 512u);
+    if (!hsa.runtime->allocate_executable_ib(est_ib_bytes, entry.ib_buf, alloc_err)) {
+        entry.slot.latch_fallback(strata::hip::pm4::TapeStatus::InvalidatedArenaOverflow, alloc_err.c_str());
+        std::fprintf(stderr,
+                     "strata mtp: PM4 %s idx=%d IB allocation refused (%s); latching fallback to hipGraph\n",
+                     what, idx, alloc_err.c_str());
+        return;
+    }
+    entry.prepared.set_ib_device_va(entry.ib_buf.gpu_address());
+
+    std::string prep_err;
+    if (!entry.prepared.prepare(
+            tape, entry.arch, std::getenv("STRATA_GFX1201_PM4_PACING"), &prep_err)) {
+        entry.slot.latch_fallback(strata::hip::pm4::TapeStatus::InvalidatedInvalidGeometry, prep_err.c_str());
+        std::fprintf(stderr,
+                     "strata mtp: PM4 %s idx=%d preparation refused (%s); latching fallback to hipGraph\n",
+                     what, idx, prep_err.c_str());
+        return;
+    }
+    const size_t lowered_bytes = entry.prepared.command_buffer().size_bytes();
+    if (lowered_bytes > entry.ib_buf.size()) {
+        if (!hsa.runtime->allocate_executable_ib(lowered_bytes, entry.ib_buf, alloc_err)) {
+            entry.slot.latch_fallback(strata::hip::pm4::TapeStatus::InvalidatedArenaOverflow, alloc_err.c_str());
+            return;
+        }
+        entry.prepared.set_ib_device_va(entry.ib_buf.gpu_address());
+    }
+    std::memcpy(entry.ib_buf.bytes(), entry.prepared.command_buffer().dwords().data(), lowered_bytes);
+    entry.ib_buf.publish_host_writes();
 }
 
 void pm4_end_mtp_capture(strata::hip::pm4::Pm4WindowCaptureSlot* slot, cudaGraph_t graph, const char* what, int idx) {
@@ -245,7 +407,85 @@ void pm4_end_mtp_capture(strata::hip::pm4::Pm4WindowCaptureSlot* slot, cudaGraph
         std::fprintf(stderr,
                      "strata mtp: PM4 %s idx=%d capture refused (%s); latching fallback to hipGraph\n",
                      what, idx, slot->tape().failure_reason().c_str());
+        return;
     }
+    std::lock_guard<std::mutex> lock(pm4_mtp_mutex());
+    for (auto& kv : pm4_mtp_slots()) {
+        if (&kv.second.slot == slot) {
+            pm4_prepare_mtp_entry_locked(kv.second, what, idx);
+            break;
+        }
+    }
+}
+
+bool pm4_try_mtp_replay(
+    const MtpDrafter* d, int kind, bool coupled, int idx, bool has_side_stream, cudaStream_t cs) {
+    const char* env_pm4 = std::getenv("STRATA_HIP_PM4");
+    if (!strata::hip::pm4::parse_strata_hip_pm4_env(env_pm4)) {
+        return false;
+    }
+    int dev = 0;
+    cudaDeviceProp prop{};
+    const bool have_prop = cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&prop, dev) == cudaSuccess;
+    if (!have_prop) {
+        (void) cudaGetLastError();
+    }
+    strata::hip::pm4::Pm4EligibilityInput elig{};
+    elig.env_strata_hip_pm4 = env_pm4;
+    elig.is_linux = true;
+    elig.hsa_available = have_prop;
+    elig.arch_name = have_prop ? prop.gcnArchName : nullptr;
+    elig.is_prefill = false;
+    elig.is_batched = false;
+    elig.is_layer_split = false;
+    elig.all_experts_resident = true;
+    elig.early_ple_flag = true;
+    elig.has_side_streams = has_side_stream;
+    elig.window_tokens = (kind == 0) ? idx : 1;
+
+    std::lock_guard<std::mutex> lock(pm4_mtp_mutex());
+    auto& slots = pm4_mtp_slots();
+    auto it = slots.find(Pm4MtpSlotKey{d, kind, coupled, idx});
+    Pm4MtpWindowEntry* entry = (it != slots.end()) ? &it->second : nullptr;
+    Pm4MtpDeviceHsa* hsa = nullptr;
+    if (entry != nullptr) {
+        auto hit = pm4_mtp_hsa_devices().find(entry->device);
+        if (hit != pm4_mtp_hsa_devices().end()) {
+            hsa = &hit->second;
+        }
+    }
+    const bool hsa_ready = hsa != nullptr && hsa->ok && hsa->queue.valid() &&
+                           entry != nullptr && entry->ib_buf.valid();
+    const auto exec_decision = strata::hip::pm4::select_pm4_execution_mode(
+        elig,
+        entry != nullptr ? &entry->slot : nullptr,
+        entry != nullptr ? &entry->prepared : nullptr,
+        hsa_ready);
+    if (exec_decision.mode != strata::hip::pm4::Pm4ExecutionMode::Pm4IndirectBufferReplay) {
+        return false;
+    }
+    if (cs != nullptr && cudaStreamSynchronize(cs) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    if (entry->slot.tape().arena().used() > 0u) {
+        std::memcpy(entry->kernarg_buf.bytes(),
+                    entry->slot.tape().arena().data(),
+                    entry->slot.tape().arena().used());
+        entry->kernarg_buf.publish_host_writes();
+    }
+    Pm4MtpSubmitCtx sctx{hsa, &entry->ib_buf, {}};
+    if (!entry->prepared.replay(&pm4_mtp_submit_ib, &sctx)) {
+        entry->slot.set_quiescence(entry->prepared.quiescence());
+        entry->slot.latch_fallback(
+            strata::hip::pm4::TapeStatus::InvalidatedNonQuiescent,
+            sctx.err.empty() ? "PM4 IB replay failed" : sctx.err.c_str());
+        std::fprintf(stderr,
+                     "strata mtp: PM4 %s idx=%d replay failed (%s); latching fallback to hipGraph\n",
+                     (kind == 0) ? "round" : "step", idx, entry->slot.tape().failure_reason().c_str());
+        return false;
+    }
+    return true;
 }
 
 void pm4_clear_mtp_slots(const MtpDrafter* d) {
@@ -1925,13 +2165,30 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     };
 
     int n = 0;
+#if defined(STRATA_PM4_MTP_HOST_ACTIVE)
+    const bool mtp_has_side = side_ != nullptr && sh_fork_ != nullptr && sh_join_ != nullptr;
+#endif
     if (min_p <= 0.0f && !chain_rule_ && max_steps > 0) {
+#if defined(STRATA_PM4_MTP_HOST_ACTIVE)
+        const cudaError_t re0 = pm4_try_mtp_replay(this, 0, cp, T, mtp_has_side, cs_)
+                                    ? cudaSuccess
+                                    : cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_);
+        if (re0 != cudaSuccess) {
+#else
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+#endif
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
         for (int j = 1; j < max_steps; ++j) {
+#if defined(STRATA_PM4_MTP_HOST_ACTIVE)
+            const cudaError_t se_j = pm4_try_mtp_replay(this, 1, cp, j, mtp_has_side, cs_)
+                                         ? cudaSuccess
+                                         : cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_);
+            if (se_j != cudaSuccess) {
+#else
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+#endif
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -1967,7 +2224,14 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (dt) g_dt.pre_ms += hms(t0);
         if (dt) cudaEventRecord(g_dt.eb[0], cs_);
         Clock::time_point tl = Clock::now();
+#if defined(STRATA_PM4_MTP_HOST_ACTIVE)
+        const cudaError_t re0 = pm4_try_mtp_replay(this, 0, cp, T, mtp_has_side, cs_)
+                                    ? cudaSuccess
+                                    : cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_);
+        if (re0 != cudaSuccess) {
+#else
         if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+#endif
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
@@ -1996,7 +2260,14 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         for (int j = 1; j < max_steps && (chain_rule_ ? chain_rule_(j - 1, pj) : pj >= min_p); ++j) {
             if (dt) cudaEventRecord(g_dt.eb[j], cs_);
             tl = Clock::now();
+#if defined(STRATA_PM4_MTP_HOST_ACTIVE)
+            const cudaError_t se_j = pm4_try_mtp_replay(this, 1, cp, j, mtp_has_side, cs_)
+                                         ? cudaSuccess
+                                         : cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_);
+            if (se_j != cudaSuccess) {
+#else
             if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+#endif
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -2133,10 +2404,21 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!stage_source_R(T, err)) return false;
     chain_early_ = std::max(0, std::min(n_early, n_out));
+#if defined(STRATA_PM4_MTP_HOST_ACTIVE)
+    const bool mtp_chain_side = side_ != nullptr && sh_fork_ != nullptr && sh_join_ != nullptr;
+    bool ok = pm4_try_mtp_replay(this, 0, false, T, mtp_chain_side, cs_) ||
+              cudaGraphLaunch(round_exec_[T], cs_) == cudaSuccess;
+#else
     bool ok = cudaGraphLaunch(round_exec_[T], cs_) == cudaSuccess;
+#endif
     if (ok && chain_early_ >= 1) ok = cudaEventRecord(ev_step_[0], cs_) == cudaSuccess;
     for (int j = 1; ok && j < n_out; ++j) {
+#if defined(STRATA_PM4_MTP_HOST_ACTIVE)
+        ok = pm4_try_mtp_replay(this, 1, false, j, mtp_chain_side, cs_) ||
+             cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess;
+#else
         ok = cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess;
+#endif
         if (ok && j < chain_early_) ok = cudaEventRecord(ev_step_[j], cs_) == cudaSuccess;
     }
     if (!ok || cudaEventRecord(ev_chain_, cs_) != cudaSuccess) {

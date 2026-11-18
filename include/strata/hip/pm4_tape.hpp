@@ -230,6 +230,14 @@ public:
     /// Any mismatch means a raw `<<<...>>>` launch bypassed `launch_pdl`, failing closed.
     TapeStatus finalize_recording(size_t expected_graph_kernel_nodes = 0) noexcept;
 
+    /// Bind validated ROCr/HSA kernel descriptor metadata onto `dispatches_[dispatch_index]`.
+    /// Fails closed if `kernel_object == 0`, `code_entry == 0`, `code_entry` is not 256B-aligned,
+    /// or `kernarg_segment_size < kernarg_bytes`.
+    bool bind_hsa_metadata(
+        size_t dispatch_index,
+        const KernelMetadata& loader_meta,
+        const KernelPm4Metadata& pm4_meta) noexcept;
+
     /// Explicitly invalidate the tape with a reason.
     void invalidate(TapeStatus status, const char* reason) noexcept;
 

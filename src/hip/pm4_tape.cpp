@@ -690,6 +690,28 @@ TapeStatus Pm4Tape::finalize_recording(size_t expected_graph_kernel_nodes) noexc
     return TapeStatus::Ok;
 }
 
+bool Pm4Tape::bind_hsa_metadata(
+    size_t dispatch_index,
+    const KernelMetadata& loader_meta,
+    const KernelPm4Metadata& pm4_meta) noexcept {
+    if (dispatch_index >= dispatches_.size()) {
+        return false;
+    }
+    if (loader_meta.kernel_object == 0ULL ||
+        pm4_meta.code_entry == 0ULL ||
+        (pm4_meta.code_entry & 0xffULL) != 0ULL) {
+        return false;
+    }
+    RecordedDispatch& disp = dispatches_[dispatch_index];
+    if (loader_meta.kernarg_segment_size < disp.kernarg_bytes) {
+        return false;
+    }
+    disp.loader_meta = loader_meta;
+    disp.pm4_meta = pm4_meta;
+    disp.has_hsa_metadata = true;
+    return true;
+}
+
 // ---- Pm4WindowCaptureSlot ----
 
 bool Pm4WindowCaptureSlot::begin_capture() noexcept {

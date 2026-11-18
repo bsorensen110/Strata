@@ -209,6 +209,47 @@ private:
     bool latched_fallback_ = false;
 };
 
+/// Execution backend selected for a verify or MTP window launch.
+enum class Pm4ExecutionMode : uint8_t {
+    HipGraphLaunch = 0,
+    Pm4IndirectBufferReplay = 1,
+};
+
+/// Reason code for the step-execution backend decision.
+enum class Pm4ExecutionReason : uint8_t {
+    UsePm4Replay = 0,
+    FallbackEligibilityRefused = 1,
+    FallbackNoSlot = 2,
+    FallbackSlotNotCaptured = 3,
+    FallbackSlotLatched = 4,
+    FallbackSlotNonQuiescent = 5,
+    FallbackWindowNotPrepared = 6,
+    FallbackWindowLatched = 7,
+    FallbackHsaUnavailable = 8,
+};
+
+const char* pm4_execution_reason_to_string(Pm4ExecutionReason reason) noexcept;
+
+/// Combined eligibility + slot-state + prepared-window execution decision.
+struct Pm4ExecutionDecision {
+    Pm4ExecutionMode mode = Pm4ExecutionMode::HipGraphLaunch;
+    Pm4ExecutionReason reason = Pm4ExecutionReason::FallbackNoSlot;
+    Pm4EligibilityDecision eligibility{};
+};
+
+/// Fail-closed execution selector for verify/MTP step execution.
+/// Selects `Pm4IndirectBufferReplay` ONLY when:
+///   1. `evaluate_pm4_eligibility(elig_input)` admits the window, AND
+///   2. `slot != nullptr` is `Captured`, not latched, and `ReplayQuiescence::Proven`, AND
+///   3. `prepared_window != nullptr` is `ready()` and not latched, AND
+///   4. `hsa_executor_ready` is true.
+/// Otherwise selects `HipGraphLaunch`.
+Pm4ExecutionDecision select_pm4_execution_mode(
+    const Pm4EligibilityInput& elig_input,
+    const Pm4WindowCaptureSlot* slot,
+    const PreparedPm4Window* prepared_window,
+    bool hsa_executor_ready = true) noexcept;
+
 }  // namespace strata::hip::pm4
 
 #endif  // (defined(__linux__) && defined(STRATA_WITH_HSA)) || defined(STRATA_PM4_HOST_TEST)
