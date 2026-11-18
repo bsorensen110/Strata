@@ -140,7 +140,7 @@ bool read_file(const std::string& path, std::vector<uint8_t>& out) {
 
 }  // namespace
 
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
 }  // namespace strata::core
 #include "strata/hip/pm4_tape.hpp"
 #include "strata/hip/pm4_plan.hpp"
@@ -502,7 +502,7 @@ void pm4_clear_mtp_slots(const MtpDrafter* d) {
 
 MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamSynchronize(cs_);
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
     pm4_clear_mtp_slots(this);
 #endif
     for (auto& e : prefill_exec_) if (e) cudaGraphExecDestroy(e);
@@ -1755,13 +1755,13 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
 
 namespace {
 bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char* what, std::string& err
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
                     , strata::hip::pm4::Pm4WindowCaptureSlot* pm4_slot = nullptr, int pm4_idx = 0
 #endif
 ) {
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs, &graph);
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
     if (pm4_slot != nullptr) {
         pm4_end_mtp_capture(pm4_slot, (ok && ce == cudaSuccess) ? graph : nullptr, what, pm4_idx);
     }
@@ -1812,7 +1812,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     const int64_t HCN = g_->hc * g_->n_embd;
     g_mp.init();   // (its allocation before the capture)
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
     strata::hip::pm4::Pm4WindowCaptureSlot* pm4_slot =
         pm4_begin_mtp_capture(this, 0, coupled, T, side_ != nullptr && sh_fork_ != nullptr && sh_join_ != nullptr);
     strata::hip::pm4::Pm4TapeScopeGuard pm4_guard(pm4_slot != nullptr ? &pm4_slot->tape() : nullptr);
@@ -1846,7 +1846,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     if (ok) g_mp.stamp(16, cs_);
     g_mp.base = -1;
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err, pm4_slot, T);
 #else
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
@@ -1863,7 +1863,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     const int row = max_t_ + j - 1;
     g_mp.init();
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) { err = "mtp: begin capture"; return false; }
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
     strata::hip::pm4::Pm4WindowCaptureSlot* pm4_slot =
         pm4_begin_mtp_capture(this, 1, coupled, j, side_ != nullptr && sh_fork_ != nullptr && sh_join_ != nullptr);
     strata::hip::pm4::Pm4TapeScopeGuard pm4_guard(pm4_slot != nullptr ? &pm4_slot->tape() : nullptr);
@@ -1880,7 +1880,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     if (ok) g_mp.stamp(16, cs_);
     g_mp.base = -1;
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err, pm4_slot, j);
 #else
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);

@@ -666,7 +666,7 @@ const int64_t g_test_drop = [] {
 }();
 }  // namespace
 
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
 }  // namespace strata::core
 #include "strata/hip/pm4_tape.hpp"
 #include "strata/hip/pm4_plan.hpp"
@@ -1139,7 +1139,7 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
     pm4_clear_verifier_slots(this);
 #endif
     for (auto& row : exec_)
@@ -3691,7 +3691,7 @@ bool Verifier::capture(int T, std::string& err) {
     prio_forks_.clear();
     prio_tails_.clear();
 #endif
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
     strata::hip::pm4::Pm4WindowCaptureSlot* pm4_slot =
         pm4_begin_verifier_capture(this, sel_long_, T, ar_on(), batch_rec_,
                                    lb_ == 0 && (g_ != nullptr && le_ == g_->n_layers) && next_ == nullptr && remote_opt_ == nullptr,
@@ -3702,7 +3702,7 @@ bool Verifier::capture(int T, std::string& err) {
     const bool ok = record_window(T, cs_, rerr);
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
     if (pm4_slot != nullptr) {
         pm4_end_verifier_capture(pm4_slot, (ok && ce == cudaSuccess) ? graph : nullptr, T);
     }
@@ -5481,7 +5481,7 @@ bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
     cudaGraphExecDestroy(e);
     e = nullptr;
     (ar_off_ ? launched_nr_ : launched_)[sel_long_][victim] = false;   // the next graph of that size is a cold first launch again
-#if defined(__linux__) && defined(__HIPCC__) && defined(STRATA_WITH_HSA)
+#if defined(__linux__) && defined(STRATA_USE_HIP) && defined(STRATA_WITH_HSA)
     if (!ar_off_) pm4_evict_verifier_slot(this, sel_long_, victim);
 #endif
     evicted = true;
