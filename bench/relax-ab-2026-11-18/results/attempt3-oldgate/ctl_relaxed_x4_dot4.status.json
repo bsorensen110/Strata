@@ -1,0 +1,10 @@
+{
+ "arm": "ctl_relaxed_x4_dot4",
+ "round": "r1",
+ "status": "cache_mismatch",
+ "reason": "Startup reported 8736 actual slots; the then-current harness expected 7500. Aborted before any inference or timing.",
+ "ts": "2026-11-18T03:26:07",
+ "expected_expert_cache_slots": 7500,
+ "expert_cache_budget_slots": 7500,
+ "actual_expert_cache_slots": 8736
+}

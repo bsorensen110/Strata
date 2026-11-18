@@ -1,0 +1,1301 @@
+{
+ "arm": "trt_aa_floor",
+ "round": "_r2",
+ "ts": "2026-11-18T04:22:44",
+ "exe": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+ "binary_sha256": "8e6b95d2ad71fcc4615fb1431472d484fc571c1556fd8673e42b309e664808b4",
+ "commit": "0ff3f48c1",
+ "engine_pid": 170278,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/results/trt_aa_floor.manifest.json",
+  "STRATA_DISPATCH_REPORT": "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/results/trt_aa_floor.dispatch.json",
+  "STRATA_WINDOW_WARM": "0",
+  "STRATA_HIP_MOE_X4": "1",
+  "STRATA_HIP_DOT4_GEMV": "1",
+  "STRATA_HIP_RELAX_PACK": "1"
+ },
+ "user_args": [
+  "--spec",
+  "8",
+  "--draft-conf",
+  "0.35",
+  "--lookup-max-t",
+  "16",
+  "--lookup-sizes",
+  "10,12,14,16",
+  "--lookup-chain",
+  "6"
+ ],
+ "parallel": 1,
+ "route_expected": true,
+ "route_engaged": true,
+ "timing_valid": true,
+ "expert_cache_budget_slots": 7500,
+ "expected_expert_cache_slots": 8736,
+ "actual_expert_cache_slots": 8736,
+ "x4_captures": {
+  "n": 192,
+  "entries": [
+   {
+    "scope_t": 12,
+    "kind": 1,
+    "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+    "n": 12
+   },
+   {
+    "scope_t": 10,
+    "kind": 1,
+    "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+    "n": 36
+   },
+   {
+    "scope_t": 10,
+    "kind": 1,
+    "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+    "n": 12
+   },
+   {
+    "scope_t": 16,
+    "kind": 1,
+    "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+    "n": 36
+   },
+   {
+    "scope_t": 16,
+    "kind": 1,
+    "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+    "n": 12
+   },
+   {
+    "scope_t": 14,
+    "kind": 1,
+    "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+    "n": 36
+   },
+   {
+    "scope_t": 14,
+    "kind": 1,
+    "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+    "n": 12
+   },
+   {
+    "scope_t": 12,
+    "kind": 1,
+    "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+    "n": 36
+   }
+  ]
+ },
+ "wide_launches": {
+  "k0": 0,
+  "k1": 43,
+  "k2": 0
+ },
+ "wide_launches_by_t": {
+  "T9": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T10": {
+   "k0": 0,
+   "k1": 2,
+   "k2": 0
+  },
+  "T11": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T12": {
+   "k0": 0,
+   "k1": 4,
+   "k2": 0
+  },
+  "T13": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T14": {
+   "k0": 0,
+   "k1": 14,
+   "k2": 0
+  },
+  "T15": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T16": {
+   "k0": 0,
+   "k1": 23,
+   "k2": 0
+  },
+  "T17": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T18": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T19": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T20": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T21": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T22": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T23": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T24": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T25": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T26": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T27": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T28": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T29": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T30": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T31": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T32": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T33": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T34": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T35": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T36": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T37": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T38": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T39": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T40": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T41": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T42": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T43": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T44": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T45": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T46": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T47": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T48": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T49": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T50": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T51": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T52": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T53": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T54": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T55": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T56": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T57": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T58": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T59": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T60": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T61": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T62": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T63": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T64": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  }
+ },
+ "wide_request_lines": [
+  "strata serve: suffix drafts: 30 windows, 409 of 428 drafts accepted",
+  "strata serve: lookup chain: 5 of 37 windows, 24 of 24 chained drafts accepted"
+ ],
+ "route_evidence": {
+  "route_expected": true,
+  "route_engaged": true,
+  "valid": true,
+  "invalid_reason": null,
+  "evidence_channel_failure": false,
+  "window_warm": "0",
+  "wide_request_order": [
+   "smoke",
+   "wide",
+   "prefill",
+   "greedy1",
+   "greedy2",
+   "burst"
+  ],
+  "expected_expert_cache_slots": 8736,
+  "actual_expert_cache_slots": 8736,
+  "x4_captures": {
+   "n": 192,
+   "entries": [
+    {
+     "scope_t": 12,
+     "kind": 1,
+     "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+     "n": 12
+    },
+    {
+     "scope_t": 10,
+     "kind": 1,
+     "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+     "n": 36
+    },
+    {
+     "scope_t": 10,
+     "kind": 1,
+     "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+     "n": 12
+    },
+    {
+     "scope_t": 16,
+     "kind": 1,
+     "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+     "n": 36
+    },
+    {
+     "scope_t": 16,
+     "kind": 1,
+     "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+     "n": 12
+    },
+    {
+     "scope_t": 14,
+     "kind": 1,
+     "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+     "n": 36
+    },
+    {
+     "scope_t": 14,
+     "kind": 1,
+     "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+     "n": 12
+    },
+    {
+     "scope_t": 12,
+     "kind": 1,
+     "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+     "n": 36
+    }
+   ]
+  },
+  "x4_captures_by_scope": [
+   {
+    "scope_t": 12,
+    "kind": 1,
+    "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+    "n": 12
+   },
+   {
+    "scope_t": 10,
+    "kind": 1,
+    "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+    "n": 36
+   },
+   {
+    "scope_t": 10,
+    "kind": 1,
+    "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+    "n": 12
+   },
+   {
+    "scope_t": 16,
+    "kind": 1,
+    "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+    "n": 36
+   },
+   {
+    "scope_t": 16,
+    "kind": 1,
+    "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+    "n": 12
+   },
+   {
+    "scope_t": 14,
+    "kind": 1,
+    "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+    "n": 36
+   },
+   {
+    "scope_t": 14,
+    "kind": 1,
+    "key": "HIP x4 QSA members=3: q|k|v (indexer stays BF16)",
+    "n": 12
+   },
+   {
+    "scope_t": 12,
+    "kind": 1,
+    "key": "HIP x4 GDN members=2: qkv|z (alpha/beta stay BF16)",
+    "n": 36
+   }
+  ],
+  "x4_wide_scope_note_count": 192,
+  "wide_launches": {
+   "k0": 0,
+   "k1": 43,
+   "k2": 0
+  },
+  "wide_launches_by_t": {
+   "T9": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T10": {
+    "k0": 0,
+    "k1": 2,
+    "k2": 0
+   },
+   "T11": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T12": {
+    "k0": 0,
+    "k1": 4,
+    "k2": 0
+   },
+   "T13": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T14": {
+    "k0": 0,
+    "k1": 14,
+    "k2": 0
+   },
+   "T15": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T16": {
+    "k0": 0,
+    "k1": 23,
+    "k2": 0
+   },
+   "T17": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T18": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T19": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T20": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T21": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T22": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T23": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T24": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T25": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T26": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T27": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T28": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T29": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T30": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T31": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T32": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T33": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T34": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T35": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T36": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T37": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T38": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T39": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T40": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T41": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T42": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T43": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T44": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T45": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T46": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T47": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T48": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T49": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T50": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T51": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T52": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T53": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T54": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T55": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T56": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T57": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T58": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T59": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T60": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T61": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T62": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T63": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T64": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   }
+  },
+  "wide_request_lines": [
+   "strata serve: suffix drafts: 30 windows, 409 of 428 drafts accepted",
+   "strata serve: lookup chain: 5 of 37 windows, 24 of 24 chained drafts accepted"
+  ],
+  "wide_request_line_count": 2,
+  "wide_window_log_lines": [
+   "strata serve: suffix drafts: 30 windows, 409 of 428 drafts accepted",
+   "strata serve: lookup chain: 5 of 37 windows, 24 of 24 chained drafts accepted"
+  ],
+  "relaxed_projection_pack_count": 156,
+  "relaxed_projection_lines": [
+   "HIP projection blk.0.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.0.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.0.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.1.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.1.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.1.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.2.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.2.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.2.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.3.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.3.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.3.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.3.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.4.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.4.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.4.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.5.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.5.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.5.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.6.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.6.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.6.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.7.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.7.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.7.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.7.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.8.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.8.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.8.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.9.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.9.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.9.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.10.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.10.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.10.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.11.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.11.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.11.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.11.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.12.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.12.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.12.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.13.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.13.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.13.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.14.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.14.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.14.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.15.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.15.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.15.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.15.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.16.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.16.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.16.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.17.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.17.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.17.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.18.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.18.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.18.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.19.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.19.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.19.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.19.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.20.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.20.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.20.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.21.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.21.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.21.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.22.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.22.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.22.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.23.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.23.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.23.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.23.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.24.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.24.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.24.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.25.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.25.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.25.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.26.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.26.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.26.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.27.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.27.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.27.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.27.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.28.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.28.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.28.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.29.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.29.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.29.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.30.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.30.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.30.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.31.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.31.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.31.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.31.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.32.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.32.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.32.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.33.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.33.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.33.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.34.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.34.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.34.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.35.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.35.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.35.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.35.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.36.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.36.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.36.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.37.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.37.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.37.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.38.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.38.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.38.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.39.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.39.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.39.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.39.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.40.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.40.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.40.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.41.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.41.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.41.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.42.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.42.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.42.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.43.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.43.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.43.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.43.attn_output.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.44.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.44.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.44.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.45.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.45.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.45.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.46.attn_qkv.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.46.attn_gate.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.46.ssm_out.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.47.attn_q.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.47.attn_k.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.47.attn_v.weight: relaxed W6 ready before capture (new A8 route)",
+   "HIP projection blk.47.attn_output.weight: relaxed W6 ready before capture (new A8 route)"
+  ],
+  "dispatch_report_path": "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/results/trt_aa_floor.dispatch.json",
+  "dispatch_report_launches": {
+   "T1/k1": 17,
+   "T2/k1": 24,
+   "T3/k1": 35,
+   "T4/k1": 52,
+   "T5/k1": 24,
+   "T6/k1": 48,
+   "T7/k1": 14,
+   "T8/k1": 215,
+   "T10/k1": 2,
+   "T12/k1": 4,
+   "T14/k1": 14,
+   "T16/k1": 23
+  },
+  "dispatch_report_counts_preview": [
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 1,
+    "var": 11,
+    "type": 14,
+    "ncols": 2,
+    "n_in": 2560,
+    "n_out": 248320,
+    "n": 1
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "head: type 14, T=2 columns, vocabulary 248320",
+    "n": 1
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "head: final mixer q8=1 fuse_head_gr=0 native_head=1",
+    "n": 1
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 0,
+    "type": 23,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 8
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 3,
+    "type": 22,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 2
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 3,
+    "type": 22,
+    "ncols": 42,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 4
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 3,
+    "type": 18,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 16
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 1,
+    "type": 23,
+    "ncols": 6,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 26
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 0,
+    "type": 23,
+    "ncols": 6,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 26
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "HIP dot4: ordered K128 fold, tokens=2 M=12288 K=2560 NT=0",
+    "n": 12
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "HIP dot4: ordered K128 fold, tokens=2 M=512 K=2560 NT=0",
+    "n": 24
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 0,
+    "type": 18,
+    "ncols": 6,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 40
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 1,
+    "var": 0,
+    "type": 8,
+    "ncols": 2,
+    "n_in": 640,
+    "n_out": 2560,
+    "n": 48
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 1,
+    "var": 0,
+    "type": 14,
+    "ncols": 2,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 94
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "hc read: weights Q8_0 copies=1 (0 = bf16 rows), half=1, qfuse=1",
+    "n": 48
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "HIP dot4: ordered K128 fold, tokens=2 M=6144 K=2560 NT=0",
+    "n": 36
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "HIP dot4: ordered K128 fold, tokens=2 M=10240 K=2560 NT=0",
+    "n": 36
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "gdn layer: side_gates=0 side_proj=0 df_branch=0",
+    "n": 36
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "hc read: weights Q8_0 copies=1 (0 = bf16 rows), half=0, qfuse=1",
+    "n": 48
+   },
+   {
+    "scope": [
+     3,
+     1
+    ],
+    "cat": 1,
+    "var": 12,
+    "type": 14,
+    "ncols": 3,
+    "n_in": 2560,
+    "n_out": 248320,
+    "n": 1
+   }
+  ],
+  "graceful_stop_error": null
+ },
+ "smoke": {
+  "prompt_tokens": 34,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.363,
+  "wall_tok_s": 8.26
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 4.568,
+  "wall_tok_s": 56.04
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.025,
+   "wall_tok_s": 127.21,
+   "hash": "4955c1f09f73d175bf9d2c238869e8eb5ba1ee5f4f1e9ecf7b58398c6435084a"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.569,
+   "wall_tok_s": 143.44,
+   "hash": "4955c1f09f73d175bf9d2c238869e8eb5ba1ee5f4f1e9ecf7b58398c6435084a"
+  }
+ ],
+ "burst": {
+  "wall_s": 4.783,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 107.04,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 2.494,
+    "wall_tok_s": 102.65,
+    "hash": "3d48d4dbda0c7ff51f601821ba4e45023e47e478188fa632a2094cf86e9697d0"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 4.782,
+    "wall_tok_s": 53.53,
+    "hash": "058b97829fed1f2ba8444185e0729587be277e2e54d27ebcba4b919480536eb5"
+   }
+  ]
+ },
+ "wide": {
+  "completion_tokens": 512,
+  "finish": "length",
+  "wall_s": 3.941,
+  "wall_tok_s": 129.93,
+  "hash": "36ec3791e18cb7bec94e5807783601b954f80a2b2e0178db38fbe0b219c50954"
+ },
+ "parity": {
+  "greedy_cold": "4955c1f09f73d175bf9d2c238869e8eb5ba1ee5f4f1e9ecf7b58398c6435084a",
+  "greedy_warm": "4955c1f09f73d175bf9d2c238869e8eb5ba1ee5f4f1e9ecf7b58398c6435084a",
+  "burst_a": "3d48d4dbda0c7ff51f601821ba4e45023e47e478188fa632a2094cf86e9697d0",
+  "burst_b": "058b97829fed1f2ba8444185e0729587be277e2e54d27ebcba4b919480536eb5"
+ },
+ "engine_decode_512": [
+  "156.1",
+  "134.3"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 61 ms (48.9 tok/s), drafts accepted 1 of 4, 1 checkpoints",
+   "generated in 3279 ms (156.1 tok/s), drafts accepted 475 of 494, 1 checkpoints",
+   "generated in 3141 ms (81.5 tok/s), drafts accepted 156 of 308, 1 checkpoints",
+   "generated in 3812 ms (134.3 tok/s), drafts accepted 413 of 588, 1 checkpoints",
+   "generated in 3534 ms (144.9 tok/s), drafts accepted 416 of 573, 1 checkpoints",
+   "generated in 2305 ms (111.1 tok/s), drafts accepted 193 of 356, 1 checkpoints",
+   "generated in 2060 ms (124.3 tok/s), drafts accepted 197 of 304, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 34 tokens = 0 reused + 34 read in 298 ms (113.9 tok/s), 3 generated in 61 ms (48.9 tok/s), drafts accepted 1 of 4, 1 checkpoints",
+   "prompt 841 tokens = 0 reused + 841 read in 658 ms (1278.4 tok/s), 512 generated in 3279 ms (156.1 tok/s), drafts accepted 475 of 494, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 1423 ms (2773.8 tok/s), 256 generated in 3141 ms (81.5 tok/s), drafts accepted 156 of 308, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 210 ms (166.6 tok/s), 512 generated in 3812 ms (134.3 tok/s), drafts accepted 413 of 588, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 33 ms (210.9 tok/s), 512 generated in 3534 ms (144.9 tok/s), drafts accepted 416 of 573, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 186 ms (187.8 tok/s), 256 generated in 2305 ms (111.1 tok/s), drafts accepted 193 of 356, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 226 ms (154.6 tok/s), 256 generated in 2060 ms (124.3 tok/s), drafts accepted 197 of 304, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 4",
+   "drafts accepted 475 of 494",
+   "drafts accepted 156 of 308",
+   "drafts accepted 413 of 588",
+   "drafts accepted 416 of 573",
+   "drafts accepted 193 of 356",
+   "drafts accepted 197 of 304"
+  ],
+  "wide_generated": [
+   "generated in 3279 ms (156.1 tok/s), drafts accepted 475 of 494, 1 checkpoints"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 8736 slots, 19.99 GiB of VRAM; policy is"
+ ],
+ "expert_cache_slots": 8736
+}

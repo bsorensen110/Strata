@@ -1,0 +1,8 @@
+strata_heat_meta=1
+provenance=runtime
+source_kind=runtime-routing
+source_profile=/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/configs/ctl_relaxed_x4_dot4/profile-learned.bin
+n_layers=48
+n_expert=512
+ranked_pairs=24576
+heat_fnv1a64=84efd4568525cde0

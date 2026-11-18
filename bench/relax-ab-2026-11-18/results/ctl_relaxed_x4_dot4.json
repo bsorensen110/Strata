@@ -1,0 +1,989 @@
+{
+ "arm": "ctl_relaxed_x4_dot4",
+ "round": "r1",
+ "ts": "2026-11-18T04:11:24",
+ "exe": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+ "binary_sha256": "8e6b95d2ad71fcc4615fb1431472d484fc571c1556fd8673e42b309e664808b4",
+ "commit": "0ff3f48c1",
+ "engine_pid": 167478,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/results/ctl_relaxed_x4_dot4.manifest.json",
+  "STRATA_DISPATCH_REPORT": "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/results/ctl_relaxed_x4_dot4.dispatch.json",
+  "STRATA_WINDOW_WARM": "0",
+  "STRATA_HIP_MOE_X4": "0"
+ },
+ "user_args": [
+  "--spec",
+  "8",
+  "--draft-conf",
+  "0.35",
+  "--lookup-max-t",
+  "16",
+  "--lookup-sizes",
+  "10,12,14,16",
+  "--lookup-chain",
+  "6"
+ ],
+ "parallel": 1,
+ "route_expected": false,
+ "route_engaged": false,
+ "timing_valid": true,
+ "expert_cache_budget_slots": 7500,
+ "expected_expert_cache_slots": 8736,
+ "actual_expert_cache_slots": 8736,
+ "x4_captures": {
+  "n": 0,
+  "entries": []
+ },
+ "wide_launches": {
+  "k0": 0,
+  "k1": 45,
+  "k2": 0
+ },
+ "wide_launches_by_t": {
+  "T9": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T10": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T11": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T12": {
+   "k0": 0,
+   "k1": 3,
+   "k2": 0
+  },
+  "T13": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T14": {
+   "k0": 0,
+   "k1": 34,
+   "k2": 0
+  },
+  "T15": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T16": {
+   "k0": 0,
+   "k1": 8,
+   "k2": 0
+  },
+  "T17": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T18": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T19": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T20": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T21": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T22": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T23": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T24": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T25": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T26": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T27": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T28": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T29": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T30": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T31": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T32": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T33": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T34": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T35": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T36": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T37": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T38": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T39": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T40": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T41": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T42": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T43": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T44": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T45": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T46": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T47": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T48": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T49": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T50": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T51": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T52": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T53": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T54": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T55": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T56": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T57": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T58": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T59": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T60": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T61": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T62": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T63": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T64": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  }
+ },
+ "wide_request_lines": [],
+ "route_evidence": {
+  "route_expected": false,
+  "route_engaged": false,
+  "valid": true,
+  "invalid_reason": null,
+  "evidence_channel_failure": false,
+  "window_warm": "0",
+  "wide_request_order": [
+   "smoke",
+   "wide",
+   "prefill",
+   "greedy1",
+   "greedy2",
+   "burst"
+  ],
+  "expected_expert_cache_slots": 8736,
+  "actual_expert_cache_slots": 8736,
+  "x4_captures": {
+   "n": 0,
+   "entries": []
+  },
+  "x4_captures_by_scope": [],
+  "x4_wide_scope_note_count": 0,
+  "wide_launches": {
+   "k0": 0,
+   "k1": 45,
+   "k2": 0
+  },
+  "wide_launches_by_t": {
+   "T9": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T10": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T11": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T12": {
+    "k0": 0,
+    "k1": 3,
+    "k2": 0
+   },
+   "T13": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T14": {
+    "k0": 0,
+    "k1": 34,
+    "k2": 0
+   },
+   "T15": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T16": {
+    "k0": 0,
+    "k1": 8,
+    "k2": 0
+   },
+   "T17": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T18": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T19": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T20": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T21": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T22": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T23": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T24": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T25": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T26": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T27": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T28": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T29": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T30": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T31": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T32": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T33": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T34": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T35": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T36": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T37": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T38": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T39": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T40": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T41": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T42": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T43": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T44": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T45": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T46": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T47": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T48": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T49": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T50": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T51": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T52": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T53": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T54": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T55": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T56": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T57": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T58": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T59": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T60": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T61": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T62": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T63": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T64": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   }
+  },
+  "wide_request_lines": [],
+  "wide_request_line_count": 0,
+  "wide_window_log_lines": [],
+  "relaxed_projection_pack_count": 0,
+  "relaxed_projection_lines": [],
+  "dispatch_report_path": "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/results/ctl_relaxed_x4_dot4.dispatch.json",
+  "dispatch_report_launches": {
+   "T1/k1": 21,
+   "T2/k1": 29,
+   "T3/k1": 36,
+   "T4/k1": 40,
+   "T5/k1": 23,
+   "T6/k1": 42,
+   "T7/k1": 13,
+   "T8/k1": 216,
+   "T12/k1": 3,
+   "T14/k1": 34,
+   "T16/k1": 8
+  },
+  "dispatch_report_counts_preview": [
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": "str",
+    "key": "head: type 14, T=12 columns, vocabulary 248320",
+    "n": 1
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 2,
+    "var": 1,
+    "type": 23,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 8
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 2,
+    "var": 0,
+    "type": 22,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 2
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 2,
+    "var": 0,
+    "type": 22,
+    "ncols": 42,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 4
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 2,
+    "var": 1,
+    "type": 23,
+    "ncols": 6,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 26
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 1,
+    "var": 0,
+    "type": 8,
+    "ncols": 1,
+    "n_in": 2560,
+    "n_out": 10240,
+    "n": 12
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 2,
+    "var": 0,
+    "type": 23,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 8
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 2,
+    "var": 3,
+    "type": 18,
+    "ncols": 6,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 40
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 1,
+    "var": 0,
+    "type": 8,
+    "ncols": 12,
+    "n_in": 640,
+    "n_out": 2560,
+    "n": 48
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 1,
+    "var": 11,
+    "type": 14,
+    "ncols": 12,
+    "n_in": 2560,
+    "n_out": 248320,
+    "n": 1
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 1,
+    "var": 11,
+    "type": 14,
+    "ncols": 12,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 94
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": "str",
+    "key": "hc read: weights Q8_0 copies=1 (0 = bf16 rows), half=1, qfuse=1",
+    "n": 48
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": 1,
+    "var": 0,
+    "type": 8,
+    "ncols": 12,
+    "n_in": 6144,
+    "n_out": 2560,
+    "n": 36
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": "str",
+    "key": "gdn layer: conv+ab fused=0 batch_rows=0",
+    "n": 36
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": "str",
+    "key": "win df_branch=0 sh_stream=0 prof=0",
+    "n": 1
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": "str",
+    "key": "win pdl=0 side_mixer=0 side_proj=0",
+    "n": 1
+   },
+   {
+    "scope": [
+     12,
+     1
+    ],
+    "cat": "str",
+    "key": "win groups=1 all_resident=0 device_plan=0",
+    "n": 1
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 1,
+    "var": 11,
+    "type": 14,
+    "ncols": 2,
+    "n_in": 2560,
+    "n_out": 248320,
+    "n": 1
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "head: type 14, T=2 columns, vocabulary 248320",
+    "n": 1
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "head: final mixer q8=1 fuse_head_gr=0 native_head=1",
+    "n": 1
+   }
+  ],
+  "graceful_stop_error": null
+ },
+ "smoke": {
+  "prompt_tokens": 37,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.345,
+  "wall_tok_s": 8.69
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 4.374,
+  "wall_tok_s": 58.53
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.711,
+   "wall_tok_s": 137.96,
+   "hash": "f8ebb47e4dee563bea4e39340b3d3ab08571caa1d11e0ab2443855c69f272803"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.712,
+   "wall_tok_s": 137.93,
+   "hash": "af001a931aa5344c743fa918f9c60255dd4a151a92011dc590c8bb22072dfcc8"
+  }
+ ],
+ "burst": {
+  "wall_s": 4.429,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 115.59,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 2.243,
+    "wall_tok_s": 114.13,
+    "hash": "a13d0759c9206b960d1af3a8485281d15c2f0150ea99441c218dd07f0d154b71"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 4.428,
+    "wall_tok_s": 57.81,
+    "hash": "169853b8943c01572e8be2aed8318c9da2284589709a66849f7e2fb632cb98fb"
+   }
+  ]
+ },
+ "wide": {
+  "completion_tokens": 512,
+  "finish": "length",
+  "wall_s": 3.662,
+  "wall_tok_s": 139.82,
+  "hash": "0d2d2ff2a78107b5e232abbc6344485dc4c9106b2204a2fe86e2438896b4cd74"
+ },
+ "parity": {
+  "greedy_cold": "f8ebb47e4dee563bea4e39340b3d3ab08571caa1d11e0ab2443855c69f272803",
+  "greedy_warm": "af001a931aa5344c743fa918f9c60255dd4a151a92011dc590c8bb22072dfcc8",
+  "burst_a": "a13d0759c9206b960d1af3a8485281d15c2f0150ea99441c218dd07f0d154b71",
+  "burst_b": "169853b8943c01572e8be2aed8318c9da2284589709a66849f7e2fb632cb98fb"
+ },
+ "engine_decode_512": [
+  "173.5",
+  "145.9"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 58 ms (51.7 tok/s), drafts accepted 1 of 2, 1 checkpoints",
+   "generated in 2951 ms (173.5 tok/s), drafts accepted 474 of 481, 1 checkpoints",
+   "generated in 2739 ms (93.5 tok/s), drafts accepted 163 of 279, 1 checkpoints",
+   "generated in 3508 ms (145.9 tok/s), drafts accepted 420 of 564, 1 checkpoints",
+   "generated in 3672 ms (139.4 tok/s), drafts accepted 408 of 616, 1 checkpoints",
+   "generated in 2073 ms (123.5 tok/s), drafts accepted 196 of 332, 1 checkpoints",
+   "generated in 1979 ms (129.3 tok/s), drafts accepted 195 of 293, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 37 tokens = 0 reused + 37 read in 284 ms (130.2 tok/s), 3 generated in 58 ms (51.7 tok/s), drafts accepted 1 of 2, 1 checkpoints",
+   "prompt 825 tokens = 0 reused + 825 read in 708 ms (1165.6 tok/s), 512 generated in 2951 ms (173.5 tok/s), drafts accepted 474 of 481, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 1631 ms (2420.5 tok/s), 256 generated in 2739 ms (93.5 tok/s), drafts accepted 163 of 279, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 201 ms (174.2 tok/s), 512 generated in 3508 ms (145.9 tok/s), drafts accepted 420 of 564, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 37 ms (187.4 tok/s), 512 generated in 3672 ms (139.4 tok/s), drafts accepted 408 of 616, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 167 ms (209.4 tok/s), 256 generated in 2073 ms (123.5 tok/s), drafts accepted 196 of 332, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 204 ms (171.5 tok/s), 256 generated in 1979 ms (129.3 tok/s), drafts accepted 195 of 293, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 2",
+   "drafts accepted 474 of 481",
+   "drafts accepted 163 of 279",
+   "drafts accepted 420 of 564",
+   "drafts accepted 408 of 616",
+   "drafts accepted 196 of 332",
+   "drafts accepted 195 of 293"
+  ],
+  "wide_generated": [
+   "generated in 2951 ms (173.5 tok/s), drafts accepted 474 of 481, 1 checkpoints"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 8736 slots, 19.99 GiB of VRAM; policy is"
+ ],
+ "expert_cache_slots": 8736
+}

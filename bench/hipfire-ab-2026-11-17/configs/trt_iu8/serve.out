@@ -1,0 +1,34 @@
+loading the model (the first start takes a minute or two) ...
+[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)
+[strata] drafting: draft vocabulary: draft_vocab.bin (set by you)
+[strata] starting the engine: reading the model's weights ...
+[strata] loading the most-used experts into RAM (up to 40 GiB; the rest are read from the model files as needed) and locking part of them for the GPU.
+         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.
+         Please wait and don't close this window; the server says when it is ready.
+[strata] filling the GPU's expert cache (10944 experts, 24.48 GiB of VRAM) ...
+[strata] still starting (23 s) - please wait ...
+[strata] almost ready ...
+[strata] slot save/restore on: /home/soren/scratch/Strata-merge-0161/bench/hipfire-ab-2026-11-17/configs/trt_iu8/slots (session files are kept until deleted: about 1.2 GB per 63K-token conversation; restore only files this server wrote)
+ready: http://127.0.0.1:8301/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, context 409600 tokens, API key required)
+       open http://127.0.0.1:8301/ in a browser to chat; close this window to stop the model
+[strata] done: 3 tokens in 0 s (62.6 tok/s) (stop, cancel=False), expert cache 72.6% hit (+4.7% of the routed experts over PCIe)
+[strata] reading the prompt: 3,940 of 3,947 tokens, 1 s so far
+[strata] answering: 75 of max 256 tokens, 82.0 tok/s, 2 s
+[strata] answering: 175 of max 256 tokens, 90.3 tok/s, 3 s
+[strata] done: 256 tokens in 4 s (88.0 tok/s) (length, cancel=False), expert cache 94.4% hit (+0.2% of the routed experts over PCIe)
+[strata] answering: 87 of max 512 tokens, 109.2 tok/s, 1 s
+[strata] answering: 232 of max 512 tokens, 128.9 tok/s, 2 s
+[strata] answering: 397 of max 512 tokens, 141.6 tok/s, 3 s
+[strata] done: 512 tokens in 4 s (143.7 tok/s) (length, cancel=False), expert cache 91.8% hit (+0.6% of the routed experts over PCIe)
+[strata] answering: 133 of max 512 tokens, 138.0 tok/s, 1 s
+[strata] answering: 289 of max 512 tokens, 145.4 tok/s, 2 s
+[strata] answering: 448 of max 512 tokens, 149.0 tok/s, 3 s
+[strata] done: 512 tokens in 3 s (150.8 tok/s) (length, cancel=False), expert cache 95.2% hit (+0.2% of the routed experts over PCIe)
+[strata] answering: 111 of max 256 tokens, 135.4 tok/s, 1 s
+[strata] done: 256 tokens in 2 s (141.1 tok/s) (length, cancel=False), expert cache 95.0% hit (+0.2% of the routed experts over PCIe)
+[strata] answering: 89 of max 256 tokens, 112.0 tok/s, 1 s
+[strata] answering: 244 of max 256 tokens, 135.6 tok/s, 2 s
+[strata] done: 256 tokens in 2 s (138.3 tok/s) (length, cancel=False), expert cache 97.3% hit (+0.1% of the routed experts over PCIe)
+
+[strata] stopping (Ctrl+C again to end the engine at once) ...
+[strata] stopped

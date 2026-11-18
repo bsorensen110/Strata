@@ -1,0 +1,87 @@
+{
+  "campaign": "hipfire-port routes (PM4 IB replay, IU8/IU4 MoE, X4/dot4 fusion, buffer loads) + baseline binary vs production, 2026-11-17",
+  "arms": [
+    {
+      "id": "baseline",
+      "bits": "unknown",
+      "src": "merge-0.1.61+hipfire",
+      "exe_ctl": "/home/soren/.local/share/strata-upstream-v0.2.10/components/engine/fork-0161-fc2de6a19/strata",
+      "exe_arm": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+      "why": "new fork-main binary (all hipfire routes default-off) vs the deployed production engine: isolates any merge/build difference from route effects",
+      "baseline": "production",
+      "arm": "new-build"
+    },
+    {
+      "id": "bufload",
+      "switch": "STRATA_HIP_BUFLOAD",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "hipfire-P4",
+      "why": "buffer-load dispatch (hip memcpy-to-buffer); doc claims bitwise-clean decode win on gfx1201",
+      "exe_ctl": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+      "exe_arm": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata"
+    },
+    {
+      "id": "pm4",
+      "switch": "STRATA_HIP_PM4",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "hipfire-P0",
+      "pin": {
+        "STRATA_GFX1201_PM4_PACING": "auto"
+      },
+      "why": "retained PM4 indirect-buffer replay for solo decode/verify windows; eligibility needs all-routed-experts-resident, so also read the latch/eligibility log",
+      "exe_ctl": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+      "exe_arm": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata"
+    },
+    {
+      "id": "iu8",
+      "switch": "STRATA_HIP_MOE_IU8",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "hipfire-P1",
+      "why": "IU8 W4A8 MoE prefill tiles; hipfire saw +11-18% prefill on their models",
+      "exe_ctl": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+      "exe_arm": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata"
+    },
+    {
+      "id": "iu4",
+      "switch": "STRATA_HIP_MOE_IU4",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "hipfire-P2",
+      "why": "IU4 verify tiles for wider rows",
+      "exe_ctl": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+      "exe_arm": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata"
+    },
+    {
+      "id": "x4",
+      "switch": "STRATA_HIP_MOE_X4",
+      "baseline": "0",
+      "arm": "1",
+      "bits": "unknown",
+      "src": "hipfire-P5",
+      "pin": {
+        "STRATA_HIP_DOT4_GEMV": "1"
+      },
+      "why": "x4 projection fusion + ordered dot4 GEMV (hipfire: -31-38% us fused)",
+      "exe_ctl": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+      "exe_arm": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata"
+    },
+    {
+      "id": "aa_floor",
+      "switch": "STRATA_HIP_BUFLOAD",
+      "baseline": "0",
+      "arm": "0",
+      "bits": "unknown",
+      "src": "none",
+      "why": "A/A floor: same binary (build-hip-port), same env on both sides; every route delta is judged against this spread",
+      "exe_ctl": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+      "exe_arm": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata"
+    }
+  ]
+}

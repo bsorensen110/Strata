@@ -1,0 +1,13 @@
+2026-11-18T03:26:07 config preflight ok: 4 unique dispatch reports
+2026-11-18T03:26:07 preflight ok: 2 pairs
+2026-11-18T03:26:07 campaign start: 2 switch pairs, first=relaxed_x4_dot4
+2026-11-18T03:26:07 production service inactive: campaign start (inactive)
+2026-11-18T03:26:07 === PAIR relaxed_x4_dot4 ROUND 1 (STRATA_HIP_MOE_X4: prod 0 -> arm 1) ===
+2026-11-18T03:26:07 production service inactive: before ctl_relaxed_x4_dot4 (inactive)
+2026-11-18T03:26:07 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T03:26:07 system memory free: MemAvailable 58.79 GiB (minimum 52 GiB)
+2026-11-18T03:26:40 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T03:26:41 gpu free: GPU free after 1 s: VRAM 142 MB, port 8301 closed
+2026-11-18T03:26:41 system memory free: MemAvailable 59.07 GiB (minimum 52 GiB)
+2026-11-18T03:26:41 production service inactive: before production restore (inactive)
+2026-11-18T03:26:41 restoring production service

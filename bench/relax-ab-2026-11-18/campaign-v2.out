@@ -1,0 +1,121 @@
+2026-11-18T04:10:23 config preflight ok: 4 unique dispatch reports
+2026-11-18T04:10:23 preflight ok: 2 pairs
+2026-11-18T04:10:23 campaign start: 2 switch pairs, first=relaxed_x4_dot4
+2026-11-18T04:10:23 production service inactive: campaign start (inactive)
+2026-11-18T04:10:23 === PAIR relaxed_x4_dot4 ROUND 1 (STRATA_HIP_MOE_X4: prod 0 -> arm 1) ===
+2026-11-18T04:10:23 production service inactive: before ctl_relaxed_x4_dot4 (inactive)
+2026-11-18T04:10:23 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:10:23 system memory free: MemAvailable 58.82 GiB (minimum 52 GiB)
+2026-11-18T04:10:23 ARM_STATUS arm=ctl_relaxed_x4_dot4 status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:11:24 ARM ctl_relaxed_x4_dot4 ok 61.1s {"arm": "ctl_relaxed_x4_dot4", "greedy_tok_s": [137.96, 137.93], "burst_agg": 115.59, "prefill_tok_s": 58.53, "prefill_prompt_tokens": 3947, "wide_tok_s": 139.82, "hashes": {"greedy_cold": "f8ebb47e4dee563bea4e39340b3d3ab08571caa1d11e0ab2443855c69f272803", "greedy_warm": "af001a931aa5344c743fa918f9c60255dd4a151a92011dc590c8bb22072dfcc8", "burst_a": "a13d0759c9206b960d1af3a8485281d15c2f0150ea99441c
+2026-11-18T04:11:24 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:11:24 system memory free: MemAvailable 59.08 GiB (minimum 52 GiB)
+2026-11-18T04:11:24 ARM_STATUS arm=ctl_relaxed_x4_dot4 status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:11:24 production service inactive: before trt_relaxed_x4_dot4 (inactive)
+2026-11-18T04:11:24 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:11:24 system memory free: MemAvailable 59.04 GiB (minimum 52 GiB)
+2026-11-18T04:11:24 ARM_STATUS arm=trt_relaxed_x4_dot4 status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:13:09 ARM trt_relaxed_x4_dot4 ok 104.4s {"arm": "trt_relaxed_x4_dot4", "greedy_tok_s": [123.84, 137.54], "burst_agg": 109.11, "prefill_tok_s": 62.99, "prefill_prompt_tokens": 3947, "wide_tok_s": 125.85, "hashes": {"greedy_cold": "f3e35c3fc39223ed41d864bba6fbf9aefa442b374dde2efd8dbda4d936e8fba0", "greedy_warm": "88e6bee925fd2100c9c00b6fd084fefc8ad8395e6f3ba8e999060a5ed74e1dbc", "burst_a": "0d550328b378c249a24e3eb6104d8c5badbb25896f4dabc9
+2026-11-18T04:13:09 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:13:09 system memory free: MemAvailable 59.15 GiB (minimum 52 GiB)
+2026-11-18T04:13:09 ARM_STATUS arm=trt_relaxed_x4_dot4 status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:13:09 PAIR relaxed_x4_dot4 round 1 control=ok treatment=ok
+2026-11-18T04:13:09 === PAIR aa_floor ROUND 1 (STRATA_HIP_RELAX_PACK: prod 1 -> arm 1) ===
+2026-11-18T04:13:09 production service inactive: before ctl_aa_floor (inactive)
+2026-11-18T04:13:09 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:13:09 system memory free: MemAvailable 59.14 GiB (minimum 52 GiB)
+2026-11-18T04:13:09 ARM_STATUS arm=ctl_aa_floor status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:14:51 ARM ctl_aa_floor ok 102.3s {"arm": "ctl_aa_floor", "greedy_tok_s": [118.9, 146.53], "burst_agg": 111.75, "prefill_tok_s": 61.03, "prefill_prompt_tokens": 3947, "wide_tok_s": 125.53, "hashes": {"greedy_cold": "e34a2642f7f60e87d758fcf9f3fdbaf18d04be9bcc67dc14ef3f5d3ae13cda34", "greedy_warm": "f0175c9d95f06f01ef31554a531979d4eb2d5c6cffd1c3add331c5cc6bc22639", "burst_a": "c42e5aeff4788ff27c417e5f5ed428e69698a5a4200e628f37d1a039
+2026-11-18T04:14:52 gpu free: GPU free after 1 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:14:52 system memory free: MemAvailable 59.25 GiB (minimum 52 GiB)
+2026-11-18T04:14:52 ARM_STATUS arm=ctl_aa_floor status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:14:52 production service inactive: before trt_aa_floor (inactive)
+2026-11-18T04:14:52 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:14:52 system memory free: MemAvailable 59.24 GiB (minimum 52 GiB)
+2026-11-18T04:14:52 ARM_STATUS arm=trt_aa_floor status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:16:37 ARM trt_aa_floor ok 104.8s {"arm": "trt_aa_floor", "greedy_tok_s": [127.36, 144.92], "burst_agg": 108.34, "prefill_tok_s": 58.52, "prefill_prompt_tokens": 3947, "wide_tok_s": 115.8, "hashes": {"greedy_cold": "69dec4e7aa3b783056466521b90deaa160f0db6f762af12d6d35a199241d103a", "greedy_warm": "f0175c9d95f06f01ef31554a531979d4eb2d5c6cffd1c3add331c5cc6bc22639", "burst_a": "c42e5aeff4788ff27c417e5f5ed428e69698a5a4200e628f37d1a039
+2026-11-18T04:16:37 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:16:37 system memory free: MemAvailable 59.10 GiB (minimum 52 GiB)
+2026-11-18T04:16:37 ARM_STATUS arm=trt_aa_floor status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:16:37 PAIR aa_floor round 1 control=ok treatment=ok
+2026-11-18T04:16:37 doc rendered: rendered campaign 9: 2 pairs, 2 rows
+2026-11-18T04:16:37 === PAIR relaxed_x4_dot4 ROUND 2 (STRATA_HIP_MOE_X4: prod 0 -> arm 1) ===
+2026-11-18T04:16:37 production service inactive: before ctl_relaxed_x4_dot4 (inactive)
+2026-11-18T04:16:37 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:16:37 system memory free: MemAvailable 59.09 GiB (minimum 52 GiB)
+2026-11-18T04:16:37 ARM_STATUS arm=ctl_relaxed_x4_dot4 status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:17:37 ARM ctl_relaxed_x4_dot4 ok 59.7s {"arm": "ctl_relaxed_x4_dot4", "greedy_tok_s": [133.23, 142.06], "burst_agg": 123.66, "prefill_tok_s": 53.67, "prefill_prompt_tokens": 3947, "wide_tok_s": 136.26, "hashes": {"greedy_cold": "f816f50e2edc54a8e01757fdb68a2a1c0c296b388d9cfdb93eda9ddf58ecdd8c", "greedy_warm": "10791651d3627d5cf8e00b6746cbc9d47f7b616cf664801c4e05c0877fe20a2e", "burst_a": "152f5fdc174e170c7738018b3b3a531def7274898e9d46f0
+2026-11-18T04:17:37 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:17:37 system memory free: MemAvailable 59.25 GiB (minimum 52 GiB)
+2026-11-18T04:17:37 ARM_STATUS arm=ctl_relaxed_x4_dot4 status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:17:37 production service inactive: before trt_relaxed_x4_dot4 (inactive)
+2026-11-18T04:17:37 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:17:37 system memory free: MemAvailable 59.26 GiB (minimum 52 GiB)
+2026-11-18T04:17:37 ARM_STATUS arm=trt_relaxed_x4_dot4 status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:19:21 ARM trt_relaxed_x4_dot4 ok 103.7s {"arm": "trt_relaxed_x4_dot4", "greedy_tok_s": [135.86, 139.21], "burst_agg": 108.2, "prefill_tok_s": 63.29, "prefill_prompt_tokens": 3947, "wide_tok_s": 130.09, "hashes": {"greedy_cold": "3ae908a6c766e60a7b8ed49380ad580b3bf8fd21b42e751cd862793fa6c1b6d5", "greedy_warm": "fb4e31a9eaf1aba0079bbb39b6a944e14e862a630248861aa151bcf37a65acbf", "burst_a": "c42e5aeff4788ff27c417e5f5ed428e69698a5a4200e628f3
+2026-11-18T04:19:21 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:19:21 system memory free: MemAvailable 59.10 GiB (minimum 52 GiB)
+2026-11-18T04:19:21 ARM_STATUS arm=trt_relaxed_x4_dot4 status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:19:21 PAIR relaxed_x4_dot4 round 2 control=ok treatment=ok
+2026-11-18T04:19:21 === PAIR aa_floor ROUND 2 (STRATA_HIP_RELAX_PACK: prod 1 -> arm 1) ===
+2026-11-18T04:19:21 production service inactive: before ctl_aa_floor (inactive)
+2026-11-18T04:19:21 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:19:21 system memory free: MemAvailable 59.11 GiB (minimum 52 GiB)
+2026-11-18T04:19:21 ARM_STATUS arm=ctl_aa_floor status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:21:02 ARM ctl_aa_floor ok 100.8s {"arm": "ctl_aa_floor", "greedy_tok_s": [136.13, 150.31], "burst_agg": 116.53, "prefill_tok_s": 63.9, "prefill_prompt_tokens": 3947, "wide_tok_s": 129.96, "hashes": {"greedy_cold": "496834353b32f7466a2b04d9d608961655e762c20f660de79a089906bedab6b1", "greedy_warm": "86553b8d0d94cf58e80fd8862b63069e250e608abb1453b1e26e0ce488781ac9", "burst_a": "1440407efc441cd8cbd8f58b799cc3764d876476e29fd15cf4e55165
+2026-11-18T04:21:02 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:21:02 system memory free: MemAvailable 59.10 GiB (minimum 52 GiB)
+2026-11-18T04:21:02 ARM_STATUS arm=ctl_aa_floor status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:21:02 production service inactive: before trt_aa_floor (inactive)
+2026-11-18T04:21:02 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:21:02 system memory free: MemAvailable 59.09 GiB (minimum 52 GiB)
+2026-11-18T04:21:02 ARM_STATUS arm=trt_aa_floor status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:22:45 ARM trt_aa_floor ok 102.3s {"arm": "trt_aa_floor", "greedy_tok_s": [127.21, 143.44], "burst_agg": 107.04, "prefill_tok_s": 56.04, "prefill_prompt_tokens": 3947, "wide_tok_s": 129.93, "hashes": {"greedy_cold": "4955c1f09f73d175bf9d2c238869e8eb5ba1ee5f4f1e9ecf7b58398c6435084a", "greedy_warm": "4955c1f09f73d175bf9d2c238869e8eb5ba1ee5f4f1e9ecf7b58398c6435084a", "burst_a": "3d48d4dbda0c7ff51f601821ba4e45023e47e478188fa632a2094cf
+2026-11-18T04:22:45 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:22:45 system memory free: MemAvailable 59.14 GiB (minimum 52 GiB)
+2026-11-18T04:22:45 ARM_STATUS arm=trt_aa_floor status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:22:45 PAIR aa_floor round 2 control=ok treatment=ok
+2026-11-18T04:22:45 doc rendered: rendered campaign 9: 2 pairs, 2 rows
+2026-11-18T04:22:45 === PAIR relaxed_x4_dot4 ROUND 3 (STRATA_HIP_MOE_X4: prod 0 -> arm 1) ===
+2026-11-18T04:22:45 production service inactive: before ctl_relaxed_x4_dot4 (inactive)
+2026-11-18T04:22:45 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:22:45 system memory free: MemAvailable 59.13 GiB (minimum 52 GiB)
+2026-11-18T04:22:45 ARM_STATUS arm=ctl_relaxed_x4_dot4 status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:23:44 ARM ctl_relaxed_x4_dot4 ok 59.0s {"arm": "ctl_relaxed_x4_dot4", "greedy_tok_s": [129.97, 151.64], "burst_agg": 121.13, "prefill_tok_s": 59.33, "prefill_prompt_tokens": 3947, "wide_tok_s": 136.42, "hashes": {"greedy_cold": "a9522473d2e5e09391d66dd29a5b51d254e84e9f62e42de25c3b3d44757dff72", "greedy_warm": "9a447e7e6b95305f090a093099dbc7ce30b20aa6cda028222e7d72fe75984616", "burst_a": "8e07fc58fb7091f322fc810f6fe1eace4523c3b852cb26a0
+2026-11-18T04:23:44 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:23:44 system memory free: MemAvailable 59.26 GiB (minimum 52 GiB)
+2026-11-18T04:23:44 ARM_STATUS arm=ctl_relaxed_x4_dot4 status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:23:44 production service inactive: before trt_relaxed_x4_dot4 (inactive)
+2026-11-18T04:23:44 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:23:44 system memory free: MemAvailable 59.26 GiB (minimum 52 GiB)
+2026-11-18T04:23:44 ARM_STATUS arm=trt_relaxed_x4_dot4 status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:25:26 ARM trt_relaxed_x4_dot4 ok 101.9s {"arm": "trt_relaxed_x4_dot4", "greedy_tok_s": [131.06, 146.79], "burst_agg": 109.25, "prefill_tok_s": 59.84, "prefill_prompt_tokens": 3947, "wide_tok_s": 132.04, "hashes": {"greedy_cold": "c4aea456230fd4d9ba6bea222f0bc402480256cdcfc0dbcb0754c962db995e02", "greedy_warm": "b6d825030f38131a286679de87e58a599acf4f1d6420bee94bc1810cf894cca4", "burst_a": "c42e5aeff4788ff27c417e5f5ed428e69698a5a4200e628f
+2026-11-18T04:25:26 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:25:26 system memory free: MemAvailable 59.42 GiB (minimum 52 GiB)
+2026-11-18T04:25:26 ARM_STATUS arm=trt_relaxed_x4_dot4 status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:25:26 PAIR relaxed_x4_dot4 round 3 control=ok treatment=ok
+2026-11-18T04:25:26 === PAIR aa_floor ROUND 3 (STRATA_HIP_RELAX_PACK: prod 1 -> arm 1) ===
+2026-11-18T04:25:26 production service inactive: before ctl_aa_floor (inactive)
+2026-11-18T04:25:26 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:25:26 system memory free: MemAvailable 59.41 GiB (minimum 52 GiB)
+2026-11-18T04:25:26 ARM_STATUS arm=ctl_aa_floor status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:27:10 ARM ctl_aa_floor ok 103.9s {"arm": "ctl_aa_floor", "greedy_tok_s": [127.96, 149.83], "burst_agg": 108.68, "prefill_tok_s": 62.23, "prefill_prompt_tokens": 3947, "wide_tok_s": 124.42, "hashes": {"greedy_cold": "88e6bee925fd2100c9c00b6fd084fefc8ad8395e6f3ba8e999060a5ed74e1dbc", "greedy_warm": "bb77a6d597d9654715e350b093eb4cb958ac3482e80fbeb4f2cd4d181695f94e", "burst_a": "3d48d4dbda0c7ff51f601821ba4e45023e47e478188fa632a2094cf
+2026-11-18T04:27:10 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:27:10 system memory free: MemAvailable 59.44 GiB (minimum 52 GiB)
+2026-11-18T04:27:10 ARM_STATUS arm=ctl_aa_floor status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:27:10 production service inactive: before trt_aa_floor (inactive)
+2026-11-18T04:27:11 gpu free: GPU free after 1 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:27:11 system memory free: MemAvailable 59.44 GiB (minimum 52 GiB)
+2026-11-18T04:27:11 ARM_STATUS arm=trt_aa_floor status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T04:28:55 ARM trt_aa_floor ok 104.0s {"arm": "trt_aa_floor", "greedy_tok_s": [136.81, 150.04], "burst_agg": 115.6, "prefill_tok_s": 59.82, "prefill_prompt_tokens": 3947, "wide_tok_s": 104.71, "hashes": {"greedy_cold": "682ee01da2b0cf7f346a88d237d701915eed85b750b7d69ed8cbf060a00be15d", "greedy_warm": "d5ab98446c69fdab64be6510674739b90ece43b817d79e8330282176cde4ff1f", "burst_a": "ea2782492801f9b491858ca9b35dc7a51cd14608fba158de9cc1bce7
+2026-11-18T04:28:55 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:28:55 system memory free: MemAvailable 59.42 GiB (minimum 52 GiB)
+2026-11-18T04:28:55 ARM_STATUS arm=trt_aa_floor status=completed expected_actual=8736 budget=7500 actual=8736 reason=
+2026-11-18T04:28:55 PAIR aa_floor round 3 control=ok treatment=ok
+2026-11-18T04:28:55 doc rendered: rendered campaign 9: 2 pairs, 2 rows
+2026-11-18T04:28:55 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T04:28:55 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T04:28:55 system memory free: MemAvailable 59.43 GiB (minimum 52 GiB)
+2026-11-18T04:28:55 production service inactive: before production restore (inactive)
+2026-11-18T04:28:55 restoring production service
+2026-11-18T04:29:37 production restored: ready

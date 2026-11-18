@@ -1,0 +1,7 @@
+{
+ "arm": "trt_relaxed_x4_dot4",
+ "round": "r1",
+ "status": "route_invalid",
+ "reason": "X4 was enabled but had no positive HIP x4 dispatch",
+ "ts": "2026-11-18T01:08:36"
+}

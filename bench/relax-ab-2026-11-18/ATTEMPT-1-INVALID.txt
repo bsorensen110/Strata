@@ -1,0 +1,5 @@
+Campaign 9 attempt 1 is invalid and incomplete. Preserve its raw result files as evidence, but do
+not include them in measured rows. The relaxed treatment loaded only 137 of 156 projection packs;
+19 were refused for OOM, then startup failed because the DFlash2 tap buffers could not be
+allocated. The treatment did not produce a valid timing sample, and the planned rounds were not
+completed. The corrected driver writes validity and route-engagement fields for new samples.

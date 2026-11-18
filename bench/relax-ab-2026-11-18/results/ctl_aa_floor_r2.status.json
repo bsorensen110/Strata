@@ -1,0 +1,10 @@
+{
+ "arm": "ctl_aa_floor",
+ "round": "_r2",
+ "status": "completed",
+ "reason": "",
+ "ts": "2026-11-18T04:21:02",
+ "expected_expert_cache_slots": 8736,
+ "actual_expert_cache_slots": 8736,
+ "expert_cache_budget_slots": 7500
+}

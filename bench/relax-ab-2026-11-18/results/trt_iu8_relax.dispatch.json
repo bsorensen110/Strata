@@ -1,0 +1,31 @@
+{
+ "launches": {},
+ "counts": [
+  {"scope": [-1, -1], "cat": 3, "var": 1, "type": 0, "ncols": 8, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": "str", "key": "init: all-resident graph declined: some expert is not resident (doorbell graph with CPU / PCIe experts)", "n": 1},
+  {"scope": [-1, -1], "cat": 3, "var": 1, "type": 0, "ncols": 7, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 3, "type": 0, "ncols": 6, "n_in": 1280, "n_out": 6, "n": 2},
+  {"scope": [-1, -1], "cat": 1, "var": 14, "type": 14, "ncols": 7, "n_in": 2560, "n_out": 248320, "n": 8},
+  {"scope": [-1, -1], "cat": 3, "var": 2, "type": 0, "ncols": 6, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 1, "type": 0, "ncols": 6, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 3, "type": 0, "ncols": 5, "n_in": 1280, "n_out": 6, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 2, "type": 0, "ncols": 5, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 1, "type": 0, "ncols": 1, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 3, "type": 0, "ncols": 8, "n_in": 1280, "n_out": 6, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 2, "type": 0, "ncols": 4, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 2, "type": 0, "ncols": 1, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 1, "type": 0, "ncols": 5, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 1, "type": 0, "ncols": 2, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 2, "type": 0, "ncols": 7, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 2, "type": 0, "ncols": 2, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 3, "type": 0, "ncols": 1, "n_in": 1280, "n_out": 6, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 1, "type": 0, "ncols": 3, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 2, "type": 0, "ncols": 8, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 3, "type": 0, "ncols": 7, "n_in": 1280, "n_out": 6, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 2, "type": 0, "ncols": 3, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 3, "type": 0, "ncols": 3, "n_in": 1280, "n_out": 6, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 3, "type": 0, "ncols": 2, "n_in": 1280, "n_out": 6, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 1, "type": 0, "ncols": 4, "n_in": 1280, "n_out": 8, "n": 2},
+  {"scope": [-1, -1], "cat": 3, "var": 3, "type": 0, "ncols": 4, "n_in": 1280, "n_out": 6, "n": 2}
+ ]
+}

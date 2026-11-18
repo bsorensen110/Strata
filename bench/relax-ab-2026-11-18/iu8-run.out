@@ -1,0 +1,30 @@
+2026-11-18T06:56:43 config preflight ok: 6 unique dispatch reports
+2026-11-18T06:56:43 preflight ok: 3 pairs
+2026-11-18T06:56:43 campaign start: 1 switch pairs, first=iu8_relax
+2026-11-18T06:56:43 production service inactive: campaign start (inactive)
+2026-11-18T06:56:43 === PAIR iu8_relax ROUND 1 (STRATA_HIP_MOE_IU8: prod 0 -> arm 1) ===
+2026-11-18T06:56:43 PAIR iu8_relax round 1 treatment-only (control reused from campaign 9 ctl_relaxed_x4_dot4)
+2026-11-18T06:56:43 production service inactive: before trt_iu8_relax (inactive)
+2026-11-18T06:56:43 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T06:56:43 system memory free: MemAvailable 58.80 GiB (minimum 52 GiB)
+2026-11-18T06:56:43 ARM_STATUS arm=trt_iu8_relax status=running expected_actual=8736 budget=7500 actual=None reason=
+2026-11-18T07:04:26 ARM trt_iu8_relax FAIL bench rc=1:  trt_iu8_relax: engine not running during readiness (state=inactive) :: []
+
+2026-11-18T07:04:26 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T07:04:26 system memory free: MemAvailable 59.19 GiB (minimum 52 GiB)
+2026-11-18T07:04:26 ARM_STATUS arm=trt_iu8_relax status=fail expected_actual=8736 budget=7500 actual=None reason=bench rc=1:  trt_iu8_relax: engine not running during readiness (state=inactive) :: []
+
+2026-11-18T07:04:26 PAIR iu8_relax round 1 control=reused campaign 9 ctl_relaxed_x4_dot4 treatment=fail
+2026-11-18T07:04:26 gpu free: GPU free after 0 s: VRAM 142 MB, port 8300 closed
+2026-11-18T07:04:26 gpu free: GPU free after 0 s: VRAM 142 MB, port 8301 closed
+2026-11-18T07:04:26 system memory free: MemAvailable 59.18 GiB (minimum 52 GiB)
+2026-11-18T07:04:26 production service inactive: before production restore (inactive)
+2026-11-18T07:04:26 restoring production service
+2026-11-18T07:05:08 production restored: ready
+Traceback (most recent call last):
+  File "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/driver.py", line 449, in <module>
+    main()
+    ~~~~^^
+  File "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/driver.py", line 418, in main
+    raise RuntimeError(f'{sid} round {rnd}: treatment arm {trt}; aborting campaign')
+RuntimeError: iu8_relax round 1: treatment arm fail; aborting campaign

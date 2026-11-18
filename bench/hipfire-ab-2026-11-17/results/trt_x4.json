@@ -1,0 +1,103 @@
+{
+ "arm": "trt_x4",
+ "round": "r1",
+ "ts": "2026-11-17T21:22:29",
+ "exe": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+ "binary_sha256": "21d8c0b4d8f2e1bdfa61578cf2845e730952cae06dfce94c1446bf084c641988",
+ "commit": "0e9a96158",
+ "engine_pid": 93378,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/scratch/Strata-merge-0161/bench/hipfire-ab-2026-11-17/results/trt_x4.manifest.json",
+  "STRATA_HIP_DOT4_GEMV": "1",
+  "STRATA_HIP_MOE_X4": "1"
+ },
+ "parallel": 1,
+ "smoke": {
+  "prompt_tokens": 34,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.272,
+  "wall_tok_s": 11.04
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 4.478,
+  "wall_tok_s": 57.17
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 4.062,
+   "wall_tok_s": 126.04,
+   "hash": "b040713a3bda139af24aee8b14d4cf7a858d829d948326149950a2d96c68a467"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.609,
+   "wall_tok_s": 141.86,
+   "hash": "ba625a605c3e5783a408a42acee4a920bdb0936456ed7f111765882ab591208b"
+  }
+ ],
+ "burst": {
+  "wall_s": 4.107,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 124.66,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 2.045,
+    "wall_tok_s": 125.18,
+    "hash": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 4.106,
+    "wall_tok_s": 62.35,
+    "hash": "5440c61ae90419703827b75b7a75ffded3b4c3b62890e9fd8d452644906faf5a"
+   }
+  ]
+ },
+ "parity": {
+  "greedy_cold": "b040713a3bda139af24aee8b14d4cf7a858d829d948326149950a2d96c68a467",
+  "greedy_warm": "ba625a605c3e5783a408a42acee4a920bdb0936456ed7f111765882ab591208b",
+  "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576",
+  "burst_b": "5440c61ae90419703827b75b7a75ffded3b4c3b62890e9fd8d452644906faf5a"
+ },
+ "engine_decode_512": [
+  "132.6",
+  "143.4"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 49 ms (61.2 tok/s), drafts accepted 1 of 4, 1 checkpoints",
+   "generated in 3042 ms (84.2 tok/s), drafts accepted 151 of 321, 1 checkpoints",
+   "generated in 3862 ms (132.6 tok/s), drafts accepted 400 of 579, 1 checkpoints",
+   "generated in 3572 ms (143.4 tok/s), drafts accepted 410 of 586, 1 checkpoints",
+   "generated in 1864 ms (137.4 tok/s), drafts accepted 201 of 302, 1 checkpoints",
+   "generated in 1863 ms (137.4 tok/s), drafts accepted 201 of 300, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 34 tokens = 0 reused + 34 read in 220 ms (154.8 tok/s), 3 generated in 49 ms (61.2 tok/s), drafts accepted 1 of 4, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 1432 ms (2757.0 tok/s), 256 generated in 3042 ms (84.2 tok/s), drafts accepted 151 of 321, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 198 ms (176.9 tok/s), 512 generated in 3862 ms (132.6 tok/s), drafts accepted 400 of 579, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 35 ms (197.4 tok/s), 512 generated in 3572 ms (143.4 tok/s), drafts accepted 410 of 586, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 178 ms (196.1 tok/s), 256 generated in 1864 ms (137.4 tok/s), drafts accepted 201 of 302, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 194 ms (180.2 tok/s), 256 generated in 1863 ms (137.4 tok/s), drafts accepted 201 of 300, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 4",
+   "drafts accepted 151 of 321",
+   "drafts accepted 400 of 579",
+   "drafts accepted 410 of 586",
+   "drafts accepted 201 of 302",
+   "drafts accepted 201 of 300"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 10944 slots, 24.48 GiB of VRAM; policy is"
+ ]
+}

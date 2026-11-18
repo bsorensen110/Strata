@@ -1,0 +1,10 @@
+{
+ "arm": "trt_iu8_relax",
+ "round": "r1",
+ "status": "fail",
+ "reason": "bench rc=1:  trt_iu8_relax: engine not running during readiness (state=inactive) :: []\n",
+ "ts": "2026-11-18T07:04:26",
+ "expected_expert_cache_slots": 8736,
+ "actual_expert_cache_slots": null,
+ "expert_cache_budget_slots": 7500
+}

@@ -1,0 +1,126 @@
+2026-11-17T20:51:10 preflight ok: 7 pairs
+2026-11-17T20:51:10 campaign start: 7 switch pairs, first=baseline
+2026-11-17T20:51:13 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T20:51:13 ctest parity subset
+2026-11-17T20:51:29 ctest rc=0 100% tests passed out of 9
+2026-11-17T20:51:29 === PAIR baseline (engine binary: fork-0161-fc2de6a19 -> build-hip-port) ===
+2026-11-17T20:52:28 ARM ctl_baseline ok 58.4s {"arm": "ctl_baseline", "greedy_tok_s": [133.15, 142.32], "burst_agg": 126.98, "prefill_tok_s": 56.96, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "3144c7f7dbc204d4c5833f5172a8073643e3e3a8194f137f5b25fd0a34fa1ba3", "greedy_warm": "d992b3d39b452b68a736c383c595247b982fe41508a5edbaf55f817e08260f10", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b":
+2026-11-17T20:52:28 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T20:53:26 ARM trt_baseline ok 57.9s {"arm": "trt_baseline", "greedy_tok_s": [136.14, 149.8], "burst_agg": 126.49, "prefill_tok_s": 59.97, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "bef18e63e4d6f47852146560761b26c685a6d296337eb77f08d9722ac53c12db", "greedy_warm": "27ed122fb20c276ca75e552b0f595df44f64389922c222b52634256d55e08bd0", "burst_a": "c4e03ca88013b47ea64dc145eb73d1d1f1870718feab6568f8465703a01f09a0", "burst_b": 
+2026-11-17T20:53:30 gpu free: GPU free after 4 s: VRAM 148 MB, port 8301 closed
+2026-11-17T20:53:30 PAIR baseline round 1 control=ok treatment=ok
+2026-11-17T20:54:28 ARM ctl_baseline ok 58.1s {"arm": "ctl_baseline", "greedy_tok_s": [136.51, 132.92], "burst_agg": 127.11, "prefill_tok_s": 62.38, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "6f4c3919d10257ba58ce6f969d5113dda2f0d5aa12d9b200bc519557fda462f2", "greedy_warm": "c50e888dc3910d369a5fece2e72c229af7d4c1b8252b6a3b5d5dde86d0b305e9", "burst_a": "9c5bc149b33d8ba968e6ff450ab40bf9c8e93692052bbcd8efc9626df7591f82", "burst_b":
+2026-11-17T20:54:29 gpu free: GPU free after 1 s: VRAM 148 MB, port 8300 closed
+2026-11-17T20:55:27 ARM trt_baseline ok 57.9s {"arm": "trt_baseline", "greedy_tok_s": [142.94, 143.85], "burst_agg": 124.4, "prefill_tok_s": 60.47, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "05dd3e9df7a58f81eaa1d5023db34ee20165979402df97643f5c597de44c3d0f", "greedy_warm": "66f872c433e6a65a5e3cdd1c74d97d43c81b3d0f08c36ca27fdf47d685b0ffd6", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": 
+2026-11-17T20:55:30 gpu free: GPU free after 3 s: VRAM 148 MB, port 8301 closed
+2026-11-17T20:55:30 PAIR baseline round 2 control=ok treatment=ok
+2026-11-17T20:56:27 ARM ctl_baseline ok 56.1s {"arm": "ctl_baseline", "greedy_tok_s": [137.53, 141.91], "burst_agg": 123.0, "prefill_tok_s": 61.13, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "1971d4e75324bc3a06e24a3ca0e99d22406b2bb9d008957a409bcdb38e052d4d", "greedy_warm": "ba625a605c3e5783a408a42acee4a920bdb0936456ed7f111765882ab591208b", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": 
+2026-11-17T20:56:27 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T20:57:24 ARM trt_baseline ok 56.1s {"arm": "trt_baseline", "greedy_tok_s": [133.62, 145.89], "burst_agg": 125.2, "prefill_tok_s": 60.2, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "80f3c37d555e1a1d9306bb73416ec7ae9149ba5a9b5a703550b23dc734015e14", "greedy_warm": "d3c4464f098a895c5ed1fec4d2f4ce21ced15ff4697fe19337c09b90085e3af5", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": "
+2026-11-17T20:57:24 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T20:57:24 PAIR baseline round 3 control=ok treatment=ok
+2026-11-17T20:57:24 doc rendered: rendered 1/7 arms, 0 telemetry rows
+2026-11-17T20:57:24 === PAIR bufload (STRATA_HIP_BUFLOAD: prod 0 -> arm 1) ===
+2026-11-17T20:58:20 ARM ctl_bufload ok 56.1s {"arm": "ctl_bufload", "greedy_tok_s": [135.92, 135.47], "burst_agg": 125.28, "prefill_tok_s": 63.54, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "98cd513e1932eb568ccb80098544de0afa647dafa0a04de4106fde1aaea3e8ca", "greedy_warm": "d0adb229ce75547fa82003b55517dc1f8ce3afb19f76b31b5e4e7dd278314a2b", "burst_a": "a6c30ad4704ce0dbb4fe9e10408c96a3bd9908b943cea5aeadc3d94a56889ea6", "burst_b": 
+2026-11-17T20:58:24 gpu free: GPU free after 4 s: VRAM 148 MB, port 8300 closed
+2026-11-17T20:59:21 ARM trt_bufload ok 56.4s {"arm": "trt_bufload", "greedy_tok_s": [133.18, 146.44], "burst_agg": 126.75, "prefill_tok_s": 55.57, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "35bf0cdc4dd243d0140b05e44183816b8d84fa2c1a6a62462f9a842b59a48f17", "greedy_warm": "d3c4464f098a895c5ed1fec4d2f4ce21ced15ff4697fe19337c09b90085e3af5", "burst_a": "a6c30ad4704ce0dbb4fe9e10408c96a3bd9908b943cea5aeadc3d94a56889ea6", "burst_b": 
+2026-11-17T20:59:21 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T20:59:21 PAIR bufload round 1 control=ok treatment=ok
+2026-11-17T21:00:20 ARM ctl_bufload ok 58.5s {"arm": "ctl_bufload", "greedy_tok_s": [122.13, 146.82], "burst_agg": 126.72, "prefill_tok_s": 58.62, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "f8ffe9bc790fc50caec784eb07d5c76d6aefa10cbb6c0b0f435205ad5a38303c", "greedy_warm": "f611a9b670dfc5694ebf941709df374403289a89e902102746babb13af544a5e", "burst_a": "a6c30ad4704ce0dbb4fe9e10408c96a3bd9908b943cea5aeadc3d94a56889ea6", "burst_b": 
+2026-11-17T21:00:20 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:01:17 ARM trt_bufload ok 56.4s {"arm": "trt_bufload", "greedy_tok_s": [145.16, 140.35], "burst_agg": 117.68, "prefill_tok_s": 58.42, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "9a447e7e6b95305f090a093099dbc7ce30b20aa6cda028222e7d72fe75984616", "greedy_warm": "66f872c433e6a65a5e3cdd1c74d97d43c81b3d0f08c36ca27fdf47d685b0ffd6", "burst_a": "94dc7c26b1ddae621847d6af8abc66d1a2860fe9e05f7427c3dafd5be7f05ef8", "burst_b": 
+2026-11-17T21:01:20 gpu free: GPU free after 3 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:01:20 PAIR bufload round 2 control=ok treatment=ok
+2026-11-17T21:02:17 ARM ctl_bufload ok 55.9s {"arm": "ctl_bufload", "greedy_tok_s": [136.61, 145.22], "burst_agg": 126.63, "prefill_tok_s": 61.5, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "e66f8207093b494d7ccc8b2c2245e1269070d1184653b135cfe77a49b9f4e804", "greedy_warm": "70328bbc6adb803d9b4f4887aa942dd331ae6b5ab321dff2dcb98212e51a5eae", "burst_a": "a6c30ad4704ce0dbb4fe9e10408c96a3bd9908b943cea5aeadc3d94a56889ea6", "burst_b": "
+2026-11-17T21:02:17 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:03:14 ARM trt_bufload ok 56.4s {"arm": "trt_bufload", "greedy_tok_s": [138.35, 135.01], "burst_agg": 122.19, "prefill_tok_s": 60.27, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "9a447e7e6b95305f090a093099dbc7ce30b20aa6cda028222e7d72fe75984616", "greedy_warm": "d61f934de585cfbcc5ac1f793b67f4efa10082dfdeea52642ff2537a72dff0f0", "burst_a": "45dc18157b8aa95695165208ad3fd7a811006fb9785848a8799c8a08dc2f4ca1", "burst_b": 
+2026-11-17T21:03:14 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:03:14 PAIR bufload round 3 control=ok treatment=ok
+2026-11-17T21:03:14 doc rendered: rendered 2/7 arms, 0 telemetry rows
+2026-11-17T21:03:14 === PAIR pm4 (STRATA_HIP_PM4: prod 0 -> arm 1) ===
+2026-11-17T21:04:11 ARM ctl_pm4 ok 56.3s {"arm": "ctl_pm4", "greedy_tok_s": [134.57, 139.69], "burst_agg": 129.91, "prefill_tok_s": 58.74, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "0cf7db29d2ec6ed107fc7ae812bd41a3e8c25036b889dda0e6e2888ba5f99431", "greedy_warm": "99cf84ca0d8f45d41639447844f575f466066cac1a72db6c6703cc3fea0d4e29", "burst_a": "a6c30ad4704ce0dbb4fe9e10408c96a3bd9908b943cea5aeadc3d94a56889ea6", "burst_b": "544
+2026-11-17T21:04:14 gpu free: GPU free after 3 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:05:13 ARM trt_pm4 ok 58.0s {"arm": "trt_pm4", "greedy_tok_s": [138.11, 136.91], "burst_agg": 131.41, "prefill_tok_s": 59.99, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "f2f19f49d39c726b353dbee19693a335a2b21b9e950020a93648d4aeed0a58eb", "greedy_warm": "916d654b39aabe3ca1eb413d965d574ce02d8308a49df7364245faed18a5e92f", "burst_a": "5c9f5b751b32b006dd1200ddebe60bc7b4483d656b38ccb572042e1b4da66b99", "burst_b": "700
+2026-11-17T21:05:13 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:05:13 PAIR pm4 round 1 control=ok treatment=ok
+2026-11-17T21:06:11 ARM ctl_pm4 ok 57.7s {"arm": "ctl_pm4", "greedy_tok_s": [138.04, 139.94], "burst_agg": 123.49, "prefill_tok_s": 67.78, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "3abe144baf9089360559a6d387700e9285310c3c54586beb8b0a1b72ef2a1ca9", "greedy_warm": "0cf7db29d2ec6ed107fc7ae812bd41a3e8c25036b889dda0e6e2888ba5f99431", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": "639
+2026-11-17T21:06:14 gpu free: GPU free after 3 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:07:11 ARM trt_pm4 ok 56.3s {"arm": "trt_pm4", "greedy_tok_s": [132.26, 140.67], "burst_agg": 124.23, "prefill_tok_s": 59.77, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "4af5cec45b3b7b25aa1027179b4ba024bf50c07383498764008b374d8764384c", "greedy_warm": "99cf84ca0d8f45d41639447844f575f466066cac1a72db6c6703cc3fea0d4e29", "burst_a": "45dc18157b8aa95695165208ad3fd7a811006fb9785848a8799c8a08dc2f4ca1", "burst_b": "639
+2026-11-17T21:07:11 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:07:11 PAIR pm4 round 2 control=ok treatment=ok
+2026-11-17T21:08:08 ARM ctl_pm4 ok 56.4s {"arm": "ctl_pm4", "greedy_tok_s": [136.9, 136.97], "burst_agg": 118.03, "prefill_tok_s": 61.17, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "2433eed9e257e85767b73f3eb7650ac330bc7a6bda6310af45c8168f52989398", "greedy_warm": "0cf7db29d2ec6ed107fc7ae812bd41a3e8c25036b889dda0e6e2888ba5f99431", "burst_a": "94dc7c26b1ddae621847d6af8abc66d1a2860fe9e05f7427c3dafd5be7f05ef8", "burst_b": "6391
+2026-11-17T21:08:08 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:09:05 ARM trt_pm4 ok 56.1s {"arm": "trt_pm4", "greedy_tok_s": [134.58, 146.25], "burst_agg": 124.95, "prefill_tok_s": 59.86, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "0cf7db29d2ec6ed107fc7ae812bd41a3e8c25036b889dda0e6e2888ba5f99431", "greedy_warm": "457274e623319686a6720101c83f09b371fda4e7117682f5c74c75f3d2fff912", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": "544
+2026-11-17T21:09:08 gpu free: GPU free after 3 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:09:08 PAIR pm4 round 3 control=ok treatment=ok
+2026-11-17T21:09:08 doc rendered: rendered 3/7 arms, 0 telemetry rows
+2026-11-17T21:09:08 === PAIR iu8 (STRATA_HIP_MOE_IU8: prod 0 -> arm 1) ===
+2026-11-17T21:10:05 ARM ctl_iu8 ok 56.5s {"arm": "ctl_iu8", "greedy_tok_s": [130.88, 139.05], "burst_agg": 124.44, "prefill_tok_s": 58.69, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "41c95ac0978c35082b7a59aa5d66f922bbf23e112c1004ef625a16975fc4e78f", "greedy_warm": "ba625a605c3e5783a408a42acee4a920bdb0936456ed7f111765882ab591208b", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": "4ce
+2026-11-17T21:10:06 gpu free: GPU free after 1 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:11:05 ARM trt_iu8 ok 58.4s {"arm": "trt_iu8", "greedy_tok_s": [134.39, 139.52], "burst_agg": 127.46, "prefill_tok_s": 56.47, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "3fa4c0cc2192c114e5aade310f3f289c2de24b002d6c9736e0fc269ba2591048", "greedy_warm": "0cf7db29d2ec6ed107fc7ae812bd41a3e8c25036b889dda0e6e2888ba5f99431", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": "a8e
+2026-11-17T21:11:05 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:11:05 PAIR iu8 round 1 control=ok treatment=ok
+2026-11-17T21:12:01 ARM ctl_iu8 ok 55.8s {"arm": "ctl_iu8", "greedy_tok_s": [141.56, 135.97], "burst_agg": 130.05, "prefill_tok_s": 62.25, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "d0639568b305a49bda228c75fb830ebc510e0161d589f0c5c515ccb7e720bf41", "greedy_warm": "de7ab36bb18fca82aa580ed4a2b8c0aa9f332d822b752aab2131f703b9fa6ab9", "burst_a": "5c9f5b751b32b006dd1200ddebe60bc7b4483d656b38ccb572042e1b4da66b99", "burst_b": "544
+2026-11-17T21:12:01 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:13:00 ARM trt_iu8 ok 58.0s {"arm": "trt_iu8", "greedy_tok_s": [140.68, 143.4], "burst_agg": 127.49, "prefill_tok_s": 58.11, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "70328bbc6adb803d9b4f4887aa942dd331ae6b5ab321dff2dcb98212e51a5eae", "greedy_warm": "29f98939cd9a3d166adeed888a837d53aee80e45dc2b6a04c806005c2187dcd0", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": "4d2c
+2026-11-17T21:13:00 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:13:00 PAIR iu8 round 2 control=ok treatment=ok
+2026-11-17T21:13:56 ARM ctl_iu8 ok 56.0s {"arm": "ctl_iu8", "greedy_tok_s": [136.55, 146.33], "burst_agg": 133.48, "prefill_tok_s": 58.46, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "5ebe7cddf5b10e4e45ce28846805f91aa699207266bb72e1cad3d4de110a7bbd", "greedy_warm": "8fe385d912392b078e60e36e83bee173ffda4ad91043a4a4f4a6bbf0785a263a", "burst_a": "4a71c8ac577aa204c133bf83663f80f5dda4e73c2e46391783deff1b0f7b3b92", "burst_b": "544
+2026-11-17T21:13:57 gpu free: GPU free after 1 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:14:55 ARM trt_iu8 ok 58.2s {"arm": "trt_iu8", "greedy_tok_s": [136.09, 149.39], "burst_agg": 126.24, "prefill_tok_s": 58.02, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "5952fb5b4e14553b9058cefd8f4890afe11215c19f6bd1795f11db93b0553299", "greedy_warm": "d992b3d39b452b68a736c383c595247b982fe41508a5edbaf55f817e08260f10", "burst_a": "c4e03ca88013b47ea64dc145eb73d1d1f1870718feab6568f8465703a01f09a0", "burst_b": "544
+2026-11-17T21:14:55 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:14:55 PAIR iu8 round 3 control=ok treatment=ok
+2026-11-17T21:14:55 doc rendered: rendered 4/7 arms, 0 telemetry rows
+2026-11-17T21:14:55 === PAIR iu4 (STRATA_HIP_MOE_IU4: prod 0 -> arm 1) ===
+2026-11-17T21:15:52 ARM ctl_iu4 ok 55.9s {"arm": "ctl_iu4", "greedy_tok_s": [137.3, 150.89], "burst_agg": 119.46, "prefill_tok_s": 62.91, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "9326cc9977a9ab6d8a007a602c8c58d86bd877f8a9516d8d1b0bb36e0dc406e6", "greedy_warm": "9a447e7e6b95305f090a093099dbc7ce30b20aa6cda028222e7d72fe75984616", "burst_a": "fa035961dfa6d09a148ad1a1ef910bfbc66f3330b788091ae22a8667dc11edb8", "burst_b": "7006
+2026-11-17T21:15:52 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:16:49 ARM trt_iu4 ok 56.1s {"arm": "trt_iu4", "greedy_tok_s": [143.15, 136.36], "burst_agg": 126.66, "prefill_tok_s": 61.12, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "89ef72fcbea1f0895bc501dd5ae8f405bd8d36d6debcf18ab8978e5cc4543aac", "greedy_warm": "fdc0f1a4ca40f654caa57e1c06b1147623a685bb028523aa1ce82052e299ca05", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": "544
+2026-11-17T21:16:49 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:16:49 PAIR iu4 round 1 control=ok treatment=ok
+2026-11-17T21:17:45 ARM ctl_iu4 ok 56.3s {"arm": "ctl_iu4", "greedy_tok_s": [143.15, 141.26], "burst_agg": 124.01, "prefill_tok_s": 56.69, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "9a447e7e6b95305f090a093099dbc7ce30b20aa6cda028222e7d72fe75984616", "greedy_warm": "66f872c433e6a65a5e3cdd1c74d97d43c81b3d0f08c36ca27fdf47d685b0ffd6", "burst_a": "721f8f64139c72feedcd049a7dd6811fc175d78637b16467080671b37a0ac9f8", "burst_b": "544
+2026-11-17T21:17:46 gpu free: GPU free after 1 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:18:42 ARM trt_iu4 ok 56.3s {"arm": "trt_iu4", "greedy_tok_s": [138.58, 144.52], "burst_agg": 121.22, "prefill_tok_s": 59.4, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "70328bbc6adb803d9b4f4887aa942dd331ae6b5ab321dff2dcb98212e51a5eae", "greedy_warm": "29f98939cd9a3d166adeed888a837d53aee80e45dc2b6a04c806005c2187dcd0", "burst_a": "fa035961dfa6d09a148ad1a1ef910bfbc66f3330b788091ae22a8667dc11edb8", "burst_b": "6391
+2026-11-17T21:18:42 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:18:42 PAIR iu4 round 2 control=ok treatment=ok
+2026-11-17T21:19:39 ARM ctl_iu4 ok 56.1s {"arm": "ctl_iu4", "greedy_tok_s": [135.96, 137.64], "burst_agg": 127.48, "prefill_tok_s": 61.57, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "3e4e62031c3d3c29f90a6cae1917fe1e8478b95b9fa1e8266ab8ca112ab7d0ec", "greedy_warm": "c7f76aea3e620edae6787081cb8eb632b3ebb5c705ecfc584411e8bca1e66a69", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": "544
+2026-11-17T21:19:39 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:20:36 ARM trt_iu4 ok 56.1s {"arm": "trt_iu4", "greedy_tok_s": [128.87, 151.76], "burst_agg": 130.72, "prefill_tok_s": 58.42, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "99cf84ca0d8f45d41639447844f575f466066cac1a72db6c6703cc3fea0d4e29", "greedy_warm": "27ed122fb20c276ca75e552b0f595df44f64389922c222b52634256d55e08bd0", "burst_a": "a6c30ad4704ce0dbb4fe9e10408c96a3bd9908b943cea5aeadc3d94a56889ea6", "burst_b": "544
+2026-11-17T21:20:36 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:20:36 PAIR iu4 round 3 control=ok treatment=ok
+2026-11-17T21:20:36 doc rendered: rendered 5/7 arms, 0 telemetry rows
+2026-11-17T21:20:36 === PAIR x4 (STRATA_HIP_MOE_X4: prod 0 -> arm 1) ===
+2026-11-17T21:21:32 ARM ctl_x4 ok 55.8s {"arm": "ctl_x4", "greedy_tok_s": [132.29, 157.53], "burst_agg": 130.64, "prefill_tok_s": 59.45, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "bbb038db601b8e7add19c62de04f20db8c8788db4fa9d118c03d0816442d9155", "greedy_warm": "05dd3e9df7a58f81eaa1d5023db34ee20165979402df97643f5c597de44c3d0f", "burst_a": "a6c30ad4704ce0dbb4fe9e10408c96a3bd9908b943cea5aeadc3d94a56889ea6", "burst_b": "5440
+2026-11-17T21:21:32 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:22:29 ARM trt_x4 ok 56.7s {"arm": "trt_x4", "greedy_tok_s": [126.04, 141.86], "burst_agg": 124.66, "prefill_tok_s": 57.17, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "b040713a3bda139af24aee8b14d4cf7a858d829d948326149950a2d96c68a467", "greedy_warm": "ba625a605c3e5783a408a42acee4a920bdb0936456ed7f111765882ab591208b", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": "5440
+2026-11-17T21:22:30 gpu free: GPU free after 1 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:22:30 PAIR x4 round 1 control=ok treatment=ok
+2026-11-17T21:23:28 ARM ctl_x4 ok 58.3s {"arm": "ctl_x4", "greedy_tok_s": [133.56, 141.88], "burst_agg": 122.48, "prefill_tok_s": 62.84, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "4af5cec45b3b7b25aa1027179b4ba024bf50c07383498764008b374d8764384c", "greedy_warm": "99cf84ca0d8f45d41639447844f575f466066cac1a72db6c6703cc3fea0d4e29", "burst_a": "45dc18157b8aa95695165208ad3fd7a811006fb9785848a8799c8a08dc2f4ca1", "burst_b": "5440
+2026-11-17T21:23:29 gpu free: GPU free after 1 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:24:25 ARM trt_x4 ok 56.4s {"arm": "trt_x4", "greedy_tok_s": [134.64, 143.82], "burst_agg": 124.66, "prefill_tok_s": 58.09, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "d3c4464f098a895c5ed1fec4d2f4ce21ced15ff4697fe19337c09b90085e3af5", "greedy_warm": "94713af64ac08e48f00927c68998da5961f78ce0232abcf9ea5b23c3ddd5c690", "burst_a": "45dc18157b8aa95695165208ad3fd7a811006fb9785848a8799c8a08dc2f4ca1", "burst_b": "6391
+2026-11-17T21:24:26 gpu free: GPU free after 1 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:24:26 PAIR x4 round 2 control=ok treatment=ok
+2026-11-17T21:25:23 ARM ctl_x4 ok 57.4s {"arm": "ctl_x4", "greedy_tok_s": [139.96, 149.38], "burst_agg": 126.76, "prefill_tok_s": 66.16, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "27ed122fb20c276ca75e552b0f595df44f64389922c222b52634256d55e08bd0", "greedy_warm": "09325960085d3bd00467e9fb02a4f57490d38db14ca26e45f6caf492b3a3ac31", "burst_a": "4ff1765c9b53ac0572b95317d80a9442ad50f286b26ae6da81ef6eca02308efb", "burst_b": "5440
+2026-11-17T21:25:24 gpu free: GPU free after 1 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:26:22 ARM trt_x4 ok 58.2s {"arm": "trt_x4", "greedy_tok_s": [137.14, 135.39], "burst_agg": 127.95, "prefill_tok_s": 60.65, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "bc04f5f675ec65a4fbec4542583709341549d802e48ddba00e59f31bb203ab93", "greedy_warm": "404921115a76e367ed395722e7c6b642b139546bd2ff08c810f7268275b970d6", "burst_a": "e844643cdf9322724c649aed6f3b281ca6fba754b6761f9e3aebd6e687e62486", "burst_b": "4ce6
+2026-11-17T21:26:22 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:26:22 PAIR x4 round 3 control=ok treatment=ok
+2026-11-17T21:26:22 doc rendered: rendered 6/7 arms, 0 telemetry rows
+2026-11-17T21:26:22 === PAIR aa_floor (STRATA_HIP_BUFLOAD: prod 0 -> arm 0) ===
+2026-11-17T21:27:19 ARM ctl_aa_floor ok 56.2s {"arm": "ctl_aa_floor", "greedy_tok_s": [141.25, 142.0], "burst_agg": 123.37, "prefill_tok_s": 60.61, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "d672c380264925bc16ac3b9dc9471b2584b41450510cd7d0e0c38ba7c2fe1ba3", "greedy_warm": "504a435340a599ab32a1469522830cee3b36559deaba0d6e861c17f4d41d7fa9", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": 
+2026-11-17T21:27:19 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:28:16 ARM trt_aa_floor ok 56.0s {"arm": "trt_aa_floor", "greedy_tok_s": [133.97, 147.22], "burst_agg": 127.21, "prefill_tok_s": 60.71, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "909b72e01d8fc63c645596c4a4ded3b32675d8792a554fc5ac8bb7ee7e5b10b9", "greedy_warm": "9fd34f6a5bdba84a6d34171d4fed17bc354f7190d0d1345ab4423b47ce138078", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b":
+2026-11-17T21:28:16 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:28:16 PAIR aa_floor round 1 control=ok treatment=ok
+2026-11-17T21:29:13 ARM ctl_aa_floor ok 56.6s {"arm": "ctl_aa_floor", "greedy_tok_s": [131.02, 138.2], "burst_agg": 125.76, "prefill_tok_s": 58.09, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "0cf7db29d2ec6ed107fc7ae812bd41a3e8c25036b889dda0e6e2888ba5f99431", "greedy_warm": "bf1f97c947d36724ddd8a5d3cb79c23c94affdd82dcccd57c9b49ac180a447f2", "burst_a": "45dc18157b8aa95695165208ad3fd7a811006fb9785848a8799c8a08dc2f4ca1", "burst_b": 
+2026-11-17T21:29:13 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:30:09 ARM trt_aa_floor ok 55.9s {"arm": "trt_aa_floor", "greedy_tok_s": [139.56, 146.21], "burst_agg": 133.75, "prefill_tok_s": 56.87, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "e7fc722a33f3eb1b51c39500d21eac1228155fdaf87a6690589800f27f9cc8af", "greedy_warm": "2bdbd497546170178471c57540b9508be476f7cdb9f102cb6143060044bbfdf0", "burst_a": "5c9f5b751b32b006dd1200ddebe60bc7b4483d656b38ccb572042e1b4da66b99", "burst_b":
+2026-11-17T21:30:10 gpu free: GPU free after 1 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:30:10 PAIR aa_floor round 2 control=ok treatment=ok
+2026-11-17T21:31:06 ARM ctl_aa_floor ok 56.2s {"arm": "ctl_aa_floor", "greedy_tok_s": [127.38, 151.83], "burst_agg": 128.61, "prefill_tok_s": 59.16, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "ce8825f078b47c9fc1011f8f9d36f663155d083b374218cc45b38abac9e6374e", "greedy_warm": "27ed122fb20c276ca75e552b0f595df44f64389922c222b52634256d55e08bd0", "burst_a": "a6c30ad4704ce0dbb4fe9e10408c96a3bd9908b943cea5aeadc3d94a56889ea6", "burst_b":
+2026-11-17T21:31:06 gpu free: GPU free after 0 s: VRAM 148 MB, port 8300 closed
+2026-11-17T21:32:05 ARM trt_aa_floor ok 58.3s {"arm": "trt_aa_floor", "greedy_tok_s": [139.41, 141.04], "burst_agg": 127.18, "prefill_tok_s": 56.3, "prefill_prompt_tokens": 3947, "hashes": {"greedy_cold": "70328bbc6adb803d9b4f4887aa942dd331ae6b5ab321dff2dcb98212e51a5eae", "greedy_warm": "213efee886484c196e48500c86ea60f35d39d004b27b98db45b97c81afa34379", "burst_a": "d17a9f4e4904b235d697142bb52035ef2bbbaafc9f9153475d774cbad21fa576", "burst_b": 
+2026-11-17T21:32:05 gpu free: GPU free after 0 s: VRAM 148 MB, port 8301 closed
+2026-11-17T21:32:05 PAIR aa_floor round 3 control=ok treatment=ok
+2026-11-17T21:32:05 doc rendered: rendered 7/7 arms, 0 telemetry rows
+2026-11-17T21:32:05 restoring production service
+2026-11-17T21:32:47 production restored: ready

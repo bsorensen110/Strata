@@ -1,0 +1,8 @@
+strata_heat_meta=1
+provenance=profile-rank-prior
+source_kind=input-profile
+source_profile=/home/soren/.local/share/strata-upstream-v0.2.10/data/profiles/qwen3.8-flash-next-ud-iq4_xs.expert-profile.bin
+n_layers=48
+n_expert=512
+ranked_pairs=24576
+heat_fnv1a64=a2b47c71f4a4924c

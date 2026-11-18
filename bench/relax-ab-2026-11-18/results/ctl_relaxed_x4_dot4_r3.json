@@ -1,0 +1,998 @@
+{
+ "arm": "ctl_relaxed_x4_dot4",
+ "round": "_r3",
+ "ts": "2026-11-18T04:23:44",
+ "exe": "/home/soren/scratch/Strata-merge-0161/build-hip-port/strata",
+ "binary_sha256": "8e6b95d2ad71fcc4615fb1431472d484fc571c1556fd8673e42b309e664808b4",
+ "commit": "0ff3f48c1",
+ "engine_pid": 170658,
+ "arm_env": {
+  "STRATA_MANIFEST": "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/results/ctl_relaxed_x4_dot4.manifest.json",
+  "STRATA_DISPATCH_REPORT": "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/results/ctl_relaxed_x4_dot4.dispatch.json",
+  "STRATA_WINDOW_WARM": "0",
+  "STRATA_HIP_MOE_X4": "0"
+ },
+ "user_args": [
+  "--spec",
+  "8",
+  "--draft-conf",
+  "0.35",
+  "--lookup-max-t",
+  "16",
+  "--lookup-sizes",
+  "10,12,14,16",
+  "--lookup-chain",
+  "6"
+ ],
+ "parallel": 1,
+ "route_expected": false,
+ "route_engaged": false,
+ "timing_valid": true,
+ "expert_cache_budget_slots": 7500,
+ "expected_expert_cache_slots": 8736,
+ "actual_expert_cache_slots": 8736,
+ "x4_captures": {
+  "n": 0,
+  "entries": []
+ },
+ "wide_launches": {
+  "k0": 0,
+  "k1": 45,
+  "k2": 0
+ },
+ "wide_launches_by_t": {
+  "T9": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T10": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T11": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T12": {
+   "k0": 0,
+   "k1": 9,
+   "k2": 0
+  },
+  "T13": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T14": {
+   "k0": 0,
+   "k1": 22,
+   "k2": 0
+  },
+  "T15": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T16": {
+   "k0": 0,
+   "k1": 14,
+   "k2": 0
+  },
+  "T17": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T18": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T19": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T20": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T21": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T22": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T23": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T24": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T25": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T26": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T27": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T28": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T29": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T30": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T31": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T32": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T33": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T34": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T35": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T36": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T37": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T38": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T39": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T40": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T41": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T42": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T43": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T44": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T45": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T46": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T47": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T48": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T49": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T50": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T51": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T52": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T53": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T54": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T55": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T56": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T57": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T58": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T59": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T60": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T61": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T62": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T63": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  },
+  "T64": {
+   "k0": 0,
+   "k1": 0,
+   "k2": 0
+  }
+ },
+ "wide_request_lines": [
+  "strata serve: suffix drafts: 24 windows, 315 of 324 drafts accepted",
+  "strata serve: lookup chain: 12 of 38 windows, 68 of 68 chained drafts accepted"
+ ],
+ "route_evidence": {
+  "route_expected": false,
+  "route_engaged": false,
+  "valid": true,
+  "invalid_reason": null,
+  "evidence_channel_failure": false,
+  "window_warm": "0",
+  "wide_request_order": [
+   "smoke",
+   "wide",
+   "prefill",
+   "greedy1",
+   "greedy2",
+   "burst"
+  ],
+  "expected_expert_cache_slots": 8736,
+  "actual_expert_cache_slots": 8736,
+  "x4_captures": {
+   "n": 0,
+   "entries": []
+  },
+  "x4_captures_by_scope": [],
+  "x4_wide_scope_note_count": 0,
+  "wide_launches": {
+   "k0": 0,
+   "k1": 45,
+   "k2": 0
+  },
+  "wide_launches_by_t": {
+   "T9": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T10": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T11": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T12": {
+    "k0": 0,
+    "k1": 9,
+    "k2": 0
+   },
+   "T13": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T14": {
+    "k0": 0,
+    "k1": 22,
+    "k2": 0
+   },
+   "T15": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T16": {
+    "k0": 0,
+    "k1": 14,
+    "k2": 0
+   },
+   "T17": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T18": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T19": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T20": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T21": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T22": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T23": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T24": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T25": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T26": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T27": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T28": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T29": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T30": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T31": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T32": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T33": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T34": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T35": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T36": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T37": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T38": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T39": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T40": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T41": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T42": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T43": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T44": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T45": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T46": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T47": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T48": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T49": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T50": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T51": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T52": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T53": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T54": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T55": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T56": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T57": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T58": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T59": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T60": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T61": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T62": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T63": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   },
+   "T64": {
+    "k0": 0,
+    "k1": 0,
+    "k2": 0
+   }
+  },
+  "wide_request_lines": [
+   "strata serve: suffix drafts: 24 windows, 315 of 324 drafts accepted",
+   "strata serve: lookup chain: 12 of 38 windows, 68 of 68 chained drafts accepted"
+  ],
+  "wide_request_line_count": 2,
+  "wide_window_log_lines": [
+   "strata serve: suffix drafts: 24 windows, 315 of 324 drafts accepted",
+   "strata serve: lookup chain: 12 of 38 windows, 68 of 68 chained drafts accepted"
+  ],
+  "relaxed_projection_pack_count": 0,
+  "relaxed_projection_lines": [],
+  "dispatch_report_path": "/home/soren/scratch/Strata-merge-0161/bench/relax-ab-2026-11-18/results/ctl_relaxed_x4_dot4.dispatch.json",
+  "dispatch_report_launches": {
+   "T1/k1": 17,
+   "T2/k1": 21,
+   "T3/k1": 32,
+   "T4/k1": 35,
+   "T5/k1": 48,
+   "T6/k1": 42,
+   "T7/k1": 18,
+   "T8/k1": 207,
+   "T12/k1": 9,
+   "T14/k1": 22,
+   "T16/k1": 14
+  },
+  "dispatch_report_counts_preview": [
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 1,
+    "var": 11,
+    "type": 14,
+    "ncols": 2,
+    "n_in": 2560,
+    "n_out": 248320,
+    "n": 1
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "head: type 14, T=2 columns, vocabulary 248320",
+    "n": 1
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "head: final mixer q8=1 fuse_head_gr=0 native_head=1",
+    "n": 1
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 0,
+    "type": 23,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 8
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 3,
+    "type": 22,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 2
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 3,
+    "type": 22,
+    "ncols": 42,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 4
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 3,
+    "type": 18,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 16
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 1,
+    "type": 23,
+    "ncols": 6,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 26
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 2,
+    "var": 0,
+    "type": 18,
+    "ncols": 6,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 40
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 1,
+    "var": 0,
+    "type": 8,
+    "ncols": 2,
+    "n_in": 640,
+    "n_out": 2560,
+    "n": 48
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": 1,
+    "var": 0,
+    "type": 14,
+    "ncols": 2,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 94
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "hc read: weights Q8_0 copies=1 (0 = bf16 rows), half=1, qfuse=1",
+    "n": 48
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "gdn layer: side_gates=0 side_proj=0 df_branch=0",
+    "n": 36
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "hc read: weights Q8_0 copies=1 (0 = bf16 rows), half=0, qfuse=1",
+    "n": 48
+   },
+   {
+    "scope": [
+     2,
+     1
+    ],
+    "cat": "str",
+    "key": "win groups=1 all_resident=0 device_plan=0",
+    "n": 1
+   },
+   {
+    "scope": [
+     3,
+     1
+    ],
+    "cat": 1,
+    "var": 12,
+    "type": 14,
+    "ncols": 3,
+    "n_in": 2560,
+    "n_out": 248320,
+    "n": 1
+   },
+   {
+    "scope": [
+     3,
+     1
+    ],
+    "cat": "str",
+    "key": "head: type 14, T=3 columns, vocabulary 248320",
+    "n": 1
+   },
+   {
+    "scope": [
+     3,
+     1
+    ],
+    "cat": "str",
+    "key": "head: final mixer q8=1 fuse_head_gr=0 native_head=1",
+    "n": 1
+   },
+   {
+    "scope": [
+     3,
+     1
+    ],
+    "cat": 2,
+    "var": 0,
+    "type": 23,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 8
+   },
+   {
+    "scope": [
+     3,
+     1
+    ],
+    "cat": 2,
+    "var": 3,
+    "type": 22,
+    "ncols": 20,
+    "n_in": 2560,
+    "n_out": 640,
+    "n": 2
+   }
+  ],
+  "graceful_stop_error": null
+ },
+ "smoke": {
+  "prompt_tokens": 37,
+  "completion_tokens": 3,
+  "finish": "stop",
+  "wall_s": 0.318,
+  "wall_tok_s": 9.42
+ },
+ "prefill": {
+  "prompt_tokens": 3947,
+  "completion_tokens": 256,
+  "finish": "length",
+  "wall_s": 4.315,
+  "wall_tok_s": 59.33
+ },
+ "greedy": [
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.939,
+   "wall_tok_s": 129.97,
+   "hash": "a9522473d2e5e09391d66dd29a5b51d254e84e9f62e42de25c3b3d44757dff72"
+  },
+  {
+   "completion_tokens": 512,
+   "finish": "length",
+   "wall_s": 3.376,
+   "wall_tok_s": 151.64,
+   "hash": "9a447e7e6b95305f090a093099dbc7ce30b20aa6cda028222e7d72fe75984616"
+  }
+ ],
+ "burst": {
+  "wall_s": 4.227,
+  "completion_tokens": 512,
+  "aggregate_tok_s": 121.13,
+  "slots": [
+   {
+    "completion_tokens": 256,
+    "wall_s": 2.143,
+    "wall_tok_s": 119.45,
+    "hash": "8e07fc58fb7091f322fc810f6fe1eace4523c3b852cb26a07eda5a065ab7e5d7"
+   },
+   {
+    "completion_tokens": 256,
+    "wall_s": 4.225,
+    "wall_tok_s": 60.58,
+    "hash": "4c90f9bbee08dc60bca239f53b6f170eac1477c3cb3c9da97f3bfe5bd654a444"
+   }
+  ]
+ },
+ "wide": {
+  "completion_tokens": 512,
+  "finish": "length",
+  "wall_s": 3.753,
+  "wall_tok_s": 136.42,
+  "hash": "4ff2c538e2894ab0b12b6fd299d0d34baa7fc70674818045929b39842fc18629"
+ },
+ "parity": {
+  "greedy_cold": "a9522473d2e5e09391d66dd29a5b51d254e84e9f62e42de25c3b3d44757dff72",
+  "greedy_warm": "9a447e7e6b95305f090a093099dbc7ce30b20aa6cda028222e7d72fe75984616",
+  "burst_a": "8e07fc58fb7091f322fc810f6fe1eace4523c3b852cb26a07eda5a065ab7e5d7",
+  "burst_b": "4c90f9bbee08dc60bca239f53b6f170eac1477c3cb3c9da97f3bfe5bd654a444"
+ },
+ "engine_decode_512": [
+  "173.6",
+  "136.9"
+ ],
+ "engine_log_lines": {
+  "generated": [
+   "generated in 61 ms (48.9 tok/s), drafts accepted 1 of 3, 1 checkpoints",
+   "generated in 2950 ms (173.6 tok/s), drafts accepted 474 of 483, 1 checkpoints",
+   "generated in 2994 ms (85.5 tok/s), drafts accepted 157 of 338, 1 checkpoints",
+   "generated in 3741 ms (136.9 tok/s), drafts accepted 409 of 591, 1 checkpoints",
+   "generated in 3342 ms (153.2 tok/s), drafts accepted 419 of 581, 1 checkpoints",
+   "generated in 1968 ms (130.1 tok/s), drafts accepted 198 of 307, 1 checkpoints",
+   "generated in 1881 ms (136.1 tok/s), drafts accepted 199 of 300, 1 checkpoints"
+  ],
+  "prompt_read": [
+   "prompt 37 tokens = 0 reused + 37 read in 254 ms (145.5 tok/s), 3 generated in 61 ms (48.9 tok/s), drafts accepted 1 of 3, 1 checkpoints",
+   "prompt 801 tokens = 0 reused + 801 read in 800 ms (1001.2 tok/s), 512 generated in 2950 ms (173.6 tok/s), drafts accepted 474 of 483, 1 checkpoints",
+   "prompt 3947 tokens = 0 reused + 3947 read in 1317 ms (2997.7 tok/s), 256 generated in 2994 ms (85.5 tok/s), drafts accepted 157 of 338, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 196 ms (178.3 tok/s), 512 generated in 3741 ms (136.9 tok/s), drafts accepted 409 of 591, 1 checkpoints",
+   "prompt 35 tokens = 28 reused + 7 read in 32 ms (217.7 tok/s), 512 generated in 3342 ms (153.2 tok/s), drafts accepted 419 of 581, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 172 ms (203.3 tok/s), 256 generated in 1968 ms (130.1 tok/s), drafts accepted 198 of 307, 1 checkpoints",
+   "prompt 35 tokens = 0 reused + 35 read in 200 ms (175.2 tok/s), 256 generated in 1881 ms (136.1 tok/s), drafts accepted 199 of 300, 1 checkpoints"
+  ],
+  "drafts": [
+   "drafts accepted 1 of 3",
+   "drafts accepted 474 of 483",
+   "drafts accepted 157 of 338",
+   "drafts accepted 409 of 591",
+   "drafts accepted 419 of 581",
+   "drafts accepted 198 of 307",
+   "drafts accepted 199 of 300"
+  ],
+  "wide_generated": [
+   "generated in 2950 ms (173.6 tok/s), drafts accepted 474 of 483, 1 checkpoints"
+  ]
+ },
+ "expert_cache": [
+  "expert cache 8736 slots, 19.99 GiB of VRAM; policy is"
+ ],
+ "expert_cache_slots": 8736
+}
