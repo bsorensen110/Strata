@@ -3,6 +3,7 @@
 // and CHANGELOG.md:856. Exact CPU-fold parity, not a speed/KLD receipt.
 #include "strata/prefill/moe_iu8_gfx.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <type_traits>
 
 #if defined(__HIPCC__) && defined(STRATA_MOE_IU8_CPU_ORACLE)
@@ -41,6 +42,92 @@ void upload(Buffer& b, const std::vector<T>& x) {
 template<class T>
 void download(const Buffer& b, std::vector<T>& x) {
     check(hipMemcpy(x.data(), b.p, x.size() * sizeof(T), hipMemcpyDeviceToHost), "download test data");
+}
+
+struct RelaxPackEnv {
+    bool was_set;
+    std::string value;
+    RelaxPackEnv() : was_set(std::getenv("STRATA_HIP_RELAX_PACK") != nullptr),
+                     value(was_set ? std::getenv("STRATA_HIP_RELAX_PACK") : "") {}
+    ~RelaxPackEnv() {
+        if (was_set) (void) setenv("STRATA_HIP_RELAX_PACK", value.c_str(), 1);
+        else (void) unsetenv("STRATA_HIP_RELAX_PACK");
+    }
+    void set(const char* v) {
+        ref::require(setenv("STRATA_HIP_RELAX_PACK", v, 1) == 0, "cannot set relaxed pack environment");
+    }
+    void unset() {
+        ref::require(unsetenv("STRATA_HIP_RELAX_PACK") == 0, "cannot unset relaxed pack environment");
+    }
+};
+
+std::vector<uint8_t> q6_single_scale(bool varied) {
+    auto source = ref::source(GGML_TYPE_Q6_K, 1, 256);
+    for (size_t offset = 0; offset < source.size(); offset += 210) {
+        uint8_t* block = source.data() + offset;
+        std::fill_n(block, 128, uint8_t{0x11});
+        std::fill_n(block + 128, 64, uint8_t{0});
+        for (int i = 0; i < 16; ++i) block[192 + i] = (uint8_t) (varied ? i % 8 + 1 : 1);
+        const uint16_t d = 0x3c00;
+        std::memcpy(block + 208, &d, sizeof(d));
+    }
+    return source;
+}
+
+void relaxed_pack_arms() {
+    RelaxPackEnv env;
+    env.unset();
+    const size_t iq4_bytes = ggml_row_size(GGML_TYPE_IQ4_NL, 128);
+    std::vector<uint8_t> iq4(iq4_bytes);
+    iu8::Pack strict;
+    std::string why;
+    ref::require(!iu8::pack_exact(GGML_TYPE_IQ4_NL, iq4.data(), iq4.size(), 1, 128, strict, why),
+                 "strict path admitted nonlinear IQ4");
+    ref::require(why.find("dequant bits are not symmetric-exact") == 0,
+                 "strict nonlinear IQ4 refusal changed");
+
+    env.set("1");
+    auto two_scale = q6_single_scale(true);
+    std::vector<float> decoded(256);
+    ggml_get_type_traits(GGML_TYPE_Q6_K)->to_float(two_scale.data(), decoded.data(), 256);
+    iu8::Pack relaxed;
+    ref::require(iu8::pack_exact(GGML_TYPE_Q6_K, two_scale.data(), two_scale.size(), 1, 256, relaxed, why), why.c_str());
+    ref::require(relaxed.bits == 6 && relaxed.symmetric_verified && relaxed.relaxed,
+                 "two-scale source did not produce verified relaxed W6");
+    ref::require(relaxed.max_rel_err >= 0.0 && relaxed.max_rel_err <= 0.2,
+                 "two-scale relaxed relative error out of bounds");
+    double observed = 0.0;
+    for (int k = 0; k < 128; ++k) {
+        const float scale = iu8::half_value(relaxed.scales[0]);
+        const float reconstructed = scale * (float) iu8::signed_code(relaxed, (size_t) k);
+        observed = std::fmax(observed, std::fabs((double) reconstructed - decoded[k]));
+        ref::require(std::fabs(reconstructed - decoded[k]) <= std::fabs(scale),
+                     "two-scale relaxed readback exceeds one scale step");
+    }
+    std::printf("PASS relaxed W6 two-scale block: max_rel_err=%.3g max_abs_err=%.3g\n",
+                relaxed.max_rel_err, observed);
+
+    std::vector<uint8_t> q5(ggml_row_size(GGML_TYPE_Q5_0, 128));
+    iu8::Pack q5_pack;
+    ref::require(iu8::pack_exact(GGML_TYPE_Q5_0, q5.data(), q5.size(), 1, 128, q5_pack, why), why.c_str());
+    ref::require(q5_pack.bits == 6 && q5_pack.relaxed, "Q5_0 source did not produce relaxed W6");
+    std::vector<float> q5_decoded(128);
+    ggml_get_type_traits(GGML_TYPE_Q5_0)->to_float(q5.data(), q5_decoded.data(), 128);
+    ref::require(std::all_of(q5_decoded.begin(), q5_decoded.end(), [](float x) { return x == 0.0f; }),
+                 "Q5_0 payload did not decode through ggml traits");
+    std::puts("PASS relaxed Q5_0 source type");
+
+    auto exact_source = q6_single_scale(false);
+    ggml_get_type_traits(GGML_TYPE_Q6_K)->to_float(exact_source.data(), decoded.data(), 256);
+    iu8::Pack exact_pack;
+    ref::require(iu8::pack_exact(GGML_TYPE_Q6_K, exact_source.data(), exact_source.size(), 1, 256, exact_pack, why),
+                 why.c_str());
+    for (int k = 0; k < 128; ++k) {
+        const float reconstructed = iu8::half_value(exact_pack.scales[0]) *
+                                   (float) iu8::signed_code(exact_pack, (size_t) k);
+        ref::require(reconstructed == decoded[k], "exact single-scale relaxed reconstruction differs");
+    }
+    std::puts("PASS relaxed exact single-scale reconstruction: max_abs_err=0");
 }
 
 void producers(hipStream_t stream) {
@@ -278,6 +365,7 @@ void grouped(int type, int m, int k, hipStream_t stream, strata::prefill::mmq::C
 int main() {
     try {
         ref::require(std::fesetround(FE_TONEAREST) == 0, "cannot set CPU RNE");
+        relaxed_pack_arms();
         int count = 0;
         const hipError_t e = hipGetDeviceCount(&count);
         if (e == hipErrorNoDevice || e == hipErrorInsufficientDriver || (e == hipSuccess && count == 0)) {
