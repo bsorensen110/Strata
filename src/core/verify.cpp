@@ -1577,9 +1577,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                         continue;
                     }
                     std::string reason;
+                    const bool relaxed_pack = i8::relax_requested();
+                    const auto* native_traits = relaxed_pack
+                        ? ggml_get_type_traits((ggml_type) w->native_type) : nullptr;
+                    const bool invalid_type = relaxed_pack
+                        ? (!native_traits || !native_traits->to_float)
+                        : (w->native_type != GGML_TYPE_Q4_0 && w->native_type != GGML_TYPE_Q6_K &&
+                           w->native_type != GGML_TYPE_IQ4_NL && w->native_type != GGML_TYPE_IQ4_XS);
                     if (w->ne0 <= 0 || w->ne1 <= 0 || w->ne0 > INT_MAX || w->ne1 > INT_MAX-127 ||
-                        w->ne0 % 128 || (w->native_type != GGML_TYPE_Q4_0 && w->native_type != GGML_TYPE_Q6_K &&
-                                        w->native_type != GGML_TYPE_IQ4_NL && w->native_type != GGML_TYPE_IQ4_XS)) {
+                        w->ne0 % 128 || invalid_type) {
                         reason = "not an admitted exact W4/W6 source/shape";
                     } else if (w->ne0 % ggml_blck_size((ggml_type)w->native_type)) {
                         reason = "incomplete native weight block";
@@ -1596,8 +1602,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                             if ((!hip_projection_modes_.x4 || i==count-1) && pack.bits != 6) reason = "dot4 requires exact W6";
                             else if (i8::upload(pack,device_weight,reason)) {
                                 hip_projection_weights_.emplace(w,std::move(device_weight));
-                                std::fprintf(stderr,"HIP projection %s: exact W%d ready before capture (new A8 route)\n",
-                                             layer.name(suffix).c_str(),pack.bits);
+                                if (pack.relaxed)
+                                    std::fprintf(stderr,"HIP projection %s: relaxed W6 ready before capture (new A8 route)\n",
+                                                 layer.name(suffix).c_str());
+                                else
+                                    std::fprintf(stderr,"HIP projection %s: exact W%d ready before capture (new A8 route)\n",
+                                                 layer.name(suffix).c_str(),pack.bits);
                                 continue;
                             }
                         }

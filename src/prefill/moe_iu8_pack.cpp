@@ -9,11 +9,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <utility>
 
 namespace strata::prefill::iu8 {
+bool relax_requested() {
+    const char* value = std::getenv("STRATA_HIP_RELAX_PACK");
+    return value && std::strcmp(value, "1") == 0;
+}
+
 namespace {
 bool equal_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(a)) == 0; }
 
@@ -43,6 +49,61 @@ bool block(const float* x, int bits, uint16_t& scale, uint8_t* codes) {
     }
     return false;
 }
+
+bool relaxed_block(const float* x, uint16_t& scale, uint8_t* codes, double& worst, double& max_abs) {
+    max_abs = 0.0;
+    for (int i = 0; i < 128; ++i) {
+        if (!std::isfinite(x[i])) return false;
+        max_abs = std::fmax(max_abs, std::fabs((double) x[i]));
+    }
+    if (max_abs == 0.0) {
+        scale = ggml_fp32_to_fp16(1.0f);
+        std::fill_n(codes, 128, uint8_t{32});
+        worst = 0.0;
+        return true;
+    }
+
+    const double target = max_abs / 31.0;
+    if (target > std::numeric_limits<float>::max()) return false;
+    uint16_t first = ggml_fp32_to_fp16((float) target);
+    while ((double) ggml_fp16_to_fp32(first) < target) {
+        if (first >= 0x7bff) return false;
+        ++first;
+    }
+
+    bool found = false;
+    uint16_t best_scale = 0;
+    uint8_t best_codes[128]{};
+    double best_worst = std::numeric_limits<double>::infinity();
+    for (int step = 0; step < 4; ++step) {
+        const unsigned half_bits = (unsigned) first + (unsigned) step;
+        if (half_bits > 0x7bff) break;
+        const uint16_t h = (uint16_t) half_bits;
+        const double d = (double) ggml_fp16_to_fp32(h);
+        if (!(d > 0.0) || !std::isfinite(d)) continue;
+        uint8_t candidate_codes[128];
+        double candidate_worst = 0.0;
+        bool fits = true;
+        for (int k = 0; k < 128; ++k) {
+            const double q = std::nearbyint((double) x[k] / d);
+            if (q < -31.0 || q > 31.0) { fits = false; break; }
+            const int qi = (int) q;
+            candidate_codes[k] = (uint8_t) (qi + 32);
+            candidate_worst = std::fmax(candidate_worst, std::fabs(d * qi - (double) x[k]));
+        }
+        if (fits && candidate_worst < best_worst) {
+            found = true;
+            best_scale = h;
+            best_worst = candidate_worst;
+            std::copy_n(candidate_codes, 128, best_codes);
+        }
+    }
+    if (!found) return false;
+    scale = best_scale;
+    std::copy_n(best_codes, 128, codes);
+    worst = best_worst;
+    return true;
+}
 }  // namespace
 
 float half_value(uint16_t h) { return ggml_fp16_to_fp32(h); }
@@ -57,15 +118,19 @@ int signed_code(const Pack& p, size_t i) {
 bool pack_exact(int type, const void* source, size_t bytes, int rows, int cols, Pack& out, std::string& why) {
     out = {};
     why.clear();
+    const bool relaxed = relax_requested();
     if (!source || rows <= 0 || cols <= 0 || cols % 128 != 0) {
         why = "symmetric IU8 weights need a nonempty tensor and K % 128 == 0"; return false;
     }
-    if (type != GGML_TYPE_IQ4_NL && type != GGML_TYPE_IQ4_XS &&
+    const auto t = (ggml_type) type;
+    if (!relaxed && type != GGML_TYPE_IQ4_NL && type != GGML_TYPE_IQ4_XS &&
         type != GGML_TYPE_Q4_0 && type != GGML_TYPE_Q6_K) {
         why = "format is not an admitted IQ4/Q4_0/Q6_K source"; return false;
     }
-    const auto t = (ggml_type) type;
     const auto* traits = ggml_get_type_traits(t);
+    if (relaxed && (!traits || !traits->to_float)) {
+        why = "format is not an admitted IQ4/Q4_0/Q6_K source"; return false;
+    }
     const size_t qk = (size_t) ggml_blck_size(t);
     if ((size_t) cols % qk || !traits->to_float ||
         (size_t) rows > std::numeric_limits<size_t>::max() / (size_t) cols) {
@@ -75,7 +140,8 @@ bool pack_exact(int type, const void* source, size_t bytes, int rows, int cols, 
     if ((size_t) rows > std::numeric_limits<size_t>::max() / row_bytes ||
         bytes != (size_t) rows * row_bytes) { why = "source tensor byte extent differs"; return false; }
     Pack p;
-    p.rows = rows; p.cols = cols; p.bits = type == GGML_TYPE_Q6_K ? 6 : 4;
+    p.rows = rows; p.cols = cols; p.bits = relaxed ? 6 : (type == GGML_TYPE_Q6_K ? 6 : 4);
+    p.relaxed = relaxed;
     const size_t count = (size_t) rows * cols;
     if (count > std::numeric_limits<size_t>::max() / (size_t) p.bits) {
         why = "packed extent overflow"; return false;
@@ -88,10 +154,18 @@ bool pack_exact(int type, const void* source, size_t bytes, int rows, int cols, 
         for (int kb = 0; kb < cols / 128; ++kb) {
             uint8_t codes[128];
             const size_t bi = (size_t) r * (cols / 128) + kb;
-            if (!block(decoded.data() + kb * 128, p.bits, p.scales[bi], codes)) {
+            double block_worst = 0.0, block_max_abs = 0.0;
+            const bool packed = relaxed
+                ? relaxed_block(decoded.data() + kb * 128, p.scales[bi], codes, block_worst, block_max_abs)
+                : block(decoded.data() + kb * 128, p.bits, p.scales[bi], codes);
+            if (!packed) {
                 why = "dequant bits are not symmetric-exact at row " + std::to_string(r) +
                       ", K128 block " + std::to_string(kb);
                 return false;
+            }
+            if (relaxed && block_max_abs != 0.0) {
+                p.max_rel_err = std::fmax(p.max_rel_err,
+                    block_worst / std::fmax(block_max_abs, (double) half_value(p.scales[bi])));
             }
             for (size_t k = 0; k < 128; ++k) {
                 const size_t bit = (bi * 128 + k) * p.bits, byte = bit / 8;
@@ -103,7 +177,9 @@ bool pack_exact(int type, const void* source, size_t bytes, int rows, int cols, 
         // Independent readback through the packed consumer, not the candidate scratch.
         for (int k = 0; k < cols; ++k) {
             const size_t i = (size_t) r * cols + k;
-            if (!equal_bits(half_value(p.scales[i / 128]) * (float) signed_code(p, i), decoded[k])) {
+            const float reconstructed = half_value(p.scales[i / 128]) * (float) signed_code(p, i);
+            if (relaxed ? std::fabs(reconstructed - decoded[k]) > std::fabs(half_value(p.scales[i / 128]))
+                        : !equal_bits(reconstructed, decoded[k])) {
                 why = "packed dequant readback differs"; return false;
             }
         }
@@ -242,6 +318,7 @@ bool load_layer(int gt, int dt, int embd, int ff, int ne, size_t bytes, size_t u
             !pack_exact(dt, b + down, bytes - down, embd, ff, dn, why)) {
             why = "expert " + std::to_string(e) + ": " + why; return false;
         }
+        layer.max_rel_err = std::fmax(layer.max_rel_err, std::fmax(gu.max_rel_err, dn.max_rel_err));
         Expert expert;
         if (!upload(gu, expert.gu, why) || !upload(dn, expert.down, why)) return false;
         layer.experts.push_back(std::move(expert));

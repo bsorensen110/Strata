@@ -1248,6 +1248,8 @@ void usage() {
                  "                       STRATA_HIP_MOE_X4); requires exact symmetric weights\n"
                  "  --hip-dot4-gemv 0|1  independent opt-in W6/A8 decode GEMV (default 0;\n"
                  "                       STRATA_HIP_DOT4_GEMV); A8 model-quality gate still required\n"
+                 "  STRATA_HIP_RELAX_PACK=1 opt-in: admit any quant via bounded-error W6 repack;\n"
+                 "                       default 0; quality gate required before production use\n"
 #endif
                  "  --native-rope         experimental pinned text-only CUDA rotary arithmetic\n"
                  "  --native-ple-postops  experimental pinned PLE postprojection arithmetic\n"

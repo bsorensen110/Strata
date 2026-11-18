@@ -2451,6 +2451,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (m.iu8_layers.empty() && src && iu8::usable()) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         m.iu8_layers.resize((size_t) g.n_layers);
+        int armed_layers = 0;
+        double worst_rel_err = 0.0;
         for (int l = stage_lb_; lay.native && l < stage_le_; ++l) {
             const auto& f = lay.fmt[(size_t) l];
             std::string why;
@@ -2458,10 +2460,19 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
                                 (size_t) f.bytes, (size_t) f.up_off, (size_t) f.down_off,
                                 [&](int e) { return src->blob(l, e); }, m.iu8_layers[(size_t) l], why))
                 std::fprintf(stderr, "HIP MoE IU8 layer %d refused: %s; keeping incumbent\n", l, why.c_str());
-            else
+            else if (iu8::relax_requested()) {
+                const auto& packed = m.iu8_layers[(size_t) l];
+                std::fprintf(stderr, "HIP MoE IU8 layer %d: all %lld experts relaxed-W6 (worst block rel err %.3g)\n",
+                             l, (long long) packed.experts.size(), packed.max_rel_err);
+                if (!packed.experts.empty()) ++armed_layers;
+                worst_rel_err = std::fmax(worst_rel_err, packed.max_rel_err);
+            } else
                 std::fprintf(stderr, "HIP MoE IU8 layer %d: all %lld experts symmetric-exact\n",
                              l, (long long) g.n_expert);
         }
+        if (iu8::relax_requested())
+            std::fprintf(stderr, "HIP MoE IU8: %d/%lld layers armed via relaxed W6 repack; worst rel err %.3g\n",
+                         armed_layers, (long long) (stage_le_ - stage_lb_), worst_rel_err);
     }
 #endif
     // the CPU share's staged-chunk limit, before the ring is sized below (a caller that sizes loans first armed it)

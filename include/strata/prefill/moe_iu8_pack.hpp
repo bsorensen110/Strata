@@ -15,9 +15,13 @@ namespace strata::prefill::iu8 {
 struct Pack {
     int rows = 0, cols = 0, bits = 0;
     bool symmetric_verified = false;
+    double max_rel_err = 0.0;
+    bool relaxed = false;
     std::vector<uint8_t> codes;
     std::vector<uint16_t> scales;
 };
+
+bool relax_requested();
 
 // Failure clears out and names the first refused block. No approximate conversion.
 bool pack_exact(int type, const void* source, size_t bytes, int rows, int cols, Pack& out, std::string& why);
@@ -42,7 +46,10 @@ struct DeviceWeight {
     DeviceWeight& operator=(const DeviceWeight&) = delete;
 };
 struct Expert { DeviceWeight gu, down; };
-struct Layer { std::vector<Expert> experts; };
+struct Layer {
+    std::vector<Expert> experts;
+    double max_rel_err = 0.0;
+};
 // Stable across cache loans and evictions: indexed by original expert id,
 // never by the mutable VRAM cache slot or a captured blob address.
 struct WindowWeights {
