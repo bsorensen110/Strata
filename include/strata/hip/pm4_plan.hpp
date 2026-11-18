@@ -143,10 +143,38 @@ using SubmitPm4IbFn = bool (*)(
     ReplayQuiescence& out_quiescence,
     void* user_ctx);
 
+/// Sentinel IB virtual address used exclusively by host-only unit tests (STRATA_PM4_HOST_TEST).
+/// Production lowering rejects this sentinel and requires a bound HSA executable buffer VA.
+inline constexpr uint64_t kSyntheticHostTestIbVa = 0x200000000ULL;
+
 /// Prepared single-IB PM4 window ready for zero-allocation in-place patching and replay.
 class PreparedPm4Window {
 public:
     PreparedPm4Window() = default;
+
+    /// Enforce production metadata and GPU buffer binding validation during `prepare()`.
+    /// In production builds (`!defined(STRATA_PM4_HOST_TEST)`), this is unconditionally
+    /// enabled and cannot be disabled; in `pm4_test` (`STRATA_PM4_HOST_TEST`), callers
+    /// can enable it via `set_require_production_metadata(true)` to test production refusal
+    /// of synthetic host-test metadata on a host machine.
+    void set_require_production_metadata(bool require) noexcept {
+#if defined(STRATA_PM4_HOST_TEST)
+        require_production_metadata_ = require;
+#else
+        (void) require;
+        require_production_metadata_ = true;
+#endif
+    }
+    bool requires_production_metadata() const noexcept { return require_production_metadata_; }
+
+    /// Validate that `tape` and `ib_device_va` carry bound, non-synthetic ROCr/HSA
+    /// kernel metadata (`has_hsa_metadata`, non-zero/non-synthetic `kernel_object` and
+    /// 256B-aligned `code_entry`, `kernarg_segment_size >= kernarg_bytes`) and bound
+    /// GPU virtual addresses for both the kernarg arena and indirect buffer.
+    static bool validate_production_bindings(
+        const Pm4Tape& tape,
+        uint64_t ib_device_va,
+        std::string* out_err = nullptr) noexcept;
 
     /// Lower a validated `Pm4Tape` into a single GFX12 PM4 command buffer with
     /// minimal barriers, `post_dispatch_nop` pacing, and recorded patch points.
@@ -202,7 +230,13 @@ private:
     Pm4BoundaryPlan plan_{};
     Gfx12Pm4CommandBuffer cb_{};
     std::vector<Pm4DispatchPatchPoint> patch_points_;
-    uint64_t ib_device_va_ = 0x200000000ULL;
+#if defined(STRATA_PM4_HOST_TEST)
+    uint64_t ib_device_va_ = kSyntheticHostTestIbVa;
+    bool require_production_metadata_ = false;
+#else
+    uint64_t ib_device_va_ = 0ULL;
+    bool require_production_metadata_ = true;
+#endif
     ReplayQuiescence quiescence_ = ReplayQuiescence::Proven;
     uint32_t replay_count_ = 0;
     bool prepared_ = false;

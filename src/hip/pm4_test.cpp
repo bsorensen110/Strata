@@ -1392,6 +1392,112 @@ void test_pm4_eligibility_gate() {
     }
 }
 
+void test_pm4_production_refuses_synthetic_metadata() {
+    AllocationTable allocs;
+    CHECK(allocs.insert(0x100000ULL, 0x10000ULL));
+    CHECK(allocs.insert(0x200000ULL, 0x10000ULL));
+
+    Pm4Tape tape(4096u);
+    tape.set_resolver(&AllocationTable::resolver_thunk, &allocs);
+    CHECK(tape.begin_recording(ReplayQuiescence::Proven));
+
+    uint8_t q_args[20] = {};
+    write_u64_le(q_args + 0, 0x100000ULL);
+    write_u64_le(q_args + 8, 0x200000ULL);
+    CHECK(tape.record_launch(
+        "native_quantize_q8_1_kernel", nullptr,
+        {16u, 1u, 1u}, {256u, 1u, 1u}, 0u, q_args, sizeof(q_args)));
+    CHECK(tape.finalize_recording(1u) == TapeStatus::Ok);
+    CHECK(!tape.dispatches()[0].has_hsa_metadata);
+
+    // 1. Production lowering refuses synthetic host-test metadata (has_hsa_metadata == false)
+    {
+        PreparedPm4Window prod_win;
+        prod_win.set_require_production_metadata(true);
+        prod_win.set_ib_device_va(0x7ff000200000ULL);
+        tape.arena().set_device_base_va(0x7ff000100000ULL);
+        std::string err;
+        CHECK(!prod_win.prepare(tape, Gfx12Arch::Gfx1201, nullptr, &err));
+        CHECK(prod_win.is_latched_fallback());
+        CHECK(!prod_win.ready());
+        CHECK(!err.empty());
+    }
+
+    // 2. bind_hsa_metadata refuses synthetic sentinels, zero addresses, unaligned code_entry,
+    //    and kernarg_segment_size < kernarg_bytes
+    const KernelMetadata real_loader = {
+        /*kernel_object=*/0x7ff000800000ULL,
+        /*kernarg_segment_size=*/32u,
+        /*kernarg_segment_alignment=*/16u,
+        /*group_segment_size=*/0u,
+        /*private_segment_size=*/0u,
+        /*dynamic_callstack=*/false,
+    };
+    const KernelPm4Metadata real_pm4 = {
+        /*code_entry=*/0x7ff000800100ULL,
+        /*compute_pgm_rsrc1=*/0x000f0004u,
+        /*compute_pgm_rsrc2=*/0x00000084u,
+        /*compute_pgm_rsrc3=*/0x00000000u,
+        /*kernel_code_properties=*/kAmdKernelCodePropertyEnableSgprKernargSegmentPtr,
+    };
+    {
+        KernelMetadata synth_loader = real_loader;
+        synth_loader.kernel_object = kSyntheticHostTestKernelObject;
+        CHECK(!tape.bind_hsa_metadata(0u, synth_loader, real_pm4));
+
+        KernelPm4Metadata synth_pm4 = real_pm4;
+        synth_pm4.code_entry = kSyntheticHostTestCodeEntry;
+        CHECK(!tape.bind_hsa_metadata(0u, real_loader, synth_pm4));
+
+        KernelPm4Metadata unaligned_pm4 = real_pm4;
+        unaligned_pm4.code_entry = 0x7ff000800180ULL;  // not 256B-aligned
+        CHECK(!tape.bind_hsa_metadata(0u, real_loader, unaligned_pm4));
+
+        KernelMetadata small_loader = real_loader;
+        small_loader.kernarg_segment_size = 8u;  // < 20B
+        CHECK(!tape.bind_hsa_metadata(0u, small_loader, real_pm4));
+    }
+
+    // Bind validated real HSA metadata
+    CHECK(tape.bind_hsa_metadata(0u, real_loader, real_pm4));
+    CHECK(tape.dispatches()[0].has_hsa_metadata);
+
+    // 3. Production lowering refuses zero or synthetic kernarg arena VA
+    for (uint64_t bad_arena_va : {uint64_t{0ULL}, kSyntheticHostTestArenaBaseVa}) {
+        tape.arena().set_device_base_va(bad_arena_va);
+        PreparedPm4Window prod_win;
+        prod_win.set_require_production_metadata(true);
+        prod_win.set_ib_device_va(0x7ff000200000ULL);
+        std::string err;
+        CHECK(!prod_win.prepare(tape, Gfx12Arch::Gfx1201, nullptr, &err));
+        CHECK(prod_win.is_latched_fallback());
+        CHECK(!prod_win.ready());
+    }
+
+    // 4. Production lowering refuses zero or synthetic IB VA
+    tape.arena().set_device_base_va(0x7ff000100000ULL);
+    for (uint64_t bad_ib_va : {uint64_t{0ULL}, kSyntheticHostTestIbVa}) {
+        PreparedPm4Window prod_win;
+        prod_win.set_require_production_metadata(true);
+        prod_win.set_ib_device_va(bad_ib_va);
+        std::string err;
+        CHECK(!prod_win.prepare(tape, Gfx12Arch::Gfx1201, nullptr, &err));
+        CHECK(prod_win.is_latched_fallback());
+        CHECK(!prod_win.ready());
+    }
+
+    // 5. Production lowering succeeds when validated HSA metadata and bound GPU VAs are present
+    {
+        PreparedPm4Window prod_win;
+        prod_win.set_require_production_metadata(true);
+        prod_win.set_ib_device_va(0x7ff000200000ULL);
+        std::string err;
+        CHECK(prod_win.prepare(tape, Gfx12Arch::Gfx1201, nullptr, &err));
+        CHECK(prod_win.ready());
+        CHECK(!prod_win.is_latched_fallback());
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1409,6 +1515,7 @@ int main(int argc, char** argv) {
     test_pm4_tape_and_contracts();
     test_pm4_boundary_planner_and_replay();
     test_pm4_eligibility_gate();
+    test_pm4_production_refuses_synthetic_metadata();
 
     if (g_fails != 0) {
         std::printf("pm4_test: %d failure(s)\n", g_fails);

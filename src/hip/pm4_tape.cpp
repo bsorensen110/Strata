@@ -906,20 +906,33 @@ bool Pm4Tape::record_launch(
     if (loader_meta != nullptr && pm4_meta != nullptr) {
         disp.loader_meta = *loader_meta;
         disp.pm4_meta = *pm4_meta;
-        disp.has_hsa_metadata = true;
+        disp.has_hsa_metadata =
+            (loader_meta->kernel_object != 0ULL &&
+             loader_meta->kernel_object != kSyntheticHostTestKernelObject &&
+             pm4_meta->code_entry != 0ULL &&
+             pm4_meta->code_entry != kSyntheticHostTestCodeEntry &&
+             (pm4_meta->code_entry & 0xffULL) == 0ULL &&
+             loader_meta->kernarg_segment_size >= disp.kernarg_bytes);
     } else {
-        // Default valid metadata for host-side planning when HSA descriptors are bound later.
-        disp.loader_meta.kernel_object = 0x7f000000ULL;
+#if defined(STRATA_PM4_HOST_TEST)
+        // Synthetic metadata fixture for host-only unit tests (STRATA_PM4_HOST_TEST).
+        // Production builds leave loader_meta/pm4_meta zeroed with has_hsa_metadata=false
+        // and refuse lowering unless real ROCr/HSA metadata is bound.
+        disp.loader_meta.kernel_object = kSyntheticHostTestKernelObject;
         disp.loader_meta.kernarg_segment_size = disp.kernarg_padded_bytes;
         disp.loader_meta.kernarg_segment_alignment = 16u;
         disp.loader_meta.group_segment_size = 0u;
         disp.loader_meta.private_segment_size = 0u;
         disp.loader_meta.dynamic_callstack = false;
-        disp.pm4_meta.code_entry = 0x7f000100ULL;
+        disp.pm4_meta.code_entry = kSyntheticHostTestCodeEntry;
         disp.pm4_meta.compute_pgm_rsrc1 = 0x000f0004u;
         disp.pm4_meta.compute_pgm_rsrc2 = 0x00000084u;
         disp.pm4_meta.compute_pgm_rsrc3 = 0x00000000u;
         disp.pm4_meta.kernel_code_properties = kAmdKernelCodePropertyEnableSgprKernargSegmentPtr;
+        disp.has_hsa_metadata = false;
+#else
+        disp.has_hsa_metadata = false;
+#endif
     }
     disp.effects = std::move(resolved_effects);
     dispatches_.push_back(std::move(disp));
@@ -958,7 +971,9 @@ bool Pm4Tape::bind_hsa_metadata(
         return false;
     }
     if (loader_meta.kernel_object == 0ULL ||
+        loader_meta.kernel_object == kSyntheticHostTestKernelObject ||
         pm4_meta.code_entry == 0ULL ||
+        pm4_meta.code_entry == kSyntheticHostTestCodeEntry ||
         (pm4_meta.code_entry & 0xffULL) != 0ULL) {
         return false;
     }

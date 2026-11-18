@@ -312,6 +312,61 @@ bool plan_pm4_boundaries(
 
 // ---- PreparedPm4Window ----
 
+bool PreparedPm4Window::validate_production_bindings(
+    const Pm4Tape& tape,
+    uint64_t ib_device_va,
+    std::string* out_err) noexcept {
+    const uint64_t arena_va = tape.arena().device_base_va();
+    if (arena_va == 0ULL || arena_va == kSyntheticHostTestArenaBaseVa) {
+        if (out_err) {
+            *out_err = "kernarg arena GPU virtual address is unbound or synthetic";
+        }
+        return false;
+    }
+    if (ib_device_va == 0ULL || ib_device_va == kSyntheticHostTestIbVa) {
+        if (out_err) {
+            *out_err = "PM4 indirect buffer GPU virtual address is unbound or synthetic";
+        }
+        return false;
+    }
+    const auto& dispatches = tape.dispatches();
+    for (size_t j = 0; j < dispatches.size(); ++j) {
+        const RecordedDispatch& disp = dispatches[j];
+        if (!disp.has_hsa_metadata) {
+            if (out_err) {
+                *out_err = "dispatch " + std::to_string(j) + " (" + disp.kernel_family +
+                           ") is missing validated ROCr/HSA metadata";
+            }
+            return false;
+        }
+        if (disp.loader_meta.kernel_object == 0ULL ||
+            disp.loader_meta.kernel_object == kSyntheticHostTestKernelObject) {
+            if (out_err) {
+                *out_err = "dispatch " + std::to_string(j) + " (" + disp.kernel_family +
+                           ") has zero or synthetic kernel_object";
+            }
+            return false;
+        }
+        if (disp.pm4_meta.code_entry == 0ULL ||
+            disp.pm4_meta.code_entry == kSyntheticHostTestCodeEntry ||
+            (disp.pm4_meta.code_entry & 0xffULL) != 0ULL) {
+            if (out_err) {
+                *out_err = "dispatch " + std::to_string(j) + " (" + disp.kernel_family +
+                           ") has zero, synthetic, or unaligned code_entry";
+            }
+            return false;
+        }
+        if (disp.loader_meta.kernarg_segment_size < disp.kernarg_bytes) {
+            if (out_err) {
+                *out_err = "dispatch " + std::to_string(j) + " (" + disp.kernel_family +
+                           ") kernarg_segment_size is smaller than recorded kernarg_bytes";
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
 bool PreparedPm4Window::prepare(
     Pm4Tape& tape,
     Gfx12Arch arch,
@@ -330,6 +385,15 @@ bool PreparedPm4Window::prepare(
     if (!tape.valid() || tape.launch_count() == 0) {
         latched_fallback_ = true;
         if (out_err) *out_err = tape.failure_reason().empty() ? "invalid or empty tape" : tape.failure_reason();
+        return false;
+    }
+#if !defined(STRATA_PM4_HOST_TEST)
+    const bool enforce_prod = true;
+#else
+    const bool enforce_prod = require_production_metadata_;
+#endif
+    if (enforce_prod && !validate_production_bindings(tape, ib_device_va_, out_err)) {
+        latched_fallback_ = true;
         return false;
     }
     if (!plan_pm4_boundaries(tape, arch, plan_, pacing_env_override)) {

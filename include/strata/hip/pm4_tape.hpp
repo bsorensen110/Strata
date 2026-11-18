@@ -31,6 +31,12 @@ inline constexpr size_t kDefaultKernargArenaBytes = 256u * 1024u;
 inline constexpr size_t kKernargSlotAlignment = 64u;
 inline constexpr size_t kKernargTailAlignment = 16u;
 
+/// Sentinel addresses used exclusively by host-only unit tests (STRATA_PM4_HOST_TEST).
+/// Production lowering rejects these sentinels and requires real ROCr/HSA bindings.
+inline constexpr uint64_t kSyntheticHostTestKernelObject = 0x7f000000ULL;
+inline constexpr uint64_t kSyntheticHostTestCodeEntry = 0x7f000100ULL;
+inline constexpr uint64_t kSyntheticHostTestArenaBaseVa = 0x100000000ULL;
+
 /// Quiescence proof for a retained window slot before re-capture or replay.
 /// Ported from hipfire crates/rdna-compute/src/replay.rs (ReplayQuiescence).
 enum class ReplayQuiescence : uint8_t {
@@ -188,7 +194,11 @@ public:
 private:
     std::vector<uint8_t> storage_;
     size_t used_ = 0;
-    uint64_t device_base_va_ = 0x100000000ULL;
+#if defined(STRATA_PM4_HOST_TEST)
+    uint64_t device_base_va_ = kSyntheticHostTestArenaBaseVa;
+#else
+    uint64_t device_base_va_ = 0ULL;
+#endif
 };
 
 /// One kernel launch recorded into a Pm4Tape.
