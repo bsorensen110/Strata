@@ -2510,14 +2510,14 @@ template <> inline constexpr bool kIlSingleStream<IlIQ3S> = true;
 inline bool mmvq_il_narrow_acc_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_MMVQ_IL_NARROW_ACC");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
     return on;
 }
 inline bool verify_wmma_dense_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_VERIFY_WMMA_DENSE");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
     return on;
 }

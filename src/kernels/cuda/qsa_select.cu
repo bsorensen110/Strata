@@ -2318,7 +2318,7 @@ void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const i
     if (nq <= 0) return;
     static const bool wide16 = [] {
         const char* v = std::getenv("STRATA_QSA_SCORES_16");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
     const int64_t limit = (wide16 && kWindowMaxT > MQ) ? kWindowMaxT : MQ;
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > limit || rows.n != nq) {

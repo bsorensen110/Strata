@@ -64,7 +64,7 @@ int main() {
     constexpr int W = k::kFusedGrWideT;
     constexpr float EPS = 1e-6f;
     const char* env_on = std::getenv("STRATA_HC_Q8_16");
-    const bool expect_single_pass = env_on != nullptr && env_on[0] != '\0' && std::atoi(env_on) != 0;
+    const bool expect_single_pass = env_on == nullptr || env_on[0] == '\0' || std::atoi(env_on) != 0;
 
     std::mt19937 rng(777);
     std::normal_distribution<float> nd(0.0f, 1.0f);

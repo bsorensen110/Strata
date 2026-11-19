@@ -5174,7 +5174,7 @@ namespace {
 int batch_tail_skip_rank() {
     static const int r = [] {
         const char* v = std::getenv("STRATA_BATCH_TAIL_SKIP");
-        const int x = v != nullptr ? std::atoi(v) : 0;
+        const int x = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 7;
         return x > 0 && x < 10 ? x : 0;
     }();
     return r;
@@ -5182,7 +5182,7 @@ int batch_tail_skip_rank() {
 int draft_tail_skip_rank() {
     static const int r = [] {
         const char* v = std::getenv("STRATA_DRAFT_TAIL_SKIP");
-        const int x = v != nullptr ? std::atoi(v) : 0;
+        const int x = (v != nullptr && v[0] != '\0') ? std::atoi(v) : 6;
         return x > 0 && x < 10 ? x : 0;
     }();
     return r;
@@ -5356,12 +5356,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // - STRATA_MOE_BUCKET_CHUNK=N: override the default 4-row chunk size in [4, kMaxWindowEntries].
         static const bool bucket_nosplit = [] {
             const char* v = std::getenv("STRATA_MOE_BUCKET_NOSPLIT");
-            return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+            return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
         }();
         static const int bucket_chunk_cfg = [] {
             if (bucket_nosplit) return (int) kMaxWindowEntries;
             const char* v = std::getenv("STRATA_MOE_BUCKET_CHUNK");
-            if (v == nullptr || v[0] == '\0') return 4;
+            if (v == nullptr || v[0] == '\0') return 8;
             return std::clamp(std::atoi(v), 4, (int) kMaxWindowEntries);
         }();
         if (pcie_min1 && pcie_ok && m < 1 && nmiss >= 2) m = 1;
@@ -5721,7 +5721,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     double run_ms_extra = 0, cr_ms = 0;
     static const bool cpu_no_split = [] {
         const char* v = std::getenv("STRATA_CPU_EXPERT_NO_SPLIT");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
     const int job_max_t = cpu_no_split ? strata::kernels::cpu::kJobMultiMaxT : MAXT;
     if (reduce_miss && d.miss_tmp.size() < (size_t) (n_tok * k * H))

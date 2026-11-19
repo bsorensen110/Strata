@@ -2949,7 +2949,7 @@ void launch_q8(const GrMulti& m, float* scratch, cudaStream_t st, unsigned long 
 }
 inline bool hc_q8_16_on() {
     const char* v = std::getenv("STRATA_HC_Q8_16");
-    return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+    return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
 }
 
 }  // namespace

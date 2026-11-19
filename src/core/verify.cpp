@@ -318,6 +318,10 @@ bool env_on(const char* name) {
     const char* e = std::getenv(name);
     return e != nullptr && e[0] != 0 && e[0] != '0';
 }
+bool env_on_default_true(const char* name) {
+    const char* e = std::getenv(name);
+    return e == nullptr || e[0] == '\0' || std::atoi(e) != 0;
+}
 #if defined(STRATA_USE_HIP)
 const bool g_coherent = env_on("STRATA_VERIFY_COHERENT");
 const bool g_doorbell_store = env_on("STRATA_DOORBELL_STORE");
@@ -974,7 +978,7 @@ namespace {
 bool pcie_fetch_overlap_on() noexcept {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_PCIE_FETCH_OVERLAP");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
     return on;
 }
@@ -982,7 +986,7 @@ bool pcie_fetch_overlap_on() noexcept {
 bool cpu_reduce_miss_env_on() noexcept {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_CPU_REDUCE_MISS");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
     return on;
 }
@@ -992,7 +996,7 @@ bool cpu_reduce_miss_env_on() noexcept {
 int64_t Verifier::staging_blobs_cap() noexcept {
     static const int64_t cap = [] {
         const char* v = std::getenv("STRATA_STAGING_BLOBS");
-        if (v == nullptr || v[0] == '\0') return kStagingBlobs;
+        if (v == nullptr || v[0] == '\0') return int64_t(32);
         const int64_t val = std::atoll(v);
         return std::max<int64_t>(16, std::min<int64_t>(64, val));
     }();
@@ -1002,7 +1006,7 @@ int64_t Verifier::staging_blobs_cap() noexcept {
 int64_t Verifier::pcie_group_rows_cap() noexcept {
     static const int64_t cap = [] {
         const char* v = std::getenv("STRATA_PCIE_GROUP_ROWS");
-        if (v == nullptr || v[0] == '\0') return kPcieGroupRows;
+        if (v == nullptr || v[0] == '\0') return int64_t(32);
         const int64_t val = std::atoll(v);
         return std::max<int64_t>(4, std::min<int64_t>(64, val));
     }();
@@ -2513,7 +2517,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool attn_rows = g_batch_attn_rows;
                 const bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
                 if (rows_ok) {
-                    static const bool qsa_scores_16 = env_on("STRATA_QSA_SCORES_16");
+                    static const bool qsa_scores_16 = env_on_default_true("STRATA_QSA_SCORES_16");
                     const int score_step = qsa_scores_16 ? kVerifyMaxT : 8;
                     const int n_rows = te - tb;
                     for (int s0 = tb; s0 < te; s0 += score_step) {
@@ -3073,7 +3077,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool use_head_il_all = head_ != nullptr && head_->loaded() && g_mmvq_il() &&
                                      T > kFusedGrMaxT && T <= 16 && T <= kVerifyMaxT &&
                                      strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_);
-        const bool head_single_16 = use_head_il_all && env_on("STRATA_HC_Q8_16") &&
+        const bool head_single_16 = use_head_il_all && env_on_default_true("STRATA_HC_Q8_16") &&
                                     (head_mix_multi_enabled() || fuse_head_gr || (hd->hc_q8 != nullptr && hu->hc_q8 != nullptr));
         const int head_chunk_t = head_single_16 ? T : kFusedGrMaxT;
         bool all_q8_head = head_ != nullptr && head_->loaded();

@@ -5375,7 +5375,7 @@ int main(int argc, char** argv) {
         const char* e = std::getenv("STRATA_PCIE_BALANCE");
         static const bool batch_bal = [] {
             const char* b = std::getenv("STRATA_BATCH_PCIE_BALANCE");
-            return b != nullptr && std::atoi(b) != 0;
+            return b == nullptr || b[0] == '\0' || std::atoi(b) != 0;
         }();
         return !pcie_given && native_pack && !multi_gpu && (o.batch <= 0 || batch_bal) && e != nullptr && std::strcmp(e, "1") == 0;
     };
@@ -7629,7 +7629,7 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_BATCH_DF2_READ_MAX_T");
                 if (v == nullptr || v[0] == '\0') v = std::getenv("STRATA_BATCH_DF2_MAX_T");
                 return v != nullptr && v[0] != '\0' ? std::clamp(std::atoi(v), 8, (int) strata::kernels::kVerifyMaxT)
-                                                    : (int) strata::kernels::kVerifyNarrowT;
+                                                    : (int) strata::kernels::kVerifyMaxT;
             }();
             return std::max(o.spec, df2_read_max_t);
         }
@@ -14676,7 +14676,7 @@ int main(int argc, char** argv) {
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         static const bool batch_pcie_auto = [] {
             const char* v = std::getenv("STRATA_BATCH_PCIE_AUTO");
-            return v != nullptr && std::atoi(v) != 0;
+            return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
         }();
         PcieAuto pcie_auto;
         if (o.pcie_frac_auto && !all_experts_resident && (o.batch == 0 || batch_pcie_auto) && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
@@ -16675,21 +16675,21 @@ int main(int argc, char** argv) {
                 const char* v = std::getenv("STRATA_BATCH_DF2_MAX_T");
                 return v != nullptr && v[0] != '\0'
                            ? std::clamp(std::atoi(v), (int) strata::kernels::kVerifyNarrowT, (int) strata::kernels::kVerifyMaxT)
-                           : (int) strata::kernels::kVerifyNarrowT;
+                           : (int) strata::kernels::kVerifyMaxT;
             }();
             static const bool df2_adaptive_t = [] {
                 const char* v = std::getenv("STRATA_BATCH_DF2_ADAPTIVE_T");
-                return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+                return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
             }();
             static const int df2_target_rows = [] {
                 const char* v = std::getenv("STRATA_BATCH_DF2_TARGET_ROWS");
                 return v != nullptr && v[0] != '\0'
                            ? std::clamp(std::atoi(v), 1, (int) strata::kernels::kVerifyMaxT)
-                           : (int) strata::kernels::kVerifyNarrowT;
+                           : 12;
             }();
             static const bool route_affinity_on = [] {
                 const char* v = std::getenv("STRATA_BATCH_ROUTE_AFFINITY");
-                return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+                return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
             }();
             int act_ids[64] = {}, nact = 0;
             for (size_t b = 0; b < bs.size() && nact < (int) (sizeof act_ids / sizeof act_ids[0]); ++b)

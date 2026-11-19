@@ -6633,20 +6633,26 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
 }
 
 bool moe_lds_nt8_on() {
-    static const bool on = env_on("STRATA_MOE_LDS_NT8");
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MOE_LDS_NT8");
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+    }();
     return on;
 }
 int64_t moe_grid_cap() {
     static const int64_t cap = [] {
         const char* v = std::getenv("STRATA_MOE_GRID_CAP");
-        if (!v || !v[0]) return int64_t(0);
+        if (!v || !v[0]) return int64_t(64);
         const int n = std::atoi(v);
         return n > 0 ? int64_t(n) : int64_t(0);
     }();
     return cap;
 }
 bool verify_wmma_moe_on() {
-    static const bool on = env_on("STRATA_VERIFY_WMMA_MOE");
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_VERIFY_WMMA_MOE");
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+    }();
     return on;
 }
 

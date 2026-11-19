@@ -1483,7 +1483,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     }
     static const bool ab_wide = [] {
         const char* v = std::getenv("STRATA_GDN_AB_WIDE");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
     const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
     cudaStream_t st = (cudaStream_t) stream;
@@ -1533,7 +1533,7 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
     }
     static const bool gsplit = [] {
         const char* v = std::getenv("STRATA_GDN_GROUPS_SPLIT");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
     GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);
     if (gsplit) {

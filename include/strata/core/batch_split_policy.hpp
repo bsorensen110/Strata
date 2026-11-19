@@ -9,7 +9,7 @@ namespace strata::core {
 inline bool batch_split_enabled() noexcept {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_BATCH_SPLIT");
-        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
     return on;
 }
