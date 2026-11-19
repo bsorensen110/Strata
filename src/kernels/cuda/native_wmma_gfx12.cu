@@ -2,6 +2,7 @@
 // and CPU software emulator for cross-platform parity validation.
 
 #include "strata/kernels/native_wmma_gfx12.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -58,18 +59,24 @@ float half_to_float_host(uint16_t h) {
     return out;
 }
 
-#if defined(__HIPCC__) && (defined(__gfx1200__) || defined(__gfx1201__))
-#define STRATA_HAS_GFX12_WMMA 1
+#if defined(STRATA_USE_HIP) && defined(STRATA_WMMA_GFX11)
+#define STRATA_BUILD_GFX12_WMMA 1
 typedef int wmma_i8x8 __attribute__((ext_vector_type(8)));
 typedef int wmma_i32x2 __attribute__((ext_vector_type(2)));
 
-__device__ __forceinline__ int pack4_i8(int8_t a, int8_t b, int8_t c, int8_t d) {
-    return (int(uint8_t(a))) | (int(uint8_t(b)) << 8) | (int(uint8_t(c)) << 16) | (int(uint8_t(d)) << 24);
+__device__ __forceinline__ int load_i32_u16(const int8_t* p) {
+    const auto* u = reinterpret_cast<const uint16_t*>(p);
+    return int(uint32_t(u[0]) | (uint32_t(u[1]) << 16));
 }
 
-__device__ __forceinline__ wmma_i8x8 gfx12_wmma_i8(wmma_i32x2 a, wmma_i32x2 b) {
-    wmma_i8x8 zero{};
-    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, zero, false);
+__device__ __forceinline__ wmma_i8x8 gfx12_wmma_i8(wmma_i32x2 a, wmma_i32x2 b, wmma_i8x8 c) {
+#if defined(__HIP_DEVICE_COMPILE__) && (defined(__gfx1200__) || defined(__gfx1201__))
+    return __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12(true, a, true, b, c, false);
+#else
+    (void) a; (void) b;
+    __builtin_trap();
+    return c;
+#endif
 }
 
 // Each wave computes 16 output rows x up to 16 columns. 4 waves per block -> 64 rows per CTA.
@@ -96,19 +103,22 @@ __global__ void wmma_q8_0_kernel(const WmmaQ80Block* __restrict__ w, const WmmaQ
     for (int b = 0; b < nblk; ++b) {
         const float my_dw = wp ? __half2float(wp[b].d) : 0.0f;
         const float dx_col = xp ? __low2float(xp[b].ds) : 0.0f;
-        const int* wqs = wp ? reinterpret_cast<const int*>(wp[b].qs) : nullptr;
+        const int8_t* wqs = wp ? wp[b].qs : nullptr;
         const int* xqs = xp ? reinterpret_cast<const int*>(xp[b].qs) : nullptr;
+        wmma_i8x8 d_tile{0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
         for (int sub = 0; sub < 2; ++sub) {
             const int i32 = sub * 4 + hi * 2;
-            const wmma_i32x2 a_frag = wqs ? wmma_i32x2{wqs[i32], wqs[i32 + 1]} : wmma_i32x2{0, 0};
+            const wmma_i32x2 a_frag = wqs
+                ? wmma_i32x2{load_i32_u16(wqs + i32 * 4), load_i32_u16(wqs + (i32 + 1) * 4)}
+                : wmma_i32x2{0, 0};
             const wmma_i32x2 b_frag = xqs ? wmma_i32x2{xqs[i32], xqs[i32 + 1]} : wmma_i32x2{0, 0};
-            const wmma_i8x8 d_tile = gfx12_wmma_i8(a_frag, b_frag);
+            d_tile = gfx12_wmma_i8(a_frag, b_frag, d_tile);
+        }
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const float dw = __shfl_sync(0xffffffffu, my_dw, 8 * hi + i);
-                acc[i] = fmaf(float(d_tile[i]), dw * dx_col, acc[i]);
-            }
+        for (int i = 0; i < 8; ++i) {
+            const float dw = __shfl_sync(0xffffffffu, my_dw, 8 * hi + i);
+            acc[i] = fmaf(float(d_tile[i]), dw * dx_col, acc[i]);
         }
     }
     if (valid_col) {
@@ -157,19 +167,22 @@ __global__ void wmma_q8_0_segs_kernel(WmmaQ80SegArray segs, const WmmaQ81Block* 
     for (int b = 0; b < nblk; ++b) {
         const float my_dw = wp ? __half2float(wp[b].d) : 0.0f;
         const float dx_col = xp ? __low2float(xp[b].ds) : 0.0f;
-        const int* wqs = wp ? reinterpret_cast<const int*>(wp[b].qs) : nullptr;
+        const int8_t* wqs = wp ? wp[b].qs : nullptr;
         const int* xqs = xp ? reinterpret_cast<const int*>(xp[b].qs) : nullptr;
+        wmma_i8x8 d_tile{0, 0, 0, 0, 0, 0, 0, 0};
 #pragma unroll
         for (int sub = 0; sub < 2; ++sub) {
             const int i32 = sub * 4 + hi * 2;
-            const wmma_i32x2 a_frag = wqs ? wmma_i32x2{wqs[i32], wqs[i32 + 1]} : wmma_i32x2{0, 0};
+            const wmma_i32x2 a_frag = wqs
+                ? wmma_i32x2{load_i32_u16(wqs + i32 * 4), load_i32_u16(wqs + (i32 + 1) * 4)}
+                : wmma_i32x2{0, 0};
             const wmma_i32x2 b_frag = xqs ? wmma_i32x2{xqs[i32], xqs[i32 + 1]} : wmma_i32x2{0, 0};
-            const wmma_i8x8 d_tile = gfx12_wmma_i8(a_frag, b_frag);
+            d_tile = gfx12_wmma_i8(a_frag, b_frag, d_tile);
+        }
 #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const float dw = __shfl_sync(0xffffffffu, my_dw, 8 * hi + i);
-                acc[i] = fmaf(float(d_tile[i]), dw * dx_col, acc[i]);
-            }
+        for (int i = 0; i < 8; ++i) {
+            const float dw = __shfl_sync(0xffffffffu, my_dw, 8 * hi + i);
+            acc[i] = fmaf(float(d_tile[i]), dw * dx_col, acc[i]);
         }
     }
     if (valid_col) {
@@ -229,7 +242,7 @@ __global__ void wmma_q6_k_kernel(const WmmaQ6KBlock* __restrict__ w, const WmmaQ
             const int* xqs = xp ? reinterpret_cast<const int*>(xp[b * 8 + qb].qs + base32) : nullptr;
             const wmma_i32x2 a_frag{aw[0], aw[1]};
             const wmma_i32x2 b_frag = xqs ? wmma_i32x2{xqs[0], xqs[1]} : wmma_i32x2{0, 0};
-            const wmma_i8x8 d_tile = gfx12_wmma_i8(a_frag, b_frag);
+            const wmma_i8x8 d_tile = gfx12_wmma_i8(a_frag, b_frag, wmma_i8x8{0, 0, 0, 0, 0, 0, 0, 0});
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
                 const float sw = __shfl_sync(0xffffffffu, my_sc, 8 * hi + i);
@@ -246,14 +259,24 @@ __global__ void wmma_q6_k_kernel(const WmmaQ6KBlock* __restrict__ w, const WmmaQ
     }
 }
 #else
-#define STRATA_HAS_GFX12_WMMA 0
+#define STRATA_BUILD_GFX12_WMMA 0
 #endif
 
 }  // namespace
 
 bool native_wmma_gfx12_available() noexcept {
-#if STRATA_HAS_GFX12_WMMA
-    return true;
+#if STRATA_BUILD_GFX12_WMMA
+    static int cached[64] = {};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    int v = cached[dev];
+    if (v == 0) {
+        cudaDeviceProp p{};
+        v = (cudaGetDeviceProperties(&p, dev) == cudaSuccess &&
+             strata::kernels::gfx_arch_is_gfx12_wmma(p.gcnArchName)) ? 1 : 2;
+        cached[dev] = v;
+    }
+    return v == 1;
 #else
     return false;
 #endif
@@ -261,7 +284,8 @@ bool native_wmma_gfx12_available() noexcept {
 
 bool native_wmma_dense_q8_0(const void* weights, const void* x_q8_1, float* y,
                             int n_in, int n_out, int ncols, void* stream) {
-#if STRATA_HAS_GFX12_WMMA
+#if STRATA_BUILD_GFX12_WMMA
+    if (!native_wmma_gfx12_available()) return false;
     if (!weights || !x_q8_1 || !y || !stream || n_in <= 0 || n_in % 32 != 0 || n_out <= 0 || ncols < 2 || ncols > 16)
         return false;
     const unsigned blocks = unsigned((n_out + 63) / 64);
@@ -279,7 +303,8 @@ bool native_wmma_dense_q8_0(const void* weights, const void* x_q8_1, float* y,
 
 bool native_wmma_dense_q8_0_segs(const NativeMmvqSeg* segs, int n_segs, const void* x_q8_1,
                                  int n_in, int ncols, void* stream) {
-#if STRATA_HAS_GFX12_WMMA
+#if STRATA_BUILD_GFX12_WMMA
+    if (!native_wmma_gfx12_available()) return false;
     if (!segs || n_segs < 2 || n_segs > 3 || !x_q8_1 || !stream || n_in <= 0 || n_in % 32 != 0 || ncols < 2 || ncols > 16)
         return false;
     WmmaQ80SegArray sa{};
@@ -301,7 +326,8 @@ bool native_wmma_dense_q8_0_segs(const NativeMmvqSeg* segs, int n_segs, const vo
 
 bool native_wmma_dense_q6_k(const void* weights, const void* x_q8_1, float* y,
                             int n_in, int n_out, int ncols, void* stream) {
-#if STRATA_HAS_GFX12_WMMA
+#if STRATA_BUILD_GFX12_WMMA
+    if (!native_wmma_gfx12_available()) return false;
     if (!weights || !x_q8_1 || !y || !stream || n_in <= 0 || n_in % 256 != 0 || n_out <= 0 || ncols < 2 || ncols > 16)
         return false;
     const unsigned blocks = unsigned((n_out + 63) / 64);
@@ -372,6 +398,7 @@ void native_wmma_gfx12_q8_0_cpu_ref_tiled(const void* weights, const void* x_q8_
                     dx_lane[l] = half_to_float_host(dxh);
                 }
             }
+            int32_t d_sum[32][8]{};
             for (int sub = 0; sub < 2; ++sub) {
                 int8_t a_lane[32][8]{}, b_lane[32][8]{};
                 int32_t d_lane[32][8]{};
@@ -389,11 +416,14 @@ void native_wmma_gfx12_q8_0_cpu_ref_tiled(const void* weights, const void* x_q8_
                 }
                 native_wmma_gfx12_emulate_16x16x16_i8(a_lane, b_lane, d_lane);
                 for (int l = 0; l < 32; ++l) {
-                    const int hi = l >> 4;
-                    for (int i = 0; i < 8; ++i) {
-                        const float dw = dw_lane[8 * hi + i];
-                        acc[l][i] = std::fmaf(float(d_lane[l][i]), dw * dx_lane[l], acc[l][i]);
-                    }
+                    for (int i = 0; i < 8; ++i) d_sum[l][i] += d_lane[l][i];
+                }
+            }
+            for (int l = 0; l < 32; ++l) {
+                const int hi = l >> 4;
+                for (int i = 0; i < 8; ++i) {
+                    const float dw = dw_lane[8 * hi + i];
+                    acc[l][i] = std::fmaf(float(d_sum[l][i]), dw * dx_lane[l], acc[l][i]);
                 }
             }
         }
