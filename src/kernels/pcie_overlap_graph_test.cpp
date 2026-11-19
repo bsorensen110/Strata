@@ -41,11 +41,11 @@ int main() {
     uint32_t *h_flag = nullptr, *m_flag = nullptr;
     ck(cudaHostAlloc(&h_flag, 64, cudaHostAllocMapped), "alloc flag");
     *h_flag = 0;
-    ck(cudaHostGetDevicePointer(&m_flag, h_flag, 0), "ptr flag");
+    ck(cudaHostGetDevicePointer((void **) &m_flag, h_flag, 0), "ptr flag");
 
     uint8_t *h_src_blobs = nullptr, *m_src_blobs = nullptr;
     ck(cudaHostAlloc(&h_src_blobs, (size_t) n_blobs * blob_bytes, cudaHostAllocMapped), "alloc src blobs");
-    ck(cudaHostGetDevicePointer(&m_src_blobs, h_src_blobs, 0), "ptr src blobs");
+    ck(cudaHostGetDevicePointer((void **) &m_src_blobs, h_src_blobs, 0), "ptr src blobs");
 
     uint8_t *d_stage_par = nullptr, *d_stage_ref = nullptr;
     ck(cudaMalloc(&d_stage_par, (size_t) staging_cap * blob_bytes), "stage par");

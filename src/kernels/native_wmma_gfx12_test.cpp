@@ -236,7 +236,8 @@ int main() {
     bool ok = true;
     ok = test_tiled_type(8, "Q8_0", 512, 133, s) && ok;
     ok = test_tiled_type(14, "Q6_K", 512, 133, s) && ok;
-    ok = test_q8_0_segs(512, s) && ok;
+    // native_mmvq_multi_segs requires n_in / 32 >= SmallTraits<Q80>::BPI (32); 512 only has 16 blocks.
+    ok = test_q8_0_segs(1024, s) && ok;
 
     cudaStreamDestroy(s);
     std::printf("native_wmma_gfx12_test: %s\n", ok ? "ok" : "FAILED");
