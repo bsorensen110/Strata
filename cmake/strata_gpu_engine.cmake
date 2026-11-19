@@ -862,6 +862,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(mmvq_il_parity PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(mmvq_il_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME mmvq_il_parity COMMAND mmvq_il_parity)
+    set_tests_properties(mmvq_il_parity PROPERTIES ENVIRONMENT "STRATA_MMVQ_IL_NARROW_ACC=0;STRATA_VERIFY_WMMA_DENSE=0")
     # (c): native_quantize_q8_1_il (one launch) against native_quantize_q8_1 + native_q8_1_interleave, byte for byte.
     add_executable(quantize_il_parity src/kernels/quantize_il_parity.cpp)
     target_include_directories(quantize_il_parity PRIVATE ${_strata_gpu_include_directories})
