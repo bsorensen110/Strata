@@ -139,6 +139,8 @@
 #include "strata/spec/window_rule.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/draft_composition.hpp"
+#include "strata/spec/df2_sample_walk.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/par_counters.hpp"
@@ -1566,7 +1568,13 @@ bool df2_context_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier&
 // on `ver.tap_dev()` (or gathers them to `df2.landing()` on layer splits), and runs `df2.draft()`.
 bool df2_draft_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& ver, int n_stages,
                     int rows, int64_t pos0, int32_t anchor, size_t tap_stride,
-                    int32_t* dd, float* pp, std::string& err) {
+                    int32_t* dd, float* pp, std::string& err, bool sample_walk = false,
+                    uint64_t sample_seed = 0, int32_t* q_packed = nullptr, int* q_count = nullptr) {
+    if (sample_walk && (q_packed == nullptr || q_count == nullptr)) {
+        err = "dflash2: sampled selector walk needs q-row outputs";
+        return false;
+    }
+    if (q_count != nullptr) *q_count = 0;
     const int kR = (int) strata::core::Dflash2Drafter::kRows;
     const auto plan = strata::core::dflash2_plan_tap_rows(rows, kR);
     if (plan.tail_m <= 0) {
@@ -1574,9 +1582,16 @@ bool df2_draft_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& v
         return false;
     }
     if (!df2_context_rows(df2, ver, n_stages, plan.head_n, pos0, tap_stride, err)) return false;
+    std::array<int32_t, strata::core::Dflash2Drafter::kDrafts * strata::spec::kDf2SelectorTopK> q_tokens{};
+    std::array<float, strata::core::Dflash2Drafter::kDrafts * strata::spec::kDf2SelectorTopK> q_probs{};
     if (n_stages > 1) {
         if (!ver.gather_taps(df2.landing(), df2.device(), plan.head_n, plan.tail_m, 0, df2.stream(), err)) return false;
-        return df2.draft(df2.landing(), plan.tail_m, pos0 + plan.head_n, anchor, dd, pp, err);
+        const bool ok = df2.draft(df2.landing(), plan.tail_m, pos0 + plan.head_n, anchor, dd, pp, err,
+                                  sample_walk, sample_seed, (uint64_t) (pos0 + rows), q_tokens.data(), q_probs.data());
+        if (ok && sample_walk && q_packed != nullptr)
+            strata::spec::pack_df2_spec_q(df2.max_drafts(), q_tokens.data(), q_probs.data(), q_packed);
+        if (ok && q_count != nullptr) *q_count = sample_walk ? df2.max_drafts() : 0;
+        return ok;
     }
     const float* tp = ver.tap_dev();
     if (tp == nullptr) {
@@ -1613,9 +1628,30 @@ bool df2_draft_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& v
                 return false;
         }
     }
-    return df2.draft(tp, plan.tail_m, pos0 + plan.head_n, anchor, dd, pp, err);
+    const bool ok = df2.draft(tp, plan.tail_m, pos0 + plan.head_n, anchor, dd, pp, err,
+                              sample_walk, sample_seed, (uint64_t) (pos0 + rows), q_tokens.data(), q_probs.data());
+    if (ok && sample_walk && q_packed != nullptr)
+        strata::spec::pack_df2_spec_q(df2.max_drafts(), q_tokens.data(), q_probs.data(), q_packed);
+    if (ok && q_count != nullptr) *q_count = sample_walk ? df2.max_drafts() : 0;
+    return ok;
 }
 #endif
+
+bool df2_suffix_fill_enabled() {
+    static const bool enabled = [] {
+        const char* e = std::getenv("STRATA_DF2_SUFFIX_FILL");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return enabled;
+}
+
+int df2_suffix_min_match() {
+    static const int min_match = [] {
+        const char* e = std::getenv("STRATA_DF2_SUFFIX_MIN_MATCH");
+        return e != nullptr && e[0] != '\0' ? std::clamp(std::atoi(e), 2, 64) : 2;
+    }();
+    return min_match;
+}
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
     out.clear();
@@ -16047,6 +16083,7 @@ int main(int argc, char** argv) {
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        if (df2_suffix_fill_enabled()) sfx.enable_short_matches();
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         strata::spec::DraftPolicy policy_idle(S);   // --draft auto: the other drafter's learned costs; swapped in with it when a request uses the other drafter
         bool policy_is_df2 = use_df2;   // which drafter's costs `policy` holds (the engine's first drafter; swapped with policy_idle when a request uses the other one)
@@ -21199,7 +21236,13 @@ int main(int argc, char** argv) {
             std::array<int32_t, 16> tr_s{};
             int tr_k = 0, tr_match = 0;
             std::vector<int32_t> sbuf((size_t) S, 0);
-            const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
+            const bool df2_sample_active = strata::spec::df2_sample_walk_for_request(
+                strata::spec::df2_sample_walk_env(), req_sp.greedy, req_sp.temperature) &&
+                req_df2 && use_df2 && !batch_df2 && n_stages <= 1;
+            std::array<int32_t, 7 * strata::spec::kDf2SampleQStride> df2_q_rows{};
+            int df2_q_count = 0;
+            const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0 ||
+                                (df2_suffix_fill_enabled() && req_df2 && use_df2 && !batch_df2);
             if (sfx_on) {
                 sfx.reset();
                 for (int64_t t : ids) sfx.append((int32_t) t);
@@ -21865,7 +21908,8 @@ int main(int argc, char** argv) {
                         if (req_logprobs >= 0) emit_lp_line(V1(A), i, outp[(size_t) i], req_logprobs, req_allowed);
                         strata::core::progress_beat();
                         ++produced_n;
-                        if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
+                        if (o.suffix_draft > 0 || (df2_suffix_fill_enabled() && req_df2 && use_df2 && !batch_df2))
+                            sfx.append(outp[(size_t) i]);
                         eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end();
                     }
                     std::fflush(stdout);
@@ -22018,7 +22062,8 @@ int main(int argc, char** argv) {
             int32_t dfr_anchor = 0;
             // a long suffix match: the next round's DFlash2 draft is deferred to that round's start (spec/window_rule.hpp skip_draft_for_lookup)
             auto defer_df2 = [&](int a_) -> bool {
-                if (o.suffix_draft <= 0 || df2_skip_min <= 0 || !req_df2) return false;
+                if (o.suffix_draft <= 0 || df2_skip_min <= 0 || !req_df2 ||
+                    (df2_suffix_fill_enabled() && use_df2 && !batch_df2)) return false;
                 const int ks = sfx.propose(S_look - 1, sbuf.data());
                 if (!strata::spec::skip_draft_for_lookup(true, df2_skip_min, ks, sfx.last_match())) return false;
                 df2_deferred = true; dfr_n = a_ + 1; dfr_pos = p; dfr_anchor = outv[(size_t) a_];
@@ -22029,7 +22074,8 @@ int main(int argc, char** argv) {
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
                 const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
-                if (!df2_draft_rows(df2, ver, n_stages, a_ + 1, p, outv[(size_t) a_], tap_stride, dd, pp, err)) return false;
+                if (!df2_draft_rows(df2, ver, n_stages, a_ + 1, p, outv[(size_t) a_], tap_stride, dd, pp, err,
+                                    df2_sample_active, req_sp.seed, df2_q_rows.data(), &df2_q_count)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 if (ss.ple.ready() && ss.ple.table != nullptr) {   // the PLE rows of the next window's tokens, read ahead (as the MTP's draft does)
                     int n_pf = 0;
@@ -22057,6 +22103,9 @@ int main(int argc, char** argv) {
                 policy.set_context(p);
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 bool from_sfx = false;
+                bool df2_compose_round = false;
+                int df2_prefix_n = 0, df2_suffix_n = 0;
+                strata::spec::DraftComposition df2_composition((size_t) std::max(0, std::min(S, S_look) - 1));
                 int sfx_pad = 0;      // a learning stretch's lookup window longer than the proposal: the filler rows (DraftPolicy::Pick::pad)
                 int sfx_match = 0;
                 bool dfr_lookup = false;
@@ -22074,7 +22123,8 @@ int main(int argc, char** argv) {
                     } else {
                         int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                         float pp[strata::core::Dflash2Drafter::kDrafts];
-                        if (!df2_draft_rows(df2, ver, n_stages, dfr_n, dfr_pos, dfr_anchor, tap_stride, dd, pp, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                        if (!df2_draft_rows(df2, ver, n_stages, dfr_n, dfr_pos, dfr_anchor, tap_stride, dd, pp, err,
+                                            df2_sample_active, req_sp.seed, df2_q_rows.data(), &df2_q_count)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                         for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                     }
                 }
@@ -22103,7 +22153,8 @@ int main(int argc, char** argv) {
                     if (first_window) T = merge_T > 0 ? merge_T : 1;
                     // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
                     // when its expected tokens per ms, from the measured acceptance and window costs, beat the MTP window's
-                    if (o.suffix_draft > 0 && !first_window) {
+                    if (o.suffix_draft > 0 && !first_window &&
+                        !(df2_suffix_fill_enabled() && req_df2 && use_df2 && !batch_df2)) {
                         const int k = sfx.propose(S_look - 1, sbuf.data());
                         sfx_match = sfx.last_match();
                         if (df2_trace != nullptr) {
@@ -22148,6 +22199,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (dfr_lookup) {   // the lookup window chosen before the draft (the draft was skipped)
+                    df2_q_count = 0;
                     sfx.propose(S_look - 1, sbuf.data());
                     T = dfr_T; from_sfx = true; sfx_match = dfr_match;
                     if (o.lookup_max_t > 0) {
@@ -22156,20 +22208,53 @@ int main(int argc, char** argv) {
                         T = t;
                     }
                 }
+                if (req_df2 && use_df2 && !batch_df2 && !first_window && !from_sfx && !gated_proposal) {
+                    if (df2_sample_active) T = std::min(T, df2_q_count + 1);
+                    df2_prefix_n = std::min(std::max(T - 1, 0), df2_sample_active ? df2_q_count : df2.max_drafts());
+                    const int valid_df2 = df2_sample_active ? df2_q_count : df2.max_drafts();
+                    if (df2_suffix_fill_enabled() && o.draft_conf > 0.0 && df2_prefix_n < valid_df2) {
+                        const int room = (int) std::min<int64_t>(std::min(S, S_look), o.max_context - p);
+                        const int remaining = std::max(0, room - T);
+                        int suffix_n = remaining > 0
+                            ? sfx.propose_after(drafts.data(), df2_prefix_n, remaining, df2_suffix_min_match(), sbuf.data())
+                            : 0;
+                        if (suffix_n > 0 && sfx.last_match() >= df2_suffix_min_match() && o.lookup_max_t > 0) {
+                            const int fit = graph_fits(T + suffix_n);
+                            if (fit < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                            suffix_n = std::min(suffix_n, std::max(0, fit - T));
+                        }
+                        if (!df2_composition.append(strata::spec::DraftCompositionSource::Dflash2, drafts.data(), df2_prefix_n)) {
+                            std::printf("ERR DFlash2 source arbitration failed\n");
+                            return 1;
+                        }
+                        if (suffix_n > 0 && sfx.last_match() >= df2_suffix_min_match()) {
+                            if (!df2_composition.append(strata::spec::DraftCompositionSource::Suffix, sbuf.data(), suffix_n)) {
+                                std::printf("ERR suffix source arbitration failed\n");
+                                return 1;
+                            }
+                            df2_suffix_n = df2_composition.count(strata::spec::DraftCompositionSource::Suffix);
+                        }
+                        T += df2_suffix_n;
+                        df2_compose_round = true;
+                    }
+                }
                 std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) std::min<size_t>(dprob.size(), 8), dwin_s.begin());
                 if (df2_trace != nullptr) std::copy(drafts.begin(), drafts.begin() + (std::ptrdiff_t) std::min<size_t>(drafts.size(), 8), tr_d.begin());
                 // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
                 int chain_n = 0, cm = 0;
                 if (o.lookup_chain > 0 && !first_window && !from_sfx && T < S) {
                     int csrc = -1;
-                    const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
+                    const int32_t* pending = df2_compose_round && !df2_composition.tokens().empty()
+                        ? df2_composition.tokens().data() : drafts.data();
+                    const int nt = chain_tail(sfx, pending, T - 1, ctail);
                     chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
                                                                  std::min(o.lookup_chain, S_look - T), o.lookup_chain_min,
                                                                  cbuf.data(), &cm, &csrc);
                     // the policy keeps the chained tokens that pay at this machine's measured window costs
                     if (chain_n > 0 && !chain_fixed) {
                         double p_mtp = 1.0;
-                        for (int i = 0; i < T - 1; ++i) p_mtp *= dprob[(size_t) i];
+                        const int n_prob = df2_compose_round ? df2_prefix_n : T - 1;
+                        for (int i = 0; i < n_prob; ++i) p_mtp *= dprob[(size_t) i];
                         chain_n = policy.chain(T, p_mtp, chain_n, cm);
                     }
                     if (chain_n > 0 && o.lookup_max_t > 0) {
@@ -22177,6 +22262,11 @@ int main(int argc, char** argv) {
                         if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
                         chain_n = std::max(0, t - T);
                     }
+                }
+                if (df2_compose_round && chain_n > 0 &&
+                    !df2_composition.append(strata::spec::DraftCompositionSource::Lookup, cbuf.data(), chain_n)) {
+                    std::printf("ERR lookup source arbitration failed\n");
+                    return 1;
                 }
                 // a learning stretch times the window sizes the round's own rule does not reach: the MTP / drafter window of a round with no lookup and no
                 // chain is run at another size (the rows past the real drafts are whatever the drafts array holds: valid ids that the verifier rejects);
@@ -22193,10 +22283,16 @@ int main(int argc, char** argv) {
                 if (p + T > o.max_context) break;
                 window[0] = x;
                 for (int i = 1; i < T_mtp; ++i)
-                    window[(size_t) i] = merged     ? (int32_t) ids[(size_t) (p + i)]
+                    window[(size_t) i] = df2_compose_round ? df2_composition.tokens()[(size_t) i - 1]
+                                         : merged     ? (int32_t) ids[(size_t) (p + i)]
                                          : from_sfx ? sbuf[(size_t) i - 1]
                                                     : drafts[(size_t) i - 1];
-                for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+                if (df2_compose_round) {
+                    for (int i = 0; i < chain_n; ++i)
+                        window[(size_t) (T_mtp + i)] = df2_composition.tokens()[(size_t) (T_mtp - 1 + i)];
+                } else {
+                    for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+                }
                 if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 drive.d.layers = 0;
                 drive.d.experts = 0;
@@ -22381,7 +22477,18 @@ int main(int argc, char** argv) {
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
+                else if (df2_sample_active && req_df2 && !from_sfx && !first_window) {
+                    const int nq = std::min(df2_q_count, df2_prefix_n);
+                    if (nq > 0) ver.set_spec_q(df2_q_rows.data(), nq);
+                }
                 else if (strata::spec::mtp_q_applies(use_mtp, req_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp)) ver.set_spec_q(mtp.spec_q(), T_mtp - 1);   // only candidates the MTP drew
+                if (df2_suffix_fill_enabled() && req_df2 && use_df2 && !batch_df2 && !first_window) {
+                    const int df2_rows = df2_compose_round ? df2_composition.count(strata::spec::DraftCompositionSource::Dflash2) : df2_prefix_n;
+                    const int suffix_rows = df2_compose_round ? df2_composition.count(strata::spec::DraftCompositionSource::Suffix) : 0;
+                    const int lookup_rows = df2_compose_round ? df2_composition.count(strata::spec::DraftCompositionSource::Lookup) : chain_n;
+                    std::fprintf(stderr, "strata serve: df2 suffix composition: p=%lld df2=%d suffix=%d lookup=%d match=%d\n",
+                                 (long long) p, df2_rows, suffix_rows, lookup_rows, sfx.last_match());
+                }
                 const auto decode_pool_fn = strata::spec::mtp_window_invariant_applies(use_mtp, req_df2, use_mtp && mtp.prob())
                     ? invariant_win_pool_fn
                     : win_pool_fn;
@@ -24260,6 +24367,7 @@ int main(int argc, char** argv) {
         int64_t rounds = 0, drafts_total = 0, drafts_ok = 0, corrupt_counter = 0;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
+        if (df2_suffix_fill_enabled()) sfx.enable_short_matches();
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         auto source_policy = policy;   // this generation's: committed outcomes only (observe_committed)
         strata::spec::DraftPolicy::ChainState chain_st;
@@ -24292,7 +24400,12 @@ int main(int argc, char** argv) {
         int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
         std::vector<int32_t> cbuf((size_t) o.spec, 0), ctail;
         strata::spec::PromptLookupSource lookup_src(sfx);
-        const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
+        const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0 ||
+                            (df2_suffix_fill_enabled() && spec_uses_df2);
+        const bool df2_sample_active = strata::spec::df2_sample_walk_for_request(
+            strata::spec::df2_sample_walk_env(), sp.greedy, sp.temperature) && spec_uses_df2 && o.spec_corrupt <= 0;
+        std::array<int32_t, 7 * strata::spec::kDf2SampleQStride> df2_q_rows{};
+        int df2_q_count = 0;
         if (sfx_on) {
             for (int64_t t : o.tokens) sfx.append((int32_t) t);
             for (int64_t t : produced) sfx.append((int32_t) t);
@@ -24341,7 +24454,8 @@ int main(int argc, char** argv) {
         auto draft_next = [&](int T_, int a_) -> bool {
 #if defined(STRATA_HAVE_DFLASH2)
             if (use_df2) {
-                if (o.suffix_draft > 0 && !first_window) {   // a long suffix match: no draft now (spec/window_rule.hpp skip_draft_for_lookup); the next round decides
+                if (o.suffix_draft > 0 && !first_window &&
+                    !(df2_suffix_fill_enabled() && spec_uses_df2)) {   // a long suffix match: no draft now (spec/window_rule.hpp skip_draft_for_lookup); the next round decides
                     const int ks = sfx.propose(o.spec - 1, sbuf.data());
                     if (strata::spec::skip_draft_for_lookup(true, df2_skip_min, ks, sfx.last_match())) {
                         df2_deferred = true; dfr_n = a_ + 1; dfr_pos = p; dfr_anchor = outv[(size_t) a_];
@@ -24353,7 +24467,8 @@ int main(int argc, char** argv) {
                 int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                 float pp[strata::core::Dflash2Drafter::kDrafts];
                 const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
-                if (!df2_draft_rows(df2, ver, 1, a_ + 1, p, outv[(size_t) a_], tap_stride, dd, pp, err)) return false;
+                if (!df2_draft_rows(df2, ver, 1, a_ + 1, p, outv[(size_t) a_], tap_stride, dd, pp, err,
+                                    df2_sample_active, sp.seed, df2_q_rows.data(), &df2_q_count)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 // what the MTP does while it drafts: the PLE rows of the tokens the next window will hold are read ahead
                 // (the window's gather would otherwise wait for them: 1.8 ms a round on strix)
@@ -24397,11 +24512,13 @@ int main(int argc, char** argv) {
                 const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
                 if (kd > 0 && pk.lookup) {
                     dfr_lookup = true; dfr_T = pk.t; dfr_match = md;
+                    df2_q_count = 0;
                     if (!df2_context_rows(df2, ver, 1, dfr_n, dfr_pos, tap_stride, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
                 } else {
                     int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                     float pp[strata::core::Dflash2Drafter::kDrafts];
-                    if (!df2_draft_rows(df2, ver, 1, dfr_n, dfr_pos, dfr_anchor, tap_stride, dd, pp, err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+                    if (!df2_draft_rows(df2, ver, 1, dfr_n, dfr_pos, dfr_anchor, tap_stride, dd, pp, err,
+                                        df2_sample_active, sp.seed, df2_q_rows.data(), &df2_q_count)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
                     for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 }
             }
@@ -24411,6 +24528,9 @@ int main(int argc, char** argv) {
             int T = S_mtp;
             policy.set_context(p);
             bool from_sfx = false;
+            bool df2_compose_round = false;
+            int df2_prefix_n = 0, df2_suffix_n = 0;
+            strata::spec::DraftComposition df2_composition((size_t) std::max(0, win_cap - 1));
             int sfx_match = 0;
             if (gated_proposal) {
                 source_policy.apply_costs(p);   // held round times whose draws are all committed now
@@ -24434,7 +24554,8 @@ int main(int argc, char** argv) {
             if (first_window) T = 1;
             std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) o.spec, dwin.begin());
             if (!t_cycle.empty() && !first_window) T = t_cycle[(size_t) (rounds % (int64_t) t_cycle.size())];
-            if (o.suffix_draft > 0 && !first_window) {
+            if (o.suffix_draft > 0 && !first_window &&
+                !(df2_suffix_fill_enabled() && spec_uses_df2)) {
                 const int k = sfx.propose(o.spec - 1, sbuf.data());
                 sfx_match = sfx.last_match();
                 // a probabilistic window must not condition the source on the draw: the policy copy fixed at the start chooses, and the
@@ -24456,19 +24577,51 @@ int main(int argc, char** argv) {
             // full window can overrun)
             const int room = (int) std::min<int64_t>(win_cap, o.max_context - p);
             T = std::min(T, room);
+            if (spec_uses_df2 && !first_window && !from_sfx && !gated_proposal) {
+                if (df2_sample_active) T = std::min(T, df2_q_count + 1);
+                df2_prefix_n = std::min(std::max(T - 1, 0), df2_sample_active ? df2_q_count : df2.max_drafts());
+                const int valid_df2 = df2_sample_active ? df2_q_count : df2.max_drafts();
+                if (df2_suffix_fill_enabled() && o.draft_conf > 0.0 && df2_prefix_n < valid_df2) {
+                    const int remaining = std::max(0, room - T);
+                    int suffix_n = remaining > 0
+                        ? sfx.propose_after(drafts.data(), df2_prefix_n, remaining, df2_suffix_min_match(), sbuf.data())
+                        : 0;
+                    if (!df2_composition.append(strata::spec::DraftCompositionSource::Dflash2, drafts.data(), df2_prefix_n)) {
+                        std::fprintf(stderr, "strata generate: DFlash2 source arbitration failed\n");
+                        return 1;
+                    }
+                    if (suffix_n > 0 && sfx.last_match() >= df2_suffix_min_match()) {
+                        if (!df2_composition.append(strata::spec::DraftCompositionSource::Suffix, sbuf.data(), suffix_n)) {
+                            std::fprintf(stderr, "strata generate: suffix source arbitration failed\n");
+                            return 1;
+                        }
+                        df2_suffix_n = df2_composition.count(strata::spec::DraftCompositionSource::Suffix);
+                    }
+                    T += df2_suffix_n;
+                    df2_compose_round = true;
+                }
+            }
             // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
             int chain_n = 0, cm = 0;
             if (o.lookup_chain > 0 && draft_on && !first_window && !from_sfx && T < room) {
                 int csrc = -1;
-                const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
+                const int32_t* pending = df2_compose_round && !df2_composition.tokens().empty()
+                    ? df2_composition.tokens().data() : drafts.data();
+                const int nt = chain_tail(sfx, pending, T - 1, ctail);
                 chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
                                                              std::min(o.lookup_chain, room - T), o.lookup_chain_min,
                                                              cbuf.data(), &cm, &csrc);
                 if (chain_n > 0 && std::getenv("STRATA_LOOKUP_CHAIN_FIXED") == nullptr) {
                     double p_mtp = 1.0;
-                    for (int i = 0; i < T - 1; ++i) p_mtp *= dprob[(size_t) i];
+                    const int n_prob = df2_compose_round ? df2_prefix_n : T - 1;
+                    for (int i = 0; i < n_prob; ++i) p_mtp *= dprob[(size_t) i];
                     chain_n = policy.chain(T, p_mtp, chain_n, cm);
                 }
+            }
+            if (df2_compose_round && chain_n > 0 &&
+                !df2_composition.append(strata::spec::DraftCompositionSource::Lookup, cbuf.data(), chain_n)) {
+                std::fprintf(stderr, "strata generate: lookup source arbitration failed\n");
+                return 1;
             }
             const int T_mtp = T;
             T += chain_n;
@@ -24481,9 +24634,10 @@ int main(int argc, char** argv) {
             window[0] = x;
             for (int i = 1; i < T; ++i) {
                 const size_t at = produced.size() - 1 + (size_t) i;
-                int32_t d = from_sfx ? sbuf[(size_t) i - 1] : draft_on ? drafts[(size_t) i - 1]
-                                                    : at < oracle.size() ? (int32_t) oracle[at] : 0;
-                if (i >= T_mtp) d = cbuf[(size_t) (i - T_mtp)];
+                int32_t d = df2_compose_round ? df2_composition.tokens()[(size_t) i - 1]
+                              : from_sfx ? sbuf[(size_t) i - 1] : draft_on ? drafts[(size_t) i - 1]
+                                                                            : at < oracle.size() ? (int32_t) oracle[at] : 0;
+                if (!df2_compose_round && i >= T_mtp) d = cbuf[(size_t) (i - T_mtp)];
                 if (o.spec_corrupt > 0 && (++corrupt_counter % o.spec_corrupt) == 0) d = (d + 1) % (int32_t) n_vocab;
                 window[(size_t) i] = d;
             }
@@ -24517,9 +24671,20 @@ int main(int argc, char** argv) {
                                  (long long) checked, (long long) bad);
             }
             if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
+            else if (df2_sample_active && spec_uses_df2 && !from_sfx && !first_window && o.spec_corrupt <= 0) {
+                const int nq = std::min(df2_q_count, df2_prefix_n);
+                if (nq > 0) ver.set_spec_q(df2_q_rows.data(), nq);
+            }
             // the MTP's q lists judge only candidates the MTP drew: DFlash2's are a deterministic pick (exact-match path)
             else if (strata::spec::mtp_q_applies(use_mtp, spec_uses_df2, use_mtp && mtp.prob(), from_sfx, first_window, T_mtp) && o.spec_corrupt <= 0)
                 ver.set_spec_q(mtp.spec_q(), T_mtp - 1);
+            if (df2_suffix_fill_enabled() && spec_uses_df2 && !first_window) {
+                const int df2_rows = df2_compose_round ? df2_composition.count(strata::spec::DraftCompositionSource::Dflash2) : df2_prefix_n;
+                const int suffix_rows = df2_compose_round ? df2_composition.count(strata::spec::DraftCompositionSource::Suffix) : 0;
+                const int lookup_rows = df2_compose_round ? df2_composition.count(strata::spec::DraftCompositionSource::Lookup) : chain_n;
+                std::fprintf(stderr, "strata generate: df2 suffix composition: p=%lld df2=%d suffix=%d lookup=%d match=%d\n",
+                             (long long) p, df2_rows, suffix_rows, lookup_rows, sfx.last_match());
+            }
             const auto decode_pool_fn = strata::spec::mtp_window_invariant_applies(use_mtp, spec_uses_df2, use_mtp && mtp.prob())
                 ? &drive_pool_multi_invariant
                 : &drive_pool_multi;
