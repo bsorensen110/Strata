@@ -172,6 +172,90 @@ __global__ void combine_k10_vec4_hits(const float4* __restrict__ parts4, const f
     sum.w = __fadd_rn(sum.w, sh.w);
     output4[c4] = sum;
 }
+template<bool GATED = false>
+__global__ void combine_k10_vec4_hits_mapped(const float4* __restrict__ hits4, const float* __restrict__ mapped_miss,
+                                             const uint32_t* __restrict__ wait_flag, uint32_t wait_val,
+                                             const int32_t* __restrict__ dst, const int32_t* __restrict__ count,
+                                             const float* __restrict__ weights, const float4* __restrict__ shared4,
+                                             float4* __restrict__ output4, int64_t n4,
+                                             const float* __restrict__ sg = nullptr) {
+    const int64_t tk = blockIdx.y;
+    const int nh = *count;
+    constexpr int kFullMask = (1 << KU) - 1;
+    int mask = kFullMask;
+    if (nh < (int) gridDim.y * KU) {
+        __shared__ int hit_mask;
+        if (threadIdx.x == 0) hit_mask = 0;
+        __syncthreads();
+        for (int h = threadIdx.x; h < nh; h += blockDim.x) {
+            const int r = dst[h];
+            if (r / KU == (int) tk) atomicOr(&hit_mask, 1 << (r % KU));
+        }
+        __syncthreads();
+        mask = hit_mask;
+    }
+    if (mask != kFullMask && wait_flag != nullptr) {
+        if (threadIdx.x == 0) {
+            while (*reinterpret_cast<const volatile uint32_t*>(wait_flag) < wait_val) {}
+        }
+        __syncthreads();
+    }
+    hits4 += tk * KU * n4;
+    weights += tk * KU;
+    shared4 += tk * n4;
+    output4 += tk * n4;
+    const int64_t c4 = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (c4 >= n4) return;
+    float4 sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    if (mask == kFullMask) {
+        const float w0 = __ldg(weights + 0);
+        const float4 p0 = hits4[c4];
+        sum = make_float4(p0.x * w0, p0.y * w0, p0.z * w0, p0.w * w0);
+#pragma unroll
+        for (int expert = 1; expert < KU; ++expert) {
+            const float w = __ldg(weights + expert);
+            const float4 p = hits4[int64_t(expert) * n4 + c4];
+            sum.x = fmaf(p.x, w, sum.x);
+            sum.y = fmaf(p.y, w, sum.y);
+            sum.z = fmaf(p.z, w, sum.z);
+            sum.w = fmaf(p.w, w, sum.w);
+        }
+    } else {
+        if (mask != 0) {
+#pragma unroll
+            for (int expert = 0; expert < KU; ++expert) {
+                if (!((mask >> expert) & 1)) continue;
+                const float w = __ldg(weights + expert);
+                const float4 p = hits4[int64_t(expert) * n4 + c4];
+                sum.x = fmaf(p.x, w, sum.x);
+                sum.y = fmaf(p.y, w, sum.y);
+                sum.z = fmaf(p.z, w, sum.z);
+                sum.w = fmaf(p.w, w, sum.w);
+            }
+        }
+        if (mapped_miss != nullptr) {
+            const volatile float* mm = mapped_miss + tk * (n4 * 4) + c4 * 4;
+            const float m0 = mm[0], m1 = mm[1], m2 = mm[2], m3 = mm[3];
+            sum.x = __fadd_rn(sum.x, m0);
+            sum.y = __fadd_rn(sum.y, m1);
+            sum.z = __fadd_rn(sum.z, m2);
+            sum.w = __fadd_rn(sum.w, m3);
+        }
+    }
+    float4 sh = shared4[c4];
+    if constexpr (GATED) {
+        const float g = __fdividef(1.0f, __fadd_rn(1.0f, __expf(-__ldg(sg + tk))));
+        sh.x = __fmul_rn(sh.x, g);
+        sh.y = __fmul_rn(sh.y, g);
+        sh.z = __fmul_rn(sh.z, g);
+        sh.w = __fmul_rn(sh.w, g);
+    }
+    sum.x = __fadd_rn(sum.x, sh.x);
+    sum.y = __fadd_rn(sum.y, sh.y);
+    sum.z = __fadd_rn(sum.z, sh.z);
+    sum.w = __fadd_rn(sum.w, sh.w);
+    output4[c4] = sum;
+}
 bool valid_span(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % alignof(float) == 0 && bytes <= UINTPTR_MAX - address;
@@ -236,6 +320,27 @@ void native_moe_combine_multi_hits_added(const float* parts, const float* hits, 
                                          const float* weights, const float* shared, float* output, int64_t n_embd, int64_t k,
                                          int n_tok, void* stream) {
     native_moe_combine_multi_hits_added(parts, hits, dst, count, weights, shared, nullptr, output, n_embd, k, n_tok, stream);
+}
+void native_moe_combine_multi_hits_mapped(const float* hits, const float* mapped_miss, const uint32_t* wait_flag,
+                                          uint32_t wait_val, const int32_t* dst, const int32_t* count,
+                                          const float* weights, const float* shared, const float* shared_gate,
+                                          float* output, int64_t n_embd, int64_t k, int n_tok, void* stream) {
+    if (!stream || k != KU || n_embd <= 0 || (n_embd & 3) != 0 || n_tok < 1 || n_tok > kVerifyMaxT ||
+        !hits || !dst || !count || !weights || !shared || !output ||
+        (((uintptr_t) hits | (uintptr_t) shared | (uintptr_t) output) & 15u) != 0)
+        throw std::invalid_argument("native MoE combine (hits mapped) requires k = 10, aligned spans, 1..max_t tokens");
+    const int64_t n4 = n_embd >> 2;
+    if (shared_gate != nullptr) {
+        combine_k10_vec4_hits_mapped<true><<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, static_cast<cudaStream_t>(stream)>>>(
+            reinterpret_cast<const float4*>(hits), mapped_miss, wait_flag, wait_val, dst, count, weights,
+            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4, shared_gate);
+    } else {
+        combine_k10_vec4_hits_mapped<false><<<dim3(unsigned((n4 + 127) / 128), (unsigned) n_tok), 128, 0, static_cast<cudaStream_t>(stream)>>>(
+            reinterpret_cast<const float4*>(hits), mapped_miss, wait_flag, wait_val, dst, count, weights,
+            reinterpret_cast<const float4*>(shared), reinterpret_cast<float4*>(output), n4);
+    }
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
 void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
                               int64_t n_embd, int64_t k, int n_tok, void* stream) {

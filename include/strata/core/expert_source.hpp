@@ -404,6 +404,8 @@ struct GpuPlanSink {
     /// holds the arena's device alias.
     int pcie_mode = 0;
     int32_t cpu_jobs = 0;   ///< host only: the distinct experts the pool computes for the layer just published
+    const float* w_host = nullptr;   ///< host routing weights [n_tok * k] when reduce_miss is set
+    bool reduce_miss = false;        ///< reduce CPU miss outputs on host into [n_tok, H] weighted sum
 };
 
 /// Verifier::set_pcie_balance: a verify window's costs, fitted to each layer's measured times (ms, least squares with
@@ -614,6 +616,7 @@ struct ExpertDispatch {
     /// Plan v0.3 P6: a native pack's per-token activations (MAXT x kNativeActBytes).
     std::vector<uint8_t> nact_multi;
     std::vector<strata::kernels::cpu::ExpertJobMulti> jobs_multi;
+    std::vector<float> miss_tmp;   ///< STRATA_CPU_REDUCE_MISS=1 scratch [n_tok * k, H] before reduction into out[n_tok, H]
     std::vector<int16_t> job_of;
     /// Plan v0.3 P6: the verify window's GPU plan (VRAM hits + the PCIe share of the misses); `pcie_num`/256 of
     /// each layer's distinct missed experts (the last ones in routing order) are read by the GPU over PCIe.

@@ -5540,9 +5540,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // the GPU's copy_rows_from_mapped zeroes the rows it computed itself (dec_batch); STRATA_VERIFY_DEVICE_PLAN's
     // copy_or_zero_from_mapped copies every row, so there the host still zeroes them
     static const bool device_plan = [] { const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN"); return v != nullptr && std::atoi(v) != 0; }();
+    const bool reduce_miss = (d.plan != nullptr && d.plan->reduce_miss && d.plan->w_host != nullptr &&
+                              d.peer == nullptr && d.remote_count == 0);
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
     if (gpu_zeroes_hits && planned_vram_entries >= 0 && planned_gpu_entries == n &&
         d.peer == nullptr && d.remote_count == 0) {
+        if (reduce_miss) std::memset(out, 0, (size_t) n_tok * (size_t) H * sizeof(float));
         d.cache_hits += planned_vram_entries;
         d.offload_entries += planned_gpu_entries - planned_vram_entries;
         d.plan->cpu_jobs = 0;
@@ -5669,6 +5672,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
     }();
     const int job_max_t = cpu_no_split ? strata::kernels::cpu::kJobMultiMaxT : MAXT;
+    if (reduce_miss && d.miss_tmp.size() < (size_t) (n_tok * k * H))
+        d.miss_tmp.resize((size_t) (n_tok * k * H));
+    float* const miss_base = reduce_miss ? d.miss_tmp.data() : out;
     const bool used_fast_jobs = plan_fast_ok && gpu_zeroes_hits && npend == 0;
     if (used_fast_jobs) {
         d.cache_hits += planned_vram_entries;
@@ -5703,7 +5709,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int16_t i = i0; i >= 0; i = next_same[i]) {
                 const int64_t t = i / k;
-                float* row = out + (size_t) i * H;
+                float* row = miss_base + (size_t) i * H;
                 ++d.cache_refused;
                 if (jb->nt == job_max_t) {
                     const int prev = jo;
@@ -5725,7 +5731,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         for (int64_t j = 0; j < k; ++j) {
             const int64_t i = t * k + j;
             const int64_t e = ids[i];
-            float* row = out + (size_t) i * H;
+            float* row = miss_base + (size_t) i * H;
             if (!first_pass && (e < 0 || e >= d.n_expert || kind[i] != -1 || !take(e, want)))
                 continue;   // a later batch: only the CPU entries of the experts that just landed
             if (first_pass && kind[i] == -1 && e >= 0 && e < d.n_expert && !take(e, 0)) continue;   // being read: a later batch
@@ -5737,7 +5743,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 return;
             }
             if (kind[i] == -2) {            // STRATA_ROUTE_TAIL_SKIP: a skipped tail expert contributes zero
-                std::memset(row, 0, (size_t) H * sizeof(float));
+                if (!reduce_miss) std::memset(row, 0, (size_t) H * sizeof(float));
                 ++d.tail_skipped;
                 continue;
             }
@@ -5747,7 +5753,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 if (kind[i] == 2 && d.peer != nullptr) ++d.peer_entries;
                 // multi-GPU: a direct peer launch is writing this row right now - zeroing it would race it;
                 // dec_batch: copy_rows_from_mapped_kernel already zeroes kind 0/1 rows on the GPU
-                if (!((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
+                if (!reduce_miss &&
+                    !((kind[i] == 2 && d.peer != nullptr && d.peer->launched_direct()) ||
                       (gpu_zeroes_hits && (kind[i] == 0 || kind[i] == 1))))
                     std::memset(row, 0, (size_t) H * sizeof(float));
                 continue;
@@ -5851,6 +5858,26 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (njobs > 0 && npend == 0) {
         if (native) d.pool->run_split_multi_native(lay.fmt[(size_t) d.layers], d.jobs_multi.data(), njobs, arithmetic);
         else d.pool->run_split_multi(d.jobs_multi.data(), njobs);
+    }
+    if (reduce_miss) {
+        const float* w_h = d.plan->w_host;
+        for (int64_t t = 0; t < n_tok; ++t) {
+            float* dst_row = out + (size_t) t * H;
+            bool has_miss = false;
+            for (int64_t j = 0; j < k; ++j) {
+                const int64_t idx = t * k + j;
+                if (kind[idx] != -1) continue;
+                const float wt = w_h[idx];
+                const float* src_row = miss_base + (size_t) idx * H;
+                if (!has_miss) {
+                    for (int d_i = 0; d_i < H; ++d_i) dst_row[d_i] = src_row[d_i] * wt;
+                    has_miss = true;
+                } else {
+                    for (int d_i = 0; d_i < H; ++d_i) dst_row[d_i] += src_row[d_i] * wt;
+                }
+            }
+            if (!has_miss) std::memset(dst_row, 0, (size_t) H * sizeof(float));
+        }
     }
     if (d.remote_count > 0) {
         static thread_local std::string remote_error;

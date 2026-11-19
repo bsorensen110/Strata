@@ -6,6 +6,7 @@
 #endif
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/batch_admit_merge.hpp"
+#include "strata/core/batch_split_policy.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -815,6 +816,9 @@ Verifier::~Verifier() {
     if (slot_hist_d_) cudaFree(slot_hist_d_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
+    if (pcie_cs_) { cudaStreamSynchronize(pcie_cs_); cudaStreamDestroy(pcie_cs_); }
+    if (ev_pcie_fork_) cudaEventDestroy(ev_pcie_fork_);
+    if (ev_pcie_join_) cudaEventDestroy(ev_pcie_join_);
     if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
     if (side2_) cudaStreamDestroy(side2_);
@@ -965,13 +969,62 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     return true;
 }
 
+namespace {
+
+bool pcie_fetch_overlap_on() noexcept {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PCIE_FETCH_OVERLAP");
+        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+bool cpu_reduce_miss_env_on() noexcept {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_CPU_REDUCE_MISS");
+        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+}  // namespace
+
+int64_t Verifier::staging_blobs_cap() noexcept {
+    static const int64_t cap = [] {
+        const char* v = std::getenv("STRATA_STAGING_BLOBS");
+        if (v == nullptr || v[0] == '\0') return kStagingBlobs;
+        const int64_t val = std::atoll(v);
+        return std::max<int64_t>(16, std::min<int64_t>(64, val));
+    }();
+    return cap;
+}
+
+int64_t Verifier::pcie_group_rows_cap() noexcept {
+    static const int64_t cap = [] {
+        const char* v = std::getenv("STRATA_PCIE_GROUP_ROWS");
+        if (v == nullptr || v[0] == '\0') return kPcieGroupRows;
+        const int64_t val = std::atoll(v);
+        return std::max<int64_t>(4, std::min<int64_t>(64, val));
+    }();
+    return cap;
+}
+
+bool Verifier::can_cpu_reduce_miss(int n, bool dec_batch) const noexcept {
+    if (!cpu_reduce_miss_env_on()) return false;
+    static const bool dec_batch_env = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    if (!dec_batch || !dec_batch_env) return false;
+    if (prof_on_ || remote_opt_ != nullptr || device_plan_ || ar_on() || m_bal_ != nullptr) return false;
+    if (!strata::kernels::native_moe_combine_enabled() || ss_ == nullptr || g_ == nullptr) return false;
+    return n >= 1 && n <= strata::kernels::kVerifyMaxT && ss_->k == 10 && (g_->n_embd & 3) == 0;
+}
+
 int64_t Verifier::plan_i32_count(int max_t, int64_t k_used, int64_t* dst2_off_out) noexcept {
     const int64_t cap = (int64_t) ((uint64_t) max_t * (uint64_t) k_used);
     const int64_t i32 = 4 + (cap + 1) + cap + cap;
     const int64_t ptr_off = (i32 + 1) & ~1ll;
     const int64_t dst2_off = (ptr_off + 4 * cap + (cap + 1) + 1 + 1) & ~1ll;
     if (dst2_off_out != nullptr) *dst2_off_out = dst2_off;
-    return dst2_off + 2 * kStagingBlobs;
+    return dst2_off + 2 * staging_blobs_cap();
 }
 
 uint64_t Verifier::carve_arena(Verifier* self, uint8_t* base, const ModelGeometry& g, int64_t max_blocks,
@@ -1042,7 +1095,7 @@ uint64_t Verifier::carve_arena(Verifier* self, uint8_t* base, const ModelGeometr
     STRATA_CARVE(hit_dst_, int32_t, T * K);
     STRATA_CARVE(hit_count_, int32_t, 4);
     STRATA_CARVE(plan_, int32_t, 2 * ((uint64_t) plan_i32 + 16));
-    STRATA_CARVE(staging_, uint8_t, (uint64_t) kStagingBlobs * staging_blob_bytes);
+    STRATA_CARVE(staging_, uint8_t, (uint64_t) staging_blobs_cap() * staging_blob_bytes);
     STRATA_CARVE(hit_xq_, uint8_t, T * (N / 32) * 34);
     STRATA_CARVE(hit_xs_, float, T * (N / 32));
     STRATA_CARVE(nat_xq_, uint8_t, T * (N / 32) * 36);
@@ -1332,7 +1385,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         had_sh_ = strata::kernels::hadamard_device_signs(strata::kernels::cpu::hadamard_signs((int) g.n_ff), (int) g.n_ff);
     }
     sink_.staging = (unsigned long long) staging_;
-    sink_.staging_cap = kStagingBlobs;
+    sink_.staging_cap = staging_blobs_cap();
     (void) TS;
     // STRATA_GRAPH_PRIO=1 (opt-in): the window's streams carry priorities that their captured kernel
     // nodes keep (the window graph is instantiated with cudaGraphInstantiateFlagUseNodePriority): the GDN gates / QSA
@@ -1401,6 +1454,13 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming) != cudaSuccess) {
         err = "verify: event create failed";
+        return false;
+    }
+    if (pcie_fetch_overlap_on() &&
+        (make_stream(&pcie_cs_, gp_mid) != cudaSuccess ||
+         cudaEventCreateWithFlags(&ev_pcie_fork_, cudaEventDisableTiming) != cudaSuccess ||
+         cudaEventCreateWithFlags(&ev_pcie_join_, cudaEventDisableTiming) != cudaSuccess)) {
+        err = "verify: pcie overlap stream / event create failed";
         return false;
     }
     {   // STRATA_DF_BRANCH=1 (opt-in): the mixer's side branches.  Off by default: on Linux (open modules, GSP) a
@@ -1514,9 +1574,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
-    // a batch window is one group; a window past kVerifyMaxT tokens is always two (--lookup-max-t: each group holds
-    // at most kVerifyMaxT, what the per-group kernels and the CPU experts take)
-    const int G = ((split_ && T >= 2) || T > kVerifyMaxT) && !batch_rec_ ? 2 : 1;
+    // A batch window is normally one group; when STRATA_BATCH_SPLIT=1 and T > 8, split at a slot boundary near T/2
+    // into two sequential <=8-row groups if possible. Non-batch windows past kVerifyMaxT stay two groups.
+    const int batch_split_s = (batch_rec_ && !ar_on() && !staging_deferred_ &&
+                               strata::core::batch_split_enabled() && T > strata::kernels::kVerifyNarrowT)
+                                  ? strata::core::batch_split_point(brow_, T, strata::kernels::kVerifyNarrowT)
+                                  : 0;
+    const int G = batch_rec_ ? (batch_split_s > 0 ? 2 : 1) : (((split_ && T >= 2) || T > kVerifyMaxT) ? 2 : 1);
+    if (batch_rec_) batch_split_map_[bkey(brow_, T, row_base_)] = batch_split_s;
     // Pipelined windows must wait for the host verdict/snapshot fence before mutating state.
     const bool self_commit = T == 1 && !always_publish_ && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
@@ -1536,7 +1601,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
     };
-    const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    const int half_b = batch_rec_ ? (batch_split_s > 0 ? batch_split_s : T) : ((T + 1) / 2);
+    const int tb_[2] = {0, half_b}, te_[2] = {G == 2 ? half_b : T, T};
     // S26 STRATA_LFUSE=1: where the shared expert's gate / scale fusions apply (the paths they replace are the ones taken)
     auto lfuse_on = [&](int n) {
         return g_lfuse() && ar_on() && native_moe_combine_enabled() && dec_batch && n > 1 && n <= kVerifyMaxT &&
@@ -2690,8 +2756,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                  m_ids_ + tb * K, m_w_ + tb * K, m_seq_, cs);
             else {
                 const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
+                const bool pub_w = can_cpu_reduce_miss(n, dec_batch);
                 doorbell_publish_res(xm, ids_ + tb * K, layer_res, (int) g.n_expert, (int64_t) n * N, (int64_t) n * K,
-                                     m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
+                                     m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs,
+                                     pub_w ? (w_ + tb * K) : nullptr, pub_w ? (m_w_ + tb * K) : nullptr);
             }
             if (sh_fork_late) {
                 note_prio_fork(cs);
@@ -2816,6 +2884,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         };
         bool hits_in_combine = false;
+        const bool reduce_miss_win = can_cpu_reduce_miss(n, dec_batch);
         if (ar_on()) {
             strata::dispatch::note("experts layer: all-resident device plan, grouped experts straight into the parts (no doorbell, no CPU rows)");
             stamp(l, 19, grp);
@@ -2837,35 +2906,49 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_copy_i32, cs);
                 }
             }
+            const bool pcie_overlap = (sink_.pcie_mode == 2 && pcie_fetch_overlap_on() && pcie_cs_ != nullptr &&
+                                       ev_pcie_fork_ != nullptr && ev_pcie_join_ != nullptr && !prof_on_);
+            if (pcie_overlap) {
+                cudaEventRecord(ev_pcie_fork_, cs);
+                cudaStreamWaitEvent(pcie_cs_, ev_pcie_fork_, 0);
+            }
             stamp(l, 19, grp);
             grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
             if (sink_.pcie_mode >= 0) {
+                cudaStream_t p_st = pcie_overlap ? pcie_cs_ : cs;
                 // (b) pcie_mode 2 with fuse_pcie_wait_on: the wait is the staging copy's own (fetch_blobs_after), no launch here
                 const bool fold_pcie_wait = sink_.pcie_mode == 2 && fuse_pcie_wait_on() && !device_plan_ && m_bal_ == nullptr;
                 if (!fold_pcie_wait) {
-                    if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
+                    if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, p_st);
                     else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
-                        wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
-                    else wait_flag_ge(m_flagB_, ring, cs);             // the PCIe share is in staging (DMA) or mapped
+                        wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, p_st);
+                    else wait_flag_ge(m_flagB_, ring, p_st);           // the PCIe share is in staging (DMA) or mapped
                 }
                 if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
-                    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                    const int64_t scap = staging_blobs_cap();
+                    const int64_t per = G == 2 ? scap / 2 : scap;
                     uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
                     const unsigned long long* p_dst2 = (const unsigned long long*) (pl + dst2_off_);   // STRATA_ADAPT_FETCH
                     if (fold_pcie_wait)
-                        fetch_blobs_after(m_flagB_, ring, p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
+                        fetch_blobs_after(m_flagB_, ring, p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, p_st, p_dst2);
                     else
-                        fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, cs, p_dst2);
-                    rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), cs, p_dst2);
+                        fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), (int) per, p_st, p_dst2);
+                    rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(l), p_st, p_dst2);
+                }
+                if (pcie_overlap) {
+                    cudaEventRecord(ev_pcie_join_, pcie_cs_);
+                    cudaStreamWaitEvent(cs, ev_pcie_join_, 0);
                 }
                 stamp(l, 21, grp);
                 // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
-                // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-                grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
+                // pcie_frac 0), so its launch strides over pcie_group_rows_cap() block rows, not cap of them
+                grouped(p_ptr2, p_start2, p_counts + 2, pcie_group_rows_cap(), hit_out, false);
                 stamp(l, 22, grp);
             }
-            if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
+            if (reduce_miss_win) {
+                stamp(l, 23, grp);
+            } else if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
                 copy_or_zero_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (long long) n * K * N,
                                          skip_ + grp, ring, cs);
@@ -2893,14 +2976,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 else
                     copy_from_mapped(parts_out, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K * N, cs);
             }
-            if (!hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
+            if (!reduce_miss_win && !hits_in_combine) moe_hit_add(parts_out, hit_out, p_dst, p_counts + 1, cap, N, cs);
         }
         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
             cudaStreamWaitEvent(cs, ev_join_, 0);
         }
-        if (hits_in_combine) {
+        if (reduce_miss_win) {
+            try {
+                native_moe_combine_multi_hits_mapped(hit_out, m_ymiss_ + (size_t) tb * N, m_flag_, ring, p_dst,
+                                                     p_counts + 1, w_ + tb * K, shared_ + tb * N,
+                                                     sg_gated_[grp] ? (sh_g_ + tb) : nullptr, bo_ + tb * N, N, K, n, cs);
+            } catch (const std::exception& e) { err = "verify combine: " + std::string(e.what()); return false; }
+        } else if (hits_in_combine) {
             try {
                 native_moe_combine_multi_hits_added(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, w_ + tb * K,
                                                     shared_ + tb * N, sg_gated_[grp] ? (sh_g_ + tb) : nullptr,
@@ -3978,10 +4067,15 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
+        const bool red_miss = can_cpu_reduce_miss(n, true);
+        sink_.w_host = red_miss ? (h_w_ + (size_t) tb * ss.k) : nullptr;
+        sink_.reduce_miss = red_miss;
         if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
-                 h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+                 red_miss ? (h_ymiss_ + (size_t) tb * g.n_embd) : (h_ymiss_ + (size_t) tb * ss.k * g.n_embd), l);
+        sink_.reduce_miss = false;
+        sink_.w_host = nullptr;
         if (remote_opt_) remote_opt_->end();
         VDBG("layer %lld served\n", (long long) l);
         if (g_trace) trace_ev(*(volatile uint32_t*) h_flagA_ == want ? "SERVED" : "SERVED-NO-PLAN-YET", k, l,
@@ -4222,8 +4316,9 @@ void Verifier::set_plan_slot(int grp) {
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
     sink_.dst2 = (unsigned long long*) (base + dst2_off_);
-    const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
-    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+    const int G = last_batch_ ? last_batch_g_ : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
+    const int64_t scap = staging_blobs_cap();
+    const int64_t per = G == 2 ? scap / 2 : scap;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
 }
@@ -5281,6 +5376,12 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     for (int t = 0; t < S; ++t) last_rows_[t] = rows[t];
     row_base_ = hbase;   // the graphs' key (and nothing else) reads it until the next stage_batch
     last_batch_ = true;
+    {
+        auto it = batch_split_map_.find(key);
+        const int bsplit = (it != batch_split_map_.end() && !ar_on() && !staging_deferred_) ? it->second : 0;
+        last_batch_split_ = bsplit;
+        last_batch_g_ = bsplit > 0 ? 2 : 1;
+    }
     for (int t = 0; t < S; ++t) { last_tokens_[t] = tokens[t]; last_pos_b_[t] = pos[t]; }
     ms_host += ms_since(t0);
     return true;
@@ -5331,7 +5432,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
-    const int64_t steps = le_ - lb_;
+    const int G = last_batch_g_;
+    const int split_pt = (G == 2 && last_batch_split_ > 0) ? last_batch_split_ : S;
+    const int gtb[2] = {0, split_pt}, gte[2] = {G == 2 ? split_pt : S, S};
+    const int64_t steps = (le_ - lb_) * G;
     // #646: a stage whose every expert is resident plans on the device and raises no host doorbells, so the
     // per-layer spin below has nothing to wait for: without the PLE flag the graph finishes with the ring silent
     // ("verify batch: layer K never rang (graph finished)" - K is that stage's first layer), and with it the graph
@@ -5372,7 +5476,9 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         return true;
     }
     for (int64_t k = 0; k < steps; ++k) {
-        const int64_t l = lb_ + k;
+        const int64_t l = lb_ + k / G;
+        const int grp = (int) (k % G);
+        const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         const uint32_t want = (uint32_t) (k + 1);
         const Clock::time_point a = Clock::now();
         auto last_flush = a;
@@ -5402,12 +5508,19 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             (size_t) l < adapt_gate_->has.size() && adapt_gate_->has[(size_t) l] != 0 &&
             !adapt_gate_wait((int32_t) l, err)) return false;
         cur_layer_ = want - 1;
-        set_plan_slot(0);
+        set_plan_slot(grp);
         progress_at("verify batch: the CPU experts of layer", l);
         // The recorded graph consumes the helper mask and weighted sum just as
         // the solo graph does. Reset both and supply this layer's routing weights.
-        if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        const bool red_miss = can_cpu_reduce_miss(n, true);
+        sink_.w_host = red_miss ? (h_w_ + (size_t) tb * ss_->k) : nullptr;
+        sink_.reduce_miss = red_miss;
+        if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss_->k, tb, n);
+        if (pool != nullptr)
+            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss_->k, n, ss_->k,
+                 red_miss ? (h_ymiss_ + (size_t) tb * g.n_embd) : (h_ymiss_ + (size_t) tb * ss_->k * g.n_embd), l);
+        sink_.reduce_miss = false;
+        sink_.w_host = nullptr;
         if (remote_opt_) remote_opt_->end();
         progress_tick();
         if (k == 0 && ple_pending_b_) {
@@ -5418,6 +5531,13 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         }
         std::atomic_thread_fence(std::memory_order_seq_cst);
         strata_store_fence();
+        if (h_bal_ != nullptr) {
+            const size_t bi = (size_t) ((k / G) * 2 + grp);
+            bal_ok_[bi] = *(volatile uint32_t*) h_flagA_ == want;
+            bal_nc_[bi] = bal_ok_[bi] ? sink_.cpu_jobs : 0;
+            bal_np_[bi] = bal_ok_[bi] ? sink_.counts[2] : 0;
+            sink_.cpu_jobs = 0;
+        }
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
             sink_.counts[0] = 0;
             sink_.counts[1] = 0;
@@ -5429,9 +5549,10 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             raise_flag_b_ordered(want);   // behind any copy still queued from an earlier layer
         }
         *flag = want;
+        if (h_bal_ != nullptr) bal_p_[(size_t) ((k / G) * 2 + grp)] = ms_since(b);
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
-        if (taps_ready_cb_ != nullptr && !tap_layers_.empty() && l == (int64_t) tap_layers_.back() + 1) {
+        if (grp == G - 1 && taps_ready_cb_ != nullptr && !tap_layers_.empty() && l == (int64_t) tap_layers_.back() + 1) {
             // Let the verifier expose the finalized taps directly to the drafter on the same device
             // after releasing the current layer's doorbell so the CPU pool and GPU combine are not delayed.
             taps_ready_cb_(taps_ready_user_, tap_dev_, S, pos);
@@ -5445,6 +5566,7 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         cudaStreamSynchronize(copy_);
         copy_used_ = false;
     }
+    if (h_bal_ != nullptr && !all_resident_ && !bal_paused_) pcie_balance_window(steps, G);
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -5672,8 +5794,13 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
         set_plan_slot(0);
+        const bool red_miss = can_cpu_reduce_miss(S, true);
+        sink_.w_host = red_miss ? h_w_ : nullptr;
+        sink_.reduce_miss = red_miss;
         if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + k);
+        sink_.reduce_miss = false;
+        sink_.w_host = nullptr;
         if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
