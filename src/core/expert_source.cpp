@@ -5319,6 +5319,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const char* v = std::getenv("STRATA_MOE_BUCKET_PLAN");
             return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
         }();
+        // Opt-in wide MoE bucket control:
+        // - STRATA_MOE_BUCKET_NOSPLIT=1: keep an expert's entire window group together instead of splitting every 4 rows.
+        // - STRATA_MOE_BUCKET_CHUNK=N: override the default 4-row chunk size in [4, kMaxWindowEntries].
+        static const bool bucket_nosplit = [] {
+            const char* v = std::getenv("STRATA_MOE_BUCKET_NOSPLIT");
+            return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+        }();
+        static const int bucket_chunk_cfg = [] {
+            if (bucket_nosplit) return (int) kMaxWindowEntries;
+            const char* v = std::getenv("STRATA_MOE_BUCKET_CHUNK");
+            if (v == nullptr || v[0] == '\0') return 4;
+            return std::clamp(std::atoi(v), 4, (int) kMaxWindowEntries);
+        }();
         if (pcie_min1 && pcie_ok && m < 1 && nmiss >= 2) m = 1;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
@@ -5387,14 +5400,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (kd == -1 && e >= 0 && e < d.n_expert) cpu_i0[n_cpu_exp++] = (int16_t) i0;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             if (bucket_plan) {
-                // Split multi-token VRAM groups into chunks of at most 4 entries (ED_NC / GRP_NC / LDS_NT) so each
-                // chunk occupies its own blockIdx.y row in the launch grid instead of looping serially inside one row.
+                // Split multi-token VRAM groups into chunks of at most bucket_chunk_cfg (default 4: ED_NC / GRP_NC / LDS_NT;
+                // STRATA_MOE_BUCKET_NOSPLIT=1 or STRATA_MOE_BUCKET_CHUNK=N keeps wider groups in one row) so each chunk
+                // occupies its own blockIdx.y row in the launch grid instead of looping serially inside one row.
                 for (int16_t cur = (int16_t) i0; cur >= 0;) {
                     vram_ptr[vram_n] = ptr;
                     vram_i0[vram_n] = cur;
                     int c = 0;
                     int16_t prev = cur;
-                    while (cur >= 0 && c < 4) {
+                    while (cur >= 0 && c < bucket_chunk_cfg) {
                         prev = cur;
                         cur = next_same[cur];
                         ++c;
@@ -5409,9 +5423,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 ++vram_n;
             }
         }
-        // STRATA_MOE_BUCKET_PLAN=1 (default): emit multi-token resident chunks (4, 3, 2 entries) before single-token
-        // groups so the GPU's first wave schedules the widest expert chunks first while single-token groups backfill tail CUs.
-        // Each chunk writes to its own disjoint ent_dst[e] rows in ascending token order, so outputs are bitwise identical.
+        // STRATA_MOE_BUCKET_PLAN=1 (default): emit multi-token resident chunks (4..1, or max_bucket..1 when wide bucketing
+        // is enabled) before single-token groups so the GPU's first wave schedules the widest expert chunks first.
         auto emit_vram_group = [&](int idx) {
             const int16_t i0 = vram_i0[idx];
             P.ptr[groups] = vram_ptr[idx];
@@ -5424,7 +5437,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             ++groups;
         };
         if (bucket_plan && vram_n > 1) {
-            for (int me = 4; me >= 1; --me)
+            int max_bucket = 4;
+            if (bucket_chunk_cfg > 4) {
+                for (int idx = 0; idx < vram_n; ++idx) {
+                    const int c = (int) cnt_same[vram_i0[idx]];
+                    if (c > max_bucket) max_bucket = c;
+                }
+            }
+            for (int me = max_bucket; me >= 1; --me)
                 for (int idx = 0; idx < vram_n; ++idx)
                     if (cnt_same[vram_i0[idx]] == me) emit_vram_group(idx);
         } else {
