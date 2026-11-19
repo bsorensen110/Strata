@@ -311,6 +311,11 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  add_executable(accept_hist_test src/spec/accept_hist_test.cpp)
+  target_include_directories(accept_hist_test PRIVATE include)
+  target_compile_features(accept_hist_test PRIVATE cxx_std_17)
+  add_test(NAME accept_hist_test COMMAND accept_hist_test)
+
   add_executable(batch_telemetry_test src/core/batch_telemetry_test.cpp)
   target_include_directories(batch_telemetry_test PRIVATE include)
   add_test(NAME batch_telemetry_test COMMAND batch_telemetry_test)

@@ -177,6 +177,9 @@ public:
     /// own stream) can launch first and finish after, so their graphs run at the same time.
     bool draft_launch(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, std::string& err);
     bool draft_finish(int32_t* drafts, float* probs, std::string& err);
+    bool candidate_dump_enabled() const { return h_candidate_tok_ != nullptr; }
+    const int32_t* candidate_tokens() const { return h_candidate_tok_; }
+    const float* candidate_scores() const { return h_candidate_score_; }
 
     /// Co-drafts `n_items` active slot drafters (1 .. kBatchMaxSlots) in two halves (launch + finish): each slot's
     /// context update and 5-layer transformer body run on its own captured body graph (`body_exec_[n_new]`) on its
@@ -323,6 +326,8 @@ private:
     int32_t* h_meta_ = nullptr;     ///< host staging of d_meta_ (mapped; m_meta_ is its device alias)
     int32_t* m_meta_ = nullptr;
     int32_t* h_out_ = nullptr;      ///< pinned: 7 draft tokens then 7 probabilities
+    int32_t* h_candidate_tok_ = nullptr;  ///< optional pinned [7][16] selector candidates for acceptance telemetry
+    float* h_candidate_score_ = nullptr; ///< optional pinned [7][16] candidate head scores
     float* hp_out_ = nullptr;
     float *kring_[8] = {}, *vring_[8] = {};
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;   ///< rope tables of the context rows and of the block rows: one allocation, rt_blk_ = rt_ctx_ + 8 * 128
