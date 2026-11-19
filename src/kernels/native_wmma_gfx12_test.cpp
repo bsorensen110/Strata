@@ -146,6 +146,81 @@ bool test_tiled_type(int type, const char* name, int n_in, int n_out, cudaStream
     return ok;
 }
 
+bool test_q8_0_segs(int n_in, cudaStream_t s) {
+    const int n_out0 = 128, n_out1 = 192;
+    const size_t rb = k::native_mmvq_weight_bytes(8, n_in, 1);
+    const size_t bs = k::native_mmvq_weight_bytes(8, 32, 1);
+    std::mt19937 rng(777 + n_in);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::uniform_int_distribution<int> byte(0, 255), ex(2, 8), man(0, 1023), sgn(0, 3);
+    auto make_w = [&](int n_out) {
+        std::vector<uint8_t> w((size_t) n_out * rb);
+        for (auto& b : w) b = uint8_t(byte(rng));
+        for (size_t o = 0; o < w.size(); o += bs) {
+            const uint16_t h = uint16_t((sgn(rng) == 0 ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));
+            std::memcpy(&w[o], &h, 2);
+        }
+        return w;
+    };
+    const std::vector<uint8_t> w0 = make_w(n_out0), w1 = make_w(n_out1);
+    const int max_c = 16;
+    std::vector<float> x((size_t) max_c * n_in);
+    for (auto& v : x) v = nd(rng);
+
+    uint8_t* dw0 = dalloc<uint8_t>(w0.size());
+    uint8_t* dw1 = dalloc<uint8_t>(w1.size());
+    float* dx = dalloc<float>(x.size());
+    uint8_t* dxq = dalloc<uint8_t>(k::native_q8_1_bytes(n_in, max_c));
+    float* dy0 = dalloc<float>((size_t) max_c * n_out0);
+    float* dy1 = dalloc<float>((size_t) max_c * n_out1);
+    float* r0 = dalloc<float>((size_t) max_c * n_out0);
+    float* r1 = dalloc<float>((size_t) max_c * n_out1);
+    ck(cudaMemcpy(dw0, w0.data(), w0.size(), cudaMemcpyHostToDevice), "w0");
+    ck(cudaMemcpy(dw1, w1.data(), w1.size(), cudaMemcpyHostToDevice), "w1");
+    ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "xs");
+    k::native_quantize_q8_1(dx, dxq, n_in, max_c, s);
+    ck(cudaStreamSynchronize(s), "q8_1_segs");
+
+    bool ok = true;
+    for (int nc : {9, 16}) {
+        const k::NativeMmvqSeg segs_wmma[2] = {{dw0, dy0, n_out0}, {dw1, dy1, n_out1}};
+        const k::NativeMmvqSeg segs_ref[2] = {{dw0, r0, n_out0}, {dw1, r1, n_out1}};
+        const bool launched = k::native_wmma_dense_q8_0_segs(segs_wmma, 2, dxq, n_in, nc, s);
+        if (launched != k::native_wmma_gfx12_available()) {
+            std::fprintf(stderr, "unexpected wmma segs launch status %d vs available %d\n",
+                         (int) launched, (int) k::native_wmma_gfx12_available());
+            ok = false;
+        }
+        if (launched) {
+            if (!k::native_mmvq_multi_segs(8, segs_ref, 2, dxq, nullptr, n_in, nc, s, false)) {
+                std::fprintf(stderr, "native_mmvq_multi_segs ref failed at nc=%d\n", nc);
+                ok = false;
+            }
+            ck(cudaStreamSynchronize(s), "wmma_segs");
+            auto check_seg = [&](const float* dg, const float* dr, int n_out) {
+                std::vector<float> hg((size_t) nc * n_out), hr((size_t) nc * n_out);
+                ck(cudaMemcpy(hg.data(), dg, hg.size() * 4, cudaMemcpyDeviceToHost), "hg");
+                ck(cudaMemcpy(hr.data(), dr, hr.size() * 4, cudaMemcpyDeviceToHost), "hr");
+                double num = 0.0, den = 0.0;
+                for (size_t i = 0; i < hg.size(); ++i) {
+                    if (!std::isfinite(hg[i]) || !std::isfinite(hr[i])) ok = false;
+                    num += std::fabs((double) hg[i] - (double) hr[i]);
+                    den += std::fabs((double) hr[i]);
+                }
+                const double rel = num / (den + 1e-30);
+                if (!(rel < 1e-4)) ok = false;
+                std::printf("  Q8_0 seg(%d) x %d nc=%2d wmma vs mmvq_segs rel=%.2e\n", n_out, n_in, nc, rel);
+            };
+            check_seg(dy0, r0, n_out0);
+            check_seg(dy1, r1, n_out1);
+        }
+    }
+
+    cudaFree(dw0); cudaFree(dw1); cudaFree(dx); cudaFree(dxq);
+    cudaFree(dy0); cudaFree(dy1); cudaFree(r0); cudaFree(r1);
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -158,6 +233,7 @@ int main() {
     bool ok = true;
     ok = test_tiled_type(8, "Q8_0", 512, 133, s) && ok;
     ok = test_tiled_type(14, "Q6_K", 512, 133, s) && ok;
+    ok = test_q8_0_segs(512, s) && ok;
 
     cudaStreamDestroy(s);
     std::printf("native_wmma_gfx12_test: %s\n", ok ? "ok" : "FAILED");
