@@ -1,5 +1,6 @@
 // src/core/dflash2.cpp - see include/strata/core/dflash2.hpp.
 #include "strata/core/dflash2.hpp"
+#include "strata/spec/df2_sample_walk.hpp"
 
 #include "strata/core/batch_admit_merge.hpp"
 #include "strata/core/native_head.hpp"
@@ -14,7 +15,7 @@
 #include "strata/platform/cpu_relax.hpp"
 
 #include <algorithm>
-#include <cstdlib>
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -67,7 +68,11 @@ bool df2_precomp_graph_on() {
 
 // STRATA_DF2_SELECT_TABLE=0: the selector walks with its one-block steps (the walk's scores computed in one parallel launch first is the default: bitwise the same drafts)
 bool df2_select_table() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_DF2_SELECT_TABLE"); return !(e && e[0] == '0'); }();
+    static const bool on = [] {
+        if (strata::spec::df2_sample_walk_env()) return true;
+        const char* e = std::getenv("STRATA_DF2_SELECT_TABLE");
+        return !(e && e[0] == '0');
+    }();
     return on;
 }
 
@@ -1838,8 +1843,11 @@ bool Dflash2Drafter::context_wait(std::string& err) {
     return true;
 }
 
-bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err) {
-    return draft_launch(taps, n_new, pos0, anchor, err) && draft_finish(drafts, probs, err);
+bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs,
+                           std::string& err, bool sample_walk, uint64_t sample_seed, uint64_t sample_position,
+                           int32_t* q_tokens, float* q_probs) {
+    return draft_launch(taps, n_new, pos0, anchor, err) &&
+           draft_finish(drafts, probs, err, sample_walk, sample_seed, sample_position, q_tokens, q_probs);
 }
 
 bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, int32_t anchor, std::string& err) {
@@ -1888,8 +1896,14 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     return true;
 }
 
-bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& err) {
+bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& err, bool sample_walk,
+                                  uint64_t sample_seed, uint64_t sample_position,
+                                  int32_t* q_tokens, float* q_probs) {
     if (!launched_) { err = "dflash2: draft_finish without draft_launch"; return false; }
+    if (sample_walk && (drafts == nullptr || probs == nullptr || q_tokens == nullptr || q_probs == nullptr)) {
+        err = "dflash2: sampled selector walk needs draft, probability, and q outputs";
+        return false;
+    }
     launched_ = false;
     const OnDevice on_device(device_);
     const int n_new = launch_n_;
@@ -1921,14 +1935,37 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
         }
         std::atomic_thread_fence(std::memory_order_acquire);
     }
-    if (candidate_dump || !solopipe || timing_ || prof_ || ((volatile int32_t*) h_out_)[std::max(0, ndraft_ - 1)] < 0) {
+    if (candidate_dump || sample_walk || !solopipe || timing_ || prof_ || ((volatile int32_t*) h_out_)[std::max(0, ndraft_ - 1)] < 0) {
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     }
     log_flush();
+    std::array<int32_t, kDrafts> sampled_drafts{};
+    std::array<float, kDrafts> sampled_selected_q{};
+    if (sample_walk) {
+        std::array<int32_t, kDrafts * strata::spec::kDf2SelectorTopK> sampled_tokens;
+        std::array<float, kDrafts * strata::spec::kDf2SelectorTopK * strata::spec::kDf2SelectorTopK> sampled_scores;
+        const size_t token_bytes = (size_t) ndraft_ * strata::spec::kDf2SelectorTopK * sizeof(int32_t);
+        const size_t score_bytes = (size_t) ndraft_ * strata::spec::kDf2SelectorTopK * strata::spec::kDf2SelectorTopK * sizeof(float);
+        if (cudaMemcpy(sampled_tokens.data(), toptok_, token_bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(sampled_scores.data(), seltab_, score_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = std::string("dflash2: sampled selector table copy: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        std::array<int32_t, kDrafts * strata::spec::kDf2SelectorTopK> row_tokens{};
+        std::array<float, kDrafts * strata::spec::kDf2SelectorTopK> row_probs{};
+        if (!strata::spec::df2_sample_selector_walk(ndraft_, sampled_tokens.data(), sampled_scores.data(),
+                                                    sample_seed, sample_position, sampled_drafts.data(),
+                                                    sampled_selected_q.data(), row_tokens.data(), row_probs.data())) {
+            err = "dflash2: sampled selector walk encountered an invalid conditional row";
+            return false;
+        }
+        std::copy(row_tokens.begin(), row_tokens.end(), q_tokens);
+        std::copy(row_probs.begin(), row_probs.end(), q_probs);
+    }
     for (int i = 0; i < kDrafts; ++i) {
         const bool made = i < ndraft_;
-        drafts[i] = made ? ((volatile int32_t*) h_out_)[i] : 0;
-        if (probs) probs[i] = made ? ((volatile float*) h_out_)[16 + i] : 0.0f;
+        drafts[i] = !made ? 0 : sample_walk ? sampled_drafts[(size_t) i] : ((volatile int32_t*) h_out_)[i];
+        if (probs) probs[i] = !made ? 0.0f : sample_walk ? sampled_selected_q[(size_t) i] : ((volatile float*) h_out_)[16 + i];
     }
     if (timing_) {
         float ms = 0;

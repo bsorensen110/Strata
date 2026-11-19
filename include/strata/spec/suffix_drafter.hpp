@@ -23,6 +23,8 @@ public:
     explicit SuffixDrafter(int min_match = 3, int max_match = 32, size_t capacity_tokens = 1u << 19);
 
     void reset();
+    /// Add a request-local bigram index for the opt-in DF2 suffix filler (minimum match length 2).
+    void enable_short_matches();
     /// Add tokens to the history (the prompt, then every accepted token).
     void append(const int32_t* tokens, size_t n);
     void append(int32_t token) { append(&token, 1); }
@@ -34,6 +36,8 @@ public:
     /// tokens), so the lookup continues where those drafts end. The history itself is unchanged; the extra tokens are
     /// only part of the suffix being matched and may be read back as part of a periodic continuation.
     int propose_after(const int32_t* extra, int n_extra, int max_k, int32_t* out);
+    /// Like propose_after(), with a per-call minimum match length.
+    int propose_after(const int32_t* extra, int n_extra, int max_k, int min_match, int32_t* out);
 
     /// Length of the match behind the last proposal (0 if none).
     int last_match() const { return last_match_; }
@@ -47,12 +51,17 @@ private:
         uint8_t n = 0;
     };
     Slot* find_slot(uint64_t key, bool insert);
+    Slot* find_short_slot(uint64_t key, bool insert);
     uint64_t key_at(size_t end) const;
+    uint64_t short_key_at(size_t end) const;
+    int propose(int max_k, int min_match, int32_t* out);
 
     int min_match_, max_match_;
     std::vector<int32_t> hist_;
     std::vector<Slot> table_;
     size_t mask_ = 0;
+    std::vector<Slot> short_table_;
+    size_t short_mask_ = 0;
     int last_match_ = 0;
 };
 

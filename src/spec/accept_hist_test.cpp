@@ -19,7 +19,11 @@ int main() {
         return 1;
     strata::spec::Df2AcceptHist suffix;
     suffix.observe(0, 2, 0, 0, 1);
-    if (suffix.lookup_rows != 2 || suffix.lookup_accept != 1) return 6;
+    suffix.observe(3, 2, 1, 5, 4);  // DF2 prefix and one suffix row accepted
+    suffix.observe(3, 2, 1, 5, 6);  // DF2, suffix, and chained lookup all accepted
+    if (suffix.lookup_rows != 6 || suffix.lookup_accept != 4 ||
+        suffix.chain_rows != 2 || suffix.chain_accept != 1)
+        return 6;
 
     FILE* f = std::tmpfile();
     if (f == nullptr) return 2;

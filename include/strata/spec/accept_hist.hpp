@@ -37,7 +37,7 @@ struct Df2AcceptHist {
             }
         }
         lookup_rows += lrows;
-        lookup_accept += std::clamp(a, 0, lrows);
+        lookup_accept += std::clamp(a - drows, 0, lrows);
         chain_rows += crows;
         chain_accept += std::clamp(a - cstart, 0, crows);
     }
