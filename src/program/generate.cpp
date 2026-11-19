@@ -5372,7 +5372,11 @@ int main(int argc, char** argv) {
     // 16 workers: 12.2 either way.  One GPU, no batch slots, no --pcie-frac.
     auto pcie_balance = [&]() {
         const char* e = std::getenv("STRATA_PCIE_BALANCE");
-        return !pcie_given && native_pack && !multi_gpu && o.batch <= 0 && e != nullptr && std::strcmp(e, "1") == 0;
+        static const bool batch_bal = [] {
+            const char* b = std::getenv("STRATA_BATCH_PCIE_BALANCE");
+            return b != nullptr && std::atoi(b) != 0;
+        }();
+        return !pcie_given && native_pack && !multi_gpu && (o.batch <= 0 || batch_bal) && e != nullptr && std::strcmp(e, "1") == 0;
     };
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) {
@@ -14669,8 +14673,12 @@ int main(int argc, char** argv) {
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
+        static const bool batch_pcie_auto = [] {
+            const char* v = std::getenv("STRATA_BATCH_PCIE_AUTO");
+            return v != nullptr && std::atoi(v) != 0;
+        }();
         PcieAuto pcie_auto;
-        if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
+        if (o.pcie_frac_auto && !all_experts_resident && (o.batch == 0 || batch_pcie_auto) && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
             double sum = 0.0;
             for (int64_t l = 0; l < g.n_layers; ++l) sum += (double) pl.blob_bytes(l);
@@ -16892,6 +16900,10 @@ int main(int argc, char** argv) {
                 return false;
             }
             if (aflipped) apply_pending(true);
+            if (pcie_auto.on && o.batch > 0 && batch_pcie_auto) {
+                double batch_req_pf = o.pcie_frac;
+                pcie_auto_step(batch_req_pf);
+            }
             const Clock::time_point w1 = Clock::now();
             // The adaptive VRAM tier, as the solo loop runs it: every --adapt-every windows, on a thread beside the commit and
             // the drafts.  Every stage's window has finished here (run_slot_rows synchronised each stage's stream), and

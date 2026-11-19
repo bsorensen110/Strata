@@ -358,7 +358,8 @@ __global__ void doorbell_publish_kernel(const float* __restrict__ x, const int32
 
 __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const int32_t* __restrict__ ids,
                                             const int32_t* __restrict__ d_res, int n_expert, int n, int k,
-                                            float* x_out, int32_t* ids_out, uint32_t* seq) {
+                                            float* x_out, int32_t* ids_out, uint32_t* seq,
+                                            const float* __restrict__ w, float* w_out) {
     __shared__ uint32_t tok_miss;
     if (threadIdx.x == 0) tok_miss = 0u;
     __syncthreads();
@@ -366,6 +367,7 @@ __global__ void doorbell_publish_res_kernel(const float* __restrict__ x, const i
     if ((int) threadIdx.x < k) {
         const int32_t id = ids[threadIdx.x];
         ids_out[threadIdx.x] = id;
+        if (w != nullptr && w_out != nullptr) w_out[threadIdx.x] = w[threadIdx.x];
         if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0)
             atomicOr(&tok_miss, per_tok ? (1u << ((int) threadIdx.x / 10)) : 0xFFFFFFFFu);
     }
@@ -448,10 +450,11 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
 }
 
 void doorbell_publish_res(const float* x, const int32_t* ids, const int32_t* d_res, int n_expert, int64_t n, int64_t k,
-                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream) {
+                          float* x_out, int32_t* ids_out, uint32_t* d_seq, void* stream,
+                          const float* w, float* w_out) {
     if (k > 1024) { std::fprintf(stderr, "doorbell_publish_res: k too large\n"); std::exit(1); }
     doorbell_publish_res_kernel<<<1, 1024, 0, (cudaStream_t) stream>>>(x, ids, d_res, n_expert, (int) n, (int) k,
-                                                                        x_out, ids_out, d_seq);
+                                                                        x_out, ids_out, d_seq, w, w_out);
     check_launch("doorbell_publish_res");
 }
 

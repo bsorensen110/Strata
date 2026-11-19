@@ -1226,6 +1226,16 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(native_multi_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(native_multi_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME native_multi_parity COMMAND native_multi_parity)
+
+  add_executable(cpu_reduce_miss_parity src/kernels/cpu_reduce_miss_parity.cpp)
+  target_include_directories(cpu_reduce_miss_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(cpu_reduce_miss_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME cpu_reduce_miss_parity COMMAND cpu_reduce_miss_parity)
+
+  add_executable(pcie_overlap_graph_test src/kernels/pcie_overlap_graph_test.cpp)
+  target_include_directories(pcie_overlap_graph_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(pcie_overlap_graph_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME pcie_overlap_graph_test COMMAND pcie_overlap_graph_test)
   # #783 PR-d: the batched K/V append (INT8, Q4_0, the hybrid fold) against the per-cell appends, memcmp
   add_executable(kv_steps_parity src/kernels/kv_steps_parity.cpp)
   target_include_directories(kv_steps_parity PRIVATE ${_strata_gpu_include_directories})

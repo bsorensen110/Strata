@@ -26,6 +26,12 @@ void native_moe_combine_multi_hits_added(const float* parts, const float* hits, 
 void native_moe_combine_multi_hits_added(const float* parts, const float* hits, const int32_t* dst, const int32_t* count,
                                          const float* weights, const float* shared, const float* shared_gate, float* output,
                                          int64_t n_embd, int64_t k, int n_tok, void* stream);
+/// Combines GPU hit rows directly with a host-reduced [n_tok, n_embd] CPU miss sum in mapped host memory
+/// (STRATA_CPU_REDUCE_MISS=1), spinning on *wait_flag >= wait_val only for tokens with at least one CPU miss.
+void native_moe_combine_multi_hits_mapped(const float* hits, const float* mapped_miss, const uint32_t* wait_flag,
+                                          uint32_t wait_val, const int32_t* dst, const int32_t* count,
+                                          const float* weights, const float* shared, const float* shared_gate,
+                                          float* output, int64_t n_embd, int64_t k, int n_tok, void* stream);
 void native_moe_combine_multi(const float* parts, const float* weights, const float* shared, float* output,
                               int64_t n_embd, int64_t k, int n_tok, void* stream);
 /// STRATA_VERIFY_RESIDENT: the same, reading every part as `0.0f + hit[i]` - bitwise what a zeroed part row plus

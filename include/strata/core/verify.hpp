@@ -480,8 +480,11 @@ private:
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
     int row_base_ = 0;                     ///< ... its hand-off rows start here (a pipeline group's own rows)
     int brow_[strata::kernels::kWindowMaxT] = {};                     ///< ... and row t is slot brow_[t]
-    bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
+    bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot)
+    int last_batch_g_ = 1;
+    int last_batch_split_ = 0;
     std::map<std::vector<int>, cudaGraphExec_t> exec_bm_, commit_bm_;   ///< full row layout avoids slot-ID collisions
+    std::map<std::vector<int>, int> batch_split_map_;   ///< split point (>0 => G=2) captured per batch graph key
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph (0.1.39); N: LRU-evict beyond N layouts
@@ -746,6 +749,8 @@ private:
     cudaEvent_t commit_done_ = nullptr;   // recorded after an async commit (set_commit_async); see wait_commit
     bool commit_pending_ = false;
     cudaStream_t copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
+    cudaStream_t pcie_cs_ = nullptr;                              // STRATA_PCIE_FETCH_OVERLAP: parallel PCIe staging stream
+    cudaEvent_t ev_pcie_fork_ = nullptr, ev_pcie_join_ = nullptr;
     using FlagSet = strata::core::FlagRaise;
     FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
@@ -786,6 +791,9 @@ private:
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
     static constexpr int64_t kStagingBlobs = 16;
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
+    static int64_t staging_blobs_cap() noexcept;
+    static int64_t pcie_group_rows_cap() noexcept;
+    bool can_cpu_reduce_miss(int n, bool dec_batch) const noexcept;
     uint8_t* hit_xq_ = nullptr;
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
     float* nat_xr_ = nullptr;     // APR: the Hadamard-rotated expert input (the shared expert and the CPU keep xm); nullptr
