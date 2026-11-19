@@ -2,6 +2,7 @@
 // and compares tiled Q8_0 / Q6_K CPU WMMA oracle against GPU native_mmvq for ncols = 9..16.
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_wmma_gfx12.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <cuda_runtime.h>
 
@@ -85,7 +86,7 @@ bool test_tiled_type(int type, const char* name, int n_in, int n_out, cudaStream
         std::memcpy(&w[o + (type == 14 ? 208 : 0)], &h, 2);
     }
 
-    const int max_c = 16;
+    const int max_c = k::kWindowMaxT;
     std::vector<float> x((size_t) max_c * n_in);
     for (auto& v : x) v = nd(rng);
 
@@ -102,7 +103,8 @@ bool test_tiled_type(int type, const char* name, int n_in, int n_out, cudaStream
     ck(cudaMemcpy(xq.data(), dxq, xq_bytes, cudaMemcpyDeviceToHost), "xq");
 
     bool ok = true;
-    for (int nc : {9, 12, 16}) {
+    for (int nc : {4, 8, 9, 12, 16}) {
+        if (nc > k::kWindowMaxT) continue;
         k::native_mmvq(type, dw, dxq, dy, n_in, n_out, nc, s);
         ck(cudaStreamSynchronize(s), "mmvq");
         std::vector<float> y_gpu((size_t) nc * n_out), y_wmma((size_t) nc * n_out);
@@ -163,7 +165,7 @@ bool test_q8_0_segs(int n_in, cudaStream_t s) {
         return w;
     };
     const std::vector<uint8_t> w0 = make_w(n_out0), w1 = make_w(n_out1);
-    const int max_c = 16;
+    const int max_c = k::kWindowMaxT;
     std::vector<float> x((size_t) max_c * n_in);
     for (auto& v : x) v = nd(rng);
 
@@ -182,7 +184,8 @@ bool test_q8_0_segs(int n_in, cudaStream_t s) {
     ck(cudaStreamSynchronize(s), "q8_1_segs");
 
     bool ok = true;
-    for (int nc : {9, 16}) {
+    for (int nc : {4, 8, 9, 16}) {
+        if (nc > k::kWindowMaxT) continue;
         const k::NativeMmvqSeg segs_wmma[2] = {{dw0, dy0, n_out0}, {dw1, dy1, n_out1}};
         const k::NativeMmvqSeg segs_ref[2] = {{dw0, r0, n_out0}, {dw1, r1, n_out1}};
         const bool launched = k::native_wmma_dense_q8_0_segs(segs_wmma, 2, dxq, n_in, nc, s);
