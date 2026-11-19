@@ -1,5 +1,6 @@
 // src/core/expert_source.cpp - the adapter.  See the header for the three clauses of the contract.
 #include "strata/core/expert_source.hpp"
+#include "strata/core/tail_skip_policy.hpp"
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -5169,6 +5170,25 @@ int tail_skip_rank() {
 }
 void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
 
+namespace {
+int batch_tail_skip_rank() {
+    static const int r = [] {
+        const char* v = std::getenv("STRATA_BATCH_TAIL_SKIP");
+        const int x = v != nullptr ? std::atoi(v) : 0;
+        return x > 0 && x < 10 ? x : 0;
+    }();
+    return r;
+}
+int draft_tail_skip_rank() {
+    static const int r = [] {
+        const char* v = std::getenv("STRATA_DRAFT_TAIL_SKIP");
+        const int x = v != nullptr ? std::atoi(v) : 0;
+        return x > 0 && x < 10 ? x : 0;
+    }();
+    return r;
+}
+}  // namespace
+
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
@@ -5225,6 +5245,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         int64_t distinct[kMaxWindowEntries], first_of[kMaxWindowEntries];
         int16_t tail_same[kMaxWindowEntries], cnt_same[kMaxWindowEntries];
         int minr_i0[kMaxWindowEntries];
+        bool any_anchor_i0[kMaxWindowEntries];
         int nd = 0, nmiss = 0;
         bool bad_id = false, any_tail_skip = false;
         // a helper GPU (RemoteExperts) holding the expert computes it in its own VRAM once begin() claims the row: like
@@ -5259,10 +5280,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 }
             }
             const int rk = (int) (i % k);
+            const int tok_idx = (int) (i / k);
+            const bool is_anchor = (d.row_is_draft == nullptr) || (d.row_is_draft[tok_idx] == 0);
+            if (d.row_route_sig != nullptr && ei >= 0) d.row_route_sig[tok_idx] |= (1ull << (ei & 63));
             if (first_of[i] == i) {
                 tail_same[i] = (int16_t) i;
                 cnt_same[i] = 1;
                 minr_i0[i] = rk;
+                any_anchor_i0[i] = is_anchor;
                 distinct[nd++] = i;
                 const int32_t e = ei;
                 if (e >= 0 && e < d.n_expert && d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] < 0 &&
@@ -5273,19 +5298,26 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 tail_same[i0] = (int16_t) i;
                 ++cnt_same[i0];
                 if (rk < minr_i0[i0]) minr_i0[i0] = rk;
+                any_anchor_i0[i0] = any_anchor_i0[i0] || is_anchor;
             }
         }
         // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
         // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
         // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
+        // STRATA_BATCH_TAIL_SKIP / STRATA_DRAFT_TAIL_SKIP (opt-in, default 0): skip only when no anchor/committed row touches the expert.
         const int tail_rank = tail_skip_rank();
+        const int batch_tail_rank = batch_tail_skip_rank();
+        const int draft_tail_rank = draft_tail_skip_rank();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
+        if ((tail_rank > 0 || batch_tail_rank > 0 || draft_tail_rank > 0) && d.peer == nullptr && d.remote_count == 0) {
             for (int q = 0; q < nd; ++q) {
                 const int64_t i0 = distinct[q];
                 const int32_t e = lid[i0];
-                if (e < 0 || e >= d.n_expert || minr_i0[i0] < tail_rank) continue;
+                if (e < 0 || e >= d.n_expert) continue;
+                if (!strata::core::should_tail_skip_expert(minr_i0[i0], any_anchor_i0[i0],
+                                                           tail_rank, batch_tail_rank, draft_tail_rank))
+                    continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
                 skip_d[q] = true;
                 any_tail_skip = true;

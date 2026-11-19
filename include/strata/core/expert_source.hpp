@@ -628,6 +628,11 @@ struct ExpertDispatch {
     /// and the distinct experts behind them (neither copied nor computed)
     int64_t tail_skipped = 0;
     int64_t tail_experts = 0;
+    /// Per-row verify metadata for opt-in draft tail-skip isolation (6B) and route affinity (6C).
+    /// Null in the default path (zero behavior change).
+    const uint8_t* row_is_draft = nullptr;       ///< [n_tok]: 1 for speculative draft rows, 0 for committed/anchor rows
+    const uint8_t* row_rank_in_slot = nullptr;   ///< [n_tok]: in-slot row position (0 = anchor, 1.. = draft)
+    uint64_t* row_route_sig = nullptr;           ///< optional [n_tok] bitmask OR'd with routed expert ids for 6C affinity
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// 149-cold STRATA_COLD_OVERLAP: 0 off (the CPU starts once every blob of the layer is read), 1 the blobs that
     /// must be read are read in the background while the pool computes the ready experts, each landed one computed

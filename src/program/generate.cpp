@@ -34,6 +34,7 @@
 #include "strata/core/batch_telemetry.hpp"
 #include "strata/core/batch_admit_merge.hpp"
 #include "strata/core/batch_df2_budget.hpp"
+#include "strata/core/batch_route_affinity.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/program/adaptive_range.hpp"
 #include "strata/core/run_manifest.hpp"
@@ -16653,7 +16654,12 @@ int main(int argc, char** argv) {
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
             int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
+            uint8_t row_is_draft[strata::kernels::kVerifyMaxT] = {};
+            uint8_t row_rank_in_slot[strata::kernels::kVerifyMaxT] = {};
+            uint64_t row_route_sig[strata::kernels::kVerifyMaxT] = {};
             static size_t next_slot = 0;
+            static float df2_ema_acc = 0.5f;
+            static uint64_t slot_route_sig[64] = {};
             // Each MTP slot uses two rows; rotate slots when more than four are active.
             int A = 0;
             // (--batch-mtp: two rows a slot, at most kVerifyNarrowT; batch_df2 and plain windows hold up to ver.max_t() / kVerifyMaxT)
@@ -16663,9 +16669,30 @@ int main(int argc, char** argv) {
                            ? std::clamp(std::atoi(v), (int) strata::kernels::kVerifyNarrowT, (int) strata::kernels::kVerifyMaxT)
                            : (int) strata::kernels::kVerifyNarrowT;
             }();
-            const int win_cap = batch_df2 ? std::min(ver.max_t(), df2_win_max_t)
-                              : batch_mtp ? (int) strata::kernels::kVerifyNarrowT
-                                          : (int) strata::kernels::kVerifyMaxT;
+            static const bool df2_adaptive_t = [] {
+                const char* v = std::getenv("STRATA_BATCH_DF2_ADAPTIVE_T");
+                return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+            }();
+            static const int df2_target_rows = [] {
+                const char* v = std::getenv("STRATA_BATCH_DF2_TARGET_ROWS");
+                return v != nullptr && v[0] != '\0'
+                           ? std::clamp(std::atoi(v), 1, (int) strata::kernels::kVerifyMaxT)
+                           : (int) strata::kernels::kVerifyNarrowT;
+            }();
+            static const bool route_affinity_on = [] {
+                const char* v = std::getenv("STRATA_BATCH_ROUTE_AFFINITY");
+                return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+            }();
+            int act_ids[64] = {}, nact = 0;
+            for (size_t b = 0; b < bs.size() && nact < (int) (sizeof act_ids / sizeof act_ids[0]); ++b)
+                if (bs[b].active) act_ids[nact++] = (int) b;
+            const int base_win_cap = batch_df2 ? std::min(ver.max_t(), df2_win_max_t)
+                                   : batch_mtp ? (int) strata::kernels::kVerifyNarrowT
+                                               : (int) strata::kernels::kVerifyMaxT;
+            const int win_cap = (batch_df2 && df2_adaptive_t)
+                                    ? strata::core::compute_adaptive_df2_win_cap(nact, base_win_cap, df2_target_rows,
+                                                                                 df2_ema_acc, true)
+                                    : base_win_cap;
             int nrow[strata::kernels::kVerifyMaxT] = {};   // the rows slot a (the a-th active) holds: its token and its drafts
             // DFlash2 slots: the rows beyond one a slot are SPARE; they carry the slots' drafts, shared evenly in slot order (so the layout of a window
             // depends on which slots are active, not on the drafts: the captured batch graphs are reused).  More slots than rows: no drafts, the slots
@@ -16685,9 +16712,6 @@ int main(int argc, char** argv) {
                 return e && e[0] ? std::max(0, std::atoi(e)) : 0;
             }();
             if (batch_df2) {
-                int act_ids[64] = {}, nact = 0;
-                for (size_t b = 0; b < bs.size() && nact < (int) (sizeof act_ids / sizeof act_ids[0]); ++b)
-                    if (bs[b].active) act_ids[nact++] = (int) b;
                 const int spare = std::max(0, win_cap - nact);
                 int slot_room[64] = {};
                 for (int k = 0; k < nact && nact > 0; ++k) {
@@ -16755,9 +16779,17 @@ int main(int argc, char** argv) {
                     }
                 }
             }
+            std::vector<int> visit_order;
+            visit_order.reserve(bs.size());
             for (size_t offset = 0; offset < bs.size(); ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
-                if (!bs[(size_t) b].active) continue;
+                if (bs[(size_t) b].active) visit_order.push_back(b);
+            }
+            if (route_affinity_on && !visit_order.empty()) {
+                visit_order = strata::core::order_slots_by_route_affinity(visit_order, slot_route_sig, 64,
+                                                                          std::max(1, win_cap));
+            }
+            for (int b : visit_order) {
                 BSlot& q = bs[(size_t) b];
                 if (kvh.on && q.p + 64 > kvh.cells && !kvh_ensure(q.p + 64)) q.stop = true;
                 const int extra = q.stop ? 0 : (batch_df2 ? (b < (int) (sizeof df2_extra / sizeof df2_extra[0]) ? df2_extra[b] : 0) : batch_mtp ? 1 : 0);
@@ -16772,11 +16804,15 @@ int main(int argc, char** argv) {
                 rows[S] = b;
                 tok[S] = q.x;
                 pos[S] = q.p;
+                row_is_draft[S] = 0;
+                row_rank_in_slot[S] = 0;
                 ++S;
                 for (int j = 0; j < extra; ++j) {
                     rows[S] = b;
                     tok[S] = q.draft[(size_t) j];
                     pos[S] = q.p + 1 + j;
+                    row_is_draft[S] = 1;
+                    row_rank_in_slot[S] = (uint8_t) (1 + j);
                     ++S;
                 }
             }
@@ -16879,7 +16915,13 @@ int main(int argc, char** argv) {
                         c->run->th = std::thread([c] { c->run->ok = c->fn(); });
                 }, &adapt_early_ctx);
             }
+            drive.d.row_is_draft = row_is_draft;
+            drive.d.row_rank_in_slot = row_rank_in_slot;
+            drive.d.row_route_sig = route_affinity_on ? row_route_sig : nullptr;
             const bool ver_ok = ver.run_slot_rows(rows, S, tok, pos, win_pool_fn, win_pool_user, outb, err);
+            drive.d.row_is_draft = nullptr;
+            drive.d.row_rank_in_slot = nullptr;
+            drive.d.row_route_sig = nullptr;
             ver.set_post_layers(nullptr, nullptr);
             adapt_run.ver_done.store(true, std::memory_order_release);
 #if defined(STRATA_HAVE_DFLASH2)
@@ -16933,6 +16975,23 @@ int main(int argc, char** argv) {
             for (int a = 0; a < A; ++a) {
                 bt_rows += keep[active[a]];
                 bt_accepted += keep[active[a]] - 1;
+            }
+            if (batch_df2 && df2_adaptive_t) {
+                int win_prop = 0, win_acc = 0;
+                for (int a = 0; a < A; ++a) {
+                    win_prop += std::max(0, nrow[a] - 1);
+                    win_acc += std::max(0, keep[active[a]] - 1);
+                }
+                if (win_prop > 0) {
+                    const float rate = std::clamp((float) win_acc / (float) win_prop, 0.0f, 1.0f);
+                    df2_ema_acc = 0.8f * df2_ema_acc + 0.2f * rate;
+                }
+            }
+            if (route_affinity_on) {
+                for (int a = 0; a < A; ++a) {
+                    const int b = active[a];
+                    if (b >= 0 && b < 64 && row_route_sig[first[a]] != 0) slot_route_sig[b] = row_route_sig[first[a]];
+                }
             }
             struct Df2LaunchEntry {
                 int b = 0;
