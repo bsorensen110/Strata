@@ -210,19 +210,22 @@ int main() {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::setvbuf(stderr, nullptr, _IONBF, 0);
     std::printf("gdn_groups_split_parity\n");
-    gdn_groups_case({4, 5}, false, false);
-    gdn_groups_case({4, 5}, false, true);
-    gdn_groups_case({2, 3, 4, 5}, false, false);
-    gdn_groups_case({2, 3, 4, 5}, false, true);
+    gdn_groups_case({4, 4}, false, false);
+    gdn_groups_case({4, 4}, false, true);
+    gdn_groups_case({1, 2, 2, 3}, false, false);
+    gdn_groups_case({1, 2, 2, 3}, true, false);
+    if constexpr (k::kWindowMaxT > 8) {
+        gdn_groups_case({4, 5}, false, false);
+        gdn_groups_case({4, 5}, false, true);
+        gdn_groups_case({2, 3, 4, 5}, false, false);
+        gdn_groups_case({2, 3, 4, 5}, false, true);
+        gdn_groups_case({1, 2, 3, 4}, true, false);
+        for (int t = 9; t <= k::kWindowMaxT; ++t) ab_wide_case(t);
+    }
     if constexpr (k::kWindowMaxT >= 16) {
         gdn_groups_case({2, 2, 2, 2, 2, 2, 2, 2}, false, false);
         gdn_groups_case({2, 2, 2, 2, 2, 2, 2, 2}, false, true);
-    }
-    gdn_groups_case({1, 2, 3, 4}, true, false);
-    gdn_groups_case({2, 2, 2, 2, 2, 2, 2, 2}, true, false);
-
-    if constexpr (k::kWindowMaxT > 8) {
-        for (int t = 9; t <= k::kWindowMaxT; ++t) ab_wide_case(t);
+        gdn_groups_case({2, 2, 2, 2, 2, 2, 2, 2}, true, false);
     }
     std::printf("gdn_groups_split_parity: %s\n", bad ? "FAILED" : "ok");
     return bad ? 1 : 0;
