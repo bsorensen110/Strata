@@ -1246,17 +1246,20 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 if (in_gu && q2_native_kernels(nfmt->gu_type)) {
                     // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
                     thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
-                    float* gp[MAXT];
-                    float* up[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-                    const int nbk = (int) (nfmt->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt->up_off, nfmt->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
-                    for (int t = 0; t < mjobs_[e].nt; ++t)
-                        for (int r = r0; r < r1; ++r)
-                            sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+                    const int nt = mjobs_[e].nt;
+                    for (int t0 = 0; t0 < nt; t0 += MAXT) {
+                        const int m = (std::min)(MAXT, nt - t0);
+                        float* gp[MAXT];
+                        float* up[MAXT];
+                        for (int t = 0; t < m; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+                        const int nbk = (int) (nfmt->n_embd / 64);
+                        q2_rows_any(mjobs_[e].blob, nfmt->gu_row, nbk, mjobs_[e].act + t0, m, gp, r0, r1);
+                        q2_rows_any(mjobs_[e].blob + nfmt->up_off, nfmt->gu_row, nbk, mjobs_[e].act + t0, m, up, r0, r1);
+                        for (int t = 0; t < m; ++t)
+                            for (int r = r0; r < r1; ++r)
+                                sb.ff[t0 + t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+                    }
                     if (sb.gu_rows_done.fetch_add(r1 - r0, std::memory_order_acq_rel) + (r1 - r0) == (int) nfmt->n_ff) {
-                        const int nt = mjobs_[e].nt;
                         for (int t = 0; t < nt; ++t) {
                             uint8_t expected = 0;
                             if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
@@ -1267,14 +1270,17 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                         }
                     }
                 } else if (in_gu) {
-                    float* ff[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    if (narithmetic_ == NativeArithmetic::WindowInvariant)
-                        native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                    else
-                        native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+                    const int nt = mjobs_[e].nt;
+                    for (int t0 = 0; t0 < nt; t0 += MAXT) {
+                        const int m = (std::min)(MAXT, nt - t0);
+                        float* ff[MAXT];
+                        for (int t = 0; t < m; ++t) ff[t] = sb.ff[t0 + t];
+                        if (narithmetic_ == NativeArithmetic::WindowInvariant)
+                            native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact + t0, m, ff, r0, r1);
+                        else
+                            native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact + t0, m, ff, r0, r1);
+                    }
                     if (sb.gu_rows_done.fetch_add(r1 - r0, std::memory_order_acq_rel) + (r1 - r0) == (int) nfmt->n_ff) {
-                        const int nt = mjobs_[e].nt;
                         for (int t = 0; t < nt; ++t) {
                             uint8_t expected = 0;
                             if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
@@ -1299,13 +1305,16 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                             }
                         }
                     }
-                    const ActQ* a2[MAXT];
-                    for (int t = 0; t < nt; ++t) {
-                        while (sb.q_state[t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
-                        a2[t] = &sb.a2[t];
+                    for (int t0 = 0; t0 < nt; t0 += MAXT) {
+                        const int m = (std::min)(MAXT, nt - t0);
+                        const ActQ* a2[MAXT];
+                        for (int t = 0; t < m; ++t) {
+                            while (sb.q_state[t0 + t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
+                            a2[t] = &sb.a2[t0 + t];
+                        }
+                        q2_rows_any(mjobs_[e].blob + nfmt->down_off, nfmt->d_row, (int) (nfmt->n_ff / 64), a2,
+                                    m, mjobs_[e].out + t0, r0, r1);
                     }
-                    q2_rows_any(mjobs_[e].blob + nfmt->down_off, nfmt->d_row, (int) (nfmt->n_ff / 64), a2,
-                                nt, mjobs_[e].out, r0, r1);
                 } else {
                     if (mode_ == 7) {
                         while (sb.gu_rows_done.load(std::memory_order_acquire) < (int) nfmt->n_ff) strata_cpu_pause();
@@ -1320,15 +1329,18 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                             }
                         }
                     }
-                    const void* hq[MAXT];
-                    for (int t = 0; t < nt; ++t) {
-                        while (sb.q_state[t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
-                        hq[t] = sb.hq[t];
+                    for (int t0 = 0; t0 < nt; t0 += MAXT) {
+                        const int m = (std::min)(MAXT, nt - t0);
+                        const void* hq[MAXT];
+                        for (int t = 0; t < m; ++t) {
+                            while (sb.q_state[t0 + t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
+                            hq[t] = sb.hq[t0 + t];
+                        }
+                        if (narithmetic_ == NativeArithmetic::WindowInvariant)
+                            native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, m, mjobs_[e].out + t0, r0, r1);
+                        else
+                            native_down_rows(*nfmt, mjobs_[e].blob, hq, m, mjobs_[e].out + t0, r0, r1);
                     }
-                    if (narithmetic_ == NativeArithmetic::WindowInvariant)
-                        native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, nt, mjobs_[e].out, r0, r1);
-                    else
-                        native_down_rows(*nfmt, mjobs_[e].blob, hq, nt, mjobs_[e].out, r0, r1);
                 }
                 g += l1 - l0;
             }
@@ -1345,11 +1357,14 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int r1 = (int) std::min<int64_t>(per, r0 + (g1 - r));
                 SplitBufMulti& sb = split_multi_[(size_t) e];
                 if (in_gu) {
-                    float* ff[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    s2_expert_gu_rows_multi(mjobs_[e].blob, mjobs_[e].act, mjobs_[e].nt, ff, r0, r1);
+                    const int nt = mjobs_[e].nt;
+                    for (int t0 = 0; t0 < nt; t0 += MAXT) {
+                        const int m = (std::min)(MAXT, nt - t0);
+                        float* ff[MAXT];
+                        for (int t = 0; t < m; ++t) ff[t] = sb.ff[t0 + t];
+                        s2_expert_gu_rows_multi(mjobs_[e].blob, mjobs_[e].act + t0, m, ff, r0, r1);
+                    }
                     if (sb.gu_rows_done.fetch_add(r1 - r0, std::memory_order_acq_rel) + (r1 - r0) == FF) {
-                        const int nt = mjobs_[e].nt;
                         for (int t = 0; t < nt; ++t) {
                             uint8_t expected = 0;
                             if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
@@ -1372,12 +1387,15 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                             }
                         }
                     }
-                    const ActQ* a2[MAXT];
-                    for (int t = 0; t < nt; ++t) {
-                        while (sb.q_state[t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
-                        a2[t] = &sb.a2[t];
+                    for (int t0 = 0; t0 < nt; t0 += MAXT) {
+                        const int m = (std::min)(MAXT, nt - t0);
+                        const ActQ* a2[MAXT];
+                        for (int t = 0; t < m; ++t) {
+                            while (sb.q_state[t0 + t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
+                            a2[t] = &sb.a2[t0 + t];
+                        }
+                        s2_expert_down_rows_multi(mjobs_[e].blob, a2, m, mjobs_[e].out + t0, r0, r1);
                     }
-                    s2_expert_down_rows_multi(mjobs_[e].blob, a2, nt, mjobs_[e].out, r0, r1);
                 }
                 r += r1 - r0;
             }

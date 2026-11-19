@@ -5573,9 +5573,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (any_cpu) {
         // Any token whose routed experts all run on a GPU (kind >= 0) or are tail-skipped (kind == -2) has no local CPU
         // expert job (kind == -1) and never reads act_multi[t] / nact_multi[t]; skip quantizing its row over PCIe.
-        int act_toks[strata::kernels::cpu::MAXT] = {};
+        int act_toks[strata::kernels::kWindowMaxT] = {};
         int n_act_toks = 0;
-        if (plan_fast_ok && n_tok <= 64 && n_tok <= strata::kernels::cpu::MAXT) {
+        if (plan_fast_ok && n_tok <= 64 && n_tok <= strata::kernels::kWindowMaxT) {
             uint64_t m = cpu_tok_mask;
             while (m != 0) {
                 act_toks[n_act_toks++] = ctzll64(m);
@@ -5584,7 +5584,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         } else {
             for (int64_t t = 0; t < n_tok; ++t) {
                 if (std::none_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v == -1; })) continue;
-                if (t < strata::kernels::cpu::MAXT) act_toks[n_act_toks++] = (int) t;
+                if (t < strata::kernels::kWindowMaxT) act_toks[n_act_toks++] = (int) t;
             }
         }
         if (n_act_toks >= 2 && d.pool->workers() > 1) {
@@ -5664,6 +5664,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     bool first_pass = true;
     uint8_t want = 0;
     double run_ms_extra = 0, cr_ms = 0;
+    static const bool cpu_no_split = [] {
+        const char* v = std::getenv("STRATA_CPU_EXPERT_NO_SPLIT");
+        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+    }();
+    const int job_max_t = cpu_no_split ? strata::kernels::cpu::kJobMultiMaxT : MAXT;
     const bool used_fast_jobs = plan_fast_ok && gpu_zeroes_hits && npend == 0;
     if (used_fast_jobs) {
         d.cache_hits += planned_vram_entries;
@@ -5700,7 +5705,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 const int64_t t = i / k;
                 float* row = out + (size_t) i * H;
                 ++d.cache_refused;
-                if (jb->nt == MAXT) {
+                if (jb->nt == job_max_t) {
                     const int prev = jo;
                     jo = njobs++;
                     jb = &d.jobs_multi[(size_t) jo];
@@ -5776,7 +5781,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++d.cold_zc;
                 }
             }
-            if (d.jobs_multi[(size_t) jo].nt == MAXT) {
+            if (d.jobs_multi[(size_t) jo].nt == job_max_t) {
                 // a window of 9..16 rows routes more than MAXT tokens to this expert: the kernels and the pool's scratch
                 // take MAXT tokens a job, so the rest are a further job over the same blob (each token's rows are its own,
                 // so the split changes no value; the blob is read once more)

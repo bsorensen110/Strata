@@ -2447,9 +2447,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool attn_rows = g_batch_attn_rows;
                 const bool rows_ok = batch_rec_ && attn_rows && te - tb <= strata::kernels::kAttnRowsMax;
                 if (rows_ok) {
+                    static const bool qsa_scores_16 = env_on("STRATA_QSA_SCORES_16");
+                    const int score_step = qsa_scores_16 ? kVerifyMaxT : 8;
                     const int n_rows = te - tb;
-                    for (int s0 = tb; s0 < te; s0 += 8) {
-                        const int s1 = std::min(te, s0 + 8);
+                    for (int s0 = tb; s0 < te; s0 += score_step) {
+                        const int s1 = std::min(te, s0 + score_step);
                         strata::kernels::QsaScoreRows sr;
                         sr.n = s1 - s0;
                         for (int t = s0; t < s1; ++t) {
@@ -2978,25 +2980,31 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         *hu = wt.find("output_hc_up.weight");
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
         // When T = 9..16 and the interleaved kernel supports T columns, gather all T mixer outputs/q8_1 columns
-        // across kFusedGrMaxT slices first, then run native_mmvq_il ONCE so the head matrix is read once.
+        // across kFusedGrMaxT slices first (or in one wide pass when STRATA_HC_Q8_16=1), then run native_mmvq_il ONCE.
         const bool use_head_il_all = head_ != nullptr && head_->loaded() && g_mmvq_il() &&
                                      T > kFusedGrMaxT && T <= 16 && T <= kVerifyMaxT &&
                                      strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_);
+        const bool head_single_16 = use_head_il_all && env_on("STRATA_HC_Q8_16") &&
+                                    (head_mix_multi_enabled() || fuse_head_gr || (hd->hc_q8 != nullptr && hu->hc_q8 != nullptr));
+        const int head_chunk_t = head_single_16 ? T : kFusedGrMaxT;
         bool all_q8_head = head_ != nullptr && head_->loaded();
-      for (int h0 = 0; h0 < T; h0 += kFusedGrMaxT) {
-        const int HT = std::min(T - h0, kFusedGrMaxT);   // this chunk's columns: h0 .. h0 + HT
+        bool il_head_wrote = false;
+      for (int h0 = 0; h0 < T; h0 += head_chunk_t) {
+        const int HT = std::min(T - h0, head_chunk_t);   // this chunk's columns: h0 .. h0 + HT
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
         // (no pending write, no inject)
         const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr && head_ != nullptr && head_->loaded();
         const bool use_head_il = !use_head_il_all && head_ != nullptr && head_->loaded() && g_mmvq_il() &&
                                  strata::kernels::native_mmvq_il_supported(head_->type(), (int) HT, (int) n_vocab_);
-        const bool want_head_il = use_head_il && qil_on() && HT >= 2 && HT <= strata::kernels::kFusedGrMaxT;
+        const bool want_head_il = (use_head_il && qil_on() && HT >= 2 && HT <= strata::kernels::kFusedGrMaxT) ||
+                                  (head_single_16 && qil_on() && g_mmvq_il_16());
         bool q8_head = false;   // the fused read wrote the head's q8_1 activation image (xq_) itself
+        bool q8_il_chunk = false;
         strata::dispatch::notef("head: final mixer q8=%ld fuse_head_gr=%ld native_head=%ld", (long) mix_q8, (long) fuse_head_gr, (long) (head_ != nullptr && head_->loaded()));
         if (!use_head_il_all && head_ != nullptr && head_->loaded())   // the head matrix itself is counted by native_mmvq / native_mmvq_il (n_out = the vocabulary)
             strata::dispatch::notef("head: type %ld, T=%ld columns, vocabulary %ld", (long) head_->type(), (long) T, (long) n_vocab_);
         if (mix_q8) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrWideT];
             for (int t = h0; t < h0 + HT; ++t) {
                 FusedGrArgs& a = fa[t - h0];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = fuse_head_gr;
@@ -3012,10 +3020,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (t == h0 && want_head_il) a.q8_il = xil_;
                 }
             }
-            q8_head = fused_gr_read_multi(fa, HT, xn_ + (size_t) h0 * HC * N, cs);
+            q8_head = fused_gr_read_multi(fa, HT, xn_ + (size_t) h0 * HC * N, cs, nullptr, 0, &q8_il_chunk);
         }
         else if (fuse_head_gr) {
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrWideT];
             for (int t = h0; t < h0 + HT; ++t) {
                 FusedGrArgs& a = fa[t - h0];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = true;
@@ -3035,7 +3043,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (t == h0 && want_head_il) a.q8_il = xil_;
                 }
             }
-            q8_head = fused_gr_read_multi(fa, HT, xn_ + (size_t) h0 * HC * N, cs);
+            q8_head = fused_gr_read_multi(fa, HT, xn_ + (size_t) h0 * HC * N, cs, nullptr, 0, &q8_il_chunk);
         } else if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded()) {
             // the final mixer, the window's tokens in one read (fused_gr_read_multi without the pending write: the
             // last layer's write was done above; its sums are gr_read's)
@@ -3043,7 +3051,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 err = "verify: the output_hc_* weights have the wrong engine forms";
                 return false;
             }
-            FusedGrArgs fa[kFusedGrMaxT];
+            FusedGrArgs fa[kFusedGrWideT];
             for (int t = h0; t < h0 + HT; ++t) {
                 FusedGrArgs& a = fa[t - h0];
                 a.R = Rt(t); a.R_out = Rt(t); a.apply = false;
@@ -3056,7 +3064,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (t == h0 && want_head_il) a.q8_il = xil_;
                 }
             }
-            q8_head = fused_gr_read_multi(fa, HT, xn_ + (size_t) h0 * HC * N, cs);
+            q8_head = fused_gr_read_multi(fa, HT, xn_ + (size_t) h0 * HC * N, cs, nullptr, 0, &q8_il_chunk);
         } else {
             for (int t = h0; t < h0 + HT; ++t) {
                 BlockBuffers bb = ss.block;
@@ -3070,6 +3078,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
         }
         all_q8_head = all_q8_head && q8_head;
+        il_head_wrote = il_head_wrote || (head_single_16 && q8_head && want_head_il && q8_il_chunk);
         if (!use_head_il_all && head_ != nullptr && head_->loaded()) {
             try {
                 float* const hl = head_logits_ + (size_t) h0 * (size_t) n_vocab_;
@@ -3080,7 +3089,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 } else {
                     if (!q8_head) native_quantize_q8_1(head_mixed_ + (size_t) h0 * N, xq_, (int) N, HT, cs);   // (else the fused read wrote this chunk's image at xq_)
                     if (use_head_il) {
-                        if (HT >= 2 && !(q8_head && want_head_il))
+                        if (HT >= 2 && !(q8_head && want_head_il && q8_il_chunk))
                             strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) HT, cs);
                         strata::kernels::native_mmvq_il(head_->type(), head_->weights(), xq_, xil_, hl, (int) N,
                                                         (int) n_vocab_, (int) HT, cs);
@@ -3098,7 +3107,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             try {
                 if (!all_q8_head && qil_on()) {
                     strata::kernels::native_quantize_q8_1_il(head_mixed_, xq_, xil_, (int) N, T, cs);
-                } else {
+                } else if (!il_head_wrote) {
                     if (!all_q8_head) native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
                     strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, T, cs);
                 }
