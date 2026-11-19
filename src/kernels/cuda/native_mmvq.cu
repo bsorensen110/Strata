@@ -24,6 +24,7 @@
 // SOFTWARE.
 
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/native_wmma_gfx12.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -2506,15 +2507,31 @@ template <class I> inline constexpr bool kIlSingleStream = false;
 template <> inline constexpr bool kIlSingleStream<IlIQ3XXS> = true;
 template <> inline constexpr bool kIlSingleStream<IlIQ3S> = true;
 
-template <typename I, int NC, int R, int NOUT = NC, typename X>
+inline bool mmvq_il_narrow_acc_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_MMVQ_IL_NARROW_ACC");
+        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+    }();
+    return on;
+}
+inline bool verify_wmma_dense_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_VERIFY_WMMA_DENSE");
+        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+template <typename I, int NC, int R, int NOUT = NC, bool NarrowAcc = false, typename X>
 __device__ __forceinline__ void mmvq_il_group(const typename I::F::Block* __restrict__ w,
                                               const X& x, float* __restrict__ y,
                                               int n_out, int bpr, int nm, int kqs, int lane, int row0) {
     using F = typename I::F;
     constexpr int SUB = WARP / F::T;
-    float acc[4][R][NC];
+    constexpr int NV = (NarrowAcc || kIlSingleStream<I>) ? 1 : 4;
+    float acc[NV][R][NC];
 #pragma unroll
-    for (int v = 0; v < 4; ++v)
+    for (int v = 0; v < NV; ++v)
 #pragma unroll
         for (int i = 0; i < R; ++i)
 #pragma unroll
@@ -2531,7 +2548,7 @@ __device__ __forceinline__ void mmvq_il_group(const typename I::F::Block* __rest
                     float o[NC];
                     I::template apply<NC>(wv, x, kbx * F::KBY, kqs, o);
 #pragma unroll
-                    for (int c = 0; c < NC; ++c) acc[kIlSingleStream<I> ? 0 : v][i][c] += o[c];
+                    for (int c = 0; c < NC; ++c) acc[NV == 1 ? 0 : v][i][c] += o[c];
                 }
             }
         }
@@ -2541,9 +2558,11 @@ __device__ __forceinline__ void mmvq_il_group(const typename I::F::Block* __rest
 #pragma unroll
         for (int c = 0; c < NC; ++c) {
             float s = acc[0][i][c];
-            s += acc[1][i][c];
-            s += acc[2][i][c];
-            s += acc[3][i][c];
+            if constexpr (NV > 1) {
+                s += acc[1][i][c];
+                s += acc[2][i][c];
+                s += acc[3][i][c];
+            }
             s = warp_sum(s);
             if (c < NOUT && lane == 0 && row0 + i < n_out) y[std::size_t(c) * n_out + row0 + i] = s;
         }
@@ -2551,7 +2570,7 @@ __device__ __forceinline__ void mmvq_il_group(const typename I::F::Block* __rest
 
 // NOUT < NC (BW-NEXT, STRATA_IL_PAD): the kernel of NC columns computes a column that is not wanted and stores only the first NOUT; each column's value is
 // its own sum, so the stored ones are bitwise those of the NOUT-column kernel.  5 columns of IQ4_XS run as 6 (the 5-column instantiation is 15-40% slower).
-template <typename I, int NC, int R, int NOUT = NC>
+template <typename I, int NC, int R, int NOUT = NC, bool NarrowAcc = false>
 __launch_bounds__(4 * WARP)
 __global__ void native_mmvq_il_kernel(const typename I::F::Block* __restrict__ w, const int* __restrict__ xq,
                                       const float* __restrict__ xd, float* __restrict__ y, int n_in, int n_out) {
@@ -2565,11 +2584,11 @@ __global__ void native_mmvq_il_kernel(const typename I::F::Block* __restrict__ w
     // A grid-stride loop over the row groups, though the grid gives each warp one: without it ptxas gives several
     // instances fewer registers (the fork measured Q6_K's at 3 columns 10-50% slower).
     for (int grp = int(blockIdx.x) * 4 + (int(threadIdx.x) >> 5); grp * R < n_out; grp += int(gridDim.x) * 4) {
-        mmvq_il_group<I, NC, R, NOUT>(w, x, y, n_out, bpr, nm, kqs, lane, grp * R);
+        mmvq_il_group<I, NC, R, NOUT, NarrowAcc>(w, x, y, n_out, bpr, nm, kqs, lane, grp * R);
     }
 }
 
-template <typename I, int NC, int R, int NOUT = NC>
+template <typename I, int NC, int R, int NOUT = NC, bool NarrowAcc = false>
 __launch_bounds__(4 * WARP)
 __global__ void native_mmvq_il_segs_kernel(MmvqSegArray<typename I::F::Block> segs, const int* __restrict__ xq,
                                            const float* __restrict__ xd, int n_in) {
@@ -2585,7 +2604,7 @@ __global__ void native_mmvq_il_segs_kernel(MmvqSegArray<typename I::F::Block> se
         const int si = grp >= segs.seg[0].grp_end ? (segs.n_segs > 2 && grp >= segs.seg[1].grp_end ? 2 : 1) : 0;
         const int grp_base = si == 0 ? 0 : segs.seg[si - 1].grp_end;
         const auto& seg = segs.seg[si];
-        mmvq_il_group<I, NC, R, NOUT>(seg.w, x, seg.y, seg.n_out, bpr, nm, kqs, lane, (grp - grp_base) * R);
+        mmvq_il_group<I, NC, R, NOUT, NarrowAcc>(seg.w, x, seg.y, seg.n_out, bpr, nm, kqs, lane, (grp - grp_base) * R);
     }
 }
 
@@ -2607,11 +2626,11 @@ int il_pf_for(int type, int ncols, int n_out, int* rows) {
     return t >> 4;
 }
 // one (type, columns, rows) launch: today's kernel, or the variant il_pf_for names for a type that has them
-template <typename I, int NC, int R, int NOUT = NC>
+template <typename I, int NC, int R, int NOUT = NC, bool NarrowAcc = false>
 void launch_il_one(unsigned blocks, const typename I::F::Block* w, const int* xq, const float* xd, float* y, int n_in, int n_out,
                    cudaStream_t s, int pf) {
 #if STRATA_IL_PF
-    if constexpr (I::HAS_PF && NOUT == NC) {
+    if constexpr (!NarrowAcc && I::HAS_PF && NOUT == NC) {
         switch (pf) {
         case 6: native_mmvq_il_pf_kernel<I, NC, R, 0, 4, false><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
         case 2: native_mmvq_il_pf_kernel<I, NC, R, 2, 4, true><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out); return;
@@ -2621,8 +2640,10 @@ void launch_il_one(unsigned blocks, const typename I::F::Block* w, const int* xq
         default: break;
         }
     }
+#else
+    (void) pf;
 #endif  // STRATA_IL_PF
-    native_mmvq_il_kernel<I, NC, R, NOUT><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out);
+    native_mmvq_il_kernel<I, NC, R, NOUT, NarrowAcc><<<blocks, 4 * WARP, 0, s>>>(w, xq, xd, y, n_in, n_out);
 }
 
 // STRATA_IL_PAD (bit 0: IQ4_XS 5 columns as 6; default on, 0 off): bitwise, see native_mmvq_il_kernel
@@ -2631,27 +2652,28 @@ int il_pad() {
     return v;
 }
 
-template <typename I, int R>
+template <typename I, int R, bool NarrowAcc = false>
 void launch_il(const void* weights, const void* x_il, float* y, int n_in, int n_out, int ncols, cudaStream_t s, int pf) {
     const auto* w = static_cast<const typename I::F::Block*>(weights);
     const unsigned blocks = unsigned(((n_out + R - 1) / R + 3) / 4);
     if (ncols == 1) {   // 143-dense: one column reads the plain q8_1 blocks (x_il is then the caller's x_q8_1)
-        launch_il_one<I, 1, R>(blocks, w, static_cast<const int*>(x_il), nullptr, y, n_in, n_out, s, pf);
+        if constexpr (!NarrowAcc)
+            launch_il_one<I, 1, R>(blocks, w, static_cast<const int*>(x_il), nullptr, y, n_in, n_out, s, pf);
         return;
     }
     const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
     const int* xq = I::PM ? parts.pm : parts.bm;
     const float* xd = parts.d;
     switch (ncols) {
-#define STRATA_IL_CASE(N) case N: launch_il_one<I, N, R>(blocks, w, xq, xd, y, n_in, n_out, s, pf); break;
+#define STRATA_IL_CASE(N) case N: if constexpr (!NarrowAcc) launch_il_one<I, N, R>(blocks, w, xq, xd, y, n_in, n_out, s, pf); break;
         STRATA_IL_CASE(2) STRATA_IL_CASE(3) STRATA_IL_CASE(4)
 #undef STRATA_IL_CASE
         // 147-verify: 5..8 columns (the cp = 8 copy) at 1 or 2 rows a warp; launch_il_rows maps 4 rows to 2 there
-#define STRATA_IL_CASE(N) case N: if constexpr (R <= 2) launch_il_one<I, N, R>(blocks, w, xq, xd, y, n_in, n_out, s, pf); break;
+#define STRATA_IL_CASE(N) case N: if constexpr (!NarrowAcc && R <= 2) launch_il_one<I, N, R>(blocks, w, xq, xd, y, n_in, n_out, s, pf); break;
         STRATA_IL_CASE(6) STRATA_IL_CASE(7) STRATA_IL_CASE(8)
 #undef STRATA_IL_CASE
     case 5:
-        if constexpr (R <= 2) {
+        if constexpr (!NarrowAcc && R <= 2) {
             if constexpr (std::is_same_v<I, IlIQ4XS>) {
                 if ((il_pad() & 1) != 0) { launch_il_one<I, 6, R, 5>(blocks, w, xq, xd, y, n_in, n_out, s, 0); break; }
             }
@@ -2659,7 +2681,7 @@ void launch_il(const void* weights, const void* x_il, float* y, int n_in, int n_
         }
         break;
 #if STRATA_VERIFY_MAX_T > 8
-#define STRATA_IL_CASE16(N) case N: if constexpr (R == 1) launch_il_one<I, N, R>(blocks, w, xq, xd, y, n_in, n_out, s, pf); break;
+#define STRATA_IL_CASE16(N) case N: if constexpr (R == 1 || (NarrowAcc && R <= 2)) launch_il_one<I, N, R, N, NarrowAcc>(blocks, w, xq, xd, y, n_in, n_out, s, pf); break;
         STRATA_IL_CASE16(9) STRATA_IL_CASE16(10) STRATA_IL_CASE16(11) STRATA_IL_CASE16(12)
 #if STRATA_VERIFY_MAX_T > 12
         STRATA_IL_CASE16(13) STRATA_IL_CASE16(14) STRATA_IL_CASE16(15) STRATA_IL_CASE16(16)
@@ -2675,8 +2697,17 @@ void launch_il_rows(int r, const void* weights, const void* x_il, float* y, int 
     int pf_rows = 0;
     const int pf = il_pf_for(I::F::TYPE, ncols, n_out, &pf_rows);
     if (pf_rows != 0) r = pf_rows;   // the pf table measured its rows with its kernel
-    if (ncols > 8) r = 1;            // 9..16 columns (cp = 16): 1 row a warp to bound register pressure
-    else if (ncols > 4 && r == 4) r = 2;   // 5..8 columns: 1 or 2 rows a warp
+    if (ncols > 8) {
+        if (mmvq_il_narrow_acc_on()) {
+            const int nr = (r == 1) ? 1 : 2;
+            if (nr == 1) launch_il<I, 1, true>(weights, x_il, y, n_in, n_out, ncols, s, 0);
+            else launch_il<I, 2, true>(weights, x_il, y, n_in, n_out, ncols, s, 0);
+            return;
+        }
+        r = 1;            // 9..16 columns (cp = 16): 1 row a warp to bound register pressure
+    } else if (ncols > 4 && r == 4) {
+        r = 2;   // 5..8 columns: 1 or 2 rows a warp
+    }
     switch (r) {
     case 1: launch_il<I, 1>(weights, x_il, y, n_in, n_out, ncols, s, pf); break;
     case 4: launch_il<I, 4>(weights, x_il, y, n_in, n_out, ncols, s, pf); break;
@@ -3807,6 +3838,7 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream) {
     if (q6_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q6_PACKED=1 heads
+    if (ncols >= 9 && verify_wmma_dense_on() && native_wmma_dense_q6_k(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;
     validate_shape(n_in, ncols, 256);
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
@@ -3985,6 +4017,7 @@ bool native_mmvq_pair_swiglu(int ggml_type, const void* w_gate, const void* w_up
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
     if (q8_packed_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;   // STRATA_Q8_PACKED=1 tensors
+    if (ncols >= 9 && verify_wmma_dense_on() && native_wmma_dense_q8_0(weights, x_q8_1, y, n_in, n_out, ncols, stream)) return;
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
@@ -4396,7 +4429,11 @@ const std::vector<IlEnvRow>& il_env_rows() {
 int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
     if (ncols < 1 || ncols > 16) return 0;
     const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
-    if (ncols > 8) {   // RDNA4 (gfx12, cc == 1202): 9..16 columns (cp = 16) use R = 1 row/warp across supported IL types
+    if (ncols > 8) {   // RDNA4 (gfx12, cc == 1202): 9..16 columns (cp = 16) use R = 1 row/warp, or R = 2 with STRATA_MMVQ_IL_NARROW_ACC=1
+        if (mmvq_il_narrow_acc_on()) {
+            if (type == 11 && !il_q3k_on()) return 0;
+            return (type == 23 || type == 12 || type == 13 || type == 14 || type == 11 || type == 21 || type == 18) ? 2 : 0;
+        }
         static const bool wide = il_env_on("STRATA_MMVQ_IL_WIDE");
         if (!wide) return 0;
         if (type == 11 && !il_q3k_on()) return 0;
@@ -4508,7 +4545,7 @@ bool il_arch_ok() {
 
 bool native_mmvq_il_supported(int ggml_type, int ncols, int n_out) {
     if (ncols < 1 || ncols > MAX_NCOLS || !g_multi_exact || !il_arch_ok()) return false;
-    if (ncols > 8 && !il_16_on()) return false;
+    if (ncols > 8 && !(il_16_on() || mmvq_il_narrow_acc_on())) return false;
     return (g_tune_rows ? g_tune_rows : il_rows(ggml_type, ncols, n_out)) != 0 &&
            (ggml_type == 23 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 11 ||
             ggml_type == 21 || ggml_type == 18);
@@ -4548,7 +4585,7 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
 }
 
 namespace {
-template <typename I, int R>
+template <typename I, int R, bool NarrowAcc = false>
 void launch_il_segs_r(const NativeMmvqSeg* in_segs, int n_segs, const void* x_il, int n_in, int ncols, cudaStream_t s) {
     MmvqSegArray<typename I::F::Block> sa{};
     sa.n_segs = n_segs;
@@ -4559,21 +4596,22 @@ void launch_il_segs_r(const NativeMmvqSeg* in_segs, int n_segs, const void* x_il
     }
     const unsigned blocks = unsigned((total_grps + 3) / 4);
     if (ncols == 1) {
-        native_mmvq_il_segs_kernel<I, 1, R><<<blocks, 4 * WARP, 0, s>>>(sa, static_cast<const int*>(x_il), nullptr, n_in);
+        if constexpr (!NarrowAcc)
+            native_mmvq_il_segs_kernel<I, 1, R><<<blocks, 4 * WARP, 0, s>>>(sa, static_cast<const int*>(x_il), nullptr, n_in);
         return;
     }
     const Q81IlParts parts = q8_1_il_parts(x_il, n_in, ncols);
     const int* xq = I::PM ? parts.pm : parts.bm;
     const float* xd = parts.d;
     switch (ncols) {
-#define STRATA_IL_SEG_CASE(N) case N: native_mmvq_il_segs_kernel<I, N, R><<<blocks, 4 * WARP, 0, s>>>(sa, xq, xd, n_in); break;
+#define STRATA_IL_SEG_CASE(N) case N: if constexpr (!NarrowAcc) native_mmvq_il_segs_kernel<I, N, R><<<blocks, 4 * WARP, 0, s>>>(sa, xq, xd, n_in); break;
         STRATA_IL_SEG_CASE(2) STRATA_IL_SEG_CASE(3) STRATA_IL_SEG_CASE(4)
 #undef STRATA_IL_SEG_CASE
-#define STRATA_IL_SEG_CASE(N) case N: if constexpr (R <= 2) native_mmvq_il_segs_kernel<I, N, R><<<blocks, 4 * WARP, 0, s>>>(sa, xq, xd, n_in); break;
+#define STRATA_IL_SEG_CASE(N) case N: if constexpr (!NarrowAcc && R <= 2) native_mmvq_il_segs_kernel<I, N, R><<<blocks, 4 * WARP, 0, s>>>(sa, xq, xd, n_in); break;
         STRATA_IL_SEG_CASE(6) STRATA_IL_SEG_CASE(7) STRATA_IL_SEG_CASE(8)
 #undef STRATA_IL_SEG_CASE
     case 5:
-        if constexpr (R <= 2) {
+        if constexpr (!NarrowAcc && R <= 2) {
             if constexpr (std::is_same_v<I, IlIQ4XS>) {
                 if ((il_pad() & 1) != 0) {
                     native_mmvq_il_segs_kernel<I, 6, R, 5><<<blocks, 4 * WARP, 0, s>>>(sa, xq, xd, n_in);
@@ -4584,7 +4622,7 @@ void launch_il_segs_r(const NativeMmvqSeg* in_segs, int n_segs, const void* x_il
         }
         break;
 #if STRATA_VERIFY_MAX_T > 8
-#define STRATA_IL_SEG_CASE16(N) case N: if constexpr (R == 1) native_mmvq_il_segs_kernel<I, N, R><<<blocks, 4 * WARP, 0, s>>>(sa, xq, xd, n_in); break;
+#define STRATA_IL_SEG_CASE16(N) case N: if constexpr (R == 1 || (NarrowAcc && R <= 2)) native_mmvq_il_segs_kernel<I, N, R, N, NarrowAcc><<<blocks, 4 * WARP, 0, s>>>(sa, xq, xd, n_in); break;
         STRATA_IL_SEG_CASE16(9) STRATA_IL_SEG_CASE16(10) STRATA_IL_SEG_CASE16(11) STRATA_IL_SEG_CASE16(12)
 #if STRATA_VERIFY_MAX_T > 12
         STRATA_IL_SEG_CASE16(13) STRATA_IL_SEG_CASE16(14) STRATA_IL_SEG_CASE16(15) STRATA_IL_SEG_CASE16(16)
@@ -4597,8 +4635,17 @@ void launch_il_segs_r(const NativeMmvqSeg* in_segs, int n_segs, const void* x_il
 
 template <typename I>
 void launch_il_segs(int r, const NativeMmvqSeg* segs, int n_segs, const void* x_il, int n_in, int ncols, cudaStream_t s) {
-    if (ncols > 8) r = 1;
-    else if (ncols > 4 && r == 4) r = 2;
+    if (ncols > 8) {
+        if (mmvq_il_narrow_acc_on()) {
+            const int nr = (r == 1) ? 1 : 2;
+            if (nr == 1) launch_il_segs_r<I, 1, true>(segs, n_segs, x_il, n_in, ncols, s);
+            else launch_il_segs_r<I, 2, true>(segs, n_segs, x_il, n_in, ncols, s);
+            return;
+        }
+        r = 1;
+    } else if (ncols > 4 && r == 4) {
+        r = 2;
+    }
     switch (r) {
     case 1: launch_il_segs_r<I, 1>(segs, n_segs, x_il, n_in, ncols, s); break;
     case 4: launch_il_segs_r<I, 4>(segs, n_segs, x_il, n_in, ncols, s); break;
@@ -4681,6 +4728,9 @@ bool native_mmvq_multi_segs(int ggml_type, const NativeMmvqSeg* segs, int n_segs
         if (segs[i].n_out > max_out) max_out = segs[i].n_out;
     }
     const auto s = static_cast<cudaStream_t>(stream);
+    if (ncols >= 9 && ggml_type == 8 && verify_wmma_dense_on() &&
+        native_wmma_dense_q8_0_segs(segs, n_segs, x_q8_1, n_in, ncols, stream))
+        return true;
     const bool iq3 = ggml_type == 18 || ggml_type == 21;
     if (use_il && ncols <= MAX_NCOLS && n_in % QK == 0 && !(iq3 && n_in > kIq3IlMaxNIn) && (ncols == 1 || x_il != nullptr)) {
         bool all_il = true;

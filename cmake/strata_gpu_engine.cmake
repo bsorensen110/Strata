@@ -67,6 +67,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/elementwise.cu
                           src/kernels/cuda/bf16_gemv.cu
                           src/kernels/cuda/native_mmvq.cu
+                          src/kernels/cuda/native_wmma_gfx12.cu
                           src/kernels/cuda/native_bf16.cu
                           src/kernels/cuda/native_gr_norm.cu
                           src/kernels/cuda/native_moe.cu
@@ -1226,6 +1227,23 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(native_multi_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(native_multi_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME native_multi_parity COMMAND native_multi_parity)
+
+  add_executable(moe_wide_bucket_parity src/kernels/moe_wide_bucket_parity.cpp)
+  target_include_directories(moe_wide_bucket_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(moe_wide_bucket_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME moe_wide_bucket_parity COMMAND moe_wide_bucket_parity)
+  set_tests_properties(moe_wide_bucket_parity PROPERTIES ENVIRONMENT "STRATA_MOE_LDS_NT8=1;STRATA_MOE_GRID_CAP=4")
+
+  add_executable(mmvq_il_narrow_acc_parity src/kernels/mmvq_il_narrow_acc_parity.cpp)
+  target_include_directories(mmvq_il_narrow_acc_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(mmvq_il_narrow_acc_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME mmvq_il_narrow_acc_parity COMMAND mmvq_il_narrow_acc_parity)
+  set_tests_properties(mmvq_il_narrow_acc_parity PROPERTIES ENVIRONMENT "STRATA_MMVQ_IL_NARROW_ACC=1;STRATA_MMVQ_IL_Q3K=1")
+
+  add_executable(native_wmma_gfx12_test src/kernels/native_wmma_gfx12_test.cpp)
+  target_include_directories(native_wmma_gfx12_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(native_wmma_gfx12_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME native_wmma_gfx12_test COMMAND native_wmma_gfx12_test)
   # #783 PR-d: the batched K/V append (INT8, Q4_0, the hybrid fold) against the per-cell appends, memcmp
   add_executable(kv_steps_parity src/kernels/kv_steps_parity.cpp)
   target_include_directories(kv_steps_parity PRIVATE ${_strata_gpu_include_directories})
