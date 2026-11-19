@@ -47,6 +47,7 @@
 #include "strata/core/serve_stop_bound.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
+#include "strata/spec/accept_hist.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/park_pool_policy.hpp"
 #include "strata/core/auto_cache.hpp"
@@ -193,6 +194,7 @@ bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 #include <array>
 #include <chrono>
 #include <algorithm>
+#include <cmath>
 #include <cassert>
 #include <memory>
 #include <iostream>
@@ -219,6 +221,7 @@ bool draft_vocab_whole_head();       // STRATA_METAL_DRAFT_VOCAB=full
 #include <stdexcept>
 #include <string>
 #include <set>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -21267,6 +21270,16 @@ int main(int argc, char** argv) {
             // client was sent.  Research switch, on by default; STRATA_SERVE_STOP_SKIP=0 turns it off (serve_stop_bound.hpp)
             static const bool stop_skip = strata::core::serve_stop_skip_on(std::getenv("STRATA_SERVE_STOP_SKIP"));
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
+            static const bool accept_hist_on = [] {
+                return strata::spec::df2_accept_hist_enabled(std::getenv("STRATA_DF2_ACCEPT_HIST"));
+            }();
+            static const char* const candidate_prefix = [] {
+                const char* e = std::getenv("STRATA_DF2_CAND_DUMP");
+                return e != nullptr && e[0] != '\0' ? e : nullptr;
+            }();
+            static int64_t telemetry_req_seq = 0;
+            const int64_t telemetry_req = accept_hist_on || candidate_prefix != nullptr ? ++telemetry_req_seq : 0;
+            strata::spec::Df2AcceptHist accept_hist;
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
@@ -22448,6 +22461,111 @@ int main(int argc, char** argv) {
                 }
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                const int verify_accept = a;
+#if defined(STRATA_HAVE_DFLASH2)
+                const int df2_rows = !merged && !from_sfx && req_df2
+                    ? std::min({std::max(0, T_mtp - 1), strata::core::Dflash2Drafter::kDrafts,
+                                (int) drafts.size(), df2.max_drafts()})
+                    : 0;
+#else
+                const int df2_rows = 0;
+#endif
+                if (accept_hist_on)
+                    accept_hist.observe(df2_rows, from_sfx ? T - 1 : 0, chain_n, T_mtp - 1, verify_accept);
+#if defined(STRATA_HAVE_DFLASH2)
+                if (!merged && !from_sfx && !first_window && req_df2 && df2.candidate_dump_enabled() && df2_rows > 0) {
+                    static const int64_t candidate_max_bytes = [] {
+                        const char* e = std::getenv("STRATA_DF2_CAND_MAX_MB");
+                        if (e == nullptr || e[0] == '\0') return int64_t{200} * 1024 * 1024;
+                        char* end = nullptr;
+                        const long long mb = std::strtoll(e, &end, 10);
+                        return end == e || *end != '\0' || mb < 0 ||
+                               mb > std::numeric_limits<int64_t>::max() / (1024 * 1024)
+                            ? int64_t{200} * 1024 * 1024
+                            : (int64_t) mb * 1024 * 1024;
+                    }();
+                    static std::FILE* candidate_file = [] {
+                        if (candidate_prefix == nullptr) return (std::FILE*) nullptr;
+                        const std::string path = std::string(candidate_prefix) + ".jsonl";
+                        std::FILE* f = std::fopen(path.c_str(), "wb");
+                        if (f == nullptr) {
+                            std::fprintf(stderr, "strata serve: STRATA_DF2_CAND_DUMP: cannot open %s\n", path.c_str());
+                            return (std::FILE*) nullptr;
+                        }
+                        static constexpr char header[] =
+                            "{\"v\":1,\"type\":\"header\",\"k_drafts\":7,\"top_k\":16,\"score\":\"draft-head logit\"}\n";
+                        if ((int64_t) (sizeof(header) - 1) > candidate_max_bytes) {
+                            std::fprintf(stderr, "strata serve: STRATA_DF2_CAND_DUMP: size limit reached; stopped dumping\n");
+                            std::fclose(f);
+                            return (std::FILE*) nullptr;
+                        }
+                        if (std::fwrite(header, 1, sizeof(header) - 1, f) != sizeof(header) - 1) {
+                            std::fprintf(stderr, "strata serve: STRATA_DF2_CAND_DUMP: cannot write header to %s\n", path.c_str());
+                            std::fclose(f);
+                            return (std::FILE*) nullptr;
+                        }
+                        return f;
+                    }();
+                    static int64_t candidate_bytes = candidate_file != nullptr ? std::ftell(candidate_file) : 0;
+                    static bool candidate_stopped = false;
+                    if (candidate_file != nullptr && !candidate_stopped) {
+                        std::ostringstream rec;
+                        rec << "{\"v\":1,\"type\":\"round\",\"req\":" << telemetry_req
+                            << ",\"prompt_tokens\":" << n << ",\"df2_rows\":" << df2_rows
+                            << ",\"window_positions\":[";
+                        for (int i = 0; i < T; ++i) rec << (i == 0 ? "" : ",") << (p + i);
+                        rec << "],\"window_tokens\":[";
+                        for (int i = 0; i < T; ++i) rec << (i == 0 ? "" : ",") << window[(size_t) i];
+                        rec << "],\"df2_tokens\":[";
+                        for (int i = 0; i < 7; ++i) rec << (i == 0 ? "" : ",") << drafts[(size_t) i];
+                        rec << "],\"selector_probs\":[";
+                        for (int i = 0; i < 7; ++i) rec << (i == 0 ? "" : ",") << dprob[(size_t) i];
+                        rec << "],\"first_rejected_position\":";
+                        // This is the zero-based proposal offset in the full verify window; the analyzer
+                        // uses df2_rows to exclude a rejection that occurred in appended lookup rows.
+                        if (verify_accept < T - 1) rec << verify_accept;
+                        else rec << "null";
+                        rec << ",\"first_rejected_token\":";
+                        if (verify_accept < T - 1) rec << outv[(size_t) verify_accept];
+                        else rec << "null";
+                        rec << ",\"candidate_tokens\":[";
+                        const int32_t* candidate_tokens = df2.candidate_tokens();
+                        const float* candidate_scores = df2.candidate_scores();
+                        for (int row = 0; row < 7; ++row) {
+                            rec << (row == 0 ? "[" : ",[");
+                            for (int j = 0; j < 16; ++j)
+                                rec << (j == 0 ? "" : ",") << candidate_tokens[row * 16 + j];
+                            rec << "]";
+                        }
+                        rec << "],\"candidate_scores\":[";
+                        for (int row = 0; row < 7; ++row) {
+                            rec << (row == 0 ? "[" : ",[");
+                            for (int j = 0; j < 16; ++j) {
+                                const float score = candidate_scores[row * 16 + j];
+                                if (j != 0) rec << ",";
+                                if (std::isfinite(score)) rec << score;
+                                else rec << "null";
+                            }
+                            rec << "]";
+                        }
+                        rec << "]}\n";
+                        const std::string line = rec.str();
+                        if (candidate_max_bytes < candidate_bytes ||
+                            (int64_t) line.size() > candidate_max_bytes - candidate_bytes) {
+                            candidate_stopped = true;
+                            std::fprintf(stderr, "strata serve: STRATA_DF2_CAND_DUMP: size limit reached; stopped dumping\n");
+                        } else if (std::fwrite(line.data(), 1, line.size(), candidate_file) != line.size()) {
+                            candidate_stopped = true;
+                            std::fprintf(stderr, "strata serve: STRATA_DF2_CAND_DUMP: write failed; stopped dumping\n");
+                        } else if (std::fflush(candidate_file) != 0) {
+                            candidate_stopped = true;
+                            std::fprintf(stderr, "strata serve: STRATA_DF2_CAND_DUMP: flush failed; stopped dumping\n");
+                        } else {
+                            candidate_bytes += (int64_t) line.size();
+                        }
+                    }
+#endif
+                }
                 if (fol != nullptr && fol_lp != nullptr) {   // rows 0..a have valid logits (their inputs are the accepted tokens)
                     std::vector<int32_t> fol_tg((size_t) a + 1, -1);
                     for (int i = 0; i <= a; ++i) {
@@ -23194,6 +23312,7 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            accept_hist.emit(stderr, accept_hist_on, telemetry_req);
             if (ck_from_pool + ck_fresh > 0)
                 std::fprintf(stderr, "strata serve: checkpoint pool: this request took %zu checkpoint%s ready from the pool and allocated %zu fresh\n",
                              ck_from_pool, ck_from_pool == 1 ? "" : "s", ck_fresh);

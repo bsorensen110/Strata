@@ -1,0 +1,4 @@
+strata serve: prompt 40000 tokens = 40000 reused + 0 read in 1 ms (1.0 tok/s), 40 generated in 1 ms (40.0 tok/s), drafts accepted 6 of 8, 1 checkpoints
+[accept-hist] req=1 df2_pos_reached=4,3,2,1,1,1,1 df2_pos_accept=3,2,1,0,0,0,0 lookup_rows=2 lookup_accept=1 chain_rows=1 chain_accept=1
+strata serve: prompt 180000 tokens = 180000 reused + 0 read in 1 ms (1.0 tok/s), 30 generated in 1 ms (30.0 tok/s), drafts accepted 3 of 5, 1 checkpoints
+[accept-hist] req=2 df2_pos_reached=3,2,1,0,0,0,0 df2_pos_accept=2,1,0,0,0,0,0 lookup_rows=0 lookup_accept=0 chain_rows=0 chain_accept=0

@@ -161,6 +161,8 @@ Dflash2Drafter::~Dflash2Drafter() {
     }
     if (h_meta_) cudaFreeHost(h_meta_);
     if (h_out_) cudaFreeHost(h_out_);
+    if (h_candidate_tok_) cudaFreeHost(h_candidate_tok_);
+    if (h_candidate_score_) cudaFreeHost(h_candidate_score_);
     if (h_bmeta_) cudaFreeHost(h_bmeta_);
     if (h_bout_) cudaFreeHost(h_bout_);
     destroy_streams();
@@ -511,6 +513,10 @@ bool Dflash2Drafter::alloc(std::string& err) {
     const size_t eff = effective_batch_slots((int) alloc_slots_, blob_shared_);
     alloc_slots_ = eff;
     const bool multi_batch = !blob_shared_ && eff > 1;
+    const bool candidate_dump = [] {
+        const char* e = std::getenv("STRATA_DF2_CAND_DUMP");
+        return e != nullptr && e[0] != '\0';
+    }() && eff == 1;
     const size_t B = eff * (size_t) kRows;
     alloc_rows_ = B;
     const size_t HMax = logits_row_count((int) eff, blob_shared_);
@@ -553,6 +559,12 @@ bool Dflash2Drafter::alloc(std::string& err) {
     h_out_ = (int32_t*) hd;
     out_tok_ = (int32_t*) dd;            // the select kernel writes the 7 picks here (host-visible) ...
     out_prob_ = (float*) dd + 16;        // ... and their probabilities at +16 ints
+    if (candidate_dump &&
+        (cudaHostAlloc((void**) &h_candidate_tok_, 7 * 16 * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess ||
+         cudaHostAlloc((void**) &h_candidate_score_, 7 * 16 * sizeof(float), cudaHostAllocPortable) != cudaSuccess)) {
+        err = "dflash2: pinned candidate-dump staging";
+        return false;
+    }
     if (multi_batch) {
         if (!mapped((kBatchMaxSlots * 4) * 4, &hd, &dd)) { err = "dflash2: mapped batch staging"; return false; }
         h_bmeta_ = (int32_t*) hd;
@@ -1883,6 +1895,19 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
     const int n_new = launch_n_;
     const int64_t pos0 = launch_pos0_, s = pos0 + n_new;
     const Clock::time_point t0 = launch_t0_;
+    const bool candidate_dump = h_candidate_tok_ != nullptr && h_candidate_score_ != nullptr;
+    if (candidate_dump) {
+        std::fill_n(h_candidate_tok_, 7 * 16, 0);
+        std::fill_n(h_candidate_score_, 7 * 16, 0.0f);
+        const size_t rows = (size_t) std::clamp(ndraft_, 0, kDrafts);
+        const size_t count = rows * 16;
+        if (count != 0 &&
+            (cudaMemcpyAsync(h_candidate_tok_, toptok_, count * sizeof(int32_t), cudaMemcpyDeviceToHost, cs_) != cudaSuccess ||
+             cudaMemcpyAsync(h_candidate_score_, topval_, count * sizeof(float), cudaMemcpyDeviceToHost, cs_) != cudaSuccess)) {
+            err = std::string("dflash2 candidate dump copy: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+    }
     static const bool solopipe = [] {
         const char* e = std::getenv("STRATA_DF2_SOLOPIPE");
         return !e || e[0] != '0';
@@ -1896,7 +1921,7 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
         }
         std::atomic_thread_fence(std::memory_order_acquire);
     }
-    if (!solopipe || timing_ || prof_ || ((volatile int32_t*) h_out_)[std::max(0, ndraft_ - 1)] < 0) {
+    if (candidate_dump || !solopipe || timing_ || prof_ || ((volatile int32_t*) h_out_)[std::max(0, ndraft_ - 1)] < 0) {
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     }
     log_flush();
