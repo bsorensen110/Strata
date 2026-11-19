@@ -18,16 +18,17 @@
 #pragma once
 
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <cstdint>
 
 namespace strata::kernels {
 
 /// scores [nq, max_blocks]; q_idx [nq, idx_n_head, idx_dim] (normed and rotated); steps [nq, kStepCount].
-/// Batch windows: query q's own indexer keys - pooled[q], dead[q] (q < n <= 8).
+/// Batch windows: query q's own indexer keys - pooled[q], dead[q] (q < n <= kWindowMaxT).
 struct QsaScoreRows {
-    const float* pooled[8] = {};
-    const float* dead[8] = {};
+    const float* pooled[kWindowMaxT] = {};
+    const float* dead[kWindowMaxT] = {};
     int n = 0;
 };
 /// qsa_block_scores for up to 8 queries of DIFFERENT sequences in one launch (the multi kernel, per query its own

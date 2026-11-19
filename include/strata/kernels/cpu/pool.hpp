@@ -30,6 +30,7 @@
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool_plan.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -54,15 +55,17 @@ struct ExpertJob {
     int slot = -1;                   ///< the job's index, for diagnostics
 };
 
+inline constexpr int kJobMultiMaxT = strata::kernels::kWindowMaxT;
+
 /// Plan v0.3 P6: one expert for the `nt` tokens of a verify window that were routed to it.  Every token's output
 /// is bitwise the single-token job's.
 struct ExpertJobMulti {
     const uint8_t* blob = nullptr;
     int nt = 0;
-    const ActQ* act[MAXT] = {};
-    float* out[MAXT] = {};
+    const ActQ* act[kJobMultiMaxT] = {};
+    float* out[kJobMultiMaxT] = {};
     /// Plan v0.3 P6: a native pack's activations (the layer's `vec_dot_type`), one per token.
-    const void* nact[MAXT] = {};
+    const void* nact[kJobMultiMaxT] = {};
     /// 149-cold: this job's own layout (null: the layer's) - the GGUF read in place, where gate / up / down are three
     /// tensors: `blob` is the gate rows and the offsets reach the expert's up and down rows in the mapping.
     const NativeFmt* fmt = nullptr;
@@ -387,16 +390,16 @@ private:
     int64_t mrows_down_ = 0;
     int mtasks_down_ = 1;
     struct SplitBufMulti {
-        alignas(64) float ff[MAXT][FF];
-        ActQ a2[MAXT];
-        alignas(64) uint8_t hq[MAXT][kNativeHBytes];   // plan v0.3 P6: native down activations
-        std::atomic<uint8_t> q_state[MAXT];
+        alignas(64) float ff[kJobMultiMaxT][FF];
+        ActQ a2[kJobMultiMaxT];
+        alignas(64) uint8_t hq[kJobMultiMaxT][kNativeHBytes];   // plan v0.3 P6: native down activations
+        std::atomic<uint8_t> q_state[kJobMultiMaxT];
         std::atomic<int> gu_rows_done{0};
         SplitBufMulti() noexcept {
-            for (int t = 0; t < MAXT; ++t) q_state[t].store(0, std::memory_order_relaxed);
+            for (int t = 0; t < kJobMultiMaxT; ++t) q_state[t].store(0, std::memory_order_relaxed);
         }
         SplitBufMulti(SplitBufMulti&& o) noexcept {
-            for (int t = 0; t < MAXT; ++t) q_state[t].store(o.q_state[t].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (int t = 0; t < kJobMultiMaxT; ++t) q_state[t].store(o.q_state[t].load(std::memory_order_relaxed), std::memory_order_relaxed);
             gu_rows_done.store(o.gu_rows_done.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
     };

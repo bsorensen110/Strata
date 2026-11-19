@@ -1083,14 +1083,15 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_kernel(const float* __re
 // qsa_block_scores takes it for every call without an active-block count and at most MQ queries: the captured decode
 // window, the uncaptured decode, and prefill's pooled16 call.
 constexpr int MQ = 8;
+template <int MAXQ = MQ>
 __device__ __forceinline__ void block_scores_multi_body(const float* __restrict__ pooled,
                                                         const float* __restrict__ dead,
                                                         const float* __restrict__ q_idx,
                                                         const int32_t* __restrict__ steps, int nq, int64_t max_blocks,
                                                         float* __restrict__ out, bool early_exit,
                                                         const QsaScoreRows& srow) {
-    __shared__ __align__(16) float qs[MQ * IDX_HEADS * IDX_DIM];
-    __shared__ int64_t s_nkv[MQ], s_nbid[MQ];
+    __shared__ __align__(16) float qs[MAXQ * IDX_HEADS * IDX_DIM];
+    __shared__ int64_t s_nkv[MAXQ], s_nbid[MAXQ];
     if (!early_exit)
         for (int i = threadIdx.x; i < nq * IDX_HEADS * IDX_DIM; i += blockDim.x) qs[i] = q_idx[i];
     if (threadIdx.x < nq) {
@@ -1144,8 +1145,19 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_kernel(co
                                                                               const int32_t* __restrict__ steps, int nq,
                                                                               int64_t max_blocks, float* __restrict__ out,
                                                                               bool early_exit, QsaScoreRows srow = {}) {
-    block_scores_multi_body(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
+    block_scores_multi_body<MQ>(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
 }
+
+#if STRATA_VERIFY_MAX_T > 8
+__global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_multi_wide_kernel(const float* __restrict__ pooled,
+                                                                                   const float* __restrict__ dead,
+                                                                                   const float* __restrict__ q_idx,
+                                                                                   const int32_t* __restrict__ steps, int nq,
+                                                                                   int64_t max_blocks, float* __restrict__ out,
+                                                                                   bool early_exit, QsaScoreRows srow = {}) {
+    block_scores_multi_body<kWindowMaxT>(pooled, dead, q_idx, steps, nq, max_blocks, out, early_exit, srow);
+}
+#endif
 
 // Queries of different slots, each with its own indexer keys: blockIdx.y is the query, and its CTAs run exactly the
 // single-query call of block_scores_multi_kernel (qsa_block_scores_slots).
@@ -2304,13 +2316,26 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
 void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const int32_t* steps, int64_t nq,
                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
     if (nq <= 0) return;
-    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > MQ || rows.n != nq) {
+    static const bool wide16 = [] {
+        const char* v = std::getenv("STRATA_QSA_SCORES_16");
+        return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
+    }();
+    const int64_t limit = (wide16 && kWindowMaxT > MQ) ? kWindowMaxT : MQ;
+    if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > limit || rows.n != nq) {
         std::fprintf(stderr, "qsa_block_scores_rows: unsupported geometry\n");
         std::exit(1);
     }
     static const bool early = [] { const char* v = std::getenv("STRATA_QSA_EARLY_EXIT"); return v == nullptr || std::atoi(v) != 0; }();
-    block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(nullptr, nullptr, q_idx, steps, (int) nq,
-                                                                                 max_blocks, scores, early, rows);
+#if STRATA_VERIFY_MAX_T > 8
+    if (nq > MQ) {
+        block_scores_multi_wide_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(nullptr, nullptr, q_idx, steps, (int) nq,
+                                                                                           max_blocks, scores, early, rows);
+    } else
+#endif
+    {
+        block_scores_multi_kernel<<<256, SCORE_WARPS * 32, 0, (cudaStream_t) stream>>>(nullptr, nullptr, q_idx, steps, (int) nq,
+                                                                                     max_blocks, scores, early, rows);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_scores_rows: %s\n", cudaGetErrorString(e)); std::exit(1); }
 }

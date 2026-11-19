@@ -2264,24 +2264,25 @@ __device__ __forceinline__ float4 q8_four(uint32_t q, float d) {
                        d * (float) (int8_t) ((q >> 16) & 255u), d * (float) (int8_t) (q >> 24));
 }
 
-template <int T>
+template <int T, int RPW = Q8_RPW>
 __global__ void __launch_bounds__(THREADS) gr_down_q8_kernel(GrMulti m, float* __restrict__ part, float* __restrict__ ssg) {
+    constexpr int RG_ = LR / (WARPS * RPW);
     __shared__ __align__(16) float xs[T][Q8_KC];
     __shared__ float red[WARPS][T];
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int rg = blockIdx.x, kc = blockIdx.y, c = kc / Q8_CPS;
-    const bool inj = rg == Q8_RG;
+    const bool inj = rg == RG_;
     // S25: the inject rows are F32 in the GGUF with BF16-exact values, so by default they are read as the pack's BF16
     // (exact); a Q8_0 copy (STRATA_HC_Q8_INJECT=1) is the other option
     const bool inj_bf16 = inj && m.a[0].q8_inject == nullptr;
-    const int nrows = inj ? (((m.a[0].q8_inject != nullptr || m.a[0].w_inject != nullptr) && warp < HC) ? 1 : 0) : Q8_RPW;
-    const int row0 = inj ? warp : (rg * WARPS + warp) * Q8_RPW;
+    const int nrows = inj ? (((m.a[0].q8_inject != nullptr || m.a[0].w_inject != nullptr) && warp < HC) ? 1 : 0) : RPW;
+    const int row0 = inj ? warp : (rg * WARPS + warp) * RPW;
     const uint8_t* wb = inj ? m.a[0].q8_inject : m.a[0].q8_down;
     const int sub = lane & 7, bl = lane >> 3;       // lanes 8b..8b+7: one Q8_0 block, 4 values each
-    uint32_t q[Q8_RPW][Q8_SPB];
-    float dq[Q8_RPW][Q8_SPB];
+    uint32_t q[RPW][Q8_SPB];
+    float dq[RPW][Q8_SPB];
 #pragma unroll
-    for (int r = 0; r < Q8_RPW; ++r) {
+    for (int r = 0; r < RPW; ++r) {
         if (r >= nrows || inj_bf16) break;
         const uint8_t* row = wb + (size_t) (row0 + r) * (D / 32) * Q8B + (size_t) kc * (Q8_KC / 32) * Q8B;
 #pragma unroll
@@ -2323,7 +2324,7 @@ __global__ void __launch_bounds__(THREADS) gr_down_q8_kernel(GrMulti m, float* _
     }
     if (nrows == 0) return;
 #pragma unroll
-    for (int r = 0; r < Q8_RPW; ++r) {
+    for (int r = 0; r < RPW; ++r) {
         if (r >= nrows) break;
         float acc[T];
 #pragma unroll
@@ -2803,7 +2804,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_q8_fast_kernel(GrMulti m, const
         }
     }
     gr_sync_lds();
-#pragma unroll(PF ? RPW8 : 2)
+#pragma unroll(PF ? RPW8 : (T <= 8 ? 2 : 1))
     for (int qq = 0; qq < RPW8; ++qq) {
         const int r = warp + qq * WARPS;
         const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
@@ -2871,30 +2872,47 @@ template <int T> void launch_q8_t(const GrMulti& m, float* part, float* ssg, cud
     const bool ts = gr_tsum_on();
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
     static const bool pfs = [] { const char* v = std::getenv("STRATA_GR_Q8_PFS"); return v != nullptr && std::atoi(v) != 0; }();
-    if (ts && pfs) gr_down_q8_fast_kernel<T, 4, true><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
-    else if (ts) gr_down_q8_fast_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
-    else gr_down_q8_kernel<T><<<dim3(Q8_RG + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+    if constexpr (T <= 8) {
+        if (ts && pfs) gr_down_q8_fast_kernel<T, 4, true><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+        else if (ts) gr_down_q8_fast_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+        else gr_down_q8_kernel<T, 4><<<dim3(LR / (WARPS * 4) + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+    } else {
+        // RPW = 1 keeps T = 9..16 register pressure within hardware limits (0 stack spills on sm_120).
+        if (ts) gr_down_q8_fast_kernel<T, 1><<<dim3(LR / WARPS + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+        else gr_down_q8_kernel<T, 1><<<dim3(LR / WARPS + 1, Q8_NKC), THREADS, 0, st>>>(m, part, ssg);
+    }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
 #if !STRATA_GR_FAST_BUILD
     if (m.a[0].q8_mixed != nullptr && qfuse_hc_local()) {   // HIP (not gfx906): the block owns a q8_1 group
         static const int upg = [] { const char* v = std::getenv("STRATA_GR_Q32_G"); const int g = v ? std::atoi(v) : 1; return g == 2 || g == 4 || g == 8 ? g : 1; }();
         static const bool upl = [] { const char* v = std::getenv("STRATA_GR_Q32_PL"); return v != nullptr && std::atoi(v) != 0; }();
-        if (ts) {
-            if (upl && upg == 2) gr_up_q8_q32_kernel<T, 2, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else if (upl && upg == 4) gr_up_q8_q32_kernel<T, 4, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else if (upl) gr_up_q8_q32_kernel<T, 1, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else if (upg == 2) gr_up_q8_q32_kernel<T, 2, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else if (upg == 4) gr_up_q8_q32_kernel<T, 4, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else if (upg == 8) gr_up_q8_q32_kernel<T, 8, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else gr_up_q8_q32_kernel<T, 1, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+        if constexpr (T <= 8) {
+            if (ts) {
+                if (upl && upg == 2) gr_up_q8_q32_kernel<T, 2, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else if (upl && upg == 4) gr_up_q8_q32_kernel<T, 4, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else if (upl) gr_up_q8_q32_kernel<T, 1, true, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else if (upg == 2) gr_up_q8_q32_kernel<T, 2, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else if (upg == 4) gr_up_q8_q32_kernel<T, 4, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else if (upg == 8) gr_up_q8_q32_kernel<T, 8, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else gr_up_q8_q32_kernel<T, 1, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+            } else {
+                if (upl && upg == 2) gr_up_q8_q32_kernel<T, 2, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else if (upl && upg == 4) gr_up_q8_q32_kernel<T, 4, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else if (upl) gr_up_q8_q32_kernel<T, 1, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else if (upg == 2) gr_up_q8_q32_kernel<T, 2, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else if (upg == 4) gr_up_q8_q32_kernel<T, 4, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else if (upg == 8) gr_up_q8_q32_kernel<T, 8, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else gr_up_q8_q32_kernel<T, 1, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+            }
         } else {
-            if (upl && upg == 2) gr_up_q8_q32_kernel<T, 2, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else if (upl && upg == 4) gr_up_q8_q32_kernel<T, 4, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else if (upl) gr_up_q8_q32_kernel<T, 1, true, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else if (upg == 2) gr_up_q8_q32_kernel<T, 2, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else if (upg == 4) gr_up_q8_q32_kernel<T, 4, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else if (upg == 8) gr_up_q8_q32_kernel<T, 8, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
-            else gr_up_q8_q32_kernel<T, 1, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+            // For T = 9..16, instantiate only G = 1 / G = 2 (PL = false) to avoid register spills and heavy compile cost.
+            if (ts) {
+                if (upg >= 2) gr_up_q8_q32_kernel<T, 2, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else gr_up_q8_q32_kernel<T, 1, false, true><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+            } else {
+                if (upg >= 2) gr_up_q8_q32_kernel<T, 2, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+                else gr_up_q8_q32_kernel<T, 1, false, false><<<Q32_BLOCKS, Q32_THREADS, 0, st>>>(m, part, ssg);
+            }
         }
         return;
     }
@@ -2913,8 +2931,25 @@ void launch_q8(const GrMulti& m, float* scratch, cudaStream_t st, unsigned long 
         case 5: launch_q8_t<5>(m, part, ssg, st, stamp_buf, stamp_i0); break;
         case 6: launch_q8_t<6>(m, part, ssg, st, stamp_buf, stamp_i0); break;
         case 7: launch_q8_t<7>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+#if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
+        case 8: launch_q8_t<8>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 9: launch_q8_t<9>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 10: launch_q8_t<10>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 11: launch_q8_t<11>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 12: launch_q8_t<12>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+#if STRATA_VERIFY_MAX_T > 12
+        case 13: launch_q8_t<13>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 14: launch_q8_t<14>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 15: launch_q8_t<15>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+        case 16: launch_q8_t<16>(m, part, ssg, st, stamp_buf, stamp_i0); break;
+#endif
+#endif
         default: launch_q8_t<8>(m, part, ssg, st, stamp_buf, stamp_i0); break;
     }
+}
+inline bool hc_q8_16_on() {
+    const char* v = std::getenv("STRATA_HC_Q8_16");
+    return v != nullptr && v[0] != '\0' && std::atoi(v) != 0;
 }
 
 }  // namespace
@@ -3348,6 +3383,11 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         std::exit(1);
     }
 #if defined(STRATA_VERIFY_MAX_T) && STRATA_VERIFY_MAX_T > 8
+    // Single-pass 9..16 Q8_0 HC execution (STRATA_HC_Q8_16=1, opt-in): runs norm/down + up/q8_1/q8_il in 1 pass.
+    // Q8_0 reads never use BF16 gr_v3_split, so do not let gr_v3_split block Q8_0 here.
+    if (hc_q8_16_on() && a[0].q8_down != nullptr && a[0].q8_up != nullptr && !gr_gfx906_split_on(a[0])) {
+        return fused_gr_read_multi_slice(a, n_tok, xn_scratch, stream, stamp_buf, stamp_i0, q8_il_written);
+    }
     // Single-pass 9..16 execution (STRATA_FUSED_GR_16, default ON): norm + down + up each run in 1 launch,
     // reading w_down and w_up once across the full window instead of across 8-column slices.  Writes q8_il (CP=16)
     // alongside q8_mixed when a[0].q8_il is set and STRATA_MMVQ_IL_16 != 0.
