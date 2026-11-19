@@ -68,4 +68,22 @@ inline int batch_df2_head_max_per_slot(int spare_next,
     return std::min(spare_next, std::max(even_ceil, il_cap_per_slot));
 }
 
+/// Opt-in (STRATA_BATCH_DF2_ADAPTIVE_T=1): adaptively clamps the DFlash2 verify window capacity between
+/// [max(active_slots, target_rows), max_win_cap] using the smoothed draft acceptance rate. Keeping low-acceptance
+/// streams near target_rows (default 8) avoids wide >8-row verify penalty while letting high-acceptance streams expand.
+inline int compute_adaptive_df2_win_cap(int active_slots,
+                                        int max_win_cap,
+                                        int target_rows,
+                                        float ema_accept_rate,
+                                        bool adaptive_on) {
+    if (!adaptive_on) return max_win_cap;
+    const int floor_rows = std::max(1, active_slots);
+    const int ceil_rows = std::max(floor_rows, max_win_cap);
+    const int tgt = std::clamp(target_rows, floor_rows, ceil_rows);
+    if (ema_accept_rate <= 0.35f) return tgt;
+    if (ema_accept_rate >= 0.70f) return ceil_rows;
+    const float t = (ema_accept_rate - 0.35f) / 0.35f;
+    return std::clamp(tgt + (int) ((float) (ceil_rows - tgt) * t + 0.5f), tgt, ceil_rows);
+}
+
 }  // namespace strata::core
