@@ -137,6 +137,7 @@
 #include "strata/program/reply_branch.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_vocab.hpp"
+#include "strata/spec/df2_adaptive_solo.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/suffix_drafter.hpp"
@@ -15998,6 +15999,7 @@ int main(int argc, char** argv) {
 #endif
         strata::core::kfd_settle::settle_before_ready();   // integrated gfx11 under Linux: until the kernel has stopped moving the registered arena (nothing elsewhere)
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
+        unsigned warmed_window_mask = 0;
         // ---- window warm-up (lane DRAFT-COSTS): the first run of a window width builds its graph / pipeline (srv118 CUDA: a capture; Metal: the first execution), so a
         // width that the policy first picks inside a long request pays it there (M5 Max, IQ3_S: +60 ms on the first five-row lookup round, in the timed code request in 5 of 8 launches
         // with a table, because the release and the live costs happen to pay it in request 1).  One dummy window per allowed width 1..S, once, before the first request is read; it
@@ -16020,6 +16022,7 @@ int main(int argc, char** argv) {
                     drive.d.experts = 0;
                     drive.d.failed = false;
                     wok = ver.run(t, wtok.data(), 0, win_pool_fn, win_pool_user, wout.data(), werr) && !drive.d.failed;
+                    if (wok && t <= strata::spec::Df2AdaptiveSolo::kMaxWidth) warmed_window_mask |= 1u << t;
                     char wb[48];
                     std::snprintf(wb, sizeof wb, "%s%d:%.0f", wlist.empty() ? "" : " ", t,
                                   std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
@@ -16074,6 +16077,10 @@ int main(int argc, char** argv) {
         // --draft-costs: this machine's fixed window costs, or learn them in this run (draft_costs_key(), CostLearner)
         constexpr int64_t kDraftCostRounds = 1000;   // a learning stretch: about 3,000 generated tokens (DFlash2: 24 requests of 256 tokens = 1,215 rounds)
         constexpr int kDraftCostMinN = 20;           // a window size needs this many rounds to be measured (fewer: filled in)
+        static const bool df2_adaptive_solo_on = [] {
+            const char* e = std::getenv("STRATA_DF2_ADAPTIVE_SOLO");
+            return e != nullptr && e[0] == '1';
+        }();
         std::string dc_key;
         bool dc_learning = false;
         bool dc_calib = false;   // a table is used and its sizes are being calibrated against real rounds (DraftPolicy::start_calibration)
@@ -21232,6 +21239,14 @@ int main(int argc, char** argv) {
                 }
             }
             bool first_window = !slot_pre_drafted;
+            strata::spec::Df2AdaptiveSolo df2_solo_adaptive;
+            int df2_base_width = 0;
+#if defined(STRATA_HAVE_DFLASH2)
+            if (df2_adaptive_solo_on && req_df2 && draft_on && !use_mtp && n_stages <= 1) {
+                df2_base_width = strata::spec::df2_solo_prefix_width(S_mtp, df2.max_drafts());
+                df2_solo_adaptive.reset(df2_base_width);
+            }
+#endif
             int last_adm_rows = 1;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             // STRATA_FOLLOW=<file> (token forcing, measurement only, off by default; tools/force_check.py): one line per request in the order the
@@ -22106,9 +22121,16 @@ int main(int argc, char** argv) {
                     T = draft_on ? S_mtp : 1;   // no drafter: one token a round unless a lookup draft fires
                     {   // the window rule of this request's ACTIVE source (spec/window_rule.hpp), as in the CLI loop: the MTP chain's cost rule
                         // and probabilities do not govern DFlash2's candidates, though the MTP may stay loaded beside it
+                        int draft_width = S_mtp;
+                        if (df2_base_width > 0) {
+                            draft_width = df2_base_width;
+                            if (slot_pre_drafted && rounds == rounds_at_start)
+                                draft_width = strata::spec::df2_solo_prefix_width(draft_width, slot_handoff_draft_n);
+                            T = draft_width;
+                        }
                         strata::spec::WindowRuleIn wr;
                         wr.use_mtp = use_mtp; wr.draft_on = draft_on; wr.df2_active = req_df2; wr.spec_cost = spec_cost; wr.first_window = first_window;
-                        wr.chain_rows = chain_rows; wr.cap = S_mtp; wr.start = T; wr.spec_min_p = req_spec_min_p;
+                        wr.chain_rows = chain_rows; wr.cap = draft_width; wr.start = T; wr.spec_min_p = req_spec_min_p;
                         wr.draft_conf = o.draft_conf; wr.dprob = dprob.data();
                         T = strata::spec::choose_window(wr);
                         if (rounds == 0 && slot_pre_drafted) T = std::min(T, 1 + slot_handoff_draft_n);
@@ -22169,33 +22191,53 @@ int main(int argc, char** argv) {
                         T = t;
                     }
                 }
+                const bool df2_adaptive_round = df2_base_width > 0 && !first_window && !merged && !from_sfx;
+                const bool df2_full_prefix = df2_adaptive_round && T == df2_base_width;
                 std::copy(dprob.begin(), dprob.begin() + (std::ptrdiff_t) std::min<size_t>(dprob.size(), 8), dwin_s.begin());
                 if (df2_trace != nullptr) std::copy(drafts.begin(), drafts.begin() + (std::ptrdiff_t) std::min<size_t>(drafts.size(), 8), tr_d.begin());
                 // --lookup-chain: what followed an earlier occurrence of the context + the MTP's drafts, after them
-                int chain_n = 0, cm = 0;
+                int chain_n = 0, chain_avail = 0, cm = 0;
                 if (o.lookup_chain > 0 && !first_window && !from_sfx && T < S) {
+                    int max_chain = std::min(o.lookup_chain, S_look - T);
+                    if (df2_adaptive_round)
+                        max_chain = (int) std::min<int64_t>(max_chain, std::max<int64_t>(0, o.max_context - p - T));
                     int csrc = -1;
                     const int nt = chain_tail(sfx, drafts.data(), T - 1, ctail);
-                    chain_n = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
-                                                                 std::min(o.lookup_chain, S_look - T), o.lookup_chain_min,
-                                                                 cbuf.data(), &cm, &csrc);
+                    chain_avail = strata::spec::propose_from_sources(lookup_src, ctail.data(), nt, T - 1,
+                                                                     max_chain, o.lookup_chain_min,
+                                                                     cbuf.data(), &cm, &csrc);
+                    chain_n = chain_avail;
                     // the policy keeps the chained tokens that pay at this machine's measured window costs
                     if (chain_n > 0 && !chain_fixed) {
                         double p_mtp = 1.0;
                         for (int i = 0; i < T - 1; ++i) p_mtp *= dprob[(size_t) i];
                         chain_n = policy.chain(T, p_mtp, chain_n, cm);
                     }
-                    if (chain_n > 0 && o.lookup_max_t > 0) {
-                        const int t = graph_fits(T + chain_n);
-                        if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
-                        chain_n = std::max(0, t - T);
-                    }
+                }
+                if (df2_full_prefix) {
+                    const int max_width = std::min(policy.max_t(), strata::spec::Df2AdaptiveSolo::kMaxWidth);
+                    const unsigned adaptive_sizes = o.lookup_max_t > 0
+                        ? policy.sizes() & warmed_window_mask & ((1u << (max_width + 1)) - 1u) : 0;
+                    double adaptive_costs[strata::spec::Df2AdaptiveSolo::kMaxWidth + 1] = {};
+                    for (int width = T; width <= std::min(max_width, T + chain_avail); ++width)
+                        adaptive_costs[width] = policy.cost_ms(width);
+                    const int old_tier = df2_solo_adaptive.tier();
+                    chain_n = df2_solo_adaptive.choose_chain(chain_avail, chain_n, adaptive_sizes, adaptive_costs);
+                    const int new_tier = df2_solo_adaptive.tier();
+                    if (new_tier != old_tier)
+                        std::fprintf(stderr, "strata serve: STRATA_DF2_ADAPTIVE_SOLO tier %d->%d (expected %.1f rows)\n",
+                                     old_tier, new_tier, df2_solo_adaptive.expected_needed_rows());
+                }
+                if (chain_n > 0 && o.lookup_max_t > 0) {
+                    const int t = graph_fits(T + chain_n);
+                    if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                    chain_n = std::max(0, t - T);
                 }
                 // a learning stretch times the window sizes the round's own rule does not reach: the MTP / drafter window of a round with no lookup and no
                 // chain is run at another size (the rows past the real drafts are whatever the drafts array holds: valid ids that the verifier rejects);
                 // a deterministic window only, and only the learning stretch (DraftPolicy::explore_window)
                 bool win_forced = false;
-                if (dc_learning && draft_on && !first_window && !merged && !from_sfx && chain_n == 0 && !gated_proposal && !(use_mtp && !req_df2 && mtp.prob())) {
+                if (dc_learning && draft_on && !first_window && !merged && !from_sfx && chain_n == 0 && !df2_adaptive_round && !gated_proposal && !(use_mtp && !req_df2 && mtp.prob())) {
                     const int sx = policy.explore_window(T, std::min<int>(S_mtp, (int) drafts.size() + 1));
                     if (sx > 0 && p + sx <= o.max_context) { T = sx; win_forced = true; }
                 }
@@ -22409,21 +22451,35 @@ int main(int argc, char** argv) {
                     return false;
 #endif
                 }();
+                static const bool df2_tap_overlap_decode = [] {
+                    const char* e = std::getenv("STRATA_DF2_TAP_OVERLAP_DECODE");
+                    return e != nullptr && e[0] == '1';
+                }();
                 struct ScopedDecodeTapsReady {
                     strata::core::Verifier& v;
-                    ScopedDecodeTapsReady(strata::core::Verifier& v_, strata::core::Dflash2Drafter* d, bool on) : v(v_) {
+                    ScopedDecodeTapsReady(strata::core::Verifier& v_, strata::core::Dflash2Drafter* d, bool on, bool cap_rows) : v(v_) {
                         if (on && d != nullptr) {
-                            v.set_taps_ready([](void* u, const float* taps_dev, int n_rows, const int64_t* pos_in) noexcept {
-                                static_cast<strata::core::Dflash2Drafter*>(u)->precompute_batch_context(taps_dev, n_rows, pos_in);
-                            }, d);
+                            if (cap_rows) {
+                                v.set_taps_ready([](void* u, const float* taps_dev, int n_rows, const int64_t* pos_in) noexcept {
+                                    auto* drafter = static_cast<strata::core::Dflash2Drafter*>(u);
+                                    drafter->precompute_batch_context(taps_dev, std::min(n_rows, (int) drafter->alloc_rows()), pos_in);
+                                }, d);
+                            } else {
+                                v.set_taps_ready([](void* u, const float* taps_dev, int n_rows, const int64_t* pos_in) noexcept {
+                                    static_cast<strata::core::Dflash2Drafter*>(u)->precompute_batch_context(taps_dev, n_rows, pos_in);
+                                }, d);
+                            }
                         }
                     }
                     ~ScopedDecodeTapsReady() { v.set_taps_ready(nullptr, nullptr); }
-                } scoped_dec_taps(ver, &df2,
-                                  df2_adm_tap_overlap && !use_mtp && use_df2 && req_df2 && n_stages <= 1 &&
-                                      ((admit_slot >= 0 && batch_df2 && admit_max_new > 1) ||
-                                       (merged && T > (int) strata::core::Dflash2Drafter::kRows) ||
-                                       (T >= max_new - produced_n)));
+                };
+                const bool legacy_tap_overlap = df2_adm_tap_overlap && !use_mtp && use_df2 && req_df2 && n_stages <= 1 &&
+                    ((admit_slot >= 0 && batch_df2 && admit_max_new > 1) ||
+                     (merged && T > (int) strata::core::Dflash2Drafter::kRows) ||
+                     (T >= max_new - produced_n));
+                const bool decode_tap_overlap = df2_tap_overlap_decode && !use_mtp && use_df2 && req_df2 &&
+                    n_stages <= 1 && admit_slot < 0 && !first_window && !merged;
+                ScopedDecodeTapsReady scoped_dec_taps(ver, &df2, legacy_tap_overlap || decode_tap_overlap, decode_tap_overlap);
 #endif
                 if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
@@ -22461,6 +22517,7 @@ int main(int argc, char** argv) {
                 }
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (df2_full_prefix) df2_solo_adaptive.observe(a, chain_n);
                 const int verify_accept = a;
 #if defined(STRATA_HAVE_DFLASH2)
                 const int df2_rows = !merged && !from_sfx && req_df2
