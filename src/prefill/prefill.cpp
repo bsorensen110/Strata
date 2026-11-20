@@ -678,14 +678,14 @@ inline bool pf_peer_cpu() {
     static const bool on = [] { const char* e = std::getenv("STRATA_PF_PEER_CPU"); return e != nullptr && std::atoi(e) != 0; }();
     return on;
 }
-// STRATA_PREFILL_CPU_SHARE_MAX (default 3072, at least 1024): with the share on, chunks below it are staged after their
+// STRATA_PREFILL_CPU_SHARE_MAX (default 2560, at least 1024): with the share on, chunks below it are staged after their
 // routing - so they can hand the CPU its share - instead of streaming every expert the cards do not hold.  The share pays
 // on chunks up to ~3K tokens, where few tokens route to many of the streamed experts; 1024 keeps the old limit.
 int64_t g_share_limit_arch = 0;   // AMD-Q: the default limit of a gfx12 card (share_rules::gfx12_share_limit), set by arm_cpu_share
 inline int64_t cpu_share_max() {
     static const int64_t v = [] {
         const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX");
-        return e ? std::max<int64_t>(kStreamAllMinDefault, (int64_t) std::atoll(e)) : (int64_t) 3072;
+        return e ? std::max<int64_t>(kStreamAllMinDefault, (int64_t) std::atoll(e)) : (int64_t) 2560;
     }();
     static const bool explicit_max = std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") != nullptr;
     // its measured range; STRATA_PF_PEER_CPU's is 3072 (see pf_peer_cpu)
@@ -2193,13 +2193,13 @@ int64_t group_cap_rows(size_t T, int64_t n_expert) {
 size_t bounds_ints(int64_t n_expert) {
     return (size_t) (2 * (n_expert + n_expert / MMQ_GROUP + 2)) + (pf_group_scratch() ? (size_t) (3 * n_expert + 64) : 0);
 }
-// STRATA_PF_HC_REGION=1 (opt-in): the hyper-connection read's scratch (xn16, lo, lo16, gated and the BF16x2 low halves) in the
+// STRATA_PF_HC_REGION (default on): the hyper-connection read's scratch (xn16, lo, lo16, gated and the BF16x2 low halves) in the
 // region the attention half and the MoE half share, as a fourth set: a half's read is done with it before that half's
 // set is written, and the fused write at a half's end (gr_write_norm_rs: the next half's xn16) runs after the half's last
 // region reader on the same stream.  The same kernels on the same values: the same bits.  ~63 KB a token outside the
 // region less (the region already holds more than this set).
 bool pf_hc_region() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_PF_HC_REGION"); return v != nullptr && std::atoi(v) != 0; }();
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_HC_REGION"); return v == nullptr || std::atoi(v) != 0; }();
     return on && !gr_unfused();
 }
 uint64_t hc_set_bytes(size_t T, bool f16_io) {
@@ -4621,9 +4621,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // before the issuer thread, so they outlive it on every return (IssuerJoin joins it first).
         static const bool rs_env = routed_stream::enabled_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM"), false);
         static const bool copy_wait_dedupe = [] {
-            const bool def_on = !rs_env;   // 2026-11-10: every backend (was HIP): one wait kernel per staging copy instead
-                                           // of a spin node per layer; STRATA_PREFILL_COPY_WAIT_DEDUPE=0 is the off switch
-            return strata::prefill::copy_wait_dedupe_from(std::getenv("STRATA_PREFILL_COPY_WAIT_DEDUPE"), def_on);
+            const char* e = std::getenv("STRATA_PREFILL_COPY_WAIT_DEDUPE");
+            const bool def_on = e == nullptr || !rs_env;   // 2026-11-19: unset defaults on; =0 is the off switch
+            return strata::prefill::copy_wait_dedupe_from(e, def_on);
         }();
         static const int rs_depth = routed_stream::depth_from(std::getenv("STRATA_PREFILL_ROUTED_STREAM_DEPTH"));
         const bool rs_on = rs_env && routed_stream::eligible(

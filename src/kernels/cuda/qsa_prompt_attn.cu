@@ -2309,7 +2309,7 @@ __global__ void __launch_bounds__(THREADS) prompt_attn_wmma_kernel(const float* 
     prompt_attn_wmma_body<SPLIT, GATE, RPF, TR>(q, p, ids, steps, n_kv_heads, page_size, scale_log2, attn, cap, qf, o16, ld16);
 }
 
-// ---- (NAS) the Q4_0-KV prompt attention on RDNA4 matrix cores (opt-in: STRATA_HIP_WMMA_Q4=1, gfx12 only).  The int8
+// ---- (NAS) the Q4_0-KV prompt attention on RDNA4 matrix cores (default on; STRATA_HIP_WMMA_Q4=0 disables it, gfx12 only).  The int8
 // kernel above with `--kv q4_0` rows: 8 blocks of {fp16 d, 16 code bytes} per row, element j of a block in the low
 // nibble of byte j (j < 16), else the high nibble of byte j - 16, value d * (nibble - 8).  A wave's 64 dims are two
 // blocks (2w, 2w+1): q.k keeps one WMMA partial per block, each times its K scale, and p.v folds two V scales (tiles
@@ -2719,10 +2719,10 @@ bool launch_wmma(const float* q, const QsaAttnPools& pools, const int32_t* ids, 
     }
     return true;
 }
-// (NAS) STRATA_HIP_WMMA_Q4=1: the Q4_0-KV kernel above on a gfx12 card (opt-in; a failed launch switches it off for
+// (NAS) STRATA_HIP_WMMA_Q4=1: the Q4_0-KV kernel above on a gfx12 card (default on; a failed launch switches it off for
 // the process, as the int8 kernel's does)
 bool hip_wmma_q4_usable() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_HIP_WMMA_Q4"); return e != nullptr && e[0] == '1'; }();
+    static const bool on = [] { const char* e = std::getenv("STRATA_HIP_WMMA_Q4"); return e == nullptr || e[0] == '1'; }();
     if (!on || g_wmma_failed.load(std::memory_order_relaxed)) return false;
     int dev = 0;
     if (hipGetDevice(&dev) != hipSuccess) { (void) hipGetLastError(); return false; }

@@ -975,10 +975,11 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
 
 namespace {
 
+// default 0: 2026-11-19 solo deep-decode regression, docs/ab/decode-dropout-diagnosis-2026-11-19.md
 bool pcie_fetch_overlap_on() noexcept {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_PCIE_FETCH_OVERLAP");
-        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+        return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
     }();
     return on;
 }

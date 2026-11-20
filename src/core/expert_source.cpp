@@ -4284,7 +4284,7 @@ bool FileExpertSource::pin_cache_complement(
     if (!role_ptr_.empty()) {
         static const bool drop_complement_cache = [] {
             const char* v = std::getenv("STRATA_COMPLEMENT_DROP_CACHE");
-            return v == nullptr || v[0] == '\0' || v[0] != '0';
+            return v != nullptr && (v[0] == '\0' || v[0] != '0');
         }();
         if (drop_complement_cache) {
             uint64_t before_free = 0, after_free = 0;
@@ -4966,7 +4966,7 @@ bool FileExpertSource::pinned(int64_t layer, int64_t expert) const {
     if (!loan_active_.empty() && index < loan_active_.size() && loan_active_[index] != nullptr) {
         static const bool pcie_pin_ok = [] {
             const char* v = std::getenv("STRATA_LEND_PCIE_PINNED");
-            return v != nullptr && std::atoi(v) != 0;
+            return v == nullptr || std::atoi(v) != 0;
         }();
         return loan_pinned_ && pcie_pin_ok;
     }
@@ -5304,7 +5304,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
         // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
         // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
-        // STRATA_BATCH_TAIL_SKIP / STRATA_DRAFT_TAIL_SKIP (opt-in, default 0): skip only when no anchor/committed row touches the expert.
+        // STRATA_BATCH_TAIL_SKIP / STRATA_DRAFT_TAIL_SKIP (defaults 7 / 6): skip only when no anchor/committed row touches the expert.
         const int tail_rank = tail_skip_rank();
         const int batch_tail_rank = batch_tail_skip_rank();
         const int draft_tail_rank = draft_tail_skip_rank();
@@ -5340,7 +5340,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             std::fputc(10, route_dump);
         }
-        // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
+        // STRATA_PCIE_BALANCE (default on when eligible, #1548): the count comes from the measured CPU and GPU costs instead of the share
         const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers);
         int m = pcie_ok ? d.pcie_model.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
         // STRATA_PCIE_MIN1 (opt-in): the share rounds to 0 for 1-2 misses per layer, so the PCIe lane idles on the typical
@@ -5353,7 +5353,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         }();
         // Opt-in wide MoE bucket control:
         // - STRATA_MOE_BUCKET_NOSPLIT=1: keep an expert's entire window group together instead of splitting every 4 rows.
-        // - STRATA_MOE_BUCKET_CHUNK=N: override the default 4-row chunk size in [4, kMaxWindowEntries].
+        // - STRATA_MOE_BUCKET_CHUNK=N: override the default 8-row chunk size in [4, kMaxWindowEntries].
         static const bool bucket_nosplit = [] {
             const char* v = std::getenv("STRATA_MOE_BUCKET_NOSPLIT");
             return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;

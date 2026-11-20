@@ -5407,17 +5407,18 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
         }
     }
-    // STRATA_PCIE_BALANCE=1 (opt-in): each verify layer's PCIe count from measured costs (Verifier::set_pcie_balance)
+    // STRATA_PCIE_BALANCE (default on when eligible): each verify layer's PCIe count from measured costs (Verifier::set_pcie_balance)
     // instead of the probe's fixed share above - the CPU's speed sets the right share as much as the link's.  IQ2_XS,
     // one AVX2 pool worker (emulated on an RTX 5090 + 9950X3D): 16.8-17.2 -> 12.8-13.0 ms a round; the 9950X3D's own
     // 16 workers: 12.2 either way.  One GPU, no batch slots, no --pcie-frac.
     auto pcie_balance = [&]() {
         const char* e = std::getenv("STRATA_PCIE_BALANCE");
+        const bool balance_on = e == nullptr || std::strcmp(e, "1") == 0;
         static const bool batch_bal = [] {
             const char* b = std::getenv("STRATA_BATCH_PCIE_BALANCE");
             return b == nullptr || b[0] == '\0' || std::atoi(b) != 0;
         }();
-        return !pcie_given && native_pack && !multi_gpu && (o.batch <= 0 || batch_bal) && e != nullptr && std::strcmp(e, "1") == 0;
+        return !pcie_given && native_pack && !multi_gpu && (o.batch <= 0 || batch_bal) && balance_on;
     };
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
     if (!native_pack) {
@@ -12846,6 +12847,7 @@ int main(int argc, char** argv) {
         kvh_start();
         if (srcp == &src && src.complement_ready() && src.complement_pinned() && !pf_parts.empty() && !host_res.empty()) {
             const char* vb = std::getenv("STRATA_LEND_RAM_BACKUP");
+            // Keep the default on: the disabled path is the #879 NaN control.
             const bool lb_on = vb == nullptr || std::atoi(vb) != 0;
             const bool lp_on = strata::prefill::share_rules::batch_lend_pinned_from(
                 std::getenv("STRATA_LEND_PCIE_PINNED"), single_card_gfx12, o.batch > 0);
@@ -20162,6 +20164,7 @@ int main(int argc, char** argv) {
                     if (srcp == &src && !p.lent.empty()) {
                         static const bool lend_backup = [] {
                             const char* v = std::getenv("STRATA_LEND_RAM_BACKUP");
+                            // Keep the default on: the disabled path is the #879 NaN control.
                             return v == nullptr || std::atoi(v) != 0;
                         }();
                         if (lend_backup && src.complement_ready()) {

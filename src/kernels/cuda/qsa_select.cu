@@ -438,7 +438,7 @@ __device__ __forceinline__ uint32_t pack_bf16x2(uint32_t a, uint32_t b) {   // l
 // rel err ~1.5e-5, enough to flip a near-tie block in/out of the top-k (gate: selections identical
 // 253-256/256 against the 6-product kernel; upstream's own WMMA-vs-warp baseline is 254/256).
 // XQ (STRATA_SELECT_GRID=1|2): x = the query tiles, so the CTAs that share a key tile are scheduled
-// together and L2 holds it for all 16 of them.  Default keeps 0.1.45's CTA order (bitwise identical
+// together and L2 holds it for all 16 of them.  Default mode 2 adapts to launch depth; explicit 0 keeps 0.1.45's CTA order (bitwise identical
 // output: only the scheduling order moves).  Measured on gfx1151 (qsa_select_bench, 256 queries,
 // capacity 524288): at 98K blocks the 6-product scorer 7.0 -> 5.1 ms; at 24K blocks the key set is
 // L2-marginal and the swap is slower, so STRATA_SELECT_GRID=2 swaps only launches deeper than
@@ -2402,20 +2402,20 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
     {
         const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
         const int64_t per = (int64_t) 4 * WITER * 16;
-        // STRATA_SELECT_SPLIT2=1: the hi/mid bf16 pieces only (3 wmma instead of 6), opt-in; the
-        // default keeps the 6-product kernel's bits.  Measured on gfx1151: the scorer 2x at all
+        // STRATA_SELECT_SPLIT2: the hi/mid bf16 pieces only (3 wmma instead of 6), default on; =0
+        // keeps the 6-product kernel's bits.  Measured on gfx1151: the scorer 2x at all
         // depths, selections 253-256/256 identical (qsa_select_bench); +1.3% end-to-end at 98K
         // against the four-lanes thread scorer (#1943) on the same card.
-                static const bool split2 = [] { const char* v = std::getenv("STRATA_SELECT_SPLIT2"); return v != nullptr && v[0] == '1'; }();
-        // STRATA_SELECT_GRID: 0 = 0.1.45's CTA order (default, byte-identical); 1 = x = the query
-        // tiles always; 2 = adaptive (x = the query tiles once the launch is deep enough for L2 to
+                static const bool split2 = [] { const char* v = std::getenv("STRATA_SELECT_SPLIT2"); return v == nullptr || v[0] == '1'; }();
+        // STRATA_SELECT_GRID: 0 = 0.1.45's CTA order (explicit, byte-identical); 1 = x = the query
+        // tiles always; 2 = adaptive (default: x = the query tiles once the launch is deep enough for L2 to
         // matter).  Measured on gfx1151 (qsa_select_bench, 256 queries, capacity 524288): the
         // 6-product scorer 7.0 -> 5.1 ms at 98K blocks; at 24K blocks the whole key set is
         // L2-marginal and the swap is slower - the adaptive bound sits between the 24K loss and
         // the 98K win, and the engine A/B (interleaved x3 at 512K context) measured +1.8%.
         static const int grid_env = [] {
             const char* v = std::getenv("STRATA_SELECT_GRID");
-            return v != nullptr ? std::atoi(v) : 0;
+            return v != nullptr ? std::atoi(v) : 2;
         }();
         static const int64_t grid_min = [] { const char* v = std::getenv("STRATA_SELECT_GRID_MIN");
                                              return v != nullptr ? std::atoll(v) : int64_t(8192); }();

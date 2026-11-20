@@ -1254,7 +1254,7 @@ static bool s26_tsum_on() {
     static const bool on = [] {
         if (dev_class() == 1) {
             const char* v = std::getenv("STRATA_MMVQ_TSUM");
-            return v && v[0] == '1';
+            return v == nullptr || v[0] == '1';   // gfx12 default on; =0 remains the opt-out
         }
         const char* v = std::getenv("STRATA_TSUM");
         return v && v[0] == '1';
@@ -2514,10 +2514,11 @@ inline bool mmvq_il_narrow_acc_on() {
     }();
     return on;
 }
+// default 0: 2026-11-19 solo deep-decode regression, docs/ab/decode-dropout-diagnosis-2026-11-19.md
 inline bool verify_wmma_dense_on() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_VERIFY_WMMA_DENSE");
-        return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
+        return v != nullptr && (v[0] == '\0' || std::atoi(v) != 0);
     }();
     return on;
 }

@@ -312,7 +312,7 @@ public:
     /// shares the pool with decode and must keep this path blocked while both run.
     void set_cpu_pool(kernels::cpu::ExpertPool* pool);
     /// With STRATA_PREFILL_CPU_SHARE set and `applies` (a pool will be set): the chunks staged after their routing - the
-    /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 3072) instead of 1024.
+    /// only ones the share applies to - go up to STRATA_PREFILL_CPU_SHARE_MAX tokens (default 2560) instead of 1024.
     /// Before any `bytes_needed` (the ring and the small-chunk buffers follow the limit); `init` also sets it.
     /// `by_default`: this path is one the share was measured on; unset variable keeps the pool share off unless explicitly armed.
     static void arm_cpu_share(bool applies, bool by_default = false, bool batch_slots = false);

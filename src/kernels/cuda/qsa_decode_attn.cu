@@ -312,7 +312,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
     }
     qda_sync_lds();
     if constexpr (V4 && KV_MODE == 1) {
-        // Opt-in STRATA_ATTN_V4=1: 4 groups of 64 threads each accumulate every 4th cell across 4 INT8 dims
+        // STRATA_ATTN_V4: 4 groups of 64 threads each accumulate every 4th cell across 4 INT8 dims
         // via a uint32_t load + one v_scale read, then fold the 4 partials in dead sq[G][HD].
         static_assert(HD == THREADS && G % 4 == 0 && KV_Q8_GROUP >= 4 && KV_Q8_GROUP % 4 == 0,
                       "STRATA_ATTN_V4 requires HD==THREADS, G%4==0, and 4|KV_Q8_GROUP");
@@ -1196,9 +1196,9 @@ bool lane_cell_attn() {
     return on;
 }
 
-// Opt-in STRATA_ATTN_V4=1: 4 groups of 64 threads vectorize kv_mode==1 V loads (4x int8 + 1 v_scale per 4 cells).
+// STRATA_ATTN_V4 defaults on: 4 groups of 64 threads vectorize kv_mode==1 V loads (4x int8 + 1 v_scale per 4 cells).
 bool attn_v4_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_ATTN_V4"); return v && v[0] == '1'; }();
+    static const bool on = [] { const char* v = std::getenv("STRATA_ATTN_V4"); return v == nullptr || v[0] == '1'; }();
     return on;
 }
 

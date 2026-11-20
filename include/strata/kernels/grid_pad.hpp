@@ -9,7 +9,8 @@
 //
 // grid_pad(blocks, threads, ncols) is the grid to launch: `blocks` plus that padding where the rule asks for it; the
 // kernel returns at once in a block past its real grid, so every output is the unpadded launch's, bit for bit.
-// Opt-in with STRATA_GRID_PAD=1, only on gfx12 and only for one token column. Other launches keep `blocks`.
+// Enabled by default on HIP; STRATA_GRID_PAD=0 disables it. It applies only on gfx12 and for one token column.
+// Other launches keep `blocks`.
 #pragma once
 
 #include "strata/kernels/gfx_arch.hpp"
@@ -47,7 +48,7 @@ struct GridPadDevice { unsigned slots = 0, wave = 32; };
 inline GridPadDevice grid_pad_device() {
     static const bool enabled = [] {
         const char* v = std::getenv("STRATA_GRID_PAD");
-        return v && std::strcmp(v, "1") == 0;
+        return v == nullptr || std::strcmp(v, "1") == 0;
     }();
     if (!enabled) return {};
     static thread_local GridPadDevice cache[16];
