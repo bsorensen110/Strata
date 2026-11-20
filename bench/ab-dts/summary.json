@@ -1,0 +1,38 @@
+{
+ "dts6": {
+  "n": 3,
+  "DRAFT_TAIL_SKIP": "6",
+  "decode_tok_s": {
+   "mean": 88.0,
+   "min": 85.6,
+   "max": 89.8
+  },
+  "accept_ratio": 0.532,
+  "delta_vs_dts8_pct": 6.2,
+  "accept_delta_vs_dts8": 0.023
+ },
+ "dts7": {
+  "n": 3,
+  "DRAFT_TAIL_SKIP": "7",
+  "decode_tok_s": {
+   "mean": 83.6,
+   "min": 80.2,
+   "max": 87.1
+  },
+  "accept_ratio": 0.505,
+  "delta_vs_dts8_pct": 0.8,
+  "accept_delta_vs_dts8": -0.004
+ },
+ "dts8": {
+  "n": 3,
+  "DRAFT_TAIL_SKIP": "8",
+  "decode_tok_s": {
+   "mean": 82.9,
+   "min": 82.1,
+   "max": 83.7
+  },
+  "accept_ratio": 0.509,
+  "delta_vs_dts8_pct": 0.0,
+  "accept_delta_vs_dts8": 0.0
+ }
+}

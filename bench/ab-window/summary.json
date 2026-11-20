@@ -1,0 +1,92 @@
+{
+ "w8": {
+  "n_launches": 3,
+  "greedy_decode_tok_s": {
+   "n": 6,
+   "mean": 63.8,
+   "min": 55.7,
+   "max": 74.6
+  },
+  "sampled_decode_tok_s": {
+   "n": 3,
+   "mean": 46.1,
+   "min": 40.3,
+   "max": 49.5
+  },
+  "greedy_accept_ratio": 0.455,
+  "parity_sha256": [
+   "5f7397f07425c818ced28c40a4d4974d9f6e37fa8905a929d3ae655608fc5f4e",
+   "b412bfafd08791f37622b3f3716df55c000e048038aba4eee11de28592cde018"
+  ],
+  "window_ladder": [
+   "strata serve: DFlash2 drafter on (/home/soren/.local/share/strata-upstream-v0.2.10/data/dflash2/qwen3.8-flash-next-dflash2.q4_0-selq4.pack, graphs captured in 209 ms); windows up to 16 tokens; no MTP ",
+   "strata serve: window warm-up: ms per width 1:21 2:33 3:86 4:22 5:25 6:45 7:92 8:31 10:83 12:85 14:117 16:95, total 1076 ms",
+   "strata serve: --lookup-max-t 16: MTP windows up to 8 tokens, window sizes 1,2,3,4,5,6,7,8,10,12,14,16"
+  ],
+  "lookup_max_t": [
+   "16"
+  ],
+  "greedy_delta_vs_w16_pct": 3.9,
+  "sampled_delta_vs_w16_pct": -11.2
+ },
+ "w12": {
+  "n_launches": 3,
+  "greedy_decode_tok_s": {
+   "n": 6,
+   "mean": 63.6,
+   "min": 55.5,
+   "max": 72.0
+  },
+  "sampled_decode_tok_s": {
+   "n": 3,
+   "mean": 57.7,
+   "min": 47.1,
+   "max": 65.3
+  },
+  "greedy_accept_ratio": 0.441,
+  "parity_sha256": [
+   "83ececf42947ca7093e80f4fc6a748762f7d624b57b8364b21d7852ae7439ae9",
+   "f9e919a6873772fa7e1627f7515913dea8c446abf7f5fee936410fa69708bac1"
+  ],
+  "window_ladder": [
+   "strata serve: DFlash2 drafter on (/home/soren/.local/share/strata-upstream-v0.2.10/data/dflash2/qwen3.8-flash-next-dflash2.q4_0-selq4.pack, graphs captured in 262 ms); windows up to 12 tokens; no MTP ",
+   "strata serve: window warm-up: ms per width 1:22 2:42 3:78 4:21 5:111 6:45 7:75 8:30 10:118 11:39 12:42, total 976 ms",
+   "strata serve: --lookup-max-t 12: MTP windows up to 8 tokens, window sizes 1,2,3,4,5,6,7,8,10,11,12"
+  ],
+  "lookup_max_t": [
+   "12"
+  ],
+  "greedy_delta_vs_w16_pct": 3.6,
+  "sampled_delta_vs_w16_pct": 11.2
+ },
+ "w16": {
+  "n_launches": 3,
+  "greedy_decode_tok_s": {
+   "n": 6,
+   "mean": 61.4,
+   "min": 52.1,
+   "max": 70.1
+  },
+  "sampled_decode_tok_s": {
+   "n": 3,
+   "mean": 51.9,
+   "min": 39.7,
+   "max": 58.4
+  },
+  "greedy_accept_ratio": 0.434,
+  "parity_sha256": [
+   "784756f38c9b3ef4606f20372a78e44d61eed6c4220b85e5f50665ed6aa3e1a6",
+   "83ececf42947ca7093e80f4fc6a748762f7d624b57b8364b21d7852ae7439ae9"
+  ],
+  "window_ladder": [
+   "strata serve: DFlash2 drafter on (/home/soren/.local/share/strata-upstream-v0.2.10/data/dflash2/qwen3.8-flash-next-dflash2.q4_0-selq4.pack, graphs captured in 134 ms); windows up to 16 tokens; no MTP ",
+   "strata serve: window warm-up: ms per width 1:31 2:45 3:31 4:31 5:39 6:55 7:37 8:41 10:67 12:98 14:60 16:84, total 936 ms",
+   "strata serve: --lookup-max-t 16: MTP windows up to 8 tokens, window sizes 1,2,3,4,5,6,7,8,10,12,14,16"
+  ],
+  "lookup_max_t": [
+   "16"
+  ],
+  "greedy_delta_vs_w16_pct": 0.0,
+  "sampled_delta_vs_w16_pct": 0.0
+ }
+}

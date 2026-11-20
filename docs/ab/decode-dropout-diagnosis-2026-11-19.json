@@ -1,0 +1,1148 @@
+{
+  "snapshot_log_lines": 54384,
+  "era_stats": [
+    {
+      "era_idx": 193,
+      "start_ts": "2026-11-18 03:26:41",
+      "engine": "fork-0161-fc2de6a19",
+      "n_requests": 4,
+      "decode_tps": {
+        "min": 51.6,
+        "p10": 60.9,
+        "median": 84.3,
+        "mean": 78.8,
+        "max": 94.9
+      },
+      "draft_accept_ratio": {
+        "median": 0.5277,
+        "p10": 0.2525
+      },
+      "lookup_chain_win_accept_ratio": {
+        "n": 4,
+        "median": 0.069
+      },
+      "lookup_chain_tok_accept_ratio": {
+        "n": 3,
+        "median": 0.0714
+      },
+      "prefill_tps_median": 425.2,
+      "prompt_tokens_median": 224330,
+      "reused_tokens_median": 156310,
+      "generated_tokens_median": 318,
+      "expert_cache_hit_pct_median": 87.8,
+      "pcie_routed_pct_median": 1.05
+    },
+    {
+      "era_idx": 194,
+      "start_ts": "2026-11-18 04:28:56",
+      "engine": "fork-0161-fc2de6a19",
+      "n_requests": 34,
+      "decode_tps": {
+        "min": 58.6,
+        "p10": 71.8,
+        "median": 82.7,
+        "mean": 85.3,
+        "max": 134.7
+      },
+      "draft_accept_ratio": {
+        "median": 0.5063,
+        "p10": 0.4537
+      },
+      "lookup_chain_win_accept_ratio": {
+        "n": 34,
+        "median": 0.0395
+      },
+      "lookup_chain_tok_accept_ratio": {
+        "n": 33,
+        "median": 0.2258
+      },
+      "prefill_tps_median": 812.0,
+      "prompt_tokens_median": 95136,
+      "reused_tokens_median": 94080,
+      "generated_tokens_median": 1130,
+      "expert_cache_hit_pct_median": 95.0,
+      "pcie_routed_pct_median": 0.2
+    },
+    {
+      "era_idx": 195,
+      "start_ts": "2026-11-18 07:04:27",
+      "engine": "fork-0161-fc2de6a19",
+      "n_requests": 77,
+      "decode_tps": {
+        "min": 34.5,
+        "p10": 71.6,
+        "median": 83.3,
+        "mean": 94.0,
+        "max": 208.6
+      },
+      "draft_accept_ratio": {
+        "median": 0.5217,
+        "p10": 0.4416
+      },
+      "lookup_chain_win_accept_ratio": {
+        "n": 77,
+        "median": 0.0376
+      },
+      "lookup_chain_tok_accept_ratio": {
+        "n": 74,
+        "median": 0.4412
+      },
+      "prefill_tps_median": 867.3,
+      "prompt_tokens_median": 146431,
+      "reused_tokens_median": 141533,
+      "generated_tokens_median": 1278,
+      "expert_cache_hit_pct_median": 94.7,
+      "pcie_routed_pct_median": 0.2
+    },
+    {
+      "era_idx": 196,
+      "start_ts": "2026-11-18 16:31:52",
+      "engine": "fork-0161-fc2de6a19",
+      "n_requests": 9,
+      "decode_tps": {
+        "min": 69.4,
+        "p10": 71.6,
+        "median": 76.7,
+        "mean": 78.6,
+        "max": 101.4
+      },
+      "draft_accept_ratio": {
+        "median": 0.4891,
+        "p10": 0.4722
+      },
+      "lookup_chain_win_accept_ratio": {
+        "n": 9,
+        "median": 0.0251
+      },
+      "lookup_chain_tok_accept_ratio": {
+        "n": 8,
+        "median": 0.2973
+      },
+      "prefill_tps_median": 1313.6,
+      "prompt_tokens_median": 239237,
+      "reused_tokens_median": 234737,
+      "generated_tokens_median": 1235,
+      "expert_cache_hit_pct_median": 95.7,
+      "pcie_routed_pct_median": 0.2
+    },
+    {
+      "era_idx": 197,
+      "start_ts": "2026-11-18 17:37:38",
+      "engine": "fork-0161-fc2de6a19",
+      "n_requests": 112,
+      "decode_tps": {
+        "min": 64.3,
+        "p10": 75.5,
+        "median": 87.5,
+        "mean": 92.1,
+        "max": 181.7
+      },
+      "draft_accept_ratio": {
+        "median": 0.54,
+        "p10": 0.4761
+      },
+      "lookup_chain_win_accept_ratio": {
+        "n": 112,
+        "median": 0.0404
+      },
+      "lookup_chain_tok_accept_ratio": {
+        "n": 109,
+        "median": 0.2321
+      },
+      "prefill_tps_median": 706.8,
+      "prompt_tokens_median": 133346,
+      "reused_tokens_median": 132381,
+      "generated_tokens_median": 407,
+      "expert_cache_hit_pct_median": 94.8,
+      "pcie_routed_pct_median": 0.3
+    },
+    {
+      "era_idx": 198,
+      "start_ts": "2026-11-19 00:26:43",
+      "engine": "fork-0161-fc2de6a19",
+      "n_requests": 34,
+      "decode_tps": {
+        "min": 70.9,
+        "p10": 75.9,
+        "median": 85.5,
+        "mean": 94.7,
+        "max": 200.0
+      },
+      "draft_accept_ratio": {
+        "median": 0.5343,
+        "p10": 0.4582
+      },
+      "lookup_chain_win_accept_ratio": {
+        "n": 34,
+        "median": 0.0408
+      },
+      "lookup_chain_tok_accept_ratio": {
+        "n": 30,
+        "median": 0.1742
+      },
+      "prefill_tps_median": 938.2,
+      "prompt_tokens_median": 122190,
+      "reused_tokens_median": 120715,
+      "generated_tokens_median": 755,
+      "expert_cache_hit_pct_median": 94.7,
+      "pcie_routed_pct_median": 0.3
+    },
+    {
+      "era_idx": 199,
+      "start_ts": "2026-11-19 01:28:29",
+      "engine": "fork-0161-fc2de6a19",
+      "n_requests": 1,
+      "decode_tps": {
+        "min": 62.1,
+        "p10": 62.1,
+        "median": 62.1,
+        "mean": 62.1,
+        "max": 62.1
+      },
+      "draft_accept_ratio": {
+        "median": 0.3333,
+        "p10": 0.3333
+      },
+      "lookup_chain_win_accept_ratio": {
+        "n": 1,
+        "median": 0.0
+      },
+      "lookup_chain_tok_accept_ratio": {
+        "n": 0,
+        "median": null
+      },
+      "prefill_tps_median": 209.7,
+      "prompt_tokens_median": 28,
+      "reused_tokens_median": 0,
+      "generated_tokens_median": 3,
+      "expert_cache_hit_pct_median": 67.9,
+      "pcie_routed_pct_median": 4.1
+    },
+    {
+      "era_idx": 200,
+      "start_ts": "2026-11-19 01:34:51",
+      "engine": "fork-58aefafc9",
+      "n_requests": 42,
+      "decode_tps": {
+        "min": 58.9,
+        "p10": 62.1,
+        "median": 72.8,
+        "mean": 77.4,
+        "max": 173.1
+      },
+      "draft_accept_ratio": {
+        "median": 0.4997,
+        "p10": 0.4407
+      },
+      "lookup_chain_win_accept_ratio": {
+        "n": 42,
+        "median": 0.0752
+      },
+      "lookup_chain_tok_accept_ratio": {
+        "n": 39,
+        "median": 0.2344
+      },
+      "prefill_tps_median": 733.6,
+      "prompt_tokens_median": 198449,
+      "reused_tokens_median": 196688,
+      "generated_tokens_median": 487,
+      "expert_cache_hit_pct_median": 95.3,
+      "pcie_routed_pct_median": 0.3
+    }
+  ],
+  "era_200_dropouts_under_65_tps": [
+    {
+      "req_index": 1,
+      "line": 53906,
+      "timestamp_est": "Nov 19 01:35:39",
+      "dec_tps": 62.4,
+      "gen": 3,
+      "dec_ms": 48.0,
+      "prompt": 28,
+      "reused": 0,
+      "read": 28,
+      "draft_acc": 1,
+      "draft_tot": 3,
+      "draft_ratio": 0.3333,
+      "lookup": {
+        "win_acc": 0,
+        "win_tot": 2,
+        "tok_acc": 0,
+        "tok_tot": 0
+      },
+      "ecache": {
+        "hit_pct": 67.4,
+        "pcie_reads": 76,
+        "pcie_pct": 3.6
+      },
+      "kvstream": {
+        "vram_hit_pct": 94.44,
+        "ram_mib": 0.4
+      },
+      "surrounding_lines": [
+        {
+          "line": 53903,
+          "text": "strata serve: window warm-up: ms per width 1:21 2:34 3:21 4:120 5:26 6:139 7:29 8:122 10:106 12:60 14:142 16:72, total 1160 ms"
+        },
+        {
+          "line": 53904,
+          "text": "strata serve: --lookup-max-t 16: MTP windows up to 8 tokens, window sizes 1,2,3,4,5,6,7,8,10,12,14,16"
+        },
+        {
+          "line": 53905,
+          "text": "strata serve: the graphics driver paused the GPU for 337 ms between requests while Linux moved memory the GPU uses"
+        },
+        {
+          "line": 53906,
+          "text": "strata serve: prompt 28 tokens = 0 reused + 28 read in 169 ms (165.2 tok/s), 3 generated in 48 ms (62.4 tok/s), drafts accepted 1 of 3, 1 checkpoints"
+        },
+        {
+          "line": 53907,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        },
+        {
+          "line": 53908,
+          "text": "strata serve: decode expert cache hit rate: 67.4% (1384 hits / 2053 lookups); 76 more read by the GPU over PCIe or from another GPU (3.6% of all 2129 routed)"
+        },
+        {
+          "line": 53909,
+          "text": "strata serve: route tail skip: 3043 missed experts skipped (3675 entries) since the start"
+        },
+        {
+          "line": 53910,
+          "text": "strata serve: resident RAM: 36.03 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file"
+        },
+        {
+          "line": 53911,
+          "text": "strata serve: expert tiers: GPU 1384 hits this request; since the start RAM 6218 blobs, files 0 blobs 26414.1 MB read (the GGUF in place)"
+        },
+        {
+          "line": 53912,
+          "text": "strata serve: file tier I/O this request: the OS read 78363.2 MB from storage (402 major faults) for 26414.1 MB of expert reads; page cache held 32608.4 MB at the read, not 32490.4 MB; io prefetch: 0 read ahead (33532.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 18611.8 ms in 10897 fetches; decode gate: cache room 0.26 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), closed, closed in 16 windows so far, 1 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)"
+        },
+        {
+          "line": 53913,
+          "text": "strata serve: KV streaming: 94.44% of 1728 block reads hit VRAM, 0.4 MiB read from RAM"
+        },
+        {
+          "line": 53914,
+          "text": "strata serve: lookup chain: 0 of 2 windows, 0 of 0 chained drafts accepted"
+        },
+        {
+          "line": 53915,
+          "text": "strata serve: conversation cache: the reply this request replaces is not parked (9 tokens past the turn checkpoint at 21)"
+        },
+        {
+          "line": 53916,
+          "text": "strata serve: prompt 28 tokens = 21 reused + 7 read in 55 ms (128.4 tok/s), 3 generated in 48 ms (62.1 tok/s), drafts accepted 1 of 2, 1 checkpoints"
+        },
+        {
+          "line": 53917,
+          "text": "strata serve: decode expert cache hit rate: 66.0% (1057 hits / 1602 lookups); 63 more read by the GPU over PCIe or from another GPU (3.8% of all 1665 routed)"
+        },
+        {
+          "line": 53918,
+          "text": "strata serve: route tail skip: 3507 missed experts skipped (4171 entries) since the start"
+        }
+      ]
+    },
+    {
+      "req_index": 2,
+      "line": 53916,
+      "timestamp_est": "Nov 19 01:35:52",
+      "dec_tps": 62.1,
+      "gen": 3,
+      "dec_ms": 48.0,
+      "prompt": 28,
+      "reused": 21,
+      "read": 7,
+      "draft_acc": 1,
+      "draft_tot": 2,
+      "draft_ratio": 0.5,
+      "lookup": {
+        "win_acc": 0,
+        "win_tot": 2,
+        "tok_acc": 0,
+        "tok_tot": 0
+      },
+      "ecache": {
+        "hit_pct": 66.0,
+        "pcie_reads": 63,
+        "pcie_pct": 3.8
+      },
+      "kvstream": {
+        "vram_hit_pct": 96.26,
+        "ram_mib": 0.4
+      },
+      "surrounding_lines": [
+        {
+          "line": 53913,
+          "text": "strata serve: KV streaming: 94.44% of 1728 block reads hit VRAM, 0.4 MiB read from RAM"
+        },
+        {
+          "line": 53914,
+          "text": "strata serve: lookup chain: 0 of 2 windows, 0 of 0 chained drafts accepted"
+        },
+        {
+          "line": 53915,
+          "text": "strata serve: conversation cache: the reply this request replaces is not parked (9 tokens past the turn checkpoint at 21)"
+        },
+        {
+          "line": 53916,
+          "text": "strata serve: prompt 28 tokens = 21 reused + 7 read in 55 ms (128.4 tok/s), 3 generated in 48 ms (62.1 tok/s), drafts accepted 1 of 2, 1 checkpoints"
+        },
+        {
+          "line": 53917,
+          "text": "strata serve: decode expert cache hit rate: 66.0% (1057 hits / 1602 lookups); 63 more read by the GPU over PCIe or from another GPU (3.8% of all 1665 routed)"
+        },
+        {
+          "line": 53918,
+          "text": "strata serve: route tail skip: 3507 missed experts skipped (4171 entries) since the start"
+        },
+        {
+          "line": 53919,
+          "text": "strata serve: resident RAM: 36.03 GiB of experts in RAM, 0 exchanged with the VRAM tier, 0 blob reads from the file"
+        },
+        {
+          "line": 53920,
+          "text": "strata serve: expert tiers: GPU 1057 hits this request; since the start RAM 7268 blobs, files 0 blobs 26414.1 MB read (the GGUF in place)"
+        },
+        {
+          "line": 53921,
+          "text": "strata serve: file tier I/O this request: the OS read 0.7 MB from storage (0 major faults) for 0.0 MB of expert reads; page cache held 0.0 MB at the read, not 0.0 MB; io prefetch: 0 read ahead (0.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 0.0 ms in 0 fetches; decode gate: cache room 0.26 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), closed, closed in 19 windows so far, 1 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)"
+        },
+        {
+          "line": 53922,
+          "text": "strata serve: KV streaming: 96.26% of 2568 block reads hit VRAM, 0.4 MiB read from RAM"
+        },
+        {
+          "line": 53923,
+          "text": "strata serve: lookup chain: 0 of 2 windows, 0 of 0 chained drafts accepted"
+        },
+        {
+          "line": 53924,
+          "text": "strata serve: conversation cache: parked 30 tokens in 6.3 ms; parked=30 bytes=236672308 evictions=0 l2_disk_bytes=236672308 snapshot_bytes=0 reused_kv_bytes=0"
+        },
+        {
+          "line": 53925,
+          "text": "strata serve: prompt 33 tokens = 0 reused + 33 read in 211 ms (156.5 tok/s), 66 generated in 978 ms (67.5 tok/s), drafts accepted 38 of 61, 1 checkpoints"
+        },
+        {
+          "line": 53926,
+          "text": "strata serve: checkpoint pool: this request took 3 checkpoints ready from the pool and allocated 0 fresh"
+        },
+        {
+          "line": 53927,
+          "text": "strata serve: decode expert cache hit rate: 91.4% (37068 hits / 40560 lookups); 43 more read by the GPU over PCIe or from another GPU (0.1% of all 40603 routed)"
+        },
+        {
+          "line": 53928,
+          "text": "strata serve: route tail skip: 6159 missed experts skipped (7125 entries) since the start"
+        }
+      ]
+    },
+    {
+      "req_index": 17,
+      "line": 54090,
+      "timestamp_est": "Nov 19 01:57:06",
+      "dec_tps": 62.2,
+      "gen": 224,
+      "dec_ms": 3599.0,
+      "prompt": 188342,
+      "reused": 188051,
+      "read": 291,
+      "draft_acc": 126,
+      "draft_tot": 285,
+      "draft_ratio": 0.4421,
+      "lookup": {
+        "win_acc": 4,
+        "win_tot": 98,
+        "tok_acc": 0,
+        "tok_tot": 10
+      },
+      "ecache": {
+        "hit_pct": 96.5,
+        "pcie_reads": 218,
+        "pcie_pct": 0.1
+      },
+      "kvstream": {
+        "vram_hit_pct": 95.52,
+        "ram_mib": 9747.9
+      },
+      "surrounding_lines": [
+        {
+          "line": 54087,
+          "text": "strata serve: suffix drafts: 10 windows, 43 of 60 drafts accepted"
+        },
+        {
+          "line": 54088,
+          "text": "strata serve: lookup chain: 10 of 140 windows, 17 of 25 chained drafts accepted"
+        },
+        {
+          "line": 54089,
+          "text": "strata prefill: chunk 512 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54090,
+          "text": "strata serve: prompt 188342 tokens = 188051 reused + 291 read in 405 ms (718.4 tok/s), 224 generated in 3599 ms (62.2 tok/s), drafts accepted 126 of 285, 6 checkpoints"
+        },
+        {
+          "line": 54091,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        },
+        {
+          "line": 54092,
+          "text": "strata serve: decode expert cache hit rate: 96.5% (172893 hits / 179217 lookups); 218 more read by the GPU over PCIe or from another GPU (0.1% of all 179435 routed)"
+        },
+        {
+          "line": 54093,
+          "text": "strata serve: route tail skip: 135806 missed experts skipped (146919 entries) since the start"
+        },
+        {
+          "line": 54094,
+          "text": "strata serve: resident RAM: 36.03 GiB of experts in RAM, 27005 exchanged with the VRAM tier, 0 blob reads from the file"
+        },
+        {
+          "line": 54095,
+          "text": "strata serve: expert tiers: GPU 172893 hits this request; since the start RAM 495529 blobs, files 0 blobs 26414.1 MB read (the GGUF in place)"
+        },
+        {
+          "line": 54096,
+          "text": "strata serve: file tier I/O this request: the OS read 47.7 MB from storage (0 major faults) for 0.0 MB of expert reads; page cache held 0.0 MB at the read, not 0.0 MB; io prefetch: 0 read ahead (0.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 0.0 ms in 0 fetches; decode gate: cache room 0.19 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), closed, closed in 1978 windows so far, 1 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)"
+        },
+        {
+          "line": 54097,
+          "text": "strata serve: KV streaming: 95.52% of 53960616 block reads hit VRAM, 9747.9 MiB read from RAM"
+        },
+        {
+          "line": 54098,
+          "text": "strata serve: suffix drafts: 3 windows, 4 of 25 drafts accepted"
+        },
+        {
+          "line": 54099,
+          "text": "strata serve: lookup chain: 4 of 98 windows, 0 of 10 chained drafts accepted"
+        },
+        {
+          "line": 54100,
+          "text": "strata prefill: chunk 256 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54101,
+          "text": "strata serve: prompt 188669 tokens = 188565 reused + 104 read in 293 ms (354.6 tok/s), 4064 generated in 61131 ms (66.5 tok/s), drafts accepted 2172 of 4592, 6 checkpoints"
+        },
+        {
+          "line": 54102,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        }
+      ]
+    },
+    {
+      "req_index": 25,
+      "line": 54180,
+      "timestamp_est": "Nov 19 02:06:09",
+      "dec_tps": 60.1,
+      "gen": 1864,
+      "dec_ms": 31006.0,
+      "prompt": 204395,
+      "reused": 204363,
+      "read": 32,
+      "draft_acc": 907,
+      "draft_tot": 2139,
+      "draft_ratio": 0.424,
+      "lookup": {
+        "win_acc": 47,
+        "win_tot": 957,
+        "tok_acc": 8,
+        "tok_tot": 60
+      },
+      "ecache": {
+        "hit_pct": 95.5,
+        "pcie_reads": 6295,
+        "pcie_pct": 0.4
+      },
+      "kvstream": {
+        "vram_hit_pct": 96.5,
+        "ram_mib": 23171.3
+      },
+      "surrounding_lines": [
+        {
+          "line": 54177,
+          "text": "strata serve: KV streaming: 96.40% of 145256832 block reads hit VRAM, 21040.4 MiB read from RAM"
+        },
+        {
+          "line": 54178,
+          "text": "strata serve: suffix drafts: 2 windows, 3 of 18 drafts accepted"
+        },
+        {
+          "line": 54179,
+          "text": "strata serve: lookup chain: 5 of 42 windows, 4 of 11 chained drafts accepted"
+        },
+        {
+          "line": 54180,
+          "text": "strata serve: prompt 204395 tokens = 204363 reused + 32 read in 196 ms (163.0 tok/s), 1864 generated in 31006 ms (60.1 tok/s), drafts accepted 907 of 2139, 6 checkpoints"
+        },
+        {
+          "line": 54181,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        },
+        {
+          "line": 54182,
+          "text": "strata serve: decode expert cache hit rate: 95.5% (1375118 hits / 1440120 lookups); 6295 more read by the GPU over PCIe or from another GPU (0.4% of all 1446415 routed)"
+        },
+        {
+          "line": 54183,
+          "text": "strata serve: route tail skip: 340121 missed experts skipped (363555 entries) since the start"
+        },
+        {
+          "line": 54184,
+          "text": "strata serve: resident RAM: 36.03 GiB of experts in RAM, 77990 exchanged with the VRAM tier, 0 blob reads from the file"
+        },
+        {
+          "line": 54185,
+          "text": "strata serve: expert tiers: GPU 1375118 hits this request; since the start RAM 866691 blobs, files 0 blobs 26414.1 MB read (the GGUF in place)"
+        },
+        {
+          "line": 54186,
+          "text": "strata serve: file tier I/O this request: the OS read 380.8 MB from storage (0 major faults) for 0.0 MB of expert reads; page cache held 0.0 MB at the read, not 0.0 MB; io prefetch: 0 read ahead (0.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 0.0 ms in 0 fetches; decode gate: cache room 0.18 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), closed, closed in 7060 windows so far, 1 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)"
+        },
+        {
+          "line": 54187,
+          "text": "strata serve: KV streaming: 96.50% of 164525304 block reads hit VRAM, 23171.3 MiB read from RAM"
+        },
+        {
+          "line": 54188,
+          "text": "strata serve: suffix drafts: 38 windows, 96 of 177 drafts accepted"
+        },
+        {
+          "line": 54189,
+          "text": "strata serve: lookup chain: 47 of 957 windows, 8 of 60 chained drafts accepted"
+        },
+        {
+          "line": 54190,
+          "text": "strata serve: conversation cache: the reply this request replaces is not parked (1868 tokens past the turn checkpoint at 204390)"
+        },
+        {
+          "line": 54191,
+          "text": "strata prefill: chunk 3328 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54192,
+          "text": "strata serve: prompt 207600 tokens = 204390 reused + 3210 read in 1458 ms (2201.8 tok/s), 1804 generated in 29216 ms (61.7 tok/s), drafts accepted 879 of 1945, 6 checkpoints"
+        }
+      ]
+    },
+    {
+      "req_index": 26,
+      "line": 54192,
+      "timestamp_est": "Nov 19 02:06:40",
+      "dec_tps": 61.7,
+      "gen": 1804,
+      "dec_ms": 29216.0,
+      "prompt": 207600,
+      "reused": 204390,
+      "read": 3210,
+      "draft_acc": 879,
+      "draft_tot": 1945,
+      "draft_ratio": 0.4519,
+      "lookup": {
+        "win_acc": 55,
+        "win_tot": 925,
+        "tok_acc": 9,
+        "tok_tot": 82
+      },
+      "ecache": {
+        "hit_pct": 96.8,
+        "pcie_reads": 1627,
+        "pcie_pct": 0.1
+      },
+      "kvstream": {
+        "vram_hit_pct": 96.55,
+        "ram_mib": 25293.6
+      },
+      "surrounding_lines": [
+        {
+          "line": 54189,
+          "text": "strata serve: lookup chain: 47 of 957 windows, 8 of 60 chained drafts accepted"
+        },
+        {
+          "line": 54190,
+          "text": "strata serve: conversation cache: the reply this request replaces is not parked (1868 tokens past the turn checkpoint at 204390)"
+        },
+        {
+          "line": 54191,
+          "text": "strata prefill: chunk 3328 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54192,
+          "text": "strata serve: prompt 207600 tokens = 204390 reused + 3210 read in 1458 ms (2201.8 tok/s), 1804 generated in 29216 ms (61.7 tok/s), drafts accepted 879 of 1945, 6 checkpoints"
+        },
+        {
+          "line": 54193,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        },
+        {
+          "line": 54194,
+          "text": "strata serve: decode expert cache hit rate: 96.8% (1302893 hits / 1345531 lookups); 1627 more read by the GPU over PCIe or from another GPU (0.1% of all 1347158 routed)"
+        },
+        {
+          "line": 54195,
+          "text": "strata serve: route tail skip: 369167 missed experts skipped (394120 entries) since the start"
+        },
+        {
+          "line": 54196,
+          "text": "strata serve: resident RAM: 36.03 GiB of experts in RAM, 86323 exchanged with the VRAM tier, 0 blob reads from the file"
+        },
+        {
+          "line": 54197,
+          "text": "strata serve: expert tiers: GPU 1302893 hits this request; since the start RAM 925943 blobs, files 0 blobs 26414.1 MB read (the GGUF in place)"
+        },
+        {
+          "line": 54198,
+          "text": "strata serve: file tier I/O this request: the OS read 363.3 MB from storage (0 major faults) for 0.0 MB of expert reads; page cache held 0.0 MB at the read, not 0.0 MB; io prefetch: 0 read ahead (0.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 0.0 ms in 0 fetches; decode gate: cache room 0.18 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), closed, closed in 7986 windows so far, 1 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)"
+        },
+        {
+          "line": 54199,
+          "text": "strata serve: KV streaming: 96.55% of 182234844 block reads hit VRAM, 25293.6 MiB read from RAM"
+        },
+        {
+          "line": 54200,
+          "text": "strata serve: suffix drafts: 32 windows, 77 of 127 drafts accepted"
+        },
+        {
+          "line": 54201,
+          "text": "strata serve: lookup chain: 55 of 925 windows, 9 of 82 chained drafts accepted"
+        },
+        {
+          "line": 54202,
+          "text": "strata serve: conversation cache: the reply this request replaces is not parked (1808 tokens past the turn checkpoint at 207595)"
+        },
+        {
+          "line": 54203,
+          "text": "strata serve: DFlash2: 1566 context rows of the window rebuilt from the drafter's log in 12.8 ms"
+        },
+        {
+          "line": 54204,
+          "text": "strata prefill: chunk 256 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        }
+      ]
+    },
+    {
+      "req_index": 34,
+      "line": 54283,
+      "timestamp_est": "Nov 19 02:09:27",
+      "dec_tps": 63.1,
+      "gen": 1232,
+      "dec_ms": 19540.0,
+      "prompt": 220660,
+      "reused": 220342,
+      "read": 318,
+      "draft_acc": 673,
+      "draft_tot": 1469,
+      "draft_ratio": 0.4581,
+      "lookup": {
+        "win_acc": 43,
+        "win_tot": 559,
+        "tok_acc": 7,
+        "tok_tot": 63
+      },
+      "ecache": {
+        "hit_pct": 95.4,
+        "pcie_reads": 2992,
+        "pcie_pct": 0.3
+      },
+      "kvstream": {
+        "vram_hit_pct": 96.23,
+        "ram_mib": 43777.5
+      },
+      "surrounding_lines": [
+        {
+          "line": 54280,
+          "text": "strata serve: suffix drafts: 17 windows, 44 of 90 drafts accepted"
+        },
+        {
+          "line": 54281,
+          "text": "strata serve: lookup chain: 24 of 285 windows, 13 of 44 chained drafts accepted"
+        },
+        {
+          "line": 54282,
+          "text": "strata prefill: chunk 512 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54283,
+          "text": "strata serve: prompt 220660 tokens = 220342 reused + 318 read in 426 ms (747.0 tok/s), 1232 generated in 19540 ms (63.1 tok/s), drafts accepted 673 of 1469, 6 checkpoints"
+        },
+        {
+          "line": 54284,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        },
+        {
+          "line": 54285,
+          "text": "strata serve: decode expert cache hit rate: 95.4% (898831 hits / 941794 lookups); 2992 more read by the GPU over PCIe or from another GPU (0.3% of all 944786 routed)"
+        },
+        {
+          "line": 54286,
+          "text": "strata serve: route tail skip: 609696 missed experts skipped (650594 entries) since the start"
+        },
+        {
+          "line": 54287,
+          "text": "strata serve: resident RAM: 36.03 GiB of experts in RAM, 142492 exchanged with the VRAM tier, 0 blob reads from the file"
+        },
+        {
+          "line": 54288,
+          "text": "strata serve: expert tiers: GPU 898831 hits this request; since the start RAM 1367646 blobs, files 0 blobs 26414.1 MB read (the GGUF in place)"
+        },
+        {
+          "line": 54289,
+          "text": "strata serve: file tier I/O this request: the OS read 264.9 MB from storage (0 major faults) for 0.0 MB of expert reads; page cache held 0.0 MB at the read, not 0.0 MB; io prefetch: 0 read ahead (0.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 0.0 ms in 0 fetches; decode gate: cache room 0.17 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), closed, closed in 12626 windows so far, 1 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)"
+        },
+        {
+          "line": 54290,
+          "text": "strata serve: KV streaming: 96.23% of 288252420 block reads hit VRAM, 43777.5 MiB read from RAM"
+        },
+        {
+          "line": 54291,
+          "text": "strata serve: suffix drafts: 21 windows, 51 of 101 drafts accepted"
+        },
+        {
+          "line": 54292,
+          "text": "strata serve: lookup chain: 43 of 559 windows, 7 of 63 chained drafts accepted"
+        },
+        {
+          "line": 54293,
+          "text": "strata serve: conversation cache: the reply this request replaces is not parked (1236 tokens past the turn checkpoint at 220655)"
+        },
+        {
+          "line": 54294,
+          "text": "strata prefill: chunk 1280 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54295,
+          "text": "strata serve: prompt 221922 tokens = 220655 reused + 1267 read in 732 ms (1730.6 tok/s), 152 generated in 1635 ms (93.0 tok/s), drafts accepted 107 of 178, 6 checkpoints"
+        }
+      ]
+    },
+    {
+      "req_index": 36,
+      "line": 54306,
+      "timestamp_est": "Nov 19 02:10:26",
+      "dec_tps": 61.7,
+      "gen": 344,
+      "dec_ms": 5576.0,
+      "prompt": 222220,
+      "reused": 222073,
+      "read": 147,
+      "draft_acc": 168,
+      "draft_tot": 399,
+      "draft_ratio": 0.4211,
+      "lookup": {
+        "win_acc": 19,
+        "win_tot": 176,
+        "tok_acc": 2,
+        "tok_tot": 25
+      },
+      "ecache": {
+        "hit_pct": 96.5,
+        "pcie_reads": 656,
+        "pcie_pct": 0.2
+      },
+      "kvstream": {
+        "vram_hit_pct": 96.24,
+        "ram_mib": 44399.8
+      },
+      "surrounding_lines": [
+        {
+          "line": 54303,
+          "text": "strata serve: suffix drafts: 6 windows, 19 of 33 drafts accepted"
+        },
+        {
+          "line": 54304,
+          "text": "strata serve: lookup chain: 7 of 45 windows, 7 of 14 chained drafts accepted"
+        },
+        {
+          "line": 54305,
+          "text": "strata prefill: chunk 256 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54306,
+          "text": "strata serve: prompt 222220 tokens = 222073 reused + 147 read in 353 ms (416.1 tok/s), 344 generated in 5576 ms (61.7 tok/s), drafts accepted 168 of 399, 6 checkpoints"
+        },
+        {
+          "line": 54307,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        },
+        {
+          "line": 54308,
+          "text": "strata serve: decode expert cache hit rate: 96.5% (259951 hits / 269303 lookups); 656 more read by the GPU over PCIe or from another GPU (0.2% of all 269959 routed)"
+        },
+        {
+          "line": 54309,
+          "text": "strata serve: route tail skip: 618665 missed experts skipped (660142 entries) since the start"
+        },
+        {
+          "line": 54310,
+          "text": "strata serve: resident RAM: 36.03 GiB of experts in RAM, 144819 exchanged with the VRAM tier, 0 blob reads from the file"
+        },
+        {
+          "line": 54311,
+          "text": "strata serve: expert tiers: GPU 259951 hits this request; since the start RAM 1394487 blobs, files 0 blobs 26414.1 MB read (the GGUF in place)"
+        },
+        {
+          "line": 54312,
+          "text": "strata serve: file tier I/O this request: the OS read 69.0 MB from storage (0 major faults) for 0.0 MB of expert reads; page cache held 0.0 MB at the read, not 0.0 MB; io prefetch: 0 read ahead (0.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 0.0 ms in 0 fetches; decode gate: cache room 0.17 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), closed, closed in 12849 windows so far, 1 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)"
+        },
+        {
+          "line": 54313,
+          "text": "strata serve: KV streaming: 96.24% of 293218980 block reads hit VRAM, 44399.8 MiB read from RAM"
+        },
+        {
+          "line": 54314,
+          "text": "strata serve: suffix drafts: 8 windows, 28 of 45 drafts accepted"
+        },
+        {
+          "line": 54315,
+          "text": "strata serve: lookup chain: 19 of 176 windows, 2 of 25 chained drafts accepted"
+        },
+        {
+          "line": 54316,
+          "text": "strata serve: prompt 222810 tokens = 222563 reused + 247 read in 462 ms (534.9 tok/s), 228 generated in 3434 ms (66.4 tok/s), drafts accepted 126 of 286, 6 checkpoints"
+        },
+        {
+          "line": 54317,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        },
+        {
+          "line": 54318,
+          "text": "strata serve: decode expert cache hit rate: 96.7% (176231 hits / 182196 lookups); 172 more read by the GPU over PCIe or from another GPU (0.1% of all 182368 routed)"
+        }
+      ]
+    },
+    {
+      "req_index": 38,
+      "line": 54327,
+      "timestamp_est": "Nov 19 02:11:02",
+      "dec_tps": 58.9,
+      "gen": 1741,
+      "dec_ms": 29570.0,
+      "prompt": 225077,
+      "reused": 223037,
+      "read": 2040,
+      "draft_acc": 828,
+      "draft_tot": 1868,
+      "draft_ratio": 0.4433,
+      "lookup": {
+        "win_acc": 35,
+        "win_tot": 913,
+        "tok_acc": 8,
+        "tok_tot": 44
+      },
+      "ecache": {
+        "hit_pct": 97.5,
+        "pcie_reads": 2868,
+        "pcie_pct": 0.2
+      },
+      "kvstream": {
+        "vram_hit_pct": 96.2,
+        "ram_mib": 47853.7
+      },
+      "surrounding_lines": [
+        {
+          "line": 54324,
+          "text": "strata serve: suffix drafts: 4 windows, 13 of 19 drafts accepted"
+        },
+        {
+          "line": 54325,
+          "text": "strata serve: lookup chain: 3 of 102 windows, 0 of 3 chained drafts accepted"
+        },
+        {
+          "line": 54326,
+          "text": "strata prefill: chunk 2048 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54327,
+          "text": "strata serve: prompt 225077 tokens = 223037 reused + 2040 read in 1143 ms (1784.0 tok/s), 1741 generated in 29570 ms (58.9 tok/s), drafts accepted 828 of 1868, 6 checkpoints"
+        },
+        {
+          "line": 54328,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        },
+        {
+          "line": 54329,
+          "text": "strata serve: decode expert cache hit rate: 97.5% (1275351 hits / 1307520 lookups); 2868 more read by the GPU over PCIe or from another GPU (0.2% of all 1310388 routed)"
+        },
+        {
+          "line": 54330,
+          "text": "strata serve: route tail skip: 645817 missed experts skipped (688650 entries) since the start"
+        },
+        {
+          "line": 54331,
+          "text": "strata serve: resident RAM: 36.03 GiB of experts in RAM, 152345 exchanged with the VRAM tier, 0 blob reads from the file"
+        },
+        {
+          "line": 54332,
+          "text": "strata serve: expert tiers: GPU 1275351 hits this request; since the start RAM 1451608 blobs, files 0 blobs 26414.1 MB read (the GGUF in place)"
+        },
+        {
+          "line": 54333,
+          "text": "strata serve: file tier I/O this request: the OS read 426.9 MB from storage (1 major faults) for 0.0 MB of expert reads; page cache held 0.0 MB at the read, not 0.0 MB; io prefetch: 0 read ahead (0.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 0.0 ms in 0 fetches; decode gate: cache room 0.17 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), closed, closed in 13866 windows so far, 1 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)"
+        },
+        {
+          "line": 54334,
+          "text": "strata serve: KV streaming: 96.20% of 312795528 block reads hit VRAM, 47853.7 MiB read from RAM"
+        },
+        {
+          "line": 54335,
+          "text": "strata serve: suffix drafts: 25 windows, 39 of 108 drafts accepted"
+        },
+        {
+          "line": 54336,
+          "text": "strata serve: lookup chain: 35 of 913 windows, 8 of 44 chained drafts accepted"
+        },
+        {
+          "line": 54337,
+          "text": "strata: the elastic host K/V grew to 245760 cells (2.90 of 4.83 GiB pinned RAM)"
+        },
+        {
+          "line": 54338,
+          "text": "strata prefill: chunk 8448 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54339,
+          "text": "strata serve: prompt 235172 tokens = 226817 reused + 8355 read in 3960 ms (2110.1 tok/s), 2566 generated in 41138 ms (62.4 tok/s), drafts accepted 1334 of 2911, 6 checkpoints"
+        }
+      ]
+    },
+    {
+      "req_index": 39,
+      "line": 54339,
+      "timestamp_est": "Nov 19 02:11:47",
+      "dec_tps": 62.4,
+      "gen": 2566,
+      "dec_ms": 41138.0,
+      "prompt": 235172,
+      "reused": 226817,
+      "read": 8355,
+      "draft_acc": 1334,
+      "draft_tot": 2911,
+      "draft_ratio": 0.4583,
+      "lookup": {
+        "win_acc": 88,
+        "win_tot": 1232,
+        "tok_acc": 19,
+        "tok_tot": 122
+      },
+      "ecache": {
+        "hit_pct": 97.0,
+        "pcie_reads": 2701,
+        "pcie_pct": 0.1
+      },
+      "kvstream": {
+        "vram_hit_pct": 96.19,
+        "ram_mib": 51990.4
+      },
+      "surrounding_lines": [
+        {
+          "line": 54336,
+          "text": "strata serve: lookup chain: 35 of 913 windows, 8 of 44 chained drafts accepted"
+        },
+        {
+          "line": 54337,
+          "text": "strata: the elastic host K/V grew to 245760 cells (2.90 of 4.83 GiB pinned RAM)"
+        },
+        {
+          "line": 54338,
+          "text": "strata prefill: chunk 8448 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54339,
+          "text": "strata serve: prompt 235172 tokens = 226817 reused + 8355 read in 3960 ms (2110.1 tok/s), 2566 generated in 41138 ms (62.4 tok/s), drafts accepted 1334 of 2911, 6 checkpoints"
+        },
+        {
+          "line": 54340,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        },
+        {
+          "line": 54341,
+          "text": "strata serve: decode expert cache hit rate: 97.0% (1884924 hits / 1943354 lookups); 2701 more read by the GPU over PCIe or from another GPU (0.1% of all 1946055 routed)"
+        },
+        {
+          "line": 54342,
+          "text": "strata serve: route tail skip: 686313 missed experts skipped (731323 entries) since the start"
+        },
+        {
+          "line": 54343,
+          "text": "strata serve: resident RAM: 36.03 GiB of experts in RAM, 163240 exchanged with the VRAM tier, 0 blob reads from the file"
+        },
+        {
+          "line": 54344,
+          "text": "strata serve: expert tiers: GPU 1884924 hits this request; since the start RAM 1527598 blobs, files 0 blobs 26414.1 MB read (the GGUF in place)"
+        },
+        {
+          "line": 54345,
+          "text": "strata serve: file tier I/O this request: the OS read 792.3 MB from storage (0 major faults) for 0.0 MB of expert reads; page cache held 0.0 MB at the read, not 0.0 MB; io prefetch: 0 read ahead (0.0 MB by pread), 0 used, 0 unused, 0 skipped (cached), 0 dropped; decode waited 0.0 ms in 0 fetches; decode gate: cache room 0.17 of the experts, read-ahead used 100%, page cache held 0% of the decode's reads (EWMA), closed, closed in 15099 windows so far, 1 flips; read ahead 0.0 MB, 0.0 MB of it used; 0 late, 0 not admitted (confidence), 0 (budget 0 MB/window)"
+        },
+        {
+          "line": 54346,
+          "text": "strata serve: KV streaming: 96.19% of 338349276 block reads hit VRAM, 51990.4 MiB read from RAM"
+        },
+        {
+          "line": 54347,
+          "text": "strata serve: suffix drafts: 41 windows, 86 of 201 drafts accepted"
+        },
+        {
+          "line": 54348,
+          "text": "strata serve: lookup chain: 88 of 1232 windows, 19 of 122 chained drafts accepted"
+        },
+        {
+          "line": 54349,
+          "text": "strata prefill: chunk 4352 tokens: STRATA_PF_HC_REGION on (the hyper-connection read's scratch is in the shared region);"
+        },
+        {
+          "line": 54350,
+          "text": "strata serve: prompt 242069 tokens = 237737 reused + 4332 read in 2464 ms (1758.2 tok/s), 1671 generated in 16946 ms (98.6 tok/s), drafts accepted 1236 of 1905, 6 checkpoints"
+        },
+        {
+          "line": 54351,
+          "text": "strata serve: checkpoint pool: this request took 1 checkpoint ready from the pool and allocated 0 fresh"
+        }
+      ]
+    }
+  ],
+  "ranked_suspects": [
+    {
+      "rank": 1,
+      "switch": "STRATA_MOE_LDS_NT8",
+      "old_effective": "0",
+      "new_effective": "1",
+      "scope": "solo_and_batch_every_T_2_to_16",
+      "mitigation_env": "Environment=STRATA_MOE_LDS_NT8=0",
+      "mechanism": "Doubles dynamic LDS (sh8 = 8*(n_embd/32)*36 B + res[8][64]) and accumulator registers (s0[8], s1[8]) in native_gu_fused_kernel and native_down_lds_kernel across all 48 MoE layers for every T>=2 window, halving CU occupancy on gfx1201 while solo T=2..8 windows mostly route 1-3 tokens per expert."
+    },
+    {
+      "rank": 2,
+      "switch": "STRATA_VERIFY_WMMA_DENSE",
+      "old_effective": "0",
+      "new_effective": "1",
+      "scope": "wide_verify_ncols_ge_9",
+      "mitigation_env": "Environment=STRATA_VERIFY_WMMA_DENSE=0",
+      "mechanism": "Replaces tuned native_mmvq / native_mmvq_il kernels with wmma_q8_0_kernel / wmma_q8_0_segs_kernel / wmma_q6_k_kernel whenever ncols >= 9 (T=10,12,14,16 lookup-chain windows). Directly measured in docs/ab/perf-verify-wide-results-2026-11-19.md (Arm 1+2 vs Arm 1) to regress R9700 throughput by -5.7%."
+    },
+    {
+      "rank": 3,
+      "switch": "STRATA_MOE_GRID_CAP",
+      "old_effective": "0 (uncapped)",
+      "new_effective": "64",
+      "scope": "solo_and_batch_MoE_n_groups_gt_64",
+      "mitigation_env": "Environment=STRATA_MOE_GRID_CAP=0",
+      "mechanism": "Caps gridDim.y of native_gu_fused_kernel<TG,8>, native_down_lds_kernel<TG,8>, and CUDA-layout MoE kernels to 64 instead of cap_groups. When a T=8..16 window routes >64 distinct experts in a layer, blocks 0..(n_groups-65) execute a second serial loop iteration with __syncthreads() while the rest sit idle."
+    },
+    {
+      "rank": 4,
+      "switch": "STRATA_DRAFT_TAIL_SKIP",
+      "old_effective": "0",
+      "new_effective": "6",
+      "scope": "solo_and_batch_draft_rows",
+      "mitigation_env": "Environment=STRATA_DRAFT_TAIL_SKIP=0",
+      "mechanism": "Skips missed experts at rank 6 (in addition to 7..9 from STRATA_ROUTE_TAIL_SKIP=7) when only speculative draft tokens route them (!any_anchor_row), degrading draft-row logits and contributing to the draft acceptance median drop from 53.4-54.0% (Eras 197-198) to 50.0% (Era 200)."
+    }
+  ]
+}
