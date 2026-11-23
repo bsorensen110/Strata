@@ -1509,12 +1509,18 @@ bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const 
         if (lane_cell) {
             if (kv_mode == 3) STRATA_ATTN_SLOTS(3, true, false);
             else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, true, false);
-            else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, true, attn_v4_on());
+            else if (kv_mode == 1) {
+                if (attn_v4_on()) STRATA_ATTN_SLOTS(1, true, true);
+                else STRATA_ATTN_SLOTS(1, true, false);
+            }
             else STRATA_ATTN_SLOTS(0, true, false);
         } else {
             if (kv_mode == 3) STRATA_ATTN_SLOTS(3, false, false);
             else if (kv_mode == 2) STRATA_ATTN_SLOTS(2, false, false);
-            else if (kv_mode == 1) STRATA_ATTN_SLOTS(1, false, attn_v4_on());
+            else if (kv_mode == 1) {
+                if (attn_v4_on()) STRATA_ATTN_SLOTS(1, false, true);
+                else STRATA_ATTN_SLOTS(1, false, false);
+            }
             else STRATA_ATTN_SLOTS(0, false, false);
         }
     }
@@ -1596,12 +1602,18 @@ void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, co
     if (lane_cell) {
         if (kv_mode == 3) STRATA_ATTN_ROWS(3, true, false);
         else if (kv_mode == 2) STRATA_ATTN_ROWS(2, true, false);
-        else if (kv_mode == 1) STRATA_ATTN_ROWS(1, true, v4);
+        else if (kv_mode == 1) {
+            if (v4) STRATA_ATTN_ROWS(1, true, true);
+            else STRATA_ATTN_ROWS(1, true, false);
+        }
         else STRATA_ATTN_ROWS(0, true, false);
     } else {
         if (kv_mode == 3) STRATA_ATTN_ROWS(3, false, false);
         else if (kv_mode == 2) STRATA_ATTN_ROWS(2, false, false);
-        else if (kv_mode == 1) STRATA_ATTN_ROWS(1, false, v4);
+        else if (kv_mode == 1) {
+            if (v4) STRATA_ATTN_ROWS(1, false, true);
+            else STRATA_ATTN_ROWS(1, false, false);
+        }
         else STRATA_ATTN_ROWS(0, false, false);
     }
     }
