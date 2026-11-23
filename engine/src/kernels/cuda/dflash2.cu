@@ -668,6 +668,218 @@ static bool df2_attn_wmma_enabled() {
     const char* woff11 = std::getenv("STRATA_GFX11_WMMA_DEFAULTS");
     return !(off11 != nullptr && off11[0] == '0') && !(woff11 != nullptr && woff11[0] == '0');
 }
+
+// ---- gfx12 (RDNA4) FP16 WMMA DFlash2 attention over the FP16 K/V ring: opt-in ----
+// Production runs STRATA_DF2_FP16_RING=1 with STRATA_DF2_ATTN_F16_SMEM=1, which never reaches the gfx11 kernel above,
+// so this variant is the only WMMA attention that can run there. Gate: STRATA_DFLASH_WMMA=1, a gfx1200/gfx1201 device,
+// and g_attn_variant == 0. Differing bits: Q and P are rounded to FP16 before the products, so the output is not
+// bit-equal to the FP32-accumulated scalar path that the FP16 ring keeps bitwise.
+// Wave32 layout of v_wmma_f32_16x16x16_f16 on gfx12 (8 halves per lane, the mapping src/prefill/wmma_gemm.cu uses):
+//   lane (l16 = lane & 15, hi = lane >> 4) holds A[row = l16][k = 8*hi + i] and B[k = 8*hi + i][col = l16];
+//   the accumulator holds D[row = 8*hi + i][col = l16] for i = 0..7.
+typedef _Float16 df2_h8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ df2_h8 df2_ld_h8(const _Float16* p) {
+    return __builtin_bit_cast(df2_h8, *reinterpret_cast<const uint4*>(p));
+}
+__device__ __forceinline__ df2_f8 df2_wmma_f16_gfx12(df2_h8 a, df2_h8 b, df2_f8 c) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
+#else
+    (void) a; (void) b;
+    __builtin_trap();
+    return c;
+#endif
+}
+
+static bool df2_attn_wmma_gfx12_f16_enabled() {
+    static const bool want = [] {
+        const char* v = std::getenv("STRATA_DFLASH_WMMA");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!want || g_attn_variant != 0) return false;
+    static strata::core::PerDeviceFlag<> g12_dev;
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    return g12_dev.get(dev, [](int d) {
+        cudaDeviceProp p;
+        return cudaGetDeviceProperties(&p, d) == cudaSuccess && strata::kernels::gfx_arch_is_gfx12(p.gcnArchName);
+    });
+}
+
+__global__ void __launch_bounds__(128) attn_part_wmma_gfx12_f16ring_kernel(
+    const uint16_t* __restrict__ kring, const uint16_t* __restrict__ vring, const float* __restrict__ q,
+    const float* __restrict__ kblk, const float* __restrict__ vblk, const int32_t* __restrict__ anchor_pos,
+    int ring_slots, int window, float* __restrict__ part, const int64_t* __restrict__ tag,
+    const int32_t* __restrict__ epoch_ptr) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __shared__ __align__(16) _Float16 Qs[32 * AS_H];
+    __shared__ __align__(16) union {
+        _Float16 Ks[32 * AS_H];
+        _Float16 Vt[HD * VS_H];
+    } KV;
+    __shared__ __align__(16) _Float16 Ps[32 * PS_H];
+    __shared__ float Sc[32 * 33];
+    __shared__ float m_s[32], l_s[32], corr_s[32];
+    __shared__ unsigned char kvalid[32];
+
+    const int kvh = blockIdx.x, chunk = blockIdx.y, tid = threadIdx.x;
+    const int wave = tid >> 5, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
+    const int s = *anchor_pos;
+    const int lo = s - (window - 1) > 0 ? s - (window - 1) : 0;
+    const int nctx = s - lo;
+    const int nkeys = nctx + kDf2Rows;
+    const int k_begin = chunk * kDf2Chunk;
+    const int64_t ep = tag != nullptr ? ((int64_t) *epoch_ptr << 32) : 0;
+    float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32) * 130;
+    if (k_begin >= nkeys) {
+        for (int i = tid; i < 32 * 130; i += 128) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
+        return;
+    }
+    const float scale = rsqrtf((float) HD);
+    for (int i = tid; i < 32 * HD / 4; i += 128) {
+        const int a = i / (HD / 4), d4 = i % (HD / 4);
+        const int row = a >> 2, g = a & 3;
+        const float4 v = *reinterpret_cast<const float4*>(q + ((size_t) row * 32 + kvh * kDf2Gqa + g) * HD + d4 * 4);
+        _Float16 h4[4] = {(_Float16) (v.x * scale), (_Float16) (v.y * scale), (_Float16) (v.z * scale), (_Float16) (v.w * scale)};
+        *reinterpret_cast<uint2*>(&Qs[a * AS_H + d4 * 4]) = *reinterpret_cast<const uint2*>(h4);
+    }
+    if (tid < 32) { m_s[tid] = -INFINITY; l_s[tid] = 0.0f; }
+
+    const int q_tile = (wave >> 1) * 16;
+    const int k_tile = (wave & 1) * 16;
+    const int d_base = (wave & 1) * 64;
+    df2_f8 O[4];
+#pragma unroll
+    for (int dt = 0; dt < 4; ++dt) O[dt] = df2_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    const int k_end = min(k_begin + kDf2Chunk, nkeys);
+    // A 32-key tile is 32 x 128 halves = 512 units of 8 halves: thread tid takes units tid + u*128 (u < 4), key t = unit >> 4,
+    // dims 8*(unit & 15) .. +7. Ring rows are copied as 16-byte units; block rows (float) are converted to FP16.
+    auto fetch = [&](int k0, uint4 (&reg)[4], const uint16_t* ring, const float* blk) {
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int i = tid + u * 128, t = i >> 4, d8 = i & 15, k = k0 + t;
+            uint4 v = make_uint4(0u, 0u, 0u, 0u);
+            if (k < nctx) {
+                v = *reinterpret_cast<const uint4*>(ring + ((size_t) kvh * ring_slots + (lo + k) % ring_slots) * HD + d8 * 8);
+            } else if (k < nkeys) {
+                const float* f = blk + ((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d8 * 8;
+                const float4 f0 = *reinterpret_cast<const float4*>(f);
+                const float4 f1 = *reinterpret_cast<const float4*>(f + 4);
+                const df2_h8 h = {(_Float16) f0.x, (_Float16) f0.y, (_Float16) f0.z, (_Float16) f0.w,
+                                  (_Float16) f1.x, (_Float16) f1.y, (_Float16) f1.z, (_Float16) f1.w};
+                v = __builtin_bit_cast(uint4, h);
+            }
+            reg[u] = v;
+        }
+    };
+    uint4 kreg[4], vreg[4];
+    fetch(k_begin, kreg, kring, kblk);
+    for (int k0 = k_begin; k0 < k_end; k0 += 32) {
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int i = tid + u * 128, t = i >> 4, d8 = i & 15;
+            *reinterpret_cast<uint4*>(&KV.Ks[t * AS_H + d8 * 8]) = kreg[u];
+        }
+        if (tid < 32) {
+            const int k = k0 + tid;
+            kvalid[tid] = (tag == nullptr || k >= nctx || k >= nkeys) ? 1 : (tag[(lo + k) % ring_slots] == (ep | (int64_t) (lo + k)) ? 1 : 0);
+        }
+        fetch(k0, vreg, vring, vblk);
+        __syncthreads();
+
+        // S = Q * K^T: 2x2 grid of 16x16 tiles, 8 K-steps of 16 dims; lane hi takes the 8 dims at d + 8*hi
+        df2_f8 sc_acc = df2_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+        for (int d = 0; d < HD; d += 16) {
+            const df2_h8 qa = df2_ld_h8(&Qs[(q_tile + l16) * AS_H + d + 8 * hi]);
+            const df2_h8 kb = df2_ld_h8(&KV.Ks[(k_tile + l16) * AS_H + d + 8 * hi]);
+            sc_acc = df2_wmma_f16_gfx12(qa, kb, sc_acc);
+        }
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int qi = q_tile + 8 * hi + i;
+            const int t = k_tile + l16;
+            const int k = k0 + t;
+            const int row = qi >> 2;
+            bool ok = k < nkeys;
+            if (ok && k < nctx) ok = (lo + k) > (s + row - window) && kvalid[t];
+            Sc[qi * 33 + t] = ok ? sc_acc[i] : -INFINITY;
+        }
+        __syncthreads();
+
+        // Online softmax, identical to the gfx11 kernel: 4 lanes per query, row-major FP16 P
+        {
+            const int qi = tid >> 2, sub = tid & 3;
+            float v[8], tmax = -INFINITY;
+#pragma unroll
+            for (int u = 0; u < 8; ++u) { v[u] = Sc[qi * 33 + sub * 8 + u]; tmax = fmaxf(tmax, v[u]); }
+            tmax = fmaxf(tmax, s26ts::xmov<1>(tmax));
+            tmax = fmaxf(tmax, s26ts::xmov<2>(tmax));
+            const float m_old = m_s[qi];
+            const float mn = fmaxf(m_old, tmax);
+            const float corr = (m_old == -INFINITY) ? 0.0f : __expf(m_old - mn);
+            float psum = 0.0f;
+            _Float16 ph[8];
+#pragma unroll
+            for (int u = 0; u < 8; ++u) {
+                const float p = v[u] == -INFINITY ? 0.0f : __expf(v[u] - mn);
+                ph[u] = (_Float16) p;
+                psum += p;
+            }
+            *reinterpret_cast<uint4*>(&Ps[qi * PS_H + sub * 8]) = *reinterpret_cast<const uint4*>(ph);
+            psum += s26ts::xmov<1>(psum);
+            psum += s26ts::xmov<2>(psum);
+            if (sub == 0) { l_s[qi] = l_s[qi] * corr + psum; m_s[qi] = mn; corr_s[qi] = corr; }
+        }
+        __syncthreads();
+
+        // Vt[d][t] from the 16-byte units: each unit is 8 dims of one key
+#pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const int i = tid + u * 128, t = i >> 4, d8 = i & 15;
+            const df2_h8 hv = __builtin_bit_cast(df2_h8, vreg[u]);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) KV.Vt[(d8 * 8 + j) * VS_H + t] = hv[j];
+        }
+        if (k0 + 32 < k_end) fetch(k0 + 32, kreg, kring, kblk);
+        __syncthreads();
+
+        // O = O * corr, then O += P * V over 2 K-steps of 16 keys; lane hi takes keys 8*hi .. +7 of each step
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float cr = corr_s[q_tile + 8 * hi + i];
+#pragma unroll
+            for (int dt = 0; dt < 4; ++dt) O[dt][i] *= cr;
+        }
+        const df2_h8 pa0 = df2_ld_h8(&Ps[(q_tile + l16) * PS_H + 8 * hi]);
+        const df2_h8 pa1 = df2_ld_h8(&Ps[(q_tile + l16) * PS_H + 16 + 8 * hi]);
+#pragma unroll
+        for (int dt = 0; dt < 4; ++dt) {
+            const df2_h8 vb0 = df2_ld_h8(&KV.Vt[(d_base + dt * 16 + l16) * VS_H + 8 * hi]);
+            const df2_h8 vb1 = df2_ld_h8(&KV.Vt[(d_base + dt * 16 + l16) * VS_H + 16 + 8 * hi]);
+            O[dt] = df2_wmma_f16_gfx12(pa0, vb0, O[dt]);
+            O[dt] = df2_wmma_f16_gfx12(pa1, vb1, O[dt]);
+        }
+    }
+    __syncthreads();
+    if (tid < 32) { pbase[tid * 130] = m_s[tid]; pbase[tid * 130 + 1] = l_s[tid]; }
+#pragma unroll
+    for (int dt = 0; dt < 4; ++dt) {
+        const int col = d_base + dt * 16 + l16;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int qi = q_tile + 8 * hi + i;
+            pbase[(size_t) qi * 130 + 2 + col] = O[dt][i];
+        }
+    }
+#else
+    (void) q; (void) kring; (void) vring; (void) kblk; (void) vblk; (void) anchor_pos;
+    (void) ring_slots; (void) window; (void) part; (void) tag; (void) epoch_ptr;
+    __builtin_trap();
+#endif
+}
 #endif  // __HIP_PLATFORM_AMD__
 
 // Clean-room MIT sm_80+ BF16 Tensor Core DFlash2 attention (Ampere RTX 3090 + Blackwell RTX 5090).
@@ -2634,6 +2846,14 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
 
 void df2_attention_f16(const float* q, const void* kring, const void* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
                        int ring_slots, int window, float* part, void* xq, float* xd, void* stream, const int64_t* tag, const int32_t* epoch) {
+#if defined(__HIP_PLATFORM_AMD__)
+    if (g_attn_variant == 0 && df2_attn_wmma_gfx12_f16_enabled()) {
+        attn_part_wmma_gfx12_f16ring_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(
+            static_cast<const uint16_t*>(kring), static_cast<const uint16_t*>(vring), q, kblk, vblk, anchor_pos, ring_slots, window, part,
+            tag, epoch);
+        check("attn_part_wmma_gfx12_f16ring");
+    } else
+#endif
     if (df2_attn_f16_smem())
         attn_part_kernel<uint16_t, true><<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, static_cast<const uint16_t*>(kring),
                                                                                                          static_cast<const uint16_t*>(vring),
