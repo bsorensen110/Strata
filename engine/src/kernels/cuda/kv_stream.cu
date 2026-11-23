@@ -370,6 +370,7 @@ void kv_stream_resolve_slots(const KvResolveSlots& slots, int64_t cap, const Qsa
     check("resolve_slots");
     copy_slots_kernel<<<dim3(96, (unsigned) slots.n), 128, 0, (cudaStream_t) stream>>>(cargs);
     check("copy_slots");
+}
 
 void kv_stream_resolve_groups(const KvResolveGroups& g, const int32_t* ids, const int32_t* steps, int64_t cap,
                               const QsaShapes& s, void* stream) {
