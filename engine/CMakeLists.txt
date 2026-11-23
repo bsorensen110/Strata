@@ -581,6 +581,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(mmq_resident_sort_test tests/prefill/mmq_resident_sort_test.cpp)
   target_include_directories(mmq_resident_sort_test PRIVATE include)
   add_test(NAME mmq_resident_sort_test COMMAND mmq_resident_sort_test)
+  add_test(NAME mmq_staged_sort_env_unset
+           COMMAND ${CMAKE_COMMAND} -E env --unset=STRATA_MMQ_STAGED_SORT $<TARGET_FILE:mmq_resident_sort_test> 0)
+  foreach(mode RANGE 0 3)
+    add_test(NAME mmq_staged_sort_env_${mode}
+             COMMAND ${CMAKE_COMMAND} -E env STRATA_MMQ_STAGED_SORT=${mode} $<TARGET_FILE:mmq_resident_sort_test> ${mode})
+  endforeach()
 
   # STRATA_SELECT_TWO_PASS: the bound between the single-pass and 3xTF32 QSA block scores and the cut-off rule that
   # keeps the selection (header-only, no GPU)

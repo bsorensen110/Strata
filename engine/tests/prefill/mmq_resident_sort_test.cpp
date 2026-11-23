@@ -9,7 +9,11 @@ namespace d = strata::prefill::detail;
 static int failed = 0;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); ++failed; } } while (0)
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 2) {
+        CHECK(d::mmq_staged_sort_mode() == std::atoi(argv[1]));
+        return failed ? 1 : 0;
+    }
     // 1. Eligibility on streamed vs staged walks
     {
         const int32_t all_res[4] = {0, 1, 2, 3};
@@ -23,6 +27,74 @@ int main() {
         CHECK(d::mmq_resident_sort_eligible(true, true, true, false, nullptr, 4, false, true, true));
         CHECK(!d::mmq_resident_sort_eligible(false, true, true, true, all_res, 4, false, true, true));
         CHECK(!d::mmq_resident_sort_eligible(true, false, true, true, all_res, 4, false, true, true));
+    }
+
+    // Staged modes keep the partial group and non-local rows intact while rebuilding all routes.
+    {
+        CHECK(d::mmq_staged_sort_mode_from(nullptr) == 0);
+        CHECK(d::mmq_staged_sort_mode_from("") == 0);
+        CHECK(d::mmq_staged_sort_mode_from("0") == 0);
+        CHECK(d::mmq_staged_sort_mode_from("1") == 1);
+        CHECK(d::mmq_staged_sort_mode_from("2") == 2);
+        CHECK(d::mmq_staged_sort_mode_from("3") == 3);
+        const int32_t res[] = {0, 1, 2, 3, 4, -1, 6, -1, 8, -1, -1, -1};
+        CHECK(d::mmq_staged_sort_eligible(true, true, true, res, 12, false));
+        CHECK(!d::mmq_staged_sort_eligible(false, true, true, res, 12, false));
+        CHECK(!d::mmq_staged_sort_eligible(true, false, true, res, 12, false));
+        CHECK(!d::mmq_staged_sort_eligible(true, true, false, res, 12, false));
+        CHECK(!d::mmq_staged_sort_eligible(true, true, true, nullptr, 12, false));
+        CHECK(!d::mmq_staged_sort_eligible(true, true, true, res, 0, false));
+        CHECK(!d::mmq_staged_sort_eligible(true, true, true, res, 12, true));
+
+        const std::vector<int32_t> count = {8, 1, 7, 2, 6, 3, 5, 4, 9, 10, 11, 2};
+        const std::vector<std::vector<int32_t>> expected = {
+            {1, 3, 6, 4, 2, 0, 5, 7, 8, 9, 10},
+            {1, 3, 5, 7, 6, 4, 2, 0, 8, 9, 10},
+            {2, 0, 8, 7, 6, 4, 1, 3, 5, 9, 10}
+        };
+        std::vector<int32_t> ids;
+        for (int32_t row = 0; row < 11; ++row)
+            for (int32_t e = 0; e < 12; ++e)
+                if (row < count[(size_t) e]) ids.push_back(e);
+        for (int mode = 1; mode <= 3; ++mode) {
+            std::vector<int32_t> order = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+            std::vector<int32_t> off(13, 0), slot(ids.size(), -1), src(ids.size(), -1);
+            int32_t cursor = 0;
+            for (size_t e = 0; e < count.size(); ++e) {
+                off[e] = cursor;
+                cursor += count[e];
+            }
+            off.back() = cursor;
+            const int32_t cpu_off = off[11];
+            d::mmq_staged_sort_rows(ids.data(), (int64_t) ids.size(), 1, count, res, 3, true,
+                                    off, order, slot.data(), src.data(), mode);
+            CHECK(order == expected[(size_t) mode - 1]);
+            cursor = 0;
+            for (int32_t e : order) {
+                CHECK(off[(size_t) e] == cursor);
+                cursor += count[(size_t) e];
+            }
+            CHECK(off[11] == cpu_off && off.back() == (int32_t) ids.size());
+            std::vector<int32_t> next(off.begin(), off.end() - 1);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                const int32_t e = ids[i];
+                CHECK(slot[i] == next[(size_t) e]++);
+                CHECK(src[(size_t) slot[i]] == (int32_t) i);
+            }
+        }
+        // Equal counts use expert ID as the tie-breaker; mode 3 only reverses non-resident groups.
+        const std::vector<int32_t> ties(5, 1), tie_ids = {4, 3, 2, 1, 0};
+        const int32_t all_res[] = {0, 1, 2, 3, 4};
+        const int32_t no_res[] = {-1, -1, -1, -1, -1};
+        for (const int32_t* residency : {all_res, no_res}) {
+            std::vector<int32_t> order = {0, 1, 2, 3, 4}, off(6), slot(5), src(5);
+            off.back() = 5;
+            d::mmq_staged_sort_rows(tie_ids.data(), 5, 1, ties, residency, 2, true,
+                                    off, order, slot.data(), src.data(), 3);
+            const std::vector<int32_t> want = residency == all_res
+                ? std::vector<int32_t>{0, 1, 2, 3, 4} : std::vector<int32_t>{2, 3, 0, 1, 4};
+            CHECK(order == want);
+        }
     }
 
     // 2. Readiness-tier + row-count sort with partial tail group kept and CPU-shared expert offsets preserved

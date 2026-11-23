@@ -2183,7 +2183,7 @@ const MmqPlan& mmq_plan() {
         }
         // the verdict depends only on the layer's formats and the visible GPUs: taken once here, not per chunk
         p.group_sort.assign(p.layer.size(), 0);
-        const bool want_group_sort = detail::mmq_group_sort_requested();
+        const bool want_group_sort = detail::mmq_group_sort_requested() || detail::mmq_staged_sort_mode() != 0;
         if (on && want_group_sort && !detail::mmq_resident_sort_requested() &&
             !detail::mmq_tier_sort_requested()) {
             int64_t ns = 0;
@@ -2193,12 +2193,14 @@ const MmqPlan& mmq_plan() {
                 p.group_sort[(size_t) l] = mmq::whole_tiles(gt, kFF2, MMQ_GROUP) && mmq::whole_tiles(dt, N, MMQ_GROUP);
                 ns += p.group_sort[(size_t) l];
             }
-            const char* tag = "STRATA_MMQ_GROUP_SORT=1";
+            const std::string tag = detail::mmq_group_sort_requested()
+                ? "STRATA_MMQ_GROUP_SORT=1"
+                : "STRATA_MMQ_STAGED_SORT=" + std::to_string(detail::mmq_staged_sort_mode());
             std::fprintf(stderr, "strata: prompt MMQ sorts the full expert groups (%s): %lld of %lld "
                                  "layers\n",
-                         tag, (long long) ns, (long long) layers);
+                         tag.c_str(), (long long) ns, (long long) layers);
             strata::core::manifest::instance().path("prefill", "mmq-group-sort", ns > 0,
-                                                    ns > 0 ? tag : "whole tiles are not guaranteed on every GPU",
+                                                    ns > 0 ? tag.c_str() : "whole tiles are not guaranteed on every GPU",
                                                     std::to_string(ns) + " of " + std::to_string(layers) + " layers");
         }
         if (on && detail::mmq_tier_sort_requested()) {
@@ -6330,8 +6332,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // tile is one block's whole K (MmqPlan::group_sort); the partial group keeps its ID order and bits.
                         // STRATA_MMQ_RESIDENT_SORT_NE=1 / STRATA_MMQ_TIER_SORT=1 take precedence (sorting the partial group too).
                         const bool sort_all = detail::mmq_resident_sort_requested() || tier_sort;
-                        const bool sort_full = !sort_all && use_mmq && mmq_plan().group_sort[(size_t) l] &&
+                        const bool sort_full = !sort_all && detail::mmq_group_sort_requested() &&
+                                               use_mmq && mmq_plan().group_sort[(size_t) l] &&
                                                order.size() >= (size_t) MMQ_GROUP;
+                        const int staged_sort_mode = detail::mmq_staged_sort_mode();
+                        const bool sort_staged = !sort_all && !sort_full && use_mmq && staged_sort_mode != 0 &&
+                                                 mmq_plan().group_sort[(size_t) l] && order.size() >= (size_t) MMQ_GROUP;
                         const int32_t* layer_res = m.host_res && m.cache ? m.host_res + (size_t) l * m.g->n_expert : nullptr;
                         if (detail::mmq_resident_sort_eligible(tier_sort || ((sort_all || sort_full) && on_peer.empty()), use_mmq, lay.native,
                                 m.cache != nullptr, layer_res, m.g->n_expert, stream_all,
@@ -6347,6 +6353,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                            detail::mmq_resident_sort_span(order.size(), MMQ_GROUP, sort_full),
                                                            tier_sort ? layer_res : nullptr,
                                                            layer_pin.empty() ? nullptr : layer_pin.data());
+                        } else if (detail::mmq_staged_sort_eligible(sort_staged && on_peer.empty(), use_mmq,
+                                                                   m.cache != nullptr, layer_res, m.g->n_expert,
+                                                                   stream_all)) {
+                            detail::mmq_staged_sort_rows(ids_h, T * K, (int32_t) K, m.cnt, layer_res, MMQ_GROUP, true,
+                                                         m.off, order, slot_h, src_h, staged_sort_mode);
                         }
                         if (grp_mapped) {
                             copy_i32(m.slot_dev, m.grp_dev + m.grp_tk, T * K, m.cs);

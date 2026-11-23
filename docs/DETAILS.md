@@ -1779,6 +1779,19 @@ An independent user (bitaccesscomau, one RTX 3090 on PCIe 3.0 x16) tried the `ST
 
 The serve loop's `strata trace:` lines (`STRATA_TRACE`) now end with `@<ms>`, a steady-clock timestamp.
 
+## Staged MMQ expert sorting
+
+`STRATA_MMQ_STAGED_SORT` is off when unset or `0`. It applies to eligible CUDA and HIP staged prompt walks with a
+resident expert cache and enough experts for a full MMQ group. The last partial group stays in ID order.
+The resident, tier and group sorting switches take precedence.
+
+- `1`: put complete resident groups first, sorted by row count; sort the remaining full groups by row count.
+- `2`: sort all full groups by row count.
+- `3`: sort by row count, then put wholly resident groups first and the other groups in reverse group order.
+
+The expert routes and staging jobs follow the chosen order. Streamed walks and peer-distributed layers do not use
+this switch.
+
 ## CUDA opt-in decode switches measured on a CMP 170HX (sm_80; off unless you set them)
 
 The author of the change (linxuhao, PR #3779) measured these on one CMP 170HX (GA100, 70 SMs) with the Qwen3.8-Flash-Next IQ3_S native pack, `--spec 3`, decode after a prompt of about 3,000 words, a fresh engine per run, reference and switch runs interleaved. We have no sm_80 card and did not measure them. Both switches keep every output bit by construction (the greedy answers to 11 prompts were the same with the switch on and off, on their card). Neither does anything on HIP, gfx906 or Metal.

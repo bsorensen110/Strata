@@ -60,7 +60,9 @@ IQ3_S has seven sizes (1,510,400 to 2,662,400 bytes) and IQ3_XXS has nine
 too, so neither could rotate.
 
 The exchange allocation holds one spare of every size per swap of a round:
-`--adapt-swaps` (at most 96) times the sum of the distinct sizes. With
+`--adapt-swaps` (at most 96) times the sum of the distinct sizes.
+`STRATA_ADAPT_COVERAGE_DEFAULTS=1` opts into coverage-based adaptive defaults
+and raises this allocation limit to 192. With
 `--adapt-async 1` the second half of the buffers only stages copies and is
 kept in the largest size alone. On IQ3_S with `--adapt-swaps 80` that is
 1.06 GiB of page-locked RAM (1.26 GiB with `--adapt-async 1`), against 0.20

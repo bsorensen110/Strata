@@ -3994,6 +3994,7 @@ int main(int argc, char** argv) {
     prime_hw_queues();
 #endif
     Options o;
+    const bool adapt_coverage_defaults = strata::program::adapt_coverage_enabled(std::getenv("STRATA_ADAPT_COVERAGE_DEFAULTS"));
     bool have_tokens = false;
     bool have_logits_stride = false;
     bool ram_keep_by_flag = false;
@@ -12273,11 +12274,20 @@ int main(int argc, char** argv) {
     // lend slots than the serve scan later borrowed, forcing hundreds of unbuffered SSD reads on every chunk.
     // The post-complement host-memory gate (share_default_ok) still runs below and disarms the default share if
     // RAM is too tight.
-    static const bool share_batch_env = [] {
-        const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH");
-        return v != nullptr && v[0] == '1';
+    const bool single_card_gfx12 = [&] {
+#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+        if (!o.serve || !stages.empty() || multi_gpu) return false;
+        cudaDeviceProp prop0{};
+        if (cudaGetDeviceProperties(&prop0, 0) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+        return strata::core::gfx12_prefill_share_default(prop0.gcnArchName);
+#else
+        return false;
+#endif
     }();
-    const bool serve_share_pool = (o.batch <= 0 || share_batch_env) && !o.no_pool;
+    const bool share_batch_enabled = strata::prefill::share_rules::batch_cpu_share_enabled_from(
+        std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH"), single_card_gfx12, o.batch > 0);
+    static const bool concurrent_read_enabled = [] { const char* v = std::getenv("STRATA_BATCH_CONCURRENT_READ"); return v != nullptr && std::atoi(v) != 0; }();
+    const bool serve_share_pool = (o.batch <= 0 || (share_batch_enabled && !concurrent_read_enabled)) && !o.no_pool;
     bool serve_share_has_work = strata::prefill::share_rules::default_share_has_work(
         (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
 #if defined(STRATA_USE_HIP) || defined(STRATA_USE_SYCL) || defined(__HIPCC__)
@@ -12311,7 +12321,7 @@ int main(int argc, char** argv) {
                 strata::prefill::Prefill::arm_cpu_share_split(true, floor_ms, pool.workers(), all_cc120);
         }
         strata::prefill::Prefill::arm_cpu_share(serve_share_pool,
-                                                serve_share_pool && serve_share_layout && serve_share_has_work);
+                                                serve_share_pool && serve_share_layout && serve_share_has_work, o.batch > 0);
     }
     if (o.resident_cpu_experts) {
         int64_t lend_from = -1;
@@ -12552,29 +12562,24 @@ int main(int argc, char** argv) {
                              : "A smaller --prefill, or auto,");
         // Issue #4870: coverage-based adaptive tier defaults (15%..65% VRAM coverage -> 2 / 192 / 0.92 when not given).
         // Apply before reserve_exchanges so resident RAM exchange buffers match the faster mid-coverage swap rate.
-        {
+        if (adapt_coverage_defaults) {
             const int64_t total_pairs = g.n_layers * g.n_expert;
             int64_t live_slots = xcache.slots();
             for (const auto& stp : stages) live_slots += stp->cache.slots();
-            const double cov = total_pairs > 0 ? (double) live_slots / (double) total_pairs : 0.0;
-            if (o.adapt_every > 0 && o.adapt_swaps > 0 && live_slots > 0 && live_slots < total_pairs &&
-                cov >= 0.15 && cov <= 0.65) {
-                const int prev_ev = o.adapt_every, prev_sw = o.adapt_swaps;
-                const float prev_dc = o.adapt_decay;
-                if (!o.adapt_every_given) o.adapt_every = 2;
-                if (!o.adapt_swaps_given) o.adapt_swaps = 192;
-                if (!o.adapt_decay_given) o.adapt_decay = 0.92f;
-                if (o.adapt_every != prev_ev || o.adapt_swaps != prev_sw || o.adapt_decay != prev_dc)
-                    std::fprintf(stderr, "strata generate: #4870 mid-coverage expert cache (%lld of %lld slots, %.1f%%): "
-                                         "adaptive defaults every %d -> %d, swaps %d -> %d, decay %.2f -> %.2f\n",
-                                 (long long) live_slots, (long long) total_pairs, 100.0 * cov,
-                                 prev_ev, o.adapt_every, prev_sw, o.adapt_swaps, prev_dc, o.adapt_decay);
-            }
+            const int prev_ev = o.adapt_every, prev_sw = o.adapt_swaps;
+            const float prev_dc = o.adapt_decay;
+            strata::program::adapt_coverage_defaults(true, live_slots, total_pairs, o.adapt_every, o.adapt_swaps, o.adapt_decay,
+                                                      o.adapt_every_given, o.adapt_swaps_given, o.adapt_decay_given);
+            if (o.adapt_every != prev_ev || o.adapt_swaps != prev_sw || o.adapt_decay != prev_dc)
+                std::fprintf(stderr, "strata generate: #4870 mid-coverage expert cache (%lld of %lld slots, %.1f%%): "
+                                     "adaptive defaults every %d -> %d, swaps %d -> %d, decay %.2f -> %.2f\n",
+                             (long long) live_slots, (long long) total_pairs, 100.0 * live_slots / total_pairs,
+                             prev_ev, o.adapt_every, prev_sw, o.adapt_swaps, prev_dc, o.adapt_decay);
         }
         if (resident_ok) {
             // --adapt-async: twice the exchange buffers - the second half bounces the copies in whose source is not
             // page-locked (an asynchronous copy instead of the driver's staged, synchronous one)
-            const int64_t ex_want = std::min<int64_t>(o.adapt_swaps, 192);
+            const int64_t ex_want = std::min<int64_t>(o.adapt_swaps, strata::program::adapt_exchange_limit(adapt_coverage_defaults));
             if (o.adapt_async && !src.reserve_exchanges(2 * ex_want, err, ex_want)) {
                 if (ex_want > 96 && src.reserve_exchanges(2 * 96, err, 96)) {
                     if (!o.adapt_swaps_given) o.adapt_swaps = 96;
@@ -12587,8 +12592,8 @@ int main(int argc, char** argv) {
             if (o.adapt_async && !src.exchange_pinned())
                 adapt_async_off("the exchange buffers could not be page-locked");
             if (o.adapt_every > 0 && o.adapt_swaps > 0 &&
-                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, 192), err)) {
-                if (o.adapt_swaps > 96 && src.reserve_exchanges(96, err)) {
+                !src.reserve_exchanges(std::min<int64_t>(o.adapt_swaps, strata::program::adapt_exchange_limit(adapt_coverage_defaults)), err)) {
+                if (adapt_coverage_defaults && o.adapt_swaps > 96 && src.reserve_exchanges(96, err)) {
                     if (!o.adapt_swaps_given) o.adapt_swaps = 96;
                 } else {
                     std::fprintf(stderr, "strata generate: CPU expert residency: %s\n", err.c_str());
@@ -12796,20 +12801,7 @@ int main(int argc, char** argv) {
 #endif
         // STRATA_PREFILL_CPU_SHARE_BATCH: enable the prompt's CPU pool for serial co-prefill windows too (default ON on single-card gfx12 when batch is used).
         // The concurrent-reader mode owns the pool on the decode thread, so it deliberately excludes the prompt share.
-        const bool single_card_gfx12 = [&] {
-#if defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
-            if (!stages.empty() || multi_gpu) return false;
-            cudaDeviceProp prop0{};
-            if (cudaGetDeviceProperties(&prop0, 0) != cudaSuccess) { (void) cudaGetLastError(); return false; }
-            return strata::core::gfx12_prefill_share_default(prop0.gcnArchName);
-#else
-            return false;
-#endif
-        }();
-        const bool share_batch_enabled = strata::prefill::share_rules::batch_cpu_share_enabled_from(
-            std::getenv("STRATA_PREFILL_CPU_SHARE_BATCH"), single_card_gfx12, o.batch > 0);
-        static const bool concurrent_read_enabled = [] { const char* v = std::getenv("STRATA_BATCH_CONCURRENT_READ"); return v != nullptr && std::atoi(v) != 0; }();
-        const bool share_pool = (o.batch <= 0 || (share_batch_enabled && !concurrent_read_enabled)) && !o.no_pool;
+        const bool share_pool = serve_share_pool;
         if (share_batch_enabled && o.batch > 0 && !concurrent_read_enabled && !o.no_pool)
             std::fprintf(stderr, "strata serve: STRATA_PREFILL_CPU_SHARE_BATCH=1: the prompt path may use the CPU pool beside the "
                                  "%lld batch slots across serial prefill/decode intervals\n", (long long) o.batch);
@@ -15725,10 +15717,6 @@ int main(int argc, char** argv) {
                                  "lower is skipped (answers differ slightly); it is off when STRATA_ROUTE_TAIL_SKIP is not set or is 0\n",
                          tail_skip_rank, tail_skip_rank);
         // STRATA_ADAPT_COVERAGE_DEFAULTS=1 opts into coverage-based adaptive defaults.
-        static const bool adapt_coverage_defaults = [] {
-            const char* v = std::getenv("STRATA_ADAPT_COVERAGE_DEFAULTS");
-            return v != nullptr && v[0] == '1';
-        }();
         // - Mid-coverage (15%..65% of total layer-experts): faster 2 / 192 / 0.92 curve (+8% hit rate, +10% decode tok/s)
         //   when not explicitly overridden on the CLI.
         // - Tiny-cache (< 15% resident): anti-thrash dampening via low_vram_adapt_swaps + Zipf-head profile pinning.
@@ -15742,9 +15730,8 @@ int main(int argc, char** argv) {
                 cov >= 0.15 && cov <= 0.65) {
                 const int prev_ev = o.adapt_every, prev_sw = o.adapt_swaps;
                 const float prev_dc = o.adapt_decay;
-                if (!o.adapt_every_given) o.adapt_every = 2;
-                if (!o.adapt_swaps_given) o.adapt_swaps = 192;
-                if (!o.adapt_decay_given) o.adapt_decay = 0.92f;
+                strata::program::adapt_coverage_defaults(true, live_gpu_slots, total_expert_pairs, o.adapt_every, o.adapt_swaps, o.adapt_decay,
+                                                          o.adapt_every_given, o.adapt_swaps_given, o.adapt_decay_given);
                 if (o.adapt_every != prev_ev || o.adapt_swaps != prev_sw || o.adapt_decay != prev_dc)
                     std::fprintf(stderr, "strata serve: #4870 mid-coverage expert cache (%lld of %lld slots, %.1f%%): "
                                          "adaptive defaults every %d -> %d, swaps %d -> %d, decay %.2f -> %.2f\n",
@@ -26644,18 +26631,13 @@ int main(int argc, char** argv) {
         const int64_t files0 = src.file_reads(), ram0 = src.ram_reads();
         const uint64_t fbytes0 = src.file_blob_bytes(), fall0 = src.file_read_bytes();
         const double fms0 = src.file_ms();
-        {
+        if (adapt_coverage_defaults) {
             // Issue #4870: coverage-based adaptive defaults in non-serve decode path as well.
             const int64_t total_pairs = g.n_layers * g.n_expert;
             int64_t live_slots = xcache.slots();
             for (const auto& stp : stages) live_slots += stp->cache.slots();
-            const double cov = total_pairs > 0 ? (double) live_slots / (double) total_pairs : 0.0;
-            if (o.adapt_every > 0 && o.adapt_swaps > 0 && live_slots > 0 && live_slots < total_pairs &&
-                cov >= 0.15 && cov <= 0.65) {
-                if (!o.adapt_every_given) o.adapt_every = 2;
-                if (!o.adapt_swaps_given) o.adapt_swaps = 192;
-                if (!o.adapt_decay_given) o.adapt_decay = 0.92f;
-            }
+            strata::program::adapt_coverage_defaults(true, live_slots, total_pairs, o.adapt_every, o.adapt_swaps, o.adapt_decay,
+                                                      o.adapt_every_given, o.adapt_swaps_given, o.adapt_decay_given);
         }
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         const char* fetch_off = d_res == nullptr ? "no residency table" : xcache.slots() <= 0 ? "0-slot expert cache" : o.spec_split ? "--spec-split"

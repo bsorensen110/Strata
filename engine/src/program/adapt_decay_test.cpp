@@ -44,6 +44,34 @@ int main() {
     const float d = adapt_decay_checked(1.5, nullptr);
     for (int i = 0; i < 100000; ++i) usage = usage * d + 1.f;
     check(std::isfinite(usage), "counts stay finite with the value the engine ends up using");
+    using namespace strata::program;
+    check(!adapt_coverage_enabled(nullptr) && !adapt_coverage_enabled("") && !adapt_coverage_enabled("0"),
+          "coverage defaults are opt-in");
+    check(adapt_coverage_enabled("1"), "coverage defaults accept opt-in");
+    check(adapt_exchange_limit(false) == 96 && adapt_exchange_limit(true) == 192, "exchange limit follows opt-in");
+    auto coverage = [](bool enabled, int64_t live, int64_t total, bool given, int expected_every, int expected_swaps, float expected_decay) {
+        int every = 8, swaps = 96;
+        float decay = 0.7f;
+        adapt_coverage_defaults(enabled, live, total, every, swaps, decay, given, given, given);
+        check(every == expected_every && swaps == expected_swaps && decay == expected_decay, "coverage policy");
+    };
+    coverage(false, 50, 100, false, 8, 96, 0.7f);
+    coverage(true, 14, 100, false, 8, 96, 0.7f);
+    coverage(true, 15, 100, false, 2, 192, 0.92f);
+    coverage(true, 65, 100, false, 2, 192, 0.92f);
+    coverage(true, 66, 100, false, 8, 96, 0.7f);
+    coverage(true, 50, 100, true, 8, 96, 0.7f);
+    coverage(true, 0, 0, false, 8, 96, 0.7f);
+    {
+        int every = 8, swaps = 96;
+        float decay = 0.7f;
+        adapt_coverage_defaults(true, 50, 100, every, swaps, decay, true, false, true);
+        check(every == 8 && swaps == 192 && decay == 0.7f, "individual CLI overrides are kept");
+        every = 0;
+        swaps = 96;
+        adapt_coverage_defaults(true, 50, 100, every, swaps, decay, false, false, false);
+        check(every == 0 && swaps == 96 && decay == 0.7f, "disabled adaptive tier stays disabled");
+    }
     std::printf("adapt_decay_test: %d checks passed\n", checks);
     return 0;
 }

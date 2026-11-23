@@ -37,6 +37,16 @@ inline bool mmq_group_sort_requested() {
     return on;
 }
 
+// Staged sorting is opt-in. Mode 1 favors complete resident groups, mode 2 sorts by row count,
+// and mode 3 puts resident groups first and the other full groups in descending count order.
+inline int mmq_staged_sort_mode_from(const char* value) {
+    return value == nullptr || value[0] == '\0' ? 0 : std::atoi(value);
+}
+
+inline int mmq_staged_sort_mode() {
+    return mmq_staged_sort_mode_from(std::getenv("STRATA_MMQ_STAGED_SORT"));
+}
+
 // STRATA_MMQ_TIER_SORT=1: GPUOS-inspired readiness-tier + row-count expert ordering across staged (!stream_all) and
 // layer-major (lm_run) MMQ prefill walks on any GPU architecture (from Volta sm_70 V100 through Ada sm_89 and newer).
 inline bool mmq_tier_sort_requested() {
@@ -79,6 +89,31 @@ inline bool mmq_resident_sort_eligible(bool requested, bool use_mmq, bool native
     return true;
 }
 
+inline bool mmq_staged_sort_eligible(bool requested, bool use_mmq, bool has_cache,
+                                     const int32_t* layer_resident, int64_t n_expert, bool stream_all) {
+    return requested && use_mmq && has_cache && layer_resident && n_expert > 0 && !stream_all;
+}
+
+inline void mmq_rebuild_routes(const int32_t* ids, int64_t routes, int32_t k,
+                               const std::vector<int32_t>& count, std::vector<int32_t>& off,
+                               const std::vector<int32_t>& order, int32_t* slot, int32_t* src) {
+    for (size_t e = 0; e + 1 < off.size(); ++e)
+        if (count[e] == 0) off[e] = 0;
+    int32_t cursor = 0;
+    for (int32_t e : order) {
+        off[(size_t) e] = cursor;
+        cursor += count[(size_t) e];
+    }
+    if (!off.empty() && (int64_t) cursor == routes) off.back() = cursor;
+    std::vector<int32_t> fill(off.begin(), off.end() - 1);
+    for (int64_t i = 0; i < routes; ++i) {
+        const int32_t e = ids[(size_t) i];
+        const int32_t p = fill[(size_t) e]++;
+        slot[(size_t) i] = p;
+        src[(size_t) p] = (int32_t) (i / k);
+    }
+}
+
 // Preconditions are established by the existing caller: IDs were range-checked and counted;
 // order contains each positive-count GPU-local expert once in ID order; off has count.size()+1 entries;
 // routes fits its original int32 offsets, and slot/src each have routes writable entries.
@@ -104,22 +139,50 @@ inline void mmq_resident_sort_rows(const int32_t* ids, int64_t routes, int32_t k
         return count[(size_t) a] != count[(size_t) b]
             ? count[(size_t) a] < count[(size_t) b] : a < b;
     });
-    for (size_t e = 0; e + 1 < off.size(); ++e)
-        if (count[e] == 0) off[e] = 0;
-    int32_t cursor = 0;
-    for (int32_t e : order) {
-        off[(size_t) e] = cursor;
-        cursor += count[(size_t) e];
+    mmq_rebuild_routes(ids, routes, k, count, off, order, slot, src);
+}
+
+inline void mmq_staged_sort_rows(const int32_t* ids, int64_t routes, int32_t k,
+                                 const std::vector<int32_t>& count, const int32_t* layer_resident,
+                                 size_t group, bool keep_tail, std::vector<int32_t>& off,
+                                 std::vector<int32_t>& order, int32_t* slot, int32_t* src, int mode) {
+    const size_t span = mmq_resident_sort_span(order.size(), group, keep_tail);
+    auto end = order.begin() + (ptrdiff_t) span;
+    auto cmp = [&](int32_t a, int32_t b) {
+        return count[(size_t) a] != count[(size_t) b]
+            ? count[(size_t) a] < count[(size_t) b] : a < b;
+    };
+    if (mode == 1 && layer_resident && group > 0 && span > 0) {
+        auto mid = std::stable_partition(order.begin(), end, [&](int32_t e) {
+            return layer_resident[(size_t) e] >= 0;
+        });
+        std::stable_sort(order.begin(), mid, cmp);
+        const size_t full_resident = (size_t) (mid - order.begin()) / group * group;
+        std::stable_sort(order.begin() + (ptrdiff_t) full_resident, end, cmp);
+    } else {
+        std::stable_sort(order.begin(), end, cmp);
+        if (mode == 3 && layer_resident && group > 0) {
+            const size_t groups = span / group;
+            std::vector<int32_t> reordered;
+            reordered.reserve(span);
+            auto resident = [&](size_t g) {
+                for (size_t i = 0; i < group; ++i)
+                    if (layer_resident[(size_t) order[g * group + i]] < 0) return false;
+                return true;
+            };
+            for (size_t g = 0; g < groups; ++g)
+                if (resident(g))
+                    reordered.insert(reordered.end(), order.begin() + (ptrdiff_t) (g * group),
+                                     order.begin() + (ptrdiff_t) ((g + 1) * group));
+            for (size_t g = groups; g > 0; --g)
+                if (!resident(g - 1))
+                    reordered.insert(reordered.end(), order.begin() + (ptrdiff_t) ((g - 1) * group),
+                                     order.begin() + (ptrdiff_t) (g * group));
+            reordered.insert(reordered.end(), order.begin() + (ptrdiff_t) (groups * group), end);
+            std::copy(reordered.begin(), reordered.end(), order.begin());
+        }
     }
-    if (!off.empty() && (int64_t) cursor == routes) off.back() = cursor;
-    std::vector<int32_t> fill(off.begin(), off.end() - 1);
-    // Preserve token-major/rank-major traversal, hence the original within-expert row order.
-    for (int64_t i = 0; i < routes; ++i) {
-        const int32_t e = ids[(size_t) i];
-        const int32_t p = fill[(size_t) e]++;
-        slot[(size_t) i] = p;
-        src[(size_t) p] = (int32_t) (i / k);
-    }
+    mmq_rebuild_routes(ids, routes, k, count, off, order, slot, src);
 }
 
 // Layer-major prefill (`lm_experts`): orders `uniq` by readiness tier (Tier 0 VRAM resident, Tier 1 pinned host RAM,
