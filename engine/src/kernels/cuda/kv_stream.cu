@@ -180,7 +180,7 @@ __device__ __forceinline__ void resolve_body(KvStreamMap m, const int32_t* __res
         m.ctl[0] = epoch;
         m.ctl[1] = hand;
         m.ctl[2] = placed;
-        if (placed < need) m.ctl[3] = 1;
+        if (placed < need) m.ctl[3] += 1;
         unsigned long long* c = reinterpret_cast<unsigned long long*>(m.ctl + 4);
         c[0] += (unsigned long long) placed;
         c[1] += (unsigned long long) s_lookups;
@@ -207,11 +207,41 @@ __global__ void __launch_bounds__(RT) resolve_slots_kernel(KvResolveArgs a, int 
     if (r.n_q > 0) resolve_body(r.map, r.ids, r.steps, r.n_q, cap, page_size);
 }
 
-__device__ __forceinline__ void copy_body(KvStreamMap m, Runs r) {
-    const int need = m.ctl[2];
+// Lean per-kernel parameter structs to stay well within CUDA's 4 KB pass-by-value kernel argument limit.
+struct KvResolveMapGroups {
+    KvStreamMap map[kKvResolveMaxGroups];
+    int first[kKvResolveMaxGroups];
+    int ntok[kKvResolveMaxGroups];
+    int ng;
+};
+static_assert(sizeof(KvResolveMapGroups) <= 2048, "sm_86 4KB kernel param limit");
+
+struct KvCopyGroups {
+    int32_t* ctl[kKvResolveMaxGroups];
+    int32_t* miss_block[kKvResolveMaxGroups];
+    int32_t* miss_slot[kKvResolveMaxGroups];
+    Runs runs[kKvResolveMaxGroups];
+    int ng;
+};
+static_assert(sizeof(KvCopyGroups) <= 2048, "sm_86 4KB kernel param limit");
+
+// One block per distinct streamed slot: resolves all ntok[g] contiguous rows of slot g in a single epoch.
+__global__ void __launch_bounds__(RT) resolve_groups_kernel(KvResolveMapGroups mg, const int32_t* __restrict__ ids,
+                                                            const int32_t* __restrict__ steps, int cap, int page_size) {
+    const unsigned g = blockIdx.x;
+    if ((int) g >= mg.ng) return;
+    const KvStreamMap m = mg.map[g];
+    const int first = mg.first[g];
+    const int n_q = mg.ntok[g];
+    resolve_body(m, ids + (long long) first * cap, steps + (long long) first * kStepCount, n_q, cap, page_size);
+}
+
+__device__ __forceinline__ void copy_runs(const int32_t* ctl, const int32_t* miss_block,
+                                          const int32_t* miss_slot, Runs r) {
+    const int need = ctl[2];
     const long long mask = r.block_shift > 0 ? ((1ll << r.block_shift) - 1) : 0;
     for (int k = blockIdx.x; k < need; k += gridDim.x) {
-        const long long b = m.miss_block[k], sl = m.miss_slot[k];
+        const long long b = miss_block[k], sl = miss_slot[k];
         const long long lb = r.block_shift > 0 ? (b & mask) : b;
         for (int a = 0; a < r.n; ++a) {
             const uint8_t* base = r.block_shift > 0
@@ -224,9 +254,20 @@ __device__ __forceinline__ void copy_body(KvStreamMap m, Runs r) {
     }
 }
 
+__device__ __forceinline__ void copy_body(KvStreamMap m, Runs r) {
+    copy_runs(m.ctl, m.miss_block, m.miss_slot, r);
+}
+
 // One block per missed block (grid-stride): copy its runs from the host copy into its slot, 16 B per thread.
 __global__ void copy_kernel(KvStreamMap m, Runs r) {
     copy_body(m, r);
+}
+
+// One block-row per distinct streamed slot (blockIdx.y = g): copies that slot's missed blocks from host into VRAM.
+__global__ void copy_groups_kernel(KvCopyGroups cg) {
+    const unsigned g = blockIdx.y;
+    if ((int) g >= cg.ng) return;
+    copy_runs(cg.ctl[g], cg.miss_block[g], cg.miss_slot[g], cg.runs[g]);
 }
 
 struct KvCopyArg {
@@ -329,6 +370,48 @@ void kv_stream_resolve_slots(const KvResolveSlots& slots, int64_t cap, const Qsa
     check("resolve_slots");
     copy_slots_kernel<<<dim3(96, (unsigned) slots.n), 128, 0, (cudaStream_t) stream>>>(cargs);
     check("copy_slots");
+
+void kv_stream_resolve_groups(const KvResolveGroups& g, const int32_t* ids, const int32_t* steps, int64_t cap,
+                              const QsaShapes& s, void* stream) {
+    if (g.ng <= 0) return;
+    if (g.ng > kKvResolveMaxGroups) {
+        std::fprintf(stderr, "kv_stream_resolve_groups: ng %d exceeds %d\n", g.ng, kKvResolveMaxGroups);
+        std::exit(1);
+    }
+    if (s.n_head_kv * s.page_size * (s.head_dim / KV_Q8_GROUP) * 2 % 16 != 0) {
+        std::fprintf(stderr, "kv_stream_resolve_groups: a block's scale run must be a multiple of 16 bytes\n");
+        std::exit(1);
+    }
+    KvResolveMapGroups mg{};
+    KvCopyGroups cg{};
+    mg.ng = cg.ng = g.ng;
+    for (int i = 0; i < g.ng; ++i) {
+        if (g.ntok[i] < 1 || g.map[i].n_slots < RT || !g.map[i].page_table || !g.map[i].ctl) {
+            std::fprintf(stderr, "kv_stream_resolve_groups: invalid group %d (ntok=%d, n_slots=%lld)\n", i, g.ntok[i],
+                         (long long) g.map[i].n_slots);
+            std::exit(1);
+        }
+        // Hard invariant: every group MUST target a physically distinct KvStreamMap so CTAs never race on one map.
+        for (int j = 0; j < i; ++j) {
+            if (g.map[i].page_table == g.map[j].page_table || g.map[i].ctl == g.map[j].ctl) {
+                std::fprintf(stderr, "kv_stream_resolve_groups: duplicate KvStreamMap between groups %d and %d\n", j, i);
+                std::exit(1);
+            }
+        }
+        mg.map[i] = g.map[i];
+        mg.first[i] = g.first[i];
+        mg.ntok[i] = g.ntok[i];
+        cg.ctl[i] = g.map[i].ctl;
+        cg.miss_block[i] = g.map[i].miss_block;
+        cg.miss_slot[i] = g.map[i].miss_slot;
+        cg.runs[i] = runs_of(g.slots[i], g.host[i], g.fmt[i], s);
+    }
+    const cudaStream_t cs = (cudaStream_t) stream;
+    resolve_groups_kernel<<<(unsigned) g.ng, RT, 0, cs>>>(mg, ids, steps, (int) cap, (int) s.page_size);
+    check("resolve groups");
+    const unsigned copy_x = g.ng <= 1 ? 96u : (g.ng == 2 ? 48u : 32u);
+    copy_groups_kernel<<<dim3(copy_x, (unsigned) g.ng), 128, 0, cs>>>(cg);
+    check("copy groups");
 }
 
 void kv_ring_table(int32_t* page_table, int64_t n_blocks, int64_t n_slots, void* stream) {
@@ -386,6 +469,7 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     r.lookups = u[1];
     r.calls = u[2];
     r.overflow = c[3] != 0;
+    r.overflow_count = (uint32_t) c[3];
     return r;
 }
 
