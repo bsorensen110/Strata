@@ -846,9 +846,12 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
     }
     const Tr dot = traits(f.gu_type);
 #if defined(STRATA_OWN_CPU_QUANT)
-    static const bool x4_on = std::getenv("STRATA_NO_DOT_X4") == nullptr;
+    static const bool x4_opt_in = [] {
+        const char* e = std::getenv("STRATA_DOT_X4");
+        return e != nullptr && std::strcmp(e, "1") == 0;
+    }();
     const strata::quant::DotX4Kernel* x4 =
-        (x4_on && (Arithmetic == NativeArithmetic::Default || flavour_avx2()))
+        (x4_opt_in && (Arithmetic == NativeArithmetic::Default || flavour_avx2()))
             ? strata::quant::dot_x4_kernel((strata::quant::Type) f.gu_type, strata::quant::Arith::Avx2)
             : nullptr;
 #endif
@@ -862,6 +865,7 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         }
     int r = r0;
 #if defined(STRATA_OWN_CPU_QUANT)
+    // Keep x4 opt-in: its rounding can vary with row-range splits, unlike the single-row dot.
     if (x4 != nullptr) {
         for (; r + 4 <= r1; r += 4) {
             const uint8_t* gr = blob + (size_t) r * f.gu_row;
@@ -1003,9 +1007,12 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
     }
     const Tr dot = traits(f.d_type);
 #if defined(STRATA_OWN_CPU_QUANT)
-    static const bool x4_on = std::getenv("STRATA_NO_DOT_X4") == nullptr;
+    static const bool x4_opt_in = [] {
+        const char* e = std::getenv("STRATA_DOT_X4");
+        return e != nullptr && std::strcmp(e, "1") == 0;
+    }();
     const strata::quant::DotX4Kernel* x4 =
-        (x4_on && (Arithmetic == NativeArithmetic::Default || flavour_avx2()))
+        (x4_opt_in && (Arithmetic == NativeArithmetic::Default || flavour_avx2()))
             ? strata::quant::dot_x4_kernel((strata::quant::Type) f.d_type, strata::quant::Arith::Avx2)
             : nullptr;
 #endif
@@ -1016,6 +1023,7 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
             row_prefetch_range(blob + f.down_off + (size_t) (r0 + k) * f.d_row, f.d_row, pf_hint);
     int r = r0;
 #if defined(STRATA_OWN_CPU_QUANT)
+    // Keep x4 opt-in: its rounding can vary with row-range splits, unlike the single-row dot.
     if (x4 != nullptr) {
         for (; r + 4 <= r1; r += 4) {
             const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;

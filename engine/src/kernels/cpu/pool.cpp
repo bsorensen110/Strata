@@ -1307,18 +1307,50 @@ void ExpertPool::native_rows(int e, int r0, int r1, bool in_gu) {
         }
     } else if (q2_native_kernels(nfmt->d_type)) {
         // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
+        if (mode_ == 7) {
+            // Fused dispatch: down rows wait for this expert's gate/up rows before quantizing the intermediate.
+            while (sb.gu_rows_done.load(std::memory_order_acquire) < (int) nfmt->n_ff) strata_cpu_pause();
+        }
+        for (int t = 0; t < nt; ++t) {
+            if (sb.q_state[t].load(std::memory_order_acquire) == 0) {
+                uint8_t expected = 0;
+                if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                    act_quant_any(sb.ff[t], FF, sb.a2[t]);
+                    sb.q_state[t].store(2, std::memory_order_release);
+                }
+            }
+        }
         for (int t0 = 0; t0 < nt; t0 += MAXT) {
             const int m = (std::min)(MAXT, nt - t0);
             const ActQ* a2[MAXT];
-            for (int t = 0; t < m; ++t) a2[t] = &sb.a2[t0 + t];
+            for (int t = 0; t < m; ++t) {
+                while (sb.q_state[t0 + t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
+                a2[t] = &sb.a2[t0 + t];
+            }
             q2_rows_any(mjobs_[e].blob + nfmt->down_off, nfmt->d_row, (int) (nfmt->n_ff / 64), a2,
                         m, mjobs_[e].out + t0, r0, r1);
         }
     } else {
+        if (mode_ == 7) {
+            // Fused dispatch: down rows wait for this expert's gate/up rows before quantizing the intermediate.
+            while (sb.gu_rows_done.load(std::memory_order_acquire) < (int) nfmt->n_ff) strata_cpu_pause();
+        }
+        for (int t = 0; t < nt; ++t) {
+            if (sb.q_state[t].load(std::memory_order_acquire) == 0) {
+                uint8_t expected = 0;
+                if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                    native_quant_h(*nfmt, sb.ff[t], sb.hq[t]);
+                    sb.q_state[t].store(2, std::memory_order_release);
+                }
+            }
+        }
         for (int t0 = 0; t0 < nt; t0 += MAXT) {
             const int m = (std::min)(MAXT, nt - t0);
             const void* hq[MAXT];
-            for (int t = 0; t < m; ++t) hq[t] = sb.hq[t0 + t];
+            for (int t = 0; t < m; ++t) {
+                while (sb.q_state[t0 + t].load(std::memory_order_acquire) != 2) strata_cpu_pause();
+                hq[t] = sb.hq[t0 + t];
+            }
             if (narithmetic_ == NativeArithmetic::WindowInvariant)
                 native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, m, mjobs_[e].out + t0, r0, r1);
             else
