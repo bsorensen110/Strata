@@ -333,7 +333,7 @@ private:
     /// per_worker: one task per worker, task j on worker j (the static slices), none on the host
     void run_phase(int mode, int n_tasks, bool per_worker = false);
     void prefetch_task(int j);
-    void native_rows(int e, int r0, int r1);
+    void native_rows(int e, int r0, int r1, bool in_gu);
     bool static_slices_ = false;
     bool per_worker_ = false;      // this batch's tasks are per worker (written before the publish, read after it)
     bool pf_inflight_ = false;     // a prefetch batch was published and has not been waited for (host only)

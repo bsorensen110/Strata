@@ -6239,7 +6239,8 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         const char* v = std::getenv("STRATA_CPU_EXPERT_NO_SPLIT");
         return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
-    const int job_max_t = cpu_no_split ? strata::kernels::cpu::kJobMultiMaxT : MAXT;
+    // Native row kernels have fixed MAXT-sized pointer arrays even when the verify window is wider.
+    const int job_max_t = !native && cpu_no_split ? strata::kernels::cpu::kJobMultiMaxT : MAXT;
     if (reduce_miss && d.miss_tmp.size() < (size_t) (n_tok * k * H))
         d.miss_tmp.resize((size_t) (n_tok * k * H));
     float* const miss_base = reduce_miss ? d.miss_tmp.data() : out;

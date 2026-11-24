@@ -78,38 +78,37 @@ int main() {
     cpu::ExpertPool pool(3, false);
     int fail = 0;
 
-    // 1. Test deferred native activation quantization across rows 0..T-1 (especially rows 8..15) + run_split_multi_native.
-    {
-        std::vector<cpu::ActQ> def_act(T);
-        std::vector<uint8_t> def_nact((size_t) T * cpu::kNativeActBytes, 0x5a);
-        std::vector<float> out_wide((size_t) T * cpu::H, std::numeric_limits<float>::quiet_NaN());
-        std::vector<float> out_split((size_t) T * cpu::H, std::numeric_limits<float>::quiet_NaN());
+    // 1. Test wide native jobs (including rows 8+) against their <=MAXT job partition, bit for bit.
+    for (const int width : {12, 16}) {
+        if (width > T) continue;
+        std::vector<cpu::ActQ> def_act(width);
+        std::vector<uint8_t> def_nact((size_t) width * cpu::kNativeActBytes, 0x5a);
+        std::vector<float> out_wide((size_t) width * cpu::H, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> out_split((size_t) width * cpu::H, std::numeric_limits<float>::quiet_NaN());
 
         pool.clear_act_quant();
-        pool.defer_act_quant(xf.data(), def_nact.data(), def_act.data(), toks.data(), T, true);
+        pool.defer_act_quant(xf.data(), def_nact.data(), def_act.data(), toks.data(), width, true);
 
         cpu::ExpertJobMulti wide_job;
         wide_job.blob = native_blob.data();
-        wide_job.nt = T;
-        for (int t = 0; t < T; ++t) {
+        wide_job.nt = width;
+        for (int t = 0; t < width; ++t) {
             wide_job.nact[t] = def_nact.data() + (size_t) t * cpu::kNativeActBytes;
             wide_job.out[t] = out_wide.data() + (size_t) t * cpu::H;
         }
         pool.run_split_multi_native(f, &wide_job, 1);
 
-        // Compare deferred nact against direct native_quant_act for every row (catching MAXT=8 truncation at t >= 8).
-        for (int t = 0; t < T; ++t) {
+        for (int t = 0; t < width; ++t) {
             if (std::memcmp(def_nact.data() + (size_t) t * cpu::kNativeActBytes,
                             ref_nact.data() + (size_t) t * cpu::kNativeActBytes, cpu::kNativeActBytes) != 0) {
-                std::fprintf(stderr, "native defer_act_quant mismatch at row %d/%d\n", t, T);
+                std::fprintf(stderr, "native defer_act_quant mismatch at row %d/%d\n", t, width);
                 ++fail;
             }
         }
 
-        // Compare single T-row job against <=MAXT-chunked jobs bitwise.
         std::vector<cpu::ExpertJobMulti> chunk_jobs;
-        for (int t0 = 0; t0 < T; t0 += cpu::MAXT) {
-            const int m = (std::min)(cpu::MAXT, T - t0);
+        for (int t0 = 0; t0 < width; t0 += cpu::MAXT) {
+            const int m = (std::min)(cpu::MAXT, width - t0);
             cpu::ExpertJobMulti cj;
             cj.blob = native_blob.data();
             cj.nt = m;
@@ -117,12 +116,13 @@ int main() {
                 cj.nact[t] = ref_nact.data() + (size_t) (t0 + t) * cpu::kNativeActBytes;
                 cj.out[t] = out_split.data() + (size_t) (t0 + t) * cpu::H;
             }
+            if (cj.nt > cpu::MAXT) return 1;
             chunk_jobs.push_back(cj);
         }
         pool.clear_act_quant();
         pool.run_split_multi_native(f, chunk_jobs.data(), (int) chunk_jobs.size());
 
-        for (int t = 0; t < T; ++t) {
+        for (int t = 0; t < width; ++t) {
             const float* a = out_wide.data() + (size_t) t * cpu::H;
             const float* b = out_split.data() + (size_t) t * cpu::H;
             double l2 = 0.0;
@@ -139,7 +139,7 @@ int main() {
                 ++fail;
             }
             if (std::memcmp(a, b, (size_t) cpu::H * sizeof(float)) != 0) {
-                std::fprintf(stderr, "native wide vs chunked output differs at row %d/%d\n", t, T);
+                std::fprintf(stderr, "native wide vs chunked output differs at row %d/%d\n", t, width);
                 ++fail;
             }
         }

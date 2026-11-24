@@ -1270,42 +1270,70 @@ void ExpertPool::wait_done(int n) {
     }
 }
 
-void ExpertPool::native_rows(int e, int r0, int r1) {
-    // the native row phases' work for expert `e` of the batch, rows [r0, r1) of its gate/up (mode 5) or down (mode 6)
+void ExpertPool::native_rows(int e, int r0, int r1, bool in_gu) {
+    // The native row phases' work for expert `e` of the batch, rows [r0, r1) of gate/up or down.
     SplitBufMulti& sb = split_multi_[(size_t) e];
     const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;   // 149-cold: same types and rows
-    if (mode_ == 5 && q2_native_kernels(nfmt->gu_type)) {
+    const int nt = mjobs_[e].nt;
+    if (nt > MAXT) {
+        std::fprintf(stderr, "strata: CPU native row job has %d tokens; maximum is %d\n", nt, MAXT);
+        std::fflush(stderr);
+        std::abort();
+    }
+    if (in_gu && q2_native_kernels(nfmt->gu_type)) {
         // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
         thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
         float* gp[MAXT];
         float* up[MAXT];
-        for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
         const int nbk = (int) (nfmt->n_embd / 64);
-        q2_rows_any(mjobs_[e].blob, nfmt->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-        q2_rows_any(mjobs_[e].blob + nfmt->up_off, nfmt->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
-        for (int t = 0; t < mjobs_[e].nt; ++t)
-            for (int r = r0; r < r1; ++r)
-                sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
-    } else if (mode_ == 5) {
-        float* ff[MAXT];
-        for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-        if (narithmetic_ == NativeArithmetic::WindowInvariant)
-            native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-        else
-            native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+        for (int t0 = 0; t0 < nt; t0 += MAXT) {
+            const int m = (std::min)(MAXT, nt - t0);
+            for (int t = 0; t < m; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+            q2_rows_any(mjobs_[e].blob, nfmt->gu_row, nbk, mjobs_[e].act + t0, m, gp, r0, r1);
+            q2_rows_any(mjobs_[e].blob + nfmt->up_off, nfmt->gu_row, nbk, mjobs_[e].act + t0, m, up, r0, r1);
+            for (int t = 0; t < m; ++t)
+                for (int r = r0; r < r1; ++r)
+                    sb.ff[t0 + t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+        }
+    } else if (in_gu) {
+        for (int t0 = 0; t0 < nt; t0 += MAXT) {
+            const int m = (std::min)(MAXT, nt - t0);
+            float* ff[MAXT];
+            for (int t = 0; t < m; ++t) ff[t] = sb.ff[t0 + t];
+            if (narithmetic_ == NativeArithmetic::WindowInvariant)
+                native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact + t0, m, ff, r0, r1);
+            else
+                native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact + t0, m, ff, r0, r1);
+        }
     } else if (q2_native_kernels(nfmt->d_type)) {
         // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
-        const ActQ* a2[MAXT];
-        for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-        q2_rows_any(mjobs_[e].blob + nfmt->down_off, nfmt->d_row, (int) (nfmt->n_ff / 64), a2,
-                    mjobs_[e].nt, mjobs_[e].out, r0, r1);
+        for (int t0 = 0; t0 < nt; t0 += MAXT) {
+            const int m = (std::min)(MAXT, nt - t0);
+            const ActQ* a2[MAXT];
+            for (int t = 0; t < m; ++t) a2[t] = &sb.a2[t0 + t];
+            q2_rows_any(mjobs_[e].blob + nfmt->down_off, nfmt->d_row, (int) (nfmt->n_ff / 64), a2,
+                        m, mjobs_[e].out + t0, r0, r1);
+        }
     } else {
-        const void* hq[MAXT];
-        for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-        if (narithmetic_ == NativeArithmetic::WindowInvariant)
-            native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
-        else
-            native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+        for (int t0 = 0; t0 < nt; t0 += MAXT) {
+            const int m = (std::min)(MAXT, nt - t0);
+            const void* hq[MAXT];
+            for (int t = 0; t < m; ++t) hq[t] = sb.hq[t0 + t];
+            if (narithmetic_ == NativeArithmetic::WindowInvariant)
+                native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, m, mjobs_[e].out + t0, r0, r1);
+            else
+                native_down_rows(*nfmt, mjobs_[e].blob, hq, m, mjobs_[e].out + t0, r0, r1);
+        }
+    }
+    if (in_gu && sb.gu_rows_done.fetch_add(r1 - r0, std::memory_order_acq_rel) + (r1 - r0) == (int) nfmt->n_ff) {
+        for (int t = 0; t < nt; ++t) {
+            uint8_t expected = 0;
+            if (sb.q_state[t].compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+                if (q2_native_kernels(nfmt->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+                else native_quant_h(*nfmt, sb.ff[t], sb.hq[t]);
+                sb.q_state[t].store(2, std::memory_order_release);
+            }
+        }
     }
 }
 
@@ -1319,7 +1347,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int r0 = (int) ((int64_t) per * id / n_), r1 = (int) ((int64_t) per * (id + 1) / n_);
             const int nb = (int) (mrows_ / per);
             if (r1 > r0)
-                for (int e = 0; e < nb; ++e) native_rows(e, r0, r1);
+                for (int e = 0; e < nb; ++e) native_rows(e, r0, r1, mode_ == 5);
         }
         done_.fetch_add(1, std::memory_order_release);
         return;
@@ -1407,7 +1435,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (g / h), l0 = (int) (g % h);
                 const int l1 = (int) std::min<int64_t>(h, l0 + (g1 - g));
                 const int r0 = row0 + l0, r1 = row0 + l1;
-                native_rows(e, r0, r1);
+                native_rows(e, r0, r1, in_gu);
                 g += l1 - l0;
             }
         } else {
@@ -1511,6 +1539,12 @@ void ExpertPool::dep_task(int i) {
     const int ngu = dep_nb_ * dep_k_gu_;
     if (i < ngu) {
         const int e = i / dep_k_gu_, p = i % dep_k_gu_;
+        if (mjobs_[e].nt > MAXT) {
+            std::fprintf(stderr, "strata: CPU dependent native row job has %d tokens; maximum is %d\n",
+                         mjobs_[e].nt, MAXT);
+            std::fflush(stderr);
+            std::abort();
+        }
         const int h = (int) f.n_ff;
         const int r0 = (int) ((int64_t) h * p / dep_k_gu_), r1 = (int) ((int64_t) h * (p + 1) / dep_k_gu_);
         SplitBufMulti& sb = split_multi_[(size_t) e];
@@ -1527,6 +1561,12 @@ void ExpertPool::dep_task(int i) {
     const int j = i - ngu;
     const int e = j / dep_k_dn_, p = j % dep_k_dn_;
     DepExpert& d = dep_[(size_t) e];
+    if (mjobs_[e].nt > MAXT) {
+        std::fprintf(stderr, "strata: CPU dependent native row job has %d tokens; maximum is %d\n",
+                     mjobs_[e].nt, MAXT);
+        std::fflush(stderr);
+        std::abort();
+    }
     while (d.gu_left.load(std::memory_order_acquire) > 0) strata_cpu_pause();   // this expert's gate/up tasks all claimed earlier: one of them is running
     int expect = 0;
     SplitBufMulti& sb = split_multi_[(size_t) e];
@@ -1701,6 +1741,35 @@ void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
 
 void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n, NativeArithmetic arithmetic) {
     if (n <= 0) { act_count_ = 0; return; }
+    bool wide = false;
+    for (int e = 0; e < n; ++e) {
+        if (jobs[e].nt < 0 || jobs[e].nt > kJobMultiMaxT) {
+            std::fprintf(stderr, "strata: CPU native expert job has invalid token count %d (maximum %d)\n",
+                         jobs[e].nt, kJobMultiMaxT);
+            std::fflush(stderr);
+            std::abort();
+        }
+        wide = wide || jobs[e].nt > MAXT;
+    }
+    if (wide) {
+        std::vector<ExpertJobMulti> bounded;
+        for (int e = 0; e < n; ++e) {
+            for (int t0 = 0; t0 < jobs[e].nt; t0 += MAXT) {
+                ExpertJobMulti job;
+                job.blob = jobs[e].blob;
+                job.fmt = jobs[e].fmt;
+                job.nt = (std::min)(MAXT, jobs[e].nt - t0);
+                for (int t = 0; t < job.nt; ++t) {
+                    job.act[t] = jobs[e].act[t0 + t];
+                    job.nact[t] = jobs[e].nact[t0 + t];
+                    job.out[t] = jobs[e].out[t0 + t];
+                }
+                bounded.push_back(job);
+            }
+        }
+        run_split_multi_native(f, bounded.data(), (int) bounded.size(), arithmetic);
+        return;
+    }
     const auto t0 = std::chrono::steady_clock::now();
     // more distinct experts than buffers: run them in batches
     for (int b0 = 0; b0 < n; b0 += kMaxSplitMulti) {
