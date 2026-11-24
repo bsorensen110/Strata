@@ -210,4 +210,9 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m);
 /// Bytes of one block (page) of K and V together.
 uint64_t kv_block_bytes(const QsaShapes& s, int fmt);
 
+/// Compacts non-contiguous accepted tree KV cells (`pos0 + path[k]` -> `pos0 + k`) for F16, Int8, Q4, and K8V4,
+/// including any streamed host mirror (`host`). `tree_commit` layout: `[n_keep, leaf_row, pos0, path[0..7]]`.
+void kv_compact_tree(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const int32_t* tree_commit,
+                     const QsaShapes& s, void* stream);
+
 }  // namespace strata::kernels

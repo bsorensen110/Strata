@@ -30,6 +30,7 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/spec/df2_tree.hpp"
 
 #include <cuda_runtime.h>
 
@@ -241,6 +242,15 @@ public:
 
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
+
+    /// DF2 tree-shaped verification (STRATA_DF2_TREE=1): verifies `tree` (`2..8` nodes, caterpillar, greedy, single-stage)
+    /// in a single `G=1` window; `out[t]` receives the greedy argmax after node `t`.
+    bool run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
+                  std::string& err);
+    /// Commits a non-contiguous accepted path `path[0..n_keep-1]` (`path[0] == 0`, `path[k] >= k`) from the last `run_tree`.
+    bool commit_tree(const uint8_t* path, int n_keep, std::string& err);
+    /// Compacts accepted tap rows `[path[0..n_keep-1]]` back into `tap_dev_[0..n_keep-1]` using `scratch` (on `wait_stream`).
+    bool compact_taps_tree(float* scratch, const uint8_t* path, int n_keep, cudaStream_t wait_stream, std::string& err);
 
     /// Is the last window's state change still undone (only `commit` / `pl_commit_async` advances it)?  False for a one-token
     /// window that advanced the state itself (see commit), and on every stage of a chain.  serve_skip_stopped_window asks this
@@ -723,6 +733,17 @@ private:
     cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;
     bool capture_oom_ = false;          // the last capture's instantiate found no VRAM (prepare)
     cudaGraphExec_t commit_exec_ = nullptr;
+    // STRATA_DF2_TREE=1: parameterized T=8 tree verify + non-contiguous commit (allocated lazily only when enabled)
+    bool tree_rec_ = false;
+    bool last_tree_ = false;
+    strata::kernels::VerifyTreeMeta *h_tree_ = nullptr, *m_tree_ = nullptr, *d_tree_ = nullptr;
+    int32_t *h_tree_commit_ = nullptr, *m_tree_commit_ = nullptr, *d_tree_commit_ = nullptr;
+    cudaGraphExec_t exec_tree_[2] = {}, exec_tree_nr_[2] = {}, commit_tree_exec_ = nullptr;
+    bool launched_tree_[2] = {}, launched_tree_nr_[2] = {};
+    bool ensure_tree_buffers(std::string& err);
+    bool capture_tree(std::string& err);
+    bool capture_commit_tree(std::string& err);
+    void stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t pos0);
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T

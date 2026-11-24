@@ -7,6 +7,7 @@
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/qsa_two_pass.hpp"
 #include "strata/kernels/qsa_two_pass_status.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/amd_community.hpp"
 
@@ -4191,5 +4192,45 @@ void qsa_two_pass_check(const float*, const int32_t*, const float*, const int32_
                         int64_t, int64_t, void*, void*) {}
 bool qsa_two_pass_stats(unsigned long long*, bool, void*) { return false; }
 #endif
+
+namespace {
+
+__global__ void qsa_tree_remap_ids_kernel(int32_t* __restrict__ ids, const int32_t* __restrict__ steps,
+                                          const VerifyTreeMeta* __restrict__ tree, int n_tok, long long cap) {
+    const int t = (int) blockIdx.x;
+    if (t >= n_tok) return;
+    const int width = steps[(size_t) t * kStepCount + kStepWidth];
+    const int pos0 = tree->pos0;
+    const int count = tree->count;
+    int32_t* row = ids + (long long) t * cap;
+    for (int i = (int) threadIdx.x; i < width; i += (int) blockDim.x) {
+        const int32_t cell = row[i];
+        if (cell >= pos0) {
+            const int d = cell - pos0;
+            if (d < 8) {
+                const int32_t mapped = tree->anc[t][d];
+                if (mapped >= 0 && mapped < count) row[i] = pos0 + mapped;
+            }
+        }
+    }
+}
+
+}  // namespace
+
+void qsa_tree_remap_ids(int32_t* ids, const int32_t* steps, const VerifyTreeMeta* tree, int n_tok, int64_t cap,
+                        void* stream) {
+    if (n_tok <= 0) return;
+    if (!ids || !steps || !tree || cap <= 0) {
+        std::fprintf(stderr, "qsa_tree_remap_ids: invalid arguments\n");
+        std::exit(1);
+    }
+    qsa_tree_remap_ids_kernel<<<(unsigned) n_tok, 256, 0, (cudaStream_t) stream>>>(
+        ids, steps, tree, n_tok, (long long) cap);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "qsa_tree_remap_ids: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+}
 
 }  // namespace strata::kernels

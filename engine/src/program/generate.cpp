@@ -155,6 +155,7 @@
 #include "strata/spec/suffix_drafter.hpp"
 #include "strata/spec/draft_composition.hpp"
 #include "strata/spec/df2_sample_walk.hpp"
+#include "strata/spec/df2_tree.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/program/bdone_drafts.hpp"
 #include "strata/program/batch_groups.hpp"
@@ -23485,6 +23486,15 @@ int main(int argc, char** argv) {
             static int64_t telemetry_req_seq = 0;
             const int64_t telemetry_req = accept_hist_on || candidate_prefix != nullptr ? ++telemetry_req_seq : 0;
             strata::spec::Df2AcceptHist accept_hist;
+            strata::spec::Df2TreeAcceptHist tree_accept_hist;
+#if defined(STRATA_HAVE_DFLASH2)
+            const bool tree_req_eligible = strata::spec::df2_tree_on() && req_df2 && use_df2 && !batch_df2 &&
+                o.batch == 0 && n_stages <= 1 && !o.draft_auto && strata::core::Dflash2Drafter::head_native() &&
+                req_sp.greedy && req_sp.temperature <= 0.0f && hist_n <= 0 && req_bias.empty() &&
+                !df2_sample_active && !gated_proposal && !pipe && fol == nullptr && req_logprobs < 0;
+#else
+            const bool tree_req_eligible = false;
+#endif
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
             std::vector<int32_t> cbuf((size_t) S, 0), ctail;
@@ -24618,20 +24628,44 @@ int main(int argc, char** argv) {
                 }
                 const int T_mtp = T;
                 T += chain_n;
+                bool tree_round = false;
+                strata::spec::Df2TreeSpec tree_spec;
+                strata::spec::Df2TreeCommitWalk tree_walk;
+                int32_t tree_bonus = 0;
+#if defined(STRATA_HAVE_DFLASH2)
+                if (tree_req_eligible && !first_window && !merged && !from_sfx && !df2_handoff_round &&
+                    df2_suffix_n == 0 && chain_n == 0 && !win_forced && df2.tree_tables_ready()) {
+                    const int tree_cap = (int) std::min<int64_t>(
+                        std::min(S_mtp, strata::spec::kDf2TreeMaxNodes), o.max_context - p);
+                    if (tree_cap >= 4) {
+                        tree_spec = strata::spec::df2_tree_build_from_selector(
+                            x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(), df2.tree_seltab(),
+                            o.draft_conf, strata::spec::kDf2TreeDefaultMinBranchP, 3, tree_cap);
+                        if (tree_spec.valid() && !tree_spec.is_linear() && tree_spec.is_caterpillar()) {
+                            tree_round = true;
+                            T = tree_spec.count;
+                        }
+                    }
+                }
+#endif
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
                 if (p + T > o.max_context) break;
-                window[0] = x;
-                for (int i = 1; i < T_mtp; ++i)
-                    window[(size_t) i] = df2_compose_round ? df2_composition.tokens()[(size_t) i - 1]
-                                         : merged     ? (int32_t) ids[(size_t) (p + i)]
-                                         : from_sfx ? sbuf[(size_t) i - 1]
-                                                    : drafts[(size_t) i - 1];
-                if (df2_compose_round) {
-                    for (int i = 0; i < chain_n; ++i)
-                        window[(size_t) (T_mtp + i)] = df2_composition.tokens()[(size_t) (T_mtp - 1 + i)];
+                if (tree_round) {
+                    for (int i = 0; i < T; ++i) window[(size_t) i] = tree_spec.token[(size_t) i];
                 } else {
-                    for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+                    window[0] = x;
+                    for (int i = 1; i < T_mtp; ++i)
+                        window[(size_t) i] = df2_compose_round ? df2_composition.tokens()[(size_t) i - 1]
+                                             : merged     ? (int32_t) ids[(size_t) (p + i)]
+                                             : from_sfx ? sbuf[(size_t) i - 1]
+                                                        : drafts[(size_t) i - 1];
+                    if (df2_compose_round) {
+                        for (int i = 0; i < chain_n; ++i)
+                            window[(size_t) (T_mtp + i)] = df2_composition.tokens()[(size_t) (T_mtp - 1 + i)];
+                    } else {
+                        for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
+                    }
                 }
                 if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
                 drive.d.layers = 0;
@@ -24869,11 +24903,14 @@ int main(int argc, char** argv) {
                     ((admit_slot >= 0 && batch_df2 && admit_max_new > 1) ||
                      (merged && T > (int) strata::core::Dflash2Drafter::kRows) ||
                      (T >= max_new - produced_n));
-                const bool decode_tap_overlap = df2_tap_overlap_decode && !use_mtp && use_df2 && req_df2 &&
+                const bool decode_tap_overlap = df2_tap_overlap_decode && !tree_round && !use_mtp && use_df2 && req_df2 &&
                     n_stages <= 1 && admit_slot < 0 && !first_window && !merged;
                 ScopedDecodeTapsReady scoped_dec_taps(ver, &df2, legacy_tap_overlap || decode_tap_overlap, decode_tap_overlap);
 #endif
-                if (!ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err) || drive.d.failed) {
+                const bool win_ok = tree_round
+                    ? ver.run_tree(tree_spec, p, decode_pool_fn, win_pool_user, outv.data(), err)
+                    : ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err);
+                if (!win_ok || drive.d.failed) {
                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
                     std::printf("ERR %s\n", drive.d.failed && drive.d.fail ? drive.d.fail : err.c_str());
                     return 1;
@@ -24912,23 +24949,29 @@ int main(int argc, char** argv) {
                         if (!merged) valid = valid && i + 1 < T && window[(size_t) i + 1] == outv[(size_t) i];
                     }
                 }
-                int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
-                while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
-                if (df2_full_prefix) df2_solo_adaptive.observe(a, chain_n);
-                const int verify_accept = a;
+                int a = 0;
+                if (tree_round) {
+                    tree_walk = strata::spec::df2_tree_greedy_accept(tree_spec, outv.data(), &tree_bonus);
+                    a = std::max(0, tree_walk.n_keep - 1);
+                    if (accept_hist_on) tree_accept_hist.observe(tree_spec, tree_walk);
+                } else {
+                    a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
+                    while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                    if (df2_full_prefix) df2_solo_adaptive.observe(a, chain_n);
+                    const int verify_accept = a;
 #if defined(STRATA_HAVE_DFLASH2)
-                const int df2_rows = df2_compose_round ? df2_prefix_n : !merged && !from_sfx && req_df2
-                    ? std::min({std::max(0, T_mtp - 1), strata::core::Dflash2Drafter::kDrafts,
-                                (int) drafts.size(), df2_handoff_round ? slot_handoff_draft_n : df2.max_drafts()})
-                    : 0;
+                    const int df2_rows = df2_compose_round ? df2_prefix_n : !merged && !from_sfx && req_df2
+                        ? std::min({std::max(0, T_mtp - 1), strata::core::Dflash2Drafter::kDrafts,
+                                    (int) drafts.size(), df2_handoff_round ? slot_handoff_draft_n : df2.max_drafts()})
+                        : 0;
 #else
-                const int df2_rows = 0;
+                    const int df2_rows = 0;
 #endif
-                if (accept_hist_on)
-                    accept_hist.observe(df2_rows, from_sfx ? T - 1 : df2_suffix_n, chain_n, T_mtp - 1, verify_accept);
+                    if (accept_hist_on)
+                        accept_hist.observe(df2_rows, from_sfx ? T - 1 : df2_suffix_n, chain_n, T_mtp - 1, verify_accept);
 #if defined(STRATA_HAVE_DFLASH2)
-                if (!merged && !from_sfx && !first_window && !df2_handoff_round && req_df2 &&
-                    df2.candidate_dump_enabled() && df2_rows > 0) {
+                    if (!merged && !from_sfx && !first_window && !df2_handoff_round && req_df2 &&
+                        df2.candidate_dump_enabled() && df2_rows > 0) {
                     static const int64_t candidate_max_bytes = [] {
                         const char* e = std::getenv("STRATA_DF2_CAND_MAX_MB");
                         if (e == nullptr || e[0] == '\0') return int64_t{200} * 1024 * 1024;
@@ -25020,33 +25063,55 @@ int main(int argc, char** argv) {
                         }
                     }
 #endif
-                }
-                if (fol != nullptr && fol_lp != nullptr) {   // rows 0..a have valid logits (their inputs are the accepted tokens)
-                    std::vector<int32_t> fol_tg((size_t) a + 1, -1);
-                    for (int i = 0; i <= a; ++i) {
-                        const int64_t fi = produced_n + i - (merged ? T - 1 : 0);
-                        fol_tg[(size_t) i] = merged && i < T - 1 ? window[(size_t) i + 1]
-                                           : (fi >= 0 && fi < (int64_t) fol->size()) ? (*fol)[(size_t) fi] : -1;
                     }
-                    std::string fe;
-                    if (!ver.window_logprobs(fol_tg.data(), a + 1, p, 248046, fol_lp, fe))
-                        std::fprintf(stderr, "strata serve: STRATA_FOLLOW_LOGPOS: %s\n", fe.c_str());
                 }
-                // A merged window contains prompt rows: every one must still be committed.
-                // Otherwise do not cache accepted rows whose outputs this request cannot emit.
-                if ((stop_bound || hold_on) && !merged)
-                    a = strata::core::serve_stop_bound(a + 1, strata::core::serve_hold_remaining(a + 1, produced_n, max_new,
-                                                           hold_on ? req_hold_n : -1, req_hold_id, outv.data()),
-                                                       outv.data(), [&](int32_t y) {
-                        return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
-                    }) - 1;
-                if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
-                if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
-                if (!from_sfx && !first_window)
-                    for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
-                if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
-                    ++t2_rej[a];
-                    if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
+                if (tree_round) {
+                    std::array<int32_t, strata::spec::kDf2TreeMaxNodes> tree_emit{};
+                    std::array<int32_t, strata::spec::kDf2TreeMaxNodes> tree_committed{};
+                    for (int k = 0; k <= a; ++k) {
+                        const uint8_t node = tree_walk.path[(size_t) k];
+                        tree_emit[(size_t) k] = outv[(size_t) node];
+                        tree_committed[(size_t) k] = tree_spec.token[(size_t) node];
+                    }
+                    if (stop_bound || hold_on) {
+                        a = strata::core::serve_stop_bound(a + 1, strata::core::serve_hold_remaining(a + 1, produced_n, max_new,
+                                                               hold_on ? req_hold_n : -1, req_hold_id, tree_emit.data()),
+                                                           tree_emit.data(), [&](int32_t y) {
+                            return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                        }) - 1;
+                    }
+                    for (int k = 0; k <= a; ++k) {
+                        outv[(size_t) k] = tree_emit[(size_t) k];
+                        window[(size_t) k] = tree_committed[(size_t) k];
+                    }
+                } else {
+                    if (fol != nullptr && fol_lp != nullptr) {   // rows 0..a have valid logits (their inputs are the accepted tokens)
+                        std::vector<int32_t> fol_tg((size_t) a + 1, -1);
+                        for (int i = 0; i <= a; ++i) {
+                            const int64_t fi = produced_n + i - (merged ? T - 1 : 0);
+                            fol_tg[(size_t) i] = merged && i < T - 1 ? window[(size_t) i + 1]
+                                               : (fi >= 0 && fi < (int64_t) fol->size()) ? (*fol)[(size_t) fi] : -1;
+                        }
+                        std::string fe;
+                        if (!ver.window_logprobs(fol_tg.data(), a + 1, p, 248046, fol_lp, fe))
+                            std::fprintf(stderr, "strata serve: STRATA_FOLLOW_LOGPOS: %s\n", fe.c_str());
+                    }
+                    // A merged window contains prompt rows: every one must still be committed.
+                    // Otherwise do not cache accepted rows whose outputs this request cannot emit.
+                    if ((stop_bound || hold_on) && !merged)
+                        a = strata::core::serve_stop_bound(a + 1, strata::core::serve_hold_remaining(a + 1, produced_n, max_new,
+                                                               hold_on ? req_hold_n : -1, req_hold_id, outv.data()),
+                                                           outv.data(), [&](int32_t y) {
+                            return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                        }) - 1;
+                    if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
+                    if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
+                    if (!from_sfx && !first_window)
+                        for (int d = 0; d < T_mtp - 1 && d < 8 && d <= a; ++d) { ++dp_tested[d]; dp_ok[d] += d < a; }
+                    if (strata::core::MtpDrafter::top2_env() && !from_sfx && !first_window && a < T_mtp - 1 && a < 8) {
+                        ++t2_rej[a];
+                        if (mtp.top2(a) == outv[(size_t) a]) ++t2_hit[a];
+                    }
                 }
                 const Clock::time_point tw1 = Clock::now();
                 std::thread adapt_thr;   // the adaptive tier beside the commit and the draft (as in generate)
@@ -25056,12 +25121,23 @@ int main(int argc, char** argv) {
                     auto usnap = snapshot_usage();
                     adapt_thr = std::thread([&, u = std::move(usnap)] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(u); });
                 }
-                if (!ver.commit(a + 1, err)) {
+                const bool commit_ok = tree_round
+                    ? ver.commit_tree(tree_walk.path.data(), a + 1, err)
+                    : ver.commit(a + 1, err);
+                if (!commit_ok) {
                     exit_if_gpu_fatal(err);
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
+#if defined(STRATA_HAVE_DFLASH2)
+                if (tree_round && !ver.compact_taps_tree(df2.landing(), tree_walk.path.data(), a + 1, df2.stream(), err)) {
+                    exit_if_gpu_fatal(err);
+                    if (adapt_thr.joinable()) adapt_thr.join();
+                    std::printf("ERR %s\n", err.c_str());
+                    return 1;
+                }
+#endif
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (!adapt_ok) {
@@ -25821,7 +25897,9 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
-            accept_hist.emit(stderr, accept_hist_on, telemetry_req);
+            accept_hist.emit(stderr, accept_hist_on, telemetry_req,
+                             (strata::spec::df2_tree_on() && tree_accept_hist.tree_rounds > 0) ? &tree_accept_hist
+                                                                                                : nullptr);
             if (ck_from_pool + ck_fresh > 0)
                 std::fprintf(stderr, "strata serve: checkpoint pool: this request took %zu checkpoint%s ready from the pool and allocated %zu fresh\n",
                              ck_from_pool, ck_from_pool == 1 ? "" : "s", ck_fresh);

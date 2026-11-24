@@ -22,6 +22,7 @@
 #include "strata/core/geometry.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/qsa_batch_check.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <atomic>
@@ -421,4 +422,219 @@ void native_qsa_indexer_append_batch(const float* raw, int64_t n, int64_t p0, in
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }
+
+namespace {
+
+template <bool TAB>
+__global__ void tree_patch_scores_kernel(const float* __restrict__ raw, const float* __restrict__ tail_snap,
+                                         const float* __restrict__ dead, const float* __restrict__ gamma,
+                                         float epsilon, const float* __restrict__ q_idx,
+                                         const VerifyTreeMeta* __restrict__ tree, int n_tok, long long max_blocks,
+                                         int pos_base, float theta_scale, float freq_scale, float corr_low,
+                                         float corr_high, float ext_factor, float mscale,
+                                         const int32_t* __restrict__ mtab, RopeTab rt, float* __restrict__ scores) {
+    const int t = (int) blockIdx.x;
+    if (t >= n_tok) return;
+    const int d = (int) threadIdx.x;
+    __shared__ float values[D];
+    __shared__ float partials[32];
+    __shared__ float sk[D];
+
+    const int pos0 = tree->pos0;
+    const int depth_t = tree->depth[t];
+    const int n_kv = pos0 + depth_t + 1;
+    const int n_bid = n_kv / R;
+    const int b0 = pos0 / R;
+    for (int b = b0; b <= n_bid; ++b) {
+        if ((long long) b >= max_blocks) break;
+        float k_val = 0.0f;
+        if (b == n_bid) {
+            if (pos0 == 0 && b == 0) {
+                float mean = 0.0f;
+                if (d < D) {
+                    const float incoming = __half2float(__float2half_rn(raw[d]));
+                    float sum = incoming;
+#pragma unroll
+                    for (int j = 1; j < R; ++j) sum = __fadd_rn(sum, incoming);
+                    mean = __fmaf_rn(0.25f, sum, 0.0f);
+                }
+                const float square_sum = norm_scale(mean, partials, d);
+                const float scale = rsqrtf(square_sum / D + epsilon);
+                if (d < D) values[d] = scale * mean * gamma[d];
+                __syncthreads();
+                if (d < D) {
+                    k_val = pooled_value<TAB>(values, d, 0, theta_scale, freq_scale, corr_low, corr_high,
+                                              ext_factor, mscale, mtab, true, rt);
+                }
+            } else if (d < D) {
+                k_val = dead[d];
+            }
+        } else {
+            float mean = 0.0f;
+            if (d < D) {
+                auto key_at = [&](int j) -> float {
+                    const int cell = b * R + j;
+                    if (cell < pos0) return tail_snap[(size_t) j * D + d];
+                    const int row = tree->anc[t][cell - pos0];
+                    return __half2float(__float2half_rn(raw[(size_t) row * D + d]));
+                };
+                float sum = key_at(0);
+#pragma unroll
+                for (int j = 1; j < R; ++j) sum = __fadd_rn(sum, key_at(j));
+                mean = __fmaf_rn(0.25f, sum, 0.0f);
+            }
+            const float square_sum = norm_scale(mean, partials, d);
+            const float scale = rsqrtf(square_sum / D + epsilon);
+            if (d < D) values[d] = scale * mean * gamma[d];
+            __syncthreads();
+            if (d < D) {
+                const int rope_pos = pos_base + R * b;
+                k_val = pooled_value<TAB>(values, d, rope_pos, theta_scale, freq_scale, corr_low, corr_high,
+                                          ext_factor, mscale, mtab, false, rt);
+            }
+        }
+        if (d < D) sk[d] = k_val;
+        __syncthreads();
+        if (d < 32) {
+            const float4 k4 = *reinterpret_cast<const float4*>(sk + d * 4);
+            const float* q = q_idx + (size_t) t * 4 * D + d * 4;
+            float score = 0.0f;
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+                const float4 q4 = *reinterpret_cast<const float4*>(q + h * D);
+                float dot = k4.x * q4.x + k4.y * q4.y + k4.z * q4.z + k4.w * q4.w;
+                dot = warp_sum(dot);
+                score += dot > 0.0f ? dot : 0.0f;
+            }
+            if (d == 0) {
+                if (b == n_bid && (n_kv % R) != 0) score += 1e9f;
+                scores[(size_t) t * (size_t) max_blocks + b] = score;
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <bool TAB>
+__global__ void append_tree_layers_kernel(const float* __restrict__ raw0, long long raw_stride,
+                                          const int32_t* __restrict__ tree_commit, int pos_base, float epsilon,
+                                          QsaIndexerLayers L, int max_cells, float theta_scale, float freq_scale,
+                                          float corr_low, float corr_high, float ext_factor, float mscale,
+                                          const int32_t* __restrict__ mtab, RopeTab rt) {
+    const int i = blockIdx.x;
+    float* tail = L.tail[i];
+    if (L.tail_src[i] != nullptr) {
+        for (int j = threadIdx.x; j < (R - 1) * D; j += blockDim.x) tail[j] = L.tail_src[i][j];
+        __syncthreads();
+    }
+    const int n_steps = tree_commit[0];
+    if (n_steps <= 0) return;
+    const int pos0 = tree_commit[2];
+    const int32_t* const path = tree_commit + 3;
+    const float* __restrict__ raw = raw0 + (long long) i * raw_stride;
+    const float* __restrict__ gamma = L.gamma[i];
+    float* __restrict__ dead = L.dead[i];
+    float* __restrict__ pooled = L.pooled[i];
+    int32_t* __restrict__ block_pos = L.block_pos[i];
+
+    __shared__ float values[D];
+    __shared__ float partials[32];
+    const int d = threadIdx.x;
+    for (int step_idx = 0; step_idx < n_steps; ++step_idx) {
+        const int pos = pos0 + step_idx;
+        const int row = path[step_idx];
+        if (pos >= 0 && pos < max_cells) {
+            const float* raw_step = raw + (std::size_t) row * D;
+            const int slot = pos % R;
+            float incoming = 0.0f;
+            if (d < D) {
+                incoming = __half2float(__float2half_rn(raw_step[d]));
+                if (slot < R - 1) tail[slot * D + d] = incoming;
+            }
+            if (pos == 0 || slot == R - 1) {
+                float mean = 0.0f;
+                if (d < D) {
+                    float sum = pos == 0 ? incoming : tail[d];
+#pragma unroll
+                    for (int j = 1; j < R; ++j)
+                        sum = __fadd_rn(sum, pos == 0 || j == R - 1 ? incoming : tail[j * D + d]);
+                    mean = __fmaf_rn(0.25f, sum, 0.0f);
+                }
+                const float square_sum = norm_scale(mean, partials, d);
+                const float scale = rsqrtf(square_sum / D + epsilon);
+                if (d < D) values[d] = scale * mean * gamma[d];
+                __syncthreads();
+                if (d < D) {
+                    const int b = pos / R;
+                    const int rope_pos = pos == 0 ? 0 : pos_base + R * b;
+                    const float y = pooled_value<TAB>(values, d, rope_pos, theta_scale, freq_scale, corr_low,
+                                                      corr_high, ext_factor, mscale, mtab, pos == 0, rt);
+                    pooled[std::size_t(b) * D + d] = y;
+                    if (pos == 0) dead[d] = y;
+                    else pooled[std::size_t(b + 1) * D + d] = dead[d];
+                    if (d == 0 && pos != 0) *block_pos = rope_pos;
+                }
+            }
+        }
+        if (n_steps > 1) __syncthreads();
+    }
+}
+
+}  // namespace
+
+void native_qsa_tree_patch_scores(const float* raw, const float* tail_snap, const float* dead, const float* gamma,
+                                  float epsilon, const float* q_idx, const VerifyTreeMeta* tree, int n_tok,
+                                  int64_t max_blocks, int32_t pos_base, const QsaShapes& shapes,
+                                  const RopeScaling& scaling, float* scores, void* stream) {
+    if (n_tok <= 0) return;
+    if (!stream || !raw || !tail_snap || !dead || !gamma || !q_idx || !tree || !scores ||
+        shapes.idx_dim != D || shapes.idx_block != R || shapes.n_rot != ROT ||
+        pos_base < 0 || pos_base % R || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr) {
+        throw std::invalid_argument("native_qsa_tree_patch_scores: invalid arguments");
+    }
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);
+    const RopeTab rt = rope_table_for(scaling);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (rt.cos != nullptr)
+        tree_patch_scores_kernel<true><<<(unsigned) n_tok, THREADS, 0, st>>>(
+            raw, tail_snap, dead, gamma, epsilon, q_idx, tree, n_tok, (long long) max_blocks, pos_base,
+            theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, mrope_table(), rt, scores);
+    else
+        tree_patch_scores_kernel<false><<<(unsigned) n_tok, THREADS, 0, st>>>(
+            raw, tail_snap, dead, gamma, epsilon, q_idx, tree, n_tok, (long long) max_blocks, pos_base,
+            theta_scale, k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, mrope_table(), rt, scores);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
+void native_qsa_indexer_append_tree_layers(const float* raw0, int64_t raw_stride, const int32_t* tree_commit,
+                                           int32_t pos_base, float epsilon, const QsaIndexerLayers& layers,
+                                           int n_layers, const QsaShapes& shapes, int64_t max_cells,
+                                           const RopeScaling& scaling, void* stream) {
+    if (n_layers <= 0) return;
+    if (!stream || !raw0 || !tree_commit || n_layers > QsaIndexerLayers::kMax ||
+        shapes.idx_dim != D || shapes.idx_block != R || shapes.n_rot != ROT ||
+        max_cells < 1 || max_cells > INT32_MAX || pos_base < 0 || pos_base % R ||
+        int64_t(pos_base) + max_cells > INT32_MAX || !std::isfinite(epsilon) || epsilon <= 0.0f ||
+        rope_scaling_invalid(scaling) != nullptr) {
+        throw std::invalid_argument("native_qsa_indexer_append_tree_layers: invalid arguments");
+    }
+    const float theta_scale = powf((float) scaling.freq_base, -2.0f / ROT);
+    const RopeKernelArgs k = scaling.kernel_args(ROT);
+    const RopeTab rt = rope_table_for(scaling);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    if (rt.cos != nullptr)
+        append_tree_layers_kernel<true><<<(unsigned) n_layers, THREADS, 0, st>>>(
+            raw0, (long long) raw_stride, tree_commit, pos_base, epsilon, layers, (int) max_cells, theta_scale,
+            k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, mrope_table(), rt);
+    else
+        append_tree_layers_kernel<false><<<(unsigned) n_layers, THREADS, 0, st>>>(
+            raw0, (long long) raw_stride, tree_commit, pos_base, epsilon, layers, (int) max_cells, theta_scale,
+            k.freq_scale, k.corr_low, k.corr_high, k.ext_factor, k.attn_factor, mrope_table(), rt);
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+
 } // namespace strata::kernels

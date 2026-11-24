@@ -1,6 +1,7 @@
 // src/core/dflash2.cpp - see include/strata/core/dflash2.hpp.
 #include "strata/core/dflash2.hpp"
 #include "strata/spec/df2_sample_walk.hpp"
+#include "strata/spec/df2_tree.hpp"
 
 #include "strata/core/batch_admit_merge.hpp"
 #include "strata/core/native_head.hpp"
@@ -69,7 +70,7 @@ bool df2_precomp_graph_on() {
 // STRATA_DF2_SELECT_TABLE=0: the selector walks with its one-block steps (the walk's scores computed in one parallel launch first is the default: bitwise the same drafts)
 bool df2_select_table() {
     static const bool on = [] {
-        if (strata::spec::df2_sample_walk_env()) return true;
+        if (strata::spec::df2_sample_walk_env() || strata::spec::df2_tree_on()) return true;
         const char* e = std::getenv("STRATA_DF2_SELECT_TABLE");
         return !(e && e[0] == '0');
     }();
@@ -168,6 +169,10 @@ Dflash2Drafter::~Dflash2Drafter() {
     if (h_out_) cudaFreeHost(h_out_);
     if (h_candidate_tok_) cudaFreeHost(h_candidate_tok_);
     if (h_candidate_score_) cudaFreeHost(h_candidate_score_);
+    if (strata::spec::df2_tree_on()) {
+        if (h_tree_tok_) cudaFreeHost(h_tree_tok_);
+        if (h_tree_seltab_) cudaFreeHost(h_tree_seltab_);
+    }
     if (h_bmeta_) cudaFreeHost(h_bmeta_);
     if (h_bout_) cudaFreeHost(h_bout_);
     destroy_streams();
@@ -628,6 +633,12 @@ bool Dflash2Drafter::alloc(std::string& err) {
         (cudaHostAlloc((void**) &h_candidate_tok_, 7 * 16 * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess ||
          cudaHostAlloc((void**) &h_candidate_score_, 7 * 16 * sizeof(float), cudaHostAllocPortable) != cudaSuccess)) {
         err = "dflash2: pinned candidate-dump staging";
+        return false;
+    }
+    if (strata::spec::df2_tree_on() && !multi_batch && !blob_shared_ &&
+        (cudaHostAlloc((void**) &h_tree_tok_, 7 * 16 * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess ||
+         cudaHostAlloc((void**) &h_tree_seltab_, 7 * 16 * 16 * sizeof(float), cudaHostAllocPortable) != cudaSuccess)) {
+        err = "dflash2: pinned tree selector staging";
         return false;
     }
     if (multi_batch) {
@@ -1397,6 +1408,7 @@ void Dflash2Drafter::init_ring_log() {
 
 void Dflash2Drafter::reset() {
     have_ctx_ = 0;
+    if (strata::spec::df2_tree_on()) tree_tables_valid_ = false;
     cur_ = Lineage{};
     stash_.clear();
     invalidate_ring();
@@ -2073,6 +2085,9 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
     const int64_t pos0 = launch_pos0_, s = pos0 + n_new;
     const Clock::time_point t0 = launch_t0_;
     const bool candidate_dump = h_candidate_tok_ != nullptr && h_candidate_score_ != nullptr;
+    const bool tree_copy = strata::spec::df2_tree_on() && !sample_walk && h_tree_tok_ != nullptr &&
+                           h_tree_seltab_ != nullptr && head_native() && ndraft_ > 0 && seltab_ != nullptr;
+    if (strata::spec::df2_tree_on()) tree_tables_valid_ = false;
     if (candidate_dump) {
         std::fill_n(h_candidate_tok_, 7 * 16, 0);
         std::fill_n(h_candidate_score_, 7 * 16, 0.0f);
@@ -2082,6 +2097,17 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
             (cudaMemcpyAsync(h_candidate_tok_, toptok_, count * sizeof(int32_t), cudaMemcpyDeviceToHost, cs_) != cudaSuccess ||
              cudaMemcpyAsync(h_candidate_score_, topval_, count * sizeof(float), cudaMemcpyDeviceToHost, cs_) != cudaSuccess)) {
             err = std::string("dflash2 candidate dump copy: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+    }
+    if (tree_copy) {
+        const size_t rows = (size_t) std::clamp(ndraft_, 0, kDrafts);
+        const size_t tok_bytes = rows * 16 * sizeof(int32_t);
+        const size_t tab_bytes = rows * 16 * 16 * sizeof(float);
+        if (tok_bytes != 0 &&
+            (cudaMemcpyAsync(h_tree_tok_, toptok_, tok_bytes, cudaMemcpyDeviceToHost, cs_) != cudaSuccess ||
+             cudaMemcpyAsync(h_tree_seltab_, seltab_, tab_bytes, cudaMemcpyDeviceToHost, cs_) != cudaSuccess)) {
+            err = std::string("dflash2 tree selector copy: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
     }
@@ -2098,9 +2124,10 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
         }
         std::atomic_thread_fence(std::memory_order_acquire);
     }
-    if (candidate_dump || sample_walk || !solopipe || timing_ || prof_ || ((volatile int32_t*) h_out_)[std::max(0, ndraft_ - 1)] < 0) {
+    if (candidate_dump || tree_copy || sample_walk || !solopipe || timing_ || prof_ || ((volatile int32_t*) h_out_)[std::max(0, ndraft_ - 1)] < 0) {
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     }
+    if (tree_copy) tree_tables_valid_ = true;
     log_flush();
     std::array<int32_t, kDrafts> sampled_drafts{};
     std::array<float, kDrafts> sampled_selected_q{};

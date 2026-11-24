@@ -186,6 +186,9 @@ public:
     bool candidate_dump_enabled() const { return h_candidate_tok_ != nullptr; }
     const int32_t* candidate_tokens() const { return h_candidate_tok_; }
     const float* candidate_scores() const { return h_candidate_score_; }
+    bool tree_tables_ready() const noexcept { return tree_tables_valid_ && h_tree_tok_ != nullptr && h_tree_seltab_ != nullptr; }
+    const int32_t* tree_toptok() const noexcept { return h_tree_tok_; }
+    const float* tree_seltab() const noexcept { return h_tree_seltab_; }
 
     /// Co-drafts `n_items` active slot drafters (1 .. kBatchMaxSlots) in two halves (launch + finish): each slot's
     /// context update and 5-layer transformer body run on its own captured body graph (`body_exec_[n_new]`) on its
@@ -334,6 +337,9 @@ private:
     int32_t* h_out_ = nullptr;      ///< pinned: 7 draft tokens then 7 probabilities
     int32_t* h_candidate_tok_ = nullptr;  ///< optional pinned [7][16] selector candidates for acceptance telemetry
     float* h_candidate_score_ = nullptr; ///< optional pinned [7][16] candidate head scores
+    int32_t* h_tree_tok_ = nullptr;       ///< optional pinned [7][16] top tokens for STRATA_DF2_TREE=1
+    float* h_tree_seltab_ = nullptr;      ///< optional pinned [7][16][16] selector table for STRATA_DF2_TREE=1
+    bool tree_tables_valid_ = false;
     float* hp_out_ = nullptr;
     float *kring_[8] = {}, *vring_[8] = {};
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;   ///< rope tables of the context rows and of the block rows: one allocation, rt_blk_ = rt_ctx_ + 8 * 128

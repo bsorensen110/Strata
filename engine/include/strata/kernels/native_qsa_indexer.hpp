@@ -4,6 +4,8 @@
 
 namespace strata::kernels {
 
+struct VerifyTreeMeta;
+
 // Configure before session construction/capture. Disabled independently of the
 // native QSA norm/gate switch; existing captures retain their selected kernels.
 void native_qsa_indexer_set_enabled(bool enabled);
@@ -82,6 +84,19 @@ struct QsaIndexerSlots {
 };
 void native_qsa_indexer_append_steps_slots(int pos_stride, int32_t pos_base, const float* gamma, float epsilon,
                                            const QsaIndexerSlots& slots, int n_slots, const QsaShapes& shapes,
+                                           const RopeScaling& scaling, void* stream);
+
+/// Tree-aware QSA block-score patcher for active blocks `[pos0/4 .. n_bid]` along each node `t`'s ancestor chain.
+void native_qsa_tree_patch_scores(const float* raw, const float* tail_snap, const float* dead, const float* gamma,
+                                  float epsilon, const float* q_idx, const VerifyTreeMeta* tree, int n_tok,
+                                  int64_t max_blocks, int32_t pos_base, const QsaShapes& shapes,
+                                  const RopeScaling& scaling, float* scores, void* stream);
+
+/// Tree commit indexer append across `n_layers` QSA layers: restores each layer's tail from `tail_src`,
+/// then appends `raw0[layer][tree_commit[3 + k]]` at logical position `tree_commit[2] + k` for `k = 0..n_keep-1`.
+void native_qsa_indexer_append_tree_layers(const float* raw0, int64_t raw_stride, const int32_t* tree_commit,
+                                           int32_t pos_base, float epsilon, const QsaIndexerLayers& layers,
+                                           int n_layers, const QsaShapes& shapes, int64_t max_cells,
                                            const RopeScaling& scaling, void* stream);
 
 } // namespace strata::kernels

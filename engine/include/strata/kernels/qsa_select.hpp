@@ -24,6 +24,8 @@
 
 namespace strata::kernels {
 
+struct VerifyTreeMeta;
+
 /// scores [nq, max_blocks]; q_idx [nq, idx_n_head, idx_dim] (normed and rotated); steps [nq, kStepCount].
 /// Batch windows: query q's own indexer keys - pooled[q], dead[q] (q < n <= kWindowMaxT).
 struct QsaScoreRows {
@@ -139,5 +141,9 @@ void qsa_two_pass_check(const float* scores, const int32_t* ids, const float* re
                         void* scratch, void* stream);
 /// The counters (two_pass::kStatCount of them, this device), read on `stream` (synchronized); reset: zeroed after.
 bool qsa_two_pass_stats(unsigned long long* out, bool reset, void* stream);
+
+/// Remaps selected logical cell IDs `>= tree->pos0` to physical tree row cells `pos0 + tree->anc[t][id - pos0]`.
+void qsa_tree_remap_ids(int32_t* ids, const int32_t* steps, const VerifyTreeMeta* tree, int n_tok, int64_t cap,
+                        void* stream);
 
 }  // namespace strata::kernels

@@ -42,4 +42,10 @@ void native_ple_postops_batch(float* key, float* hidden, const float* value, flo
 void native_ple_postops_batch_snap(float* key, float* hidden, const float* value, float* history, const PleWeights& w,
                                    float* query_norm, float* gated, float* gate, int T, float* snap, void* stream);
 
+/// Tree-aware Layer-1 PLE postops: reads `history` read-only, evaluates dilated Conv1D along `ple_taps[T][3]`,
+/// and writes each tree node's post-node history snapshot into `snap` (`T x 9 x 10240`) using `depth` and `anc`.
+void native_ple_postops_tree_snap(float* key, float* hidden, const float* value, const float* history, const PleWeights& w,
+                                  float* query_norm, float* gated, float* gate, const int32_t* ple_taps,
+                                  const int32_t* depth, const int32_t* anc, int T, float* snap, void* stream);
+
 } // namespace strata::kernels

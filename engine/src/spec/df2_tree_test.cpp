@@ -250,6 +250,115 @@ void test_serialization_and_telemetry_roundtrip() {
           "telemetry round-trip matches exactly");
 }
 
+void test_env_gate_and_selector_builder() {
+    check(!df2_tree_env_enabled(nullptr), "null env keeps tree off");
+    check(!df2_tree_env_enabled(""), "empty env keeps tree off");
+    check(!df2_tree_env_enabled("0"), "0 env keeps tree off");
+    check(!df2_tree_env_enabled("2"), "non-1 env keeps tree off");
+    check(df2_tree_env_enabled("1"), "1 env enables tree");
+
+    std::array<int32_t, 7> drafts{101, 102, 103, 104, 105, 106, 107};
+    std::array<float, 7> probs{0.95f, 0.90f, 0.85f, 0.45f, 0.80f, 0.75f, 0.70f};
+    std::array<int32_t, 7 * kDf2TreeSelectorTopK> toptok{};
+    std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+    toptok.fill(-1);
+    seltab.fill(-100.0f);
+
+    for (int r = 0; r < 7; ++r) {
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0] = drafts[static_cast<size_t>(r)];
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 1] = 200 + r;
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 2] = 300 + r;
+        seltab[(static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 0] = 0.0f;
+    }
+
+    // At cut depth c=3 (0.95*0.9*0.85=0.72675 >= 0.5, *0.45 < 0.5), prev_slot=0 (drafts[2] at slot 0):
+    // give runner-up 1 conditional p ~ 0.25 and runner-up 2 conditional p ~ 0.15 (>= 0.10).
+    const size_t base3 = (3u * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+    seltab[base3 + 0] = 1.0f;    // exp(1.0) = 2.718
+    seltab[base3 + 1] = 0.0f;    // exp(0.0) = 1.000 -> p ~ 0.22
+    seltab[base3 + 2] = -0.3f;   // exp(-0.3) = 0.741 -> p ~ 0.166
+    const Df2TreeSpec tree = df2_tree_build_from_selector(99, drafts.data(), probs.data(), 7,
+                                                          toptok.data(), seltab.data(), 0.5, 0.10f, 3, 8);
+    // Nodes: 0(99)->1(101)->2(102)->3(103); 3->4(104), 3->5(203), 3->6(303); 4->7(105)
+    check(tree.count == 8 && tree.valid() && tree.is_caterpillar() && !tree.is_linear(),
+          "selector builder produces 8-node PrefixFanout caterpillar");
+    check(tree.shape == Df2TreeShape::PrefixFanout && tree.branch_node == 3, "branch_node at cut depth 3");
+    check(tree.token[4] == 104 && tree.token[5] == 203 && tree.token[6] == 303 && tree.token[7] == 105,
+          "selector builder keeps primary continuation, 2 runner-ups, and primary tail");
+    check(tree.parent[4] == 3 && tree.parent[5] == 3 && tree.parent[6] == 3 && tree.parent[7] == 4,
+          "selector builder attaches fanout and tail to right parents");
+
+    // Below min_branch_p -> falls back to linear
+    const Df2TreeSpec lin_fallback = df2_tree_build_from_selector(99, drafts.data(), probs.data(), 7,
+                                                                  toptok.data(), seltab.data(), 0.5, 0.50f, 3, 8);
+    check(lin_fallback.is_linear() && lin_fallback.count == 8,
+          "high min_branch_p falls back to linear tree");
+
+    // Cut depth >= 6 (no budget for 2-way fanout) -> linear
+    const Df2TreeSpec late_cut = df2_tree_build_from_selector(99, drafts.data(), probs.data(), 7,
+                                                              toptok.data(), seltab.data(), 0.01, 0.10f, 3, 8);
+    check(late_cut.is_linear() && late_cut.count == 8, "late confidence cut falls back to linear");
+
+    // draft_conf == 0.0 picks argmin probs[i] within cap-2 (index 3 here)
+    const Df2TreeSpec no_conf = df2_tree_build_from_selector(99, drafts.data(), probs.data(), 7,
+                                                             toptok.data(), seltab.data(), 0.0, 0.10f, 3, 8);
+    check(no_conf.shape == Df2TreeShape::PrefixFanout && no_conf.branch_node == 3,
+          "draft_conf=0 picks lowest-prob spine slot for branching");
+
+    // Respects max_nodes < 8
+    const Df2TreeSpec capped = df2_tree_build_from_selector(99, drafts.data(), probs.data(), 7,
+                                                            toptok.data(), seltab.data(), 0.5, 0.10f, 3, 6);
+    check(capped.count == 6 && capped.valid() && capped.is_caterpillar(), "respects max_nodes=6 cap");
+}
+
+void test_gdn_order_ple_taps_and_remap_invariants() {
+    const int32_t prefix[2] = {10, 11};
+    const int32_t br[3] = {20, 21, 22};
+    const int32_t ptail[1] = {30};
+    // 0->1->2; 2->3(20), 2->4(21), 2->5(22); 3->6(30) => count = 7, padded row 7 at depth 1 under 0
+    const Df2TreeSpec t = make_prefix_fanout_tree(1, prefix, 2, br, 3, ptail, 1);
+    check(t.count == 7 && t.is_caterpillar(), "7-node fanout tree is caterpillar");
+
+    int32_t order[8] = {}, is_spine[8] = {};
+    check(df2_tree_caterpillar_gdn_order(t, order, is_spine, 8), "gdn_order succeeds for 7-node tree padded to 8");
+    // Depth 0: 0(spine)
+    // Depth 1: 7(padded leaf) before 1(spine)
+    // Depth 2: 2(spine)
+    // Depth 3: 4(leaf), 5(leaf) before 3(spine)
+    // Depth 4: 6(leaf)
+    check(order[0] == 0 && is_spine[0] == 1, "root spine first");
+    check(order[1] == 7 && order[2] == 1 && is_spine[7] == 0 && is_spine[1] == 1,
+          "padded dummy leaf runs before depth-1 spine");
+    check(order[3] == 2 && is_spine[2] == 1, "depth-2 spine");
+    check(order[4] == 4 && order[5] == 5 && order[6] == 3 && is_spine[3] == 1,
+          "depth-3 runner-up leaves run before depth-3 spine");
+    check(order[7] == 6 && is_spine[6] == 0, "depth-4 tail leaf last");
+
+    // PLE dilated conv taps [d-9, d-6, d-3]
+    check((df2_tree_ple_conv_taps(t, 0) == std::array<int32_t, 3>{-9, -6, -3}), "root ple taps");
+    check((df2_tree_ple_conv_taps(t, 3) == std::array<int32_t, 3>{-6, -3, 0}), "depth-3 primary ple taps");
+    check((df2_tree_ple_conv_taps(t, 5) == std::array<int32_t, 3>{-6, -3, 0}), "depth-3 runner-up ple taps");
+    check((df2_tree_ple_conv_taps(t, 6) == std::array<int32_t, 3>{-5, -2, 1}), "depth-4 tail ple taps");
+
+    // Verify QSA ancestor remap preserves strictly ascending order and non-contiguous commit satisfies path[k] >= k
+    for (int pos0 = 0; pos0 < 16; ++pos0) {
+        for (int n = 0; n < t.count; ++n) {
+            int prev_cell = -1;
+            for (int d = 0; d <= static_cast<int>(t.depth[static_cast<size_t>(n)]); ++d) {
+                const int phys = pos0 + static_cast<int>(t.anc[static_cast<size_t>(n)][static_cast<size_t>(d)]);
+                check(phys > prev_cell, "remapped tree QSA cells stay strictly ascending");
+                prev_cell = phys;
+            }
+        }
+    }
+    const int32_t argmax[7] = {10, 11, 22, 0, 0, 999, 0};
+    const Df2TreeCommitWalk walk = df2_tree_greedy_accept(t, argmax);
+    check(walk.n_keep == 4 && walk.path[3] == 5 && walk.needs_compaction(), "runner-up branch 5 selected");
+    for (int k = 0; k < walk.n_keep; ++k) {
+        check(static_cast<int>(walk.path[static_cast<size_t>(k)]) >= k, "commit path satisfies path[k] >= k");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -259,6 +368,8 @@ int main() {
     test_topological_order_and_canonicalize();
     test_acceptance_walks_and_branch_kill();
     test_serialization_and_telemetry_roundtrip();
+    test_env_gate_and_selector_builder();
+    test_gdn_order_ple_taps_and_remap_invariants();
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }

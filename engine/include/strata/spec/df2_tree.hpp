@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,19 @@ namespace strata::spec {
 inline constexpr int kDf2TreeMaxNodes = 8;   ///< matches kVerifyNarrowT (anchor + up to 7 drafts)
 inline constexpr int kDf2TreeMaxDrafts = 7;  ///< matches Dflash2Drafter::kDrafts
 inline constexpr int8_t kDf2TreeNoParent = -1;
+inline constexpr int kDf2TreeSelectorTopK = 16;
+inline constexpr float kDf2TreeDefaultMinBranchP = 0.10f;
+
+/// Parses STRATA_DF2_TREE value ("1" enables tree drafting; anything else keeps default off).
+inline bool df2_tree_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+/// Process-wide host-side runtime gate read once from STRATA_DF2_TREE (default OFF).
+inline bool df2_tree_on() noexcept {
+    static const bool on = df2_tree_env_enabled(std::getenv("STRATA_DF2_TREE"));
+    return on;
+}
 
 enum class Df2TreeShape : uint8_t {
     Linear = 0,
@@ -250,11 +264,13 @@ inline Df2TreeSpec make_linear_tree(int32_t anchor, const int32_t* drafts, int n
 ///   - linear prefix of `prefix_len` drafts (`0 -> 1 -> ... -> prefix_len`)
 ///   - `fanout`-way branch at node `prefix_len` using distinct tokens from `branch_tokens[0..fanout-1]`
 ///     (where `branch_tokens[0]` is the primary continuation and `1..fanout-1` are runner-ups)
-///   - optional linear tail `primary_tail[0..primary_tail_len-1]` off `branch_tokens[0]` while nodes < 8.
+///   - optional linear tail `primary_tail[0..primary_tail_len-1]` off `branch_tokens[0]` while nodes < max_nodes.
 /// Resulting tree is always a caterpillar (0 GDN checkpoint memory).
 inline Df2TreeSpec make_prefix_fanout_tree(int32_t anchor, const int32_t* prefix_drafts, int prefix_len,
                                            const int32_t* branch_tokens, int fanout,
-                                           const int32_t* primary_tail = nullptr, int primary_tail_len = 0) noexcept {
+                                           const int32_t* primary_tail = nullptr, int primary_tail_len = 0,
+                                           int max_nodes = kDf2TreeMaxNodes) noexcept {
+    const int node_cap = std::clamp(max_nodes, 1, kDf2TreeMaxNodes);
     Df2TreeSpec t;
     t.count = 1;
     t.token[0] = anchor;
@@ -263,8 +279,8 @@ inline Df2TreeSpec make_prefix_fanout_tree(int32_t anchor, const int32_t* prefix
     t.slot_rank[0] = 0;
     t.shape = Df2TreeShape::PrefixFanout;
 
-    const int p_len = (prefix_drafts != nullptr) ? std::clamp(prefix_len, 0, kDf2TreeMaxDrafts - 1) : 0;
-    for (int i = 0; i < p_len && t.count < kDf2TreeMaxNodes; ++i) {
+    const int p_len = (prefix_drafts != nullptr) ? std::clamp(prefix_len, 0, std::max(0, node_cap - 2)) : 0;
+    for (int i = 0; i < p_len && t.count < node_cap; ++i) {
         const int idx = t.count++;
         t.token[static_cast<size_t>(idx)] = prefix_drafts[i];
         t.parent[static_cast<size_t>(idx)] = static_cast<int8_t>(idx - 1);
@@ -277,7 +293,7 @@ inline Df2TreeSpec make_prefix_fanout_tree(int32_t anchor, const int32_t* prefix
     int primary_child = -1;
     int added_branches = 0;
     if (branch_tokens != nullptr && fanout > 0) {
-        const int f_cap = std::min(fanout, kDf2TreeMaxNodes - t.count);
+        const int f_cap = std::min(fanout, node_cap - t.count);
         for (int b = 0; b < f_cap; ++b) {
             const int32_t tok = branch_tokens[b];
             bool dup = false;
@@ -303,7 +319,7 @@ inline Df2TreeSpec make_prefix_fanout_tree(int32_t anchor, const int32_t* prefix
 
     if (primary_child >= 0 && primary_tail != nullptr && primary_tail_len > 0) {
         int cur_parent = primary_child;
-        for (int i = 0; i < primary_tail_len && t.count < kDf2TreeMaxNodes; ++i) {
+        for (int i = 0; i < primary_tail_len && t.count < node_cap; ++i) {
             const int idx = t.count++;
             t.token[static_cast<size_t>(idx)] = primary_tail[i];
             t.parent[static_cast<size_t>(idx)] = static_cast<int8_t>(cur_parent);
@@ -314,6 +330,118 @@ inline Df2TreeSpec make_prefix_fanout_tree(int32_t anchor, const int32_t* prefix
     }
     t.build_anc();
     return t;
+}
+
+/// Builds a PrefixFanout caterpillar tree directly from DF2's primary path (`drafts`, `probs`) and
+/// selector tables (`toptok[n_drafts][16]`, `seltab[n_drafts][16][16]`), fanning out 2..max_fanout
+/// candidates at the confidence-cut depth when runner-up conditional probability >= min_branch_p.
+inline Df2TreeSpec df2_tree_build_from_selector(int32_t anchor, const int32_t* drafts, const float* probs,
+                                                int n_drafts, const int32_t* toptok, const float* seltab,
+                                                double draft_conf,
+                                                float min_branch_p = kDf2TreeDefaultMinBranchP,
+                                                int max_fanout = 3,
+                                                int max_nodes = kDf2TreeMaxNodes) noexcept {
+    const int cap = std::clamp(max_nodes, 1, kDf2TreeMaxNodes);
+    const int nd = (drafts != nullptr) ? std::clamp(n_drafts, 0, kDf2TreeMaxDrafts) : 0;
+    const int lin_n = std::min(nd, cap - 1);
+    if (nd < 2 || cap < 4 || drafts == nullptr || probs == nullptr || toptok == nullptr || seltab == nullptr) {
+        return make_linear_tree(anchor, drafts, lin_n);
+    }
+
+    int cut = -1;
+    if (draft_conf > 0.0) {
+        cut = df2_tree_cut_depth(probs, nd, draft_conf);
+        if (cut > cap - 3 || cut >= nd) {
+            return make_linear_tree(anchor, drafts, lin_n);
+        }
+    } else {
+        const int search_lim = std::min(nd, cap - 2);
+        float best_p = probs[0];
+        cut = 0;
+        for (int i = 1; i < search_lim; ++i) {
+            if (probs[i] < best_p) {
+                best_p = probs[i];
+                cut = i;
+            }
+        }
+    }
+
+    int prev_slot = 0;
+    if (cut > 0) {
+        prev_slot = -1;
+        const int32_t* prev_toks = toptok + static_cast<size_t>(cut - 1) * kDf2TreeSelectorTopK;
+        const int32_t prev_pick = drafts[cut - 1];
+        for (int j = 0; j < kDf2TreeSelectorTopK; ++j) {
+            if (prev_toks[j] == prev_pick) {
+                prev_slot = j;
+                break;
+            }
+        }
+        if (prev_slot < 0) return make_linear_tree(anchor, drafts, lin_n);
+    }
+
+    const int32_t* row_toks = toptok + static_cast<size_t>(cut) * kDf2TreeSelectorTopK;
+    const float* row_scores = seltab + (static_cast<size_t>(cut) * kDf2TreeSelectorTopK + static_cast<size_t>(prev_slot)) *
+                                           kDf2TreeSelectorTopK;
+
+    float max_score = -INFINITY;
+    for (int j = 0; j < kDf2TreeSelectorTopK; ++j) {
+        if (row_toks[j] >= 0 && std::isfinite(row_scores[j])) {
+            max_score = std::max(max_score, row_scores[j]);
+        }
+    }
+    if (!std::isfinite(max_score)) return make_linear_tree(anchor, drafts, lin_n);
+
+    std::array<double, kDf2TreeSelectorTopK> weights{};
+    double total = 0.0;
+    for (int j = 0; j < kDf2TreeSelectorTopK; ++j) {
+        if (row_toks[j] < 0 || !std::isfinite(row_scores[j])) continue;
+        weights[static_cast<size_t>(j)] = std::exp(static_cast<double>(row_scores[j] - max_score));
+        total += weights[static_cast<size_t>(j)];
+    }
+    if (!(total > 0.0) || !std::isfinite(total)) return make_linear_tree(anchor, drafts, lin_n);
+
+    struct Cand {
+        int slot;
+        int32_t tok;
+        float p;
+    };
+    std::array<Cand, kDf2TreeSelectorTopK> runners{};
+    int n_runners = 0;
+    const int32_t primary_tok = drafts[cut];
+    for (int j = 0; j < kDf2TreeSelectorTopK; ++j) {
+        const int32_t tok = row_toks[j];
+        if (tok < 0 || tok == primary_tok) continue;
+        const float p = static_cast<float>(weights[static_cast<size_t>(j)] / total);
+        if (p < min_branch_p) continue;
+        bool dup = false;
+        for (int k = 0; k < n_runners; ++k) {
+            if (runners[static_cast<size_t>(k)].tok == tok) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) runners[static_cast<size_t>(n_runners++)] = Cand{j, tok, p};
+    }
+    if (n_runners == 0) return make_linear_tree(anchor, drafts, lin_n);
+
+    std::sort(runners.begin(), runners.begin() + n_runners, [](const Cand& a, const Cand& b) {
+        if (a.p != b.p) return a.p > b.p;
+        return a.slot < b.slot;
+    });
+
+    const int fan_budget = std::clamp(max_fanout, 2, std::min(kDf2TreeMaxNodes - (1 + cut), cap - (1 + cut)));
+    std::array<int32_t, kDf2TreeMaxNodes> branch_tokens{};
+    branch_tokens[0] = primary_tok;
+    int fanout = 1;
+    for (int k = 0; k < n_runners && fanout < fan_budget; ++k) {
+        branch_tokens[static_cast<size_t>(fanout++)] = runners[static_cast<size_t>(k)].tok;
+    }
+    if (fanout < 2) return make_linear_tree(anchor, drafts, lin_n);
+
+    const int tail_len = std::max(0, nd - (cut + 1));
+    return make_prefix_fanout_tree(anchor, drafts, cut, branch_tokens.data(), fanout,
+                                   tail_len > 0 ? drafts + cut + 1 : nullptr, tail_len, cap);
 }
 
 /// Builds Shape B (PrefixFork2Tail):
@@ -490,6 +618,55 @@ inline std::array<int8_t, 3> df2_tree_conv_ancestors(const Df2TreeSpec& tree, in
         } else {
             // Slots before root 0: dist == path.length -> -1, dist == path.length+1 -> -2, etc.
             taps[static_cast<size_t>(j)] = static_cast<int8_t>(-(dist - path.length + 1));
+        }
+    }
+    return taps;
+}
+
+/// Computes the caterpillar GDN execution order and spine flags for `pad_to` rows (`<= 8`).
+/// Nodes `tree.count .. pad_to-1` are treated as dummy leaves at depth 1 under root 0.
+/// At each depth `d = 0..max_depth`, all leaf rows (`is_spine == 0`) appear before the depth's spine row (`is_spine == 1`),
+/// so the GDN recurrence kernel evaluates leaves read-only against `s[r]` before the spine step updates `s[r]`.
+inline bool df2_tree_caterpillar_gdn_order(const Df2TreeSpec& tree, int32_t out_order[kDf2TreeMaxNodes],
+                                           int32_t out_is_spine[kDf2TreeMaxNodes],
+                                           int pad_to = kDf2TreeMaxNodes) noexcept {
+    if (!tree.is_caterpillar() || out_order == nullptr || out_is_spine == nullptr) return false;
+    const int n_pad = std::clamp(pad_to, tree.count, kDf2TreeMaxNodes);
+    std::array<uint8_t, kDf2TreeMaxNodes> has_child{};
+    for (int i = 1; i < tree.count; ++i) {
+        has_child[static_cast<size_t>(tree.parent[static_cast<size_t>(i)])] = 1;
+    }
+    for (int i = 0; i < kDf2TreeMaxNodes; ++i) {
+        out_is_spine[i] = (i < tree.count && has_child[static_cast<size_t>(i)] != 0) ? 1 : 0;
+        out_order[i] = i;
+    }
+    const int max_d = std::max(tree.max_depth(), n_pad > tree.count ? 1 : 0);
+    int out_idx = 0;
+    for (int d = 0; d <= max_d; ++d) {
+        int spine_at_d = -1;
+        for (int i = 0; i < n_pad; ++i) {
+            const int node_d = i < tree.count ? static_cast<int>(tree.depth[static_cast<size_t>(i)]) : 1;
+            if (node_d != d) continue;
+            if (out_is_spine[i] != 0) spine_at_d = i;
+            else out_order[out_idx++] = i;
+        }
+        if (spine_at_d >= 0) out_order[out_idx++] = spine_at_d;
+    }
+    return out_idx == n_pad;
+}
+
+/// Returns the 3 history/normalized tap indices `[d-9, d-6, d-3]` along `node`'s ancestor chain for Layer-1 PLE Conv1D.
+/// Negative values `(-9..-1)` index `history[9 + tap]`; non-negative values index `normalized[tap]`.
+inline std::array<int32_t, 3> df2_tree_ple_conv_taps(const Df2TreeSpec& tree, int node) noexcept {
+    std::array<int32_t, 3> taps{-9, -6, -3};
+    if (!tree.is_topological() || node < 0 || node >= tree.count) return taps;
+    const int d = static_cast<int>(tree.depth[static_cast<size_t>(node)]);
+    for (int k = 0; k < 3; ++k) {
+        const int dist = 9 - 3 * k;  // 9, 6, 3
+        if (d >= dist) {
+            taps[static_cast<size_t>(k)] = static_cast<int32_t>(tree.anc[static_cast<size_t>(node)][static_cast<size_t>(d - dist)]);
+        } else {
+            taps[static_cast<size_t>(k)] = static_cast<int32_t>(d - dist);
         }
     }
     return taps;

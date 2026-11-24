@@ -272,4 +272,53 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
 void window_ids_floor(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, const int32_t* floor_cell,
                       void* stream);
 
+// ---- DF2 tree-shaped verification (STRATA_DF2_TREE=1) ----
+
+/// Device-copied topology descriptor for a M <= 8 caterpillar verification tree (padded to T <= 8).
+struct VerifyTreeMeta {
+    int32_t count;          // active tree nodes M in [2, 8]
+    int32_t pos0;           // base logical/physical position of root 0
+    int32_t parent[8];      // parent[0] = -1, parent[t] in [0, t-1]
+    int32_t depth[8];       // depth[0] = 0, depth[t] = depth[parent[t]] + 1
+    int32_t is_spine[8];    // 1 = primary spine (updates s[r]), 0 = read-only leaf branch or padded row
+    int32_t anc[8][8];      // anc[t][d] = row index of ancestor at depth d
+    int32_t anc3[8][3];     // GDN conv taps [t-3, t-2, t-1]: <0 = hist[3+tap], >=0 = qkv[tap]
+    int32_t gdn_order[8];   // caterpillar execution order (leaves before spine at each depth)
+    int32_t ple_taps[8][3]; // PLE dilated conv taps [d-9, d-6, d-3]: <0 = hist[9+tap], >=0 = normalized[tap]
+};
+
+/// Copies step[T][4] and VerifyTreeMeta from mapped host staging and broadcasts logical RoPE positions
+/// (pos0 + depth[t]) into pos/pos_k/pos_i while keeping physical cell pos0 + t in step[t].pos.
+void copy_tree_step_pos_from_mapped(int32_t* step, int32_t* pos, VerifyTreeMeta* d_tree, const int32_t* m_step,
+                                    const VerifyTreeMeta* m_tree, int T, int MT, int NH, int NKV, int IQ,
+                                    void* stream);
+
+/// Tree-aware GDN Conv1D + L2 norm reading ancestor taps from `tree->anc3[t]` without mutating `history`.
+void gdn_conv_l2_tree(const float* history, const float* qkv, const float* conv_w, float* h,
+                      const VerifyTreeMeta* tree, int channels, int qk_heads, float eps, int n_tok, void* stream);
+
+/// Fused tree GDN Conv1D + a/b gate projections in one launch (matches gdn_conv_ab_multi).
+void gdn_conv_ab_tree(const float* history, const float* qkv, const float* conv_w, float* h,
+                      const VerifyTreeMeta* tree, int channels, int qk_heads, float eps, int n_tok,
+                      const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt,
+                      const float* ssm_a, float* gate, float* beta, int n_embd, int h_v, void* stream);
+
+/// Caterpillar tree GDN recurrence + output norm: reads `state` read-only, evaluates leaves at each depth
+/// read-only against current `s[r]` before advancing `s[r]` with that depth's spine node (0 checkpoint VRAM).
+void gdn_step_norm_tree(const float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                        const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                        const VerifyTreeMeta* tree, void* stream, void* xq_out = nullptr,
+                        void* xq_il_out = nullptr);
+
+/// Replays accepted non-contiguous path `tree_commit[3 + 0 .. n_keep-1]` across `n_layers` GDN layers.
+/// `tree_commit` layout: [n_keep, leaf_row, pos0, path[0], ..., path[7]].
+bool gdn_commit_tree_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv,
+                            int64_t qkv_stride, const float* h, int64_t h_stride, const float* gate,
+                            const float* beta, int64_t gb_stride, int conv_channels, int h_k, int h_v,
+                            int n_layers, const int32_t* tree_commit, void* stream);
+
+/// Gathers `n_keep` rows indexed by `path[0..n_keep-1]` (`row_floats` floats each) into contiguous `dst`.
+void df2_gather_taps(const float* src, float* dst, const int32_t* path, int n_keep, int64_t row_floats,
+                     void* stream);
+
 }  // namespace strata::kernels

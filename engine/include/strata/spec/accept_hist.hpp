@@ -1,5 +1,7 @@
 #pragma once
 
+#include "strata/spec/df2_tree.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -42,7 +44,7 @@ struct Df2AcceptHist {
         chain_accept += std::clamp(a - cstart, 0, crows);
     }
 
-    void emit(FILE* out, bool enabled, int64_t request_id) const {
+    void emit(FILE* out, bool enabled, int64_t request_id, const Df2TreeAcceptHist* tree = nullptr) const {
         if (!enabled || out == nullptr) return;
         std::fprintf(out, "[accept-hist] req=%lld df2_pos_reached=", (long long) request_id);
         for (size_t i = 0; i < reached.size(); ++i)
@@ -50,9 +52,13 @@ struct Df2AcceptHist {
         std::fprintf(out, " df2_pos_accept=");
         for (size_t i = 0; i < accepted.size(); ++i)
             std::fprintf(out, "%s%lld", i == 0 ? "" : ",", (long long) accepted[i]);
-        std::fprintf(out, " lookup_rows=%lld lookup_accept=%lld chain_rows=%lld chain_accept=%lld\n",
+        std::fprintf(out, " lookup_rows=%lld lookup_accept=%lld chain_rows=%lld chain_accept=%lld",
                      (long long) lookup_rows, (long long) lookup_accept,
                      (long long) chain_rows, (long long) chain_accept);
+        if (tree != nullptr && tree->tree_rounds > 0) {
+            std::fprintf(out, " %s", tree->format_accept_hist_fields().c_str());
+        }
+        std::fprintf(out, "\n");
     }
 };
 

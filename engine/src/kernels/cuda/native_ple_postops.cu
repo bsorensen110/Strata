@@ -209,6 +209,53 @@ __global__ void history_batch_snap_kernel(float* history, const float* normalize
     }
 }
 
+__global__ void conv_residual_tree_kernel(const float* history, const float* normalized, const uint16_t* weights,
+                                          float* hidden, const float* gated, const int32_t* ple_taps, int T) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= size_t(T) * D) return;
+    const int t = int(i / D), c = int(i % D);
+    float sum = 0;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        float x;
+        if (k == 3) {
+            x = normalized[size_t(t) * D + c];
+        } else {
+            const int tap = ple_taps[t * 3 + k];
+            x = tap >= 0 ? normalized[size_t(tap) * D + c] : history[size_t(c) * HISTORY + (HISTORY + tap)];
+        }
+        const float wk = __half2float(__ushort_as_half(weights[c * 4 + k]));
+        const float term = __fmul_rn(x, wk);
+        sum = k == 0 ? term : __fadd_rn(sum, term);
+    }
+    const float activation = sum / (1.0f + expf(-sum));
+    hidden[i] = __fadd_rn(hidden[i], __fadd_rn(gated[i], activation));
+}
+
+// Writes per-node post-node history snapshots without mutating `history` during tree verify.
+__global__ void history_tree_snap_kernel(const float* history, const float* normalized, const int32_t* depth,
+                                         const int32_t* anc, int T, float* snap) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= D) return;
+    float h0[HISTORY];
+#pragma unroll
+    for (int r = 0; r < HISTORY; ++r) h0[r] = history[size_t(c) * HISTORY + r];
+    for (int t = 0; t < T; ++t) {
+        const int d_t = depth[t];
+        float* out = snap + size_t(t) * HISTORY * D + size_t(c) * HISTORY;
+#pragma unroll
+        for (int r = 0; r < HISTORY; ++r) {
+            const int p = r + d_t + 1 - HISTORY;
+            if (p >= 0) {
+                const int node = p < 8 ? anc[t * 8 + p] : t;
+                out[r] = normalized[size_t(node) * D + c];
+            } else {
+                out[r] = h0[r + d_t + 1];
+            }
+        }
+    }
+}
+
 struct Span { const void* p; size_t bytes; size_t alignment; };
 bool overlaps(Span a, Span b) {
     const auto x = reinterpret_cast<uintptr_t>(a.p), y = reinterpret_cast<uintptr_t>(b.p);
@@ -286,6 +333,25 @@ void native_ple_postops_batch_snap(float* key, float* hidden, const float* value
     rms_rep_rt_kernel<<<rows, 1024, 0, st>>>(gated, w.norm_conv, query_norm, N, NG_RMS_EPS);
     conv_residual_batch_kernel<<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, T);
     history_batch_snap_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, T, snap);
+    launch_check();
+}
+
+void native_ple_postops_tree_snap(float* key, float* hidden, const float* value, const float* history, const PleWeights& w,
+                                  float* query_norm, float* gated, float* gate, const int32_t* ple_taps,
+                                  const int32_t* depth, const int32_t* anc, int T, float* snap, void* stream) {
+    if (!stream || T <= 0 || !key || !hidden || !value || !history || !query_norm || !gated || !gate ||
+        !ple_taps || !depth || !anc || !snap)
+        throw std::invalid_argument("native PLE postops tree (snapshots): null input or empty batch");
+    auto st = static_cast<cudaStream_t>(stream);
+    const unsigned rows = unsigned(T) * H;
+    const unsigned blocks = unsigned((size_t(T) * D + 255) / 256);
+    rms_rep_rt_kernel<<<rows, 1024, 0, st>>>(key, w.norm_key, key, N, NG_RMS_EPS);
+    rms_rep_rt_kernel<<<rows, 1024, 0, st>>>(hidden, w.norm_query, query_norm, N, NG_RMS_EPS);
+    gate_kernel<<<rows, 512, 0, st>>>(key, query_norm, gate, 1.0f / std::sqrt(float(N)));
+    broadcast_batch_kernel<<<blocks, 256, 0, st>>>(value, gate, gated, T);
+    rms_rep_rt_kernel<<<rows, 1024, 0, st>>>(gated, w.norm_conv, query_norm, N, NG_RMS_EPS);
+    conv_residual_tree_kernel<<<blocks, 256, 0, st>>>(history, query_norm, w.conv1d_f16, hidden, gated, ple_taps, T);
+    history_tree_snap_kernel<<<D / 256, 256, 0, st>>>(history, query_norm, depth, anc, T, snap);
     launch_check();
 }
 } // namespace strata::kernels

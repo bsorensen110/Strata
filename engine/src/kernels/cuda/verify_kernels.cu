@@ -2271,6 +2271,363 @@ void copy_step_pos_from_mapped(int32_t* step, int32_t* pos, const int32_t* m_ste
     check("copy_step_pos_from_mapped");
 }
 
+namespace {
+
+__global__ void copy_tree_step_pos_from_mapped_kernel(int32_t* __restrict__ step, int32_t* __restrict__ pos,
+                                                      VerifyTreeMeta* __restrict__ d_tree,
+                                                      const volatile int32_t* __restrict__ m_step,
+                                                      const volatile int32_t* __restrict__ m_tree_i32,
+                                                      int T, int MT, int NH, int NKV, int IQ) {
+    const int tid = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    const int stride = (int) gridDim.x * (int) blockDim.x;
+    const int n_step = T * 4;
+    for (int i = tid; i < n_step; i += stride) step[i] = m_step[i];
+    int32_t* const d_tree_i32 = reinterpret_cast<int32_t*>(d_tree);
+    constexpr int kTreeI32 = (int) (sizeof(VerifyTreeMeta) / sizeof(int32_t));
+    for (int i = tid; i < kTreeI32; i += stride) d_tree_i32[i] = m_tree_i32[i];
+    __syncthreads();
+    const int32_t pos0 = d_tree->pos0;
+    int32_t* pk = pos + (size_t) MT * NH;
+    int32_t* pi = pk + (size_t) MT * NKV;
+    const int total_h = NH + NKV + IQ;
+    const int total = T * total_h;
+    for (int i = tid; i < total; i += stride) {
+        const int t = i / total_h;
+        const int rem = i - t * total_h;
+        const int32_t p = pos0 + d_tree->depth[t];
+        if (rem < NH) pos[(size_t) t * NH + rem] = p;
+        else if (rem < NH + NKV) pk[(size_t) t * NKV + (rem - NH)] = p;
+        else pi[(size_t) t * IQ + (rem - NH - NKV)] = p;
+    }
+}
+
+__device__ __forceinline__ void gdn_conv_l2_tree_body(const int bx, const int by, const float* __restrict__ hist,
+                                                      const float* __restrict__ qkv, const float* __restrict__ w,
+                                                      float* __restrict__ h, const VerifyTreeMeta* __restrict__ tree,
+                                                      int C, int qk_heads, float eps) {
+    __shared__ float part[S / 32];
+    const int t = by;
+    const int c = bx * S + threadIdx.x;
+    float win[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int tap = tree->anc3[t][j];
+        win[j] = tap < 0 ? hist[(size_t) c * 3 + (3 + tap)] : qkv[(size_t) tap * C + c];
+    }
+    const float v0 = win[0], v1 = win[1], v2 = win[2], x = qkv[(size_t) t * C + c];
+    float sum = v0 * w[c * 4] + v1 * w[c * 4 + 1] + v2 * w[c * 4 + 2] + x * w[c * 4 + 3];
+    float y = sum / (1.0f + __expf(-sum));
+    if ((int) bx < qk_heads) {
+        float sq = y * y;
+        for (int o = 16; o > 0; o >>= 1) sq += __shfl_xor_sync(0xffffffffu, sq, o);
+        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
+        vk_sync_lds();
+        const float ss = part[0] + part[1] + part[2] + part[3];
+        y *= rsqrtf(ss + eps);
+    }
+    h[(size_t) t * C + c] = y;
+}
+
+__global__ void __launch_bounds__(S) gdn_conv_l2_tree_kernel(const float* __restrict__ hist,
+                                                              const float* __restrict__ qkv,
+                                                              const float* __restrict__ w, float* __restrict__ h,
+                                                              const VerifyTreeMeta* __restrict__ tree, int C,
+                                                              int qk_heads, float eps) {
+    gdn_conv_l2_tree_body(blockIdx.x, blockIdx.y, hist, qkv, w, h, tree, C, qk_heads, eps);
+}
+
+template <int MAX_T, bool EXACT_T>
+__global__ void __launch_bounds__(S) gdn_conv_ab_tree_kernel(int conv_blocks, const float* __restrict__ hist,
+                                                             const float* __restrict__ qkv,
+                                                             const float* __restrict__ w, float* __restrict__ h,
+                                                             const VerifyTreeMeta* __restrict__ tree, int C,
+                                                             int qk_heads, float eps, const float* __restrict__ x,
+                                                             const uint16_t* __restrict__ wa,
+                                                             const uint16_t* __restrict__ wb,
+                                                             const float* __restrict__ dt,
+                                                             const float* __restrict__ ssm_a,
+                                                             float* __restrict__ gate, float* __restrict__ beta,
+                                                             int n, int h_v, int T) {
+    const int ab_blocks = (2 * h_v + 1) / 2;
+    if ((int) blockIdx.x >= ab_blocks) {
+        gdn_conv_l2_tree_body((int) blockIdx.x - ab_blocks, (int) blockIdx.y, hist, qkv, w, h, tree, C, qk_heads, eps);
+    } else if (blockIdx.y == 0 && threadIdx.x < 64) {
+        gdn_ab_body<MAX_T, EXACT_T>((int) blockIdx.x, x, wa, wb, dt, ssm_a, gate, beta, n, h_v, T);
+    }
+}
+
+template <bool Q>
+__global__ void __launch_bounds__(S * RG) gdn_step_norm_tree_kernel(const float* __restrict__ state,
+                                                                    const float* __restrict__ hbuf, int C,
+                                                                    const float* __restrict__ gate,
+                                                                    const float* __restrict__ beta,
+                                                                    const float* __restrict__ z,
+                                                                    const float* __restrict__ gamma, float eps,
+                                                                    float* __restrict__ y, int h_k, int h_v, int T,
+                                                                    const VerifyTreeMeta* __restrict__ tree,
+                                                                    GdnQ81* __restrict__ xq, GdnQ81Il xq_il = {}) {
+    __shared__ float sk[2][S], sq[2][S];
+    __shared__ float red_kv[RG][S];
+    __shared__ float red_o[RG][S];
+    __shared__ float wsum[S / 32];
+    const int head = blockIdx.x;
+    const int col = threadIdx.x;
+    const int rg = threadIdx.y;
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    const int value_dim = S * h_v;
+    float s[RPG];
+    const float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = __ldg(&base[r * row_stride]);
+    const float gam = (rg == 0) ? gamma[col] : 0.0f;
+    if (T > 0 && (rg == 0 || rg == 1)) {
+        const int t0 = tree->gdn_order[0];
+        const float kq0 = hbuf[(size_t) t0 * C + (rg == 0 ? qk : 0) + qh * S + col];
+        if (rg == 0) sk[0][col] = kq0;
+        else sq[0][col] = kq0;
+    }
+    for (int idx = 0; idx < T; ++idx) {
+        const int t = tree->gdn_order[idx];
+        const bool is_spine = (tree->is_spine[t] != 0);
+        const int cur = idx & 1, nxt = (idx + 1) & 1;
+        const float* ht = hbuf + (size_t) t * C;
+        vk_sync_lds();
+        const bool load_kq = (idx + 1 < T) && (rg == 0 || rg == 1);
+        float kq_next = 0.0f;
+        if (load_kq) {
+            const int t_next = tree->gdn_order[idx + 1];
+            const float* ht_next = hbuf + (size_t) t_next * C;
+            kq_next = ht_next[(rg == 0 ? qk : 0) + qh * S + col];
+        }
+        const float vt = ht[2 * qk + head * S + col];
+        const float g = __expf(gate[(size_t) t * h_v + head]);
+        const float bt = beta[(size_t) t * h_v + head];
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[cur][rg * RPG + r], kv);
+        red_kv[rg][col] = kv;
+        if (load_kq) {
+            if (rg == 0) sk[nxt][col] = kq_next;
+            else sq[nxt][col] = kq_next;
+        }
+        vk_sync_lds();
+        const float kv_col = red_kv[0][col] + red_kv[1][col] + red_kv[2][col] + red_kv[3][col];
+        const float delta = (vt - g * kv_col) * bt;
+        const float zz = (rg == 0) ? z[(size_t) t * value_dim + head * S + col] : 0.0f;
+        float o = 0.0f;
+        if (is_spine) {
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) {
+                s[r] = fmaf(g, s[r], sk[cur][rg * RPG + r] * delta);
+                o = fmaf(s[r], sq[cur][rg * RPG + r], o);
+            }
+        } else {
+            // Caterpillar leaf sibling: evaluate read-only against current register state s[r].
+#pragma unroll
+            for (int r = 0; r < RPG; ++r) {
+                const float s_leaf = fmaf(g, s[r], sk[cur][rg * RPG + r] * delta);
+                o = fmaf(s_leaf, sq[cur][rg * RPG + r], o);
+            }
+        }
+        red_o[rg][col] = o;
+        vk_sync_lds();
+        float oc = 0.0f, sq_part = 0.0f;
+        if (rg == 0) {
+            oc = (red_o[0][col] + red_o[1][col] + red_o[2][col] + red_o[3][col]) * rsqrtf((float) S);
+            sq_part = oc * oc;
+        }
+        for (int o2 = 16; o2 > 0; o2 >>= 1) sq_part += __shfl_xor_sync(0xffffffffu, sq_part, o2);
+        if (rg == 0 && (col & 31) == 0) wsum[col >> 5] = sq_part;
+        vk_sync_lds();
+        if (rg == 0) {
+            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+            const float scale = rsqrtf(ss / (float) S + eps);
+            const float yv = oc * scale * gam * (1.0f / (1.0f + __expf(-zz)));
+            y[(size_t) t * value_dim + head * S + col] = yv;
+            if constexpr (Q)
+                gdn_q8_1_store(xq, (size_t) t * value_dim + head * S + col, yv,
+                               xq_il, t, (head * S + col) >> 5);
+        }
+    }
+}
+
+__global__ void gdn_conv_commit_tree_layers_kernel(float* __restrict__ hist0, long long hist_stride,
+                                                    const float* __restrict__ qkv0, long long qkv_stride, int C,
+                                                    const int32_t* __restrict__ tree_commit) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int n = tree_commit[0];
+    if (n <= 0) return;
+    const int32_t* const path = tree_commit + 3;
+    float* hist = hist0 + (long long) blockIdx.y * hist_stride;
+    const float* qkv = qkv0 + (long long) blockIdx.y * qkv_stride;
+    float seq[3];
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int src = n + j;
+        seq[j] = src < 3 ? hist[(size_t) c * 3 + src] : qkv[(size_t) path[src - 3] * C + c];
+    }
+    hist[(size_t) c * 3] = seq[0];
+    hist[(size_t) c * 3 + 1] = seq[1];
+    hist[(size_t) c * 3 + 2] = seq[2];
+}
+
+__global__ void __launch_bounds__(32 * RG) gdn_step_commit_tree_layers_kernel(float* __restrict__ state0,
+                                                                               long long state_stride,
+                                                                               const float* __restrict__ hbuf0,
+                                                                               long long h_stride, int C,
+                                                                               const float* __restrict__ gate0,
+                                                                               const float* __restrict__ beta0,
+                                                                               long long gb_stride, int h_k, int h_v,
+                                                                               const int32_t* __restrict__ tree_commit) {
+    const int n = tree_commit[0];
+    if (n <= 0) return;
+    const int32_t* const path = tree_commit + 3;
+    const long long z = blockIdx.z;
+    float* __restrict__ state = state0 + z * state_stride;
+    const float* __restrict__ hbuf = hbuf0 + z * h_stride;
+    const float* __restrict__ gate = gate0 + z * gb_stride;
+    const float* __restrict__ beta = beta0 + z * gb_stride;
+    __shared__ float sk[S];
+    __shared__ float red[RG][32];
+    const int head = blockIdx.x;
+    const int col_local = threadIdx.x;
+    const int col = blockIdx.y * 32 + col_local;
+    const int rg = threadIdx.y;
+    const int tid = rg * 32 + col_local;
+    const int qh = head % h_k;
+    const int qk = S * h_k;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
+    const size_t row_stride = (size_t) h_v * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * row_stride];
+    for (int k = 0; k < n; ++k) {
+        const int row = path[k];
+        const float* ht = hbuf + (size_t) row * C;
+        vk_sync_lds();
+        sk[tid] = ht[qk + qh * S + tid];
+        vk_sync_lds();
+        const float g = __expf(gate[(size_t) row * h_v + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red[rg][col_local] = kv;
+        vk_sync_lds();
+        const float kv_col = red[0][col_local] + red[1][col_local] + red[2][col_local] + red[3][col_local];
+        const float delta = (ht[2 * qk + head * S + col] - g * kv_col) * beta[(size_t) row * h_v + head];
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+}
+
+__global__ void df2_gather_taps_kernel(const float* __restrict__ src, float* __restrict__ dst,
+                                       const int32_t* __restrict__ path, int n_keep, long long row_floats) {
+    const int k = (int) blockIdx.y;
+    if (k >= n_keep) return;
+    const int row = path[k];
+    const float* s = src + (size_t) row * (size_t) row_floats;
+    float* d = dst + (size_t) k * (size_t) row_floats;
+    for (long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x; i < row_floats;
+         i += (long long) gridDim.x * blockDim.x) {
+        d[i] = s[i];
+    }
+}
+
+}  // namespace
+
+void copy_tree_step_pos_from_mapped(int32_t* step, int32_t* pos, VerifyTreeMeta* d_tree, const int32_t* m_step,
+                                    const VerifyTreeMeta* m_tree, int T, int MT, int NH, int NKV, int IQ,
+                                    void* stream) {
+    if (T <= 0) return;
+    copy_tree_step_pos_from_mapped_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(
+        step, pos, d_tree, (const volatile int32_t*) m_step, (const volatile int32_t*) m_tree, T, MT, NH, NKV, IQ);
+    check("copy_tree_step_pos_from_mapped");
+}
+
+void gdn_conv_l2_tree(const float* history, const float* qkv, const float* conv_w, float* h,
+                      const VerifyTreeMeta* tree, int channels, int qk_heads, float eps, int n_tok, void* stream) {
+    if (!history || !qkv || !conv_w || !h || !tree || channels % S != 0 || n_tok < 1 || n_tok > kVerifyNarrowT) {
+        std::fprintf(stderr, "gdn_conv_l2_tree: invalid arguments\n");
+        std::exit(1);
+    }
+    gdn_conv_l2_tree_kernel<<<dim3((unsigned) (channels / S), (unsigned) n_tok), S, 0, (cudaStream_t) stream>>>(
+        history, qkv, conv_w, h, tree, channels, qk_heads, eps);
+    check("gdn_conv_l2_tree");
+}
+
+void gdn_conv_ab_tree(const float* history, const float* qkv, const float* conv_w, float* h,
+                      const VerifyTreeMeta* tree, int channels, int qk_heads, float eps, int n_tok,
+                      const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt,
+                      const float* ssm_a, float* gate, float* beta, int n_embd, int h_v, void* stream) {
+    if (!history || !qkv || !conv_w || !h || !tree || channels % S != 0 || n_tok < 1 || n_tok > kVerifyNarrowT ||
+        n_embd % 8 != 0) {
+        std::fprintf(stderr, "gdn_conv_ab_tree: invalid arguments\n");
+        std::exit(1);
+    }
+    const int conv_blocks = channels / S, ab_blocks = (2 * h_v + 1) / 2;
+    const dim3 grid((unsigned) (conv_blocks + ab_blocks), (unsigned) n_tok);
+    cudaStream_t st = (cudaStream_t) stream;
+    switch (n_tok) {
+        case 1: gdn_conv_ab_tree_kernel<1, true><<<grid, S, 0, st>>>(conv_blocks, history, qkv, conv_w, h, tree, channels, qk_heads, eps, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 2: gdn_conv_ab_tree_kernel<2, true><<<grid, S, 0, st>>>(conv_blocks, history, qkv, conv_w, h, tree, channels, qk_heads, eps, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 3: gdn_conv_ab_tree_kernel<3, true><<<grid, S, 0, st>>>(conv_blocks, history, qkv, conv_w, h, tree, channels, qk_heads, eps, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 4: gdn_conv_ab_tree_kernel<4, true><<<grid, S, 0, st>>>(conv_blocks, history, qkv, conv_w, h, tree, channels, qk_heads, eps, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 5: gdn_conv_ab_tree_kernel<5, true><<<grid, S, 0, st>>>(conv_blocks, history, qkv, conv_w, h, tree, channels, qk_heads, eps, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        case 6: gdn_conv_ab_tree_kernel<6, true><<<grid, S, 0, st>>>(conv_blocks, history, qkv, conv_w, h, tree, channels, qk_heads, eps, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+        default: gdn_conv_ab_tree_kernel<kVerifyNarrowT, false><<<grid, S, 0, st>>>(conv_blocks, history, qkv, conv_w, h, tree, channels, qk_heads, eps, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
+    }
+    check("gdn_conv_ab_tree");
+}
+
+void gdn_step_norm_tree(const float* state, const float* h, int conv_channels, const float* gate, const float* beta,
+                        const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
+                        const VerifyTreeMeta* tree, void* stream, void* xq_out, void* xq_il_out) {
+    if (!state || !h || !gate || !beta || !z || !gamma || !y || !tree || h_k <= 0 || h_v % h_k || n_tok < 1 ||
+        n_tok > kVerifyNarrowT) {
+        std::fprintf(stderr, "gdn_step_norm_tree: invalid arguments\n");
+        std::exit(1);
+    }
+    GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);
+    const GdnQ81Il xq_il = xq ? make_gdn_q81_il(xq_il_out, S * h_v, n_tok) : GdnQ81Il{};
+    if (xq)
+        gdn_step_norm_tree_kernel<true><<<h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, tree, xq, xq_il);
+    else
+        gdn_step_norm_tree_kernel<false><<<h_v, dim3(S, RG), 0, (cudaStream_t) stream>>>(
+            state, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, tree, nullptr);
+    check("gdn_step_norm_tree");
+}
+
+bool gdn_commit_tree_layers(float* state, int64_t state_stride, int64_t conv_off, const float* qkv,
+                            int64_t qkv_stride, const float* h, int64_t h_stride, const float* gate,
+                            const float* beta, int64_t gb_stride, int conv_channels, int h_k, int h_v,
+                            int n_layers, const int32_t* tree_commit, void* stream) {
+    if (n_layers <= 0 || n_layers > 65535 || tree_commit == nullptr || h_v <= 0 || h_k <= 0 || h_v % h_k != 0)
+        return false;
+    cudaStream_t st = (cudaStream_t) stream;
+    gdn_conv_commit_tree_layers_kernel<<<dim3((unsigned) ((conv_channels + 255) / 256), (unsigned) n_layers), 256, 0, st>>>(
+        state + conv_off, (long long) state_stride, qkv, (long long) qkv_stride, conv_channels, tree_commit);
+    gdn_step_commit_tree_layers_kernel<<<dim3((unsigned) h_v, 4u, (unsigned) n_layers), dim3(32, RG), 0, st>>>(
+        state, (long long) state_stride, h, (long long) h_stride, conv_channels, gate, beta, (long long) gb_stride, h_k, h_v,
+        tree_commit);
+    check("gdn_commit_tree_layers");
+    return true;
+}
+
+void df2_gather_taps(const float* src, float* dst, const int32_t* path, int n_keep, int64_t row_floats,
+                     void* stream) {
+    if (n_keep <= 0 || row_floats <= 0) return;
+    const unsigned gx = (unsigned) ((row_floats + 255) / 256 < 64 ? (row_floats + 255) / 256 : 64);
+    df2_gather_taps_kernel<<<dim3(gx, (unsigned) n_keep), 256, 0, (cudaStream_t) stream>>>(
+        src, dst, path, n_keep, (long long) row_floats);
+    check("df2_gather_taps");
+}
+
 void wait_flag_ge(const uint32_t* flag, uint32_t value, void* stream) {
     wait_flag_ge_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
     check("wait_flag_ge");

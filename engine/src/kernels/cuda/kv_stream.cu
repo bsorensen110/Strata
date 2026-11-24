@@ -474,4 +474,170 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     return r;
 }
 
+namespace {
+
+__device__ __forceinline__ void kv_compact_f16_cell(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table,
+                                                    const KvHostPools& host, long long src_pos, long long dst_pos,
+                                                    int kv_heads, int head_dim, int page_size) {
+    const long long src_blk = src_pos / page_size;
+    const long long dst_blk = dst_pos / page_size;
+    const long long src_page = (long long) page_table[src_blk];
+    const long long dst_page = (long long) page_table[dst_blk];
+    const int total = kv_heads * head_dim;
+    for (int i = (int) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (int) gridDim.x * blockDim.x) {
+        const int h = i / head_dim, d = i - h * head_dim;
+        uint16_t kv = 0, vv = 0;
+        if (src_page >= 0) {
+            const long long sr = (src_page * kv_heads + h) * page_size + (src_pos % page_size);
+            kv = k_pool[sr * head_dim + d];
+            vv = v_pool[sr * head_dim + d];
+        } else if (host.k_pool != nullptr) {
+            const long long sr = host.local_row(src_pos, kv_heads, h, page_size);
+            kv = host.chunk_base(host.k_pool, host.k_pool_chunks, src_blk)[sr * head_dim + d];
+            vv = host.chunk_base(host.v_pool, host.v_pool_chunks, src_blk)[sr * head_dim + d];
+        }
+        if (dst_page >= 0) {
+            const long long dr = (dst_page * kv_heads + h) * page_size + (dst_pos % page_size);
+            k_pool[dr * head_dim + d] = kv;
+            v_pool[dr * head_dim + d] = vv;
+        }
+        if (host.k_pool != nullptr) {
+            const long long dr = host.local_row(dst_pos, kv_heads, h, page_size);
+            host.chunk_base(host.k_pool, host.k_pool_chunks, dst_blk)[dr * head_dim + d] = kv;
+            host.chunk_base(host.v_pool, host.v_pool_chunks, dst_blk)[dr * head_dim + d] = vv;
+        }
+    }
+}
+
+__device__ __forceinline__ void kv_compact_q8_plane(int8_t* pool, uint16_t* scale, const int32_t* page_table,
+                                                    int8_t* h_flat, int8_t* const* h_chunks,
+                                                    uint16_t* hs_flat, uint16_t* const* hs_chunks,
+                                                    const KvHostPools& host, long long src_pos, long long dst_pos,
+                                                    int kv_heads, int head_dim, int page_size) {
+    const long long src_blk = src_pos / page_size;
+    const long long dst_blk = dst_pos / page_size;
+    const long long src_page = (long long) page_table[src_blk];
+    const long long dst_page = (long long) page_table[dst_blk];
+    const int groups = head_dim / KV_Q8_GROUP;
+    const int total = kv_heads * head_dim;
+    for (int i = (int) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (int) gridDim.x * blockDim.x) {
+        const int h = i / head_dim, d = i - h * head_dim;
+        int8_t qv = 0;
+        if (src_page >= 0) {
+            const long long sr = (src_page * kv_heads + h) * page_size + (src_pos % page_size);
+            qv = pool[sr * head_dim + d];
+        } else if (h_flat != nullptr) {
+            const long long sr = host.local_row(src_pos, kv_heads, h, page_size);
+            qv = host.chunk_base(h_flat, h_chunks, src_blk)[sr * head_dim + d];
+        }
+        if (dst_page >= 0) {
+            const long long dr = (dst_page * kv_heads + h) * page_size + (dst_pos % page_size);
+            pool[dr * head_dim + d] = qv;
+        }
+        if (h_flat != nullptr) {
+            const long long dr = host.local_row(dst_pos, kv_heads, h, page_size);
+            host.chunk_base(h_flat, h_chunks, dst_blk)[dr * head_dim + d] = qv;
+        }
+        if ((d & (KV_Q8_GROUP - 1)) == 0) {
+            const int g = d / KV_Q8_GROUP;
+            uint16_t sv = 0;
+            if (src_page >= 0) {
+                const long long sr = (src_page * kv_heads + h) * page_size + (src_pos % page_size);
+                sv = scale[sr * groups + g];
+            } else if (hs_flat != nullptr) {
+                const long long sr = host.local_row(src_pos, kv_heads, h, page_size);
+                sv = host.chunk_base(hs_flat, hs_chunks, src_blk)[sr * groups + g];
+            }
+            if (dst_page >= 0) {
+                const long long dr = (dst_page * kv_heads + h) * page_size + (dst_pos % page_size);
+                scale[dr * groups + g] = sv;
+            }
+            if (hs_flat != nullptr) {
+                const long long dr = host.local_row(dst_pos, kv_heads, h, page_size);
+                host.chunk_base(hs_flat, hs_chunks, dst_blk)[dr * groups + g] = sv;
+            }
+        }
+    }
+}
+
+__device__ __forceinline__ void kv_compact_q4_plane(uint8_t* pool, const int32_t* page_table,
+                                                    uint8_t* h_flat, uint8_t* const* h_chunks,
+                                                    const KvHostPools& host, long long src_pos, long long dst_pos,
+                                                    int kv_heads, int head_dim, int page_size) {
+    const long long src_blk = src_pos / page_size;
+    const long long dst_blk = dst_pos / page_size;
+    const long long src_page = (long long) page_table[src_blk];
+    const long long dst_page = (long long) page_table[dst_blk];
+    const int bytes_per_head = (head_dim / QK4_0) * (int) sizeof(block_q4_0);
+    const int total = kv_heads * bytes_per_head;
+    for (int i = (int) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (int) gridDim.x * blockDim.x) {
+        const int h = i / bytes_per_head, b = i - h * bytes_per_head;
+        uint8_t bv = 0;
+        if (src_page >= 0) {
+            const long long sr = (src_page * kv_heads + h) * page_size + (src_pos % page_size);
+            bv = pool[sr * bytes_per_head + b];
+        } else if (h_flat != nullptr) {
+            const long long sr = host.local_row(src_pos, kv_heads, h, page_size);
+            bv = host.chunk_base(h_flat, h_chunks, src_blk)[sr * bytes_per_head + b];
+        }
+        if (dst_page >= 0) {
+            const long long dr = (dst_page * kv_heads + h) * page_size + (dst_pos % page_size);
+            pool[dr * bytes_per_head + b] = bv;
+        }
+        if (h_flat != nullptr) {
+            const long long dr = host.local_row(dst_pos, kv_heads, h, page_size);
+            host.chunk_base(h_flat, h_chunks, dst_blk)[dr * bytes_per_head + b] = bv;
+        }
+    }
+}
+
+__global__ void kv_compact_tree_kernel(QsaAttnPools slots, KvHostPools host, int fmt,
+                                       const int32_t* __restrict__ tree_commit,
+                                       int kv_heads, int head_dim, int page_size) {
+    const int n_keep = tree_commit[0];
+    if (n_keep <= 1) return;
+    const long long pos0 = (long long) tree_commit[2];
+    const int32_t* const path = tree_commit + 3;
+    // Sequential over k = 0..n_keep-1 inside one block: path[k] >= k ensures race-free in-place compaction.
+    for (int k = 0; k < n_keep; ++k) {
+        const int row = path[k];
+        if (row == k) continue;
+        const long long src_pos = pos0 + row;
+        const long long dst_pos = pos0 + k;
+        if (fmt == kKvHybrid) {
+            kv_compact_q8_plane(const_cast<int8_t*>(slots.k_q), const_cast<uint16_t*>(slots.k_scale),
+                                slots.page_table, host.k_q, host.k_q_chunks, host.k_scale, host.k_scale_chunks, host,
+                                src_pos, dst_pos, kv_heads, head_dim, page_size);
+            kv_compact_q4_plane(const_cast<uint8_t*>(slots.v_q4), slots.page_table, host.v_q4, host.v_q4_chunks, host,
+                                src_pos, dst_pos, kv_heads, head_dim, page_size);
+        } else if (fmt == kKvQ4) {
+            kv_compact_q4_plane(const_cast<uint8_t*>(slots.k_q4), slots.page_table, host.k_q4, host.k_q4_chunks, host,
+                                src_pos, dst_pos, kv_heads, head_dim, page_size);
+            kv_compact_q4_plane(const_cast<uint8_t*>(slots.v_q4), slots.page_table, host.v_q4, host.v_q4_chunks, host,
+                                src_pos, dst_pos, kv_heads, head_dim, page_size);
+        } else if (fmt == kKvInt8) {
+            kv_compact_q8_plane(const_cast<int8_t*>(slots.k_q), const_cast<uint16_t*>(slots.k_scale),
+                                slots.page_table, host.k_q, host.k_q_chunks, host.k_scale, host.k_scale_chunks, host,
+                                src_pos, dst_pos, kv_heads, head_dim, page_size);
+            kv_compact_q8_plane(const_cast<int8_t*>(slots.v_q), const_cast<uint16_t*>(slots.v_scale),
+                                slots.page_table, host.v_q, host.v_q_chunks, host.v_scale, host.v_scale_chunks, host,
+                                src_pos, dst_pos, kv_heads, head_dim, page_size);
+        } else {
+            kv_compact_f16_cell(const_cast<uint16_t*>(slots.k_pool), const_cast<uint16_t*>(slots.v_pool),
+                                slots.page_table, host, src_pos, dst_pos, kv_heads, head_dim, page_size);
+        }
+    }
+}
+
+}  // namespace
+
+void kv_compact_tree(const QsaAttnPools& slots, const KvHostPools& host, int fmt, const int32_t* tree_commit,
+                     const QsaShapes& s, void* stream) {
+    if (tree_commit == nullptr || slots.page_table == nullptr) return;
+    const int threads = 256;
+    kv_compact_tree_kernel<<<1, threads, 0, (cudaStream_t) stream>>>(
+        slots, host, fmt, tree_commit, (int) s.n_head_kv, (int) s.head_dim, (int) s.page_size);
+    check("kv_compact_tree");
+}
+
 }  // namespace strata::kernels
