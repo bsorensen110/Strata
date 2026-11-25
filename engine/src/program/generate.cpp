@@ -23487,6 +23487,7 @@ int main(int argc, char** argv) {
             const int64_t telemetry_req = accept_hist_on || candidate_prefix != nullptr ? ++telemetry_req_seq : 0;
             strata::spec::Df2AcceptHist accept_hist;
             strata::spec::Df2TreeAcceptHist tree_accept_hist;
+            strata::spec::Df2TreeAdaptivePolicy tree_adaptive_policy;
 #if defined(STRATA_HAVE_DFLASH2)
             const bool tree_req_eligible = strata::spec::df2_tree_on() && req_df2 && use_df2 && !batch_df2 &&
                 o.batch == 0 && n_stages <= 1 && !o.draft_auto && strata::core::Dflash2Drafter::head_native() &&
@@ -24638,10 +24639,17 @@ int main(int argc, char** argv) {
                     const int tree_cap = (int) std::min<int64_t>(
                         std::min(S_mtp, strata::spec::kDf2TreeMaxNodes), o.max_context - p);
                     if (tree_cap >= 4) {
-                        tree_spec = strata::spec::df2_tree_build_from_selector(
+                        strata::spec::Df2TreeBuildOptions tree_opts;
+                        tree_opts.draft_conf = o.draft_conf;
+                        tree_opts.min_branch_p = strata::spec::df2_tree_min_branch_p();
+                        tree_opts.max_fanout = strata::spec::df2_tree_max_fanout();
+                        tree_opts.max_nodes = tree_cap;
+                        tree_opts.ev_cut = strata::spec::df2_tree_ev_cut();
+                        tree_opts.adaptive_cut = strata::spec::df2_tree_adaptive_on();
+                        tree_opts.dedup_siblings = strata::spec::df2_tree_dedup_on();
+                        tree_spec = strata::spec::df2_tree_build_from_selector_ex(
                             x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(), df2.tree_seltab(),
-                            o.draft_conf, strata::spec::df2_tree_min_branch_p(), strata::spec::df2_tree_max_fanout(),
-                            tree_cap);
+                            tree_opts, tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr);
                         if (tree_spec.valid() && !tree_spec.is_linear() && tree_spec.is_caterpillar()) {
                             tree_round = true;
                             T = tree_spec.count;
@@ -24955,6 +24963,7 @@ int main(int argc, char** argv) {
                     tree_walk = strata::spec::df2_tree_greedy_accept(tree_spec, outv.data(), &tree_bonus);
                     a = std::max(0, tree_walk.n_keep - 1);
                     if (accept_hist_on) tree_accept_hist.observe(tree_spec, tree_walk);
+                    if (strata::spec::df2_tree_adaptive_on()) tree_adaptive_policy.observe_tree(tree_spec, tree_walk);
                 } else {
                     a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                     while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
@@ -24970,6 +24979,8 @@ int main(int argc, char** argv) {
 #endif
                     if (accept_hist_on)
                         accept_hist.observe(df2_rows, from_sfx ? T - 1 : df2_suffix_n, chain_n, T_mtp - 1, verify_accept);
+                    if (tree_req_eligible && strata::spec::df2_tree_adaptive_on() && df2_rows > 0)
+                        tree_adaptive_policy.observe_linear(df2_rows, verify_accept);
 #if defined(STRATA_HAVE_DFLASH2)
                     if (!merged && !from_sfx && !first_window && !df2_handoff_round && req_df2 &&
                         df2.candidate_dump_enabled() && df2_rows > 0) {

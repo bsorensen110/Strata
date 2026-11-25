@@ -311,6 +311,265 @@ void test_env_gate_and_selector_builder() {
     check(capped.count == 6 && capped.valid() && capped.is_caterpillar(), "respects max_nodes=6 cap");
 }
 
+void test_ev_budget_ordering_and_cut_drop() {
+    check(df2_tree_parse_ev_cut(nullptr) == 0.0f, "null ev_cut defaults to 0");
+    check(df2_tree_parse_ev_cut("") == 0.0f, "empty ev_cut defaults to 0");
+    check(df2_tree_parse_ev_cut("abc") == 0.0f, "invalid ev_cut defaults to 0");
+    check(df2_tree_parse_ev_cut("-0.1") == 0.0f, "negative ev_cut defaults to 0");
+    check(df2_tree_parse_ev_cut("1.2") == 0.0f, "out-of-range ev_cut defaults to 0");
+    check(df2_tree_parse_ev_cut("0.15") > 0.149f && df2_tree_parse_ev_cut("0.15") < 0.151f, "valid ev_cut parsed");
+
+    std::array<int32_t, 7> drafts{101, 102, 103, 104, 105, 106, 107};
+    // Survival: S1=0.90, S2=0.81, S3=0.729, S4=0.2916, S5=0.1166, S6=0.0350, S7=0.0105
+    std::array<float, 7> probs{0.90f, 0.90f, 0.90f, 0.40f, 0.40f, 0.30f, 0.30f};
+    std::array<int32_t, 7 * kDf2TreeSelectorTopK> toptok{};
+    std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+    toptok.fill(-1);
+    seltab.fill(-100.0f);
+    for (int r = 0; r < 7; ++r) {
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0] = drafts[static_cast<size_t>(r)];
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 1] = 200 + r;
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 2] = 300 + r;
+        seltab[(static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 0] = 0.0f;
+    }
+    // Depth 2 runner-up (under node 2): S2*p_run = 0.81 * 0.25 = 0.2025
+    const size_t base2 = (2u * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+    seltab[base2 + 0] = 1.1f;   // exp(1.1)=3.004
+    seltab[base2 + 1] = 0.0f;   // 1/(3.004+1) ~ 0.250
+    // Depth 3 runner-up (under node 3): S3*p_run = 0.729 * 0.27 = 0.1968
+    const size_t base3 = (3u * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+    seltab[base3 + 0] = 1.0f;   // exp(1.0)=2.718
+    seltab[base3 + 1] = 0.0f;   // 1/3.718 = 0.2689
+
+    // Default ev_cut=0 reproduces df2_tree_build_from_selector identically.
+    Df2TreeBuildOptions legacy_opts;
+    legacy_opts.draft_conf = 0.5;
+    legacy_opts.min_branch_p = 0.10f;
+    legacy_opts.max_fanout = 2;
+    legacy_opts.max_nodes = 8;
+    const Df2TreeSpec ex_def = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                               toptok.data(), seltab.data(), legacy_opts);
+    const Df2TreeSpec orig = df2_tree_build_from_selector(99, drafts.data(), probs.data(), 7,
+                                                          toptok.data(), seltab.data(), 0.5, 0.10f, 2, 8);
+    check(ex_def.count == orig.count && ex_def.token == orig.token && ex_def.parent == orig.parent &&
+              ex_def.shape == orig.shape && ex_def.branch_node == orig.branch_node,
+          "default options reproduce legacy df2_tree_build_from_selector identically");
+
+    // EV budget (ev_cut=0.05): drops low-EV tail drafts[5], drafts[6] (0.035, 0.0105) in favor of
+    // multi-point caterpillar runner-ups 202 (under node 2, EV~0.202) and 203 (under node 3, EV~0.196).
+    Df2TreeBuildOptions ev_opts = legacy_opts;
+    ev_opts.ev_cut = 0.05f;
+    const Df2TreeSpec ev_tree = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                toptok.data(), seltab.data(), ev_opts);
+    // Expected kept: anchor(0), spine 1..5 (101..105), leaves 202 (parent=2), 203 (parent=3) => 8 nodes Caterpillar
+    check(ev_tree.count == 8 && ev_tree.valid() && ev_tree.is_caterpillar(), "EV builder produces valid 8-node caterpillar");
+    check(ev_tree.shape == Df2TreeShape::Caterpillar && ev_tree.branch_node == -1, "multi-point EV tree is Caterpillar");
+    check(ev_tree.token[5] == 105 && ev_tree.token[6] == 202 && ev_tree.parent[6] == 2 &&
+              ev_tree.token[7] == 203 && ev_tree.parent[7] == 3,
+          "EV builder replaces dead tail nodes with higher-EV runner-ups at nodes 2 and 3");
+
+    // Primary-first topological indexing avoids compaction on primary spine wins and flags runner-up hits cleanly.
+    const int32_t arg_prim[8] = {101, 102, 103, 104, 105, 999, 0, 0};
+    const Df2TreeCommitWalk w_prim = df2_tree_greedy_accept(ev_tree, arg_prim);
+    check(w_prim.n_keep == 6 && !w_prim.needs_compaction() && !w_prim.branch_hit && !w_prim.runner_up_hit,
+          "primary spine win on EV caterpillar needs no compaction");
+    const int32_t arg_run[8] = {101, 102, 202, 0, 0, 0, 999, 0};
+    const Df2TreeCommitWalk w_run = df2_tree_greedy_accept(ev_tree, arg_run);
+    check(w_run.n_keep == 4 && w_run.path[3] == 6 && w_run.branch_hit && w_run.runner_up_hit,
+          "runner-up leaf win on EV caterpillar sets branch_hit and runner_up_hit");
+
+    // Higher ev_cut=0.25 prunes nodes < 0.25 (S4=0.2916 kept; S5=0.1166 and leaves ~0.20 dropped -> falls back to linear)
+    // Wait: check ev_cut=0.18 prunes S5 (0.1166) while keeping leaves 202 (0.202) and 203 (0.196) -> count=7!
+    ev_opts.ev_cut = 0.18f;
+    const Df2TreeSpec pruned = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                               toptok.data(), seltab.data(), ev_opts);
+    check(pruned.count == 7 && pruned.valid() && pruned.shape == Df2TreeShape::Caterpillar,
+          "ev_cut=0.18 prunes low-EV spine node 105 to 7 nodes while keeping both higher-EV leaves");
+
+    // High ev_cut=0.30 drops all runner-ups -> falls back to linear
+    ev_opts.ev_cut = 0.30f;
+    const Df2TreeSpec lin_drop = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                 toptok.data(), seltab.data(), ev_opts);
+    check(lin_drop.is_linear() && lin_drop.count == 8, "high ev_cut dropping all runner-ups falls back to linear");
+}
+
+void test_adaptive_cut_choice() {
+    check(!df2_tree_adaptive_env_enabled(nullptr) && !df2_tree_adaptive_env_enabled("0") &&
+              df2_tree_adaptive_env_enabled("1"),
+          "adaptive env gate parser");
+
+    std::array<int32_t, 7> drafts{101, 102, 103, 104, 105, 106, 107};
+    std::array<float, 7> probs{0.85f, 0.85f, 0.80f, 0.35f, 0.35f, 0.35f, 0.35f};
+    std::array<int32_t, 7 * kDf2TreeSelectorTopK> toptok{};
+    std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+    toptok.fill(-1);
+    seltab.fill(-100.0f);
+    for (int r = 0; r < 7; ++r) {
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0] = drafts[static_cast<size_t>(r)];
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 1] = 200 + r;
+        seltab[(static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 0] = 0.0f;
+    }
+    // Give depth 1 runner-up p=0.28 and depth 2 runner-up p=0.45.
+    const size_t base1 = (1u * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+    seltab[base1 + 0] = 0.944f;  // exp(0.944)=2.570 -> runner 1/(3.570) ~ 0.280
+    seltab[base1 + 1] = 0.0f;
+    const size_t base2 = (2u * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+    seltab[base2 + 0] = 0.20f;   // exp(0.20)=1.2214 -> runner 1/(2.2214) ~ 0.450
+    seltab[base2 + 1] = 0.0f;
+
+    Df2TreeBuildOptions opts;
+    opts.draft_conf = 0.7;
+    opts.min_branch_p = 0.10f;
+    opts.max_fanout = 2;
+    opts.max_nodes = 8;
+    opts.adaptive_cut = true;
+
+    // 1. High empirical acceptance at depths 0..2 -> cut=2 beats cut=1 and linear.
+    Df2TreeAdaptivePolicy high_pol;
+    for (int i = 0; i < 30; ++i) high_pol.observe_linear(7, 7);
+    const Df2TreeSpec t_high = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                               toptok.data(), seltab.data(), opts, &high_pol);
+    check(t_high.shape == Df2TreeShape::PrefixFanout && t_high.branch_node == 2,
+          "high EWMA survival picks higher-yield cut=2");
+
+    // 2. Collapsed depth-1 acceptance (only 1 draft accepted repeatedly) lowers S[2] -> shifts cut to 1.
+    Df2TreeAdaptivePolicy low_pol;
+    for (int i = 0; i < 30; ++i) low_pol.observe_linear(7, 1);
+    const Df2TreeSpec t_low = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                              toptok.data(), seltab.data(), opts, &low_pol);
+    check(t_low.shape == Df2TreeShape::PrefixFanout && t_low.branch_node == 1,
+          "low depth-1 EWMA survival shifts adaptive cut earlier to 1");
+
+    // 3. observe_tree updates primary spine nodes only (ignores runner-up slots).
+    Df2TreeAdaptivePolicy tree_pol;
+    const int32_t arg_run[8] = {101, 201, 0, 0, 0, 0, 0, 0};  // depth-0 accepted, depth-1 primary rejected, runner-up 201 accepted
+    tree_pol.observe_tree(t_low, df2_tree_greedy_accept(t_low, arg_run));
+    check(tree_pol.seen_weight(0) > 0.99 && tree_pol.seen_weight(1) > 0.99 && tree_pol.seen_weight(2) == 0.0,
+          "observe_tree updates reached primary depths only");
+    check(tree_pol.empirical_rate(0) > 0.6 && tree_pol.empirical_rate(1) < 0.4,
+          "observe_tree records depth-0 primary accept and depth-1 primary reject");
+
+    // 4. High primary probs everywhere + tiny runner-up -> linear beats branching (no-gain fallback).
+    const std::array<float, 7> strong_probs{0.96f, 0.96f, 0.96f, 0.96f, 0.96f, 0.96f, 0.96f};
+    seltab[base1 + 0] = 2.1f;   // p_run ~ 0.11
+    seltab[base2 + 0] = 2.1f;   // p_run ~ 0.11
+    const Df2TreeSpec t_nogain = df2_tree_build_from_selector_ex(99, drafts.data(), strong_probs.data(), 7,
+                                                                 toptok.data(), seltab.data(), opts, &high_pol);
+    check(t_nogain.is_linear() && t_nogain.count == 8,
+          "adaptive builder falls back to linear when branching lowers expected accepted drafts");
+}
+
+void test_sibling_dedup() {
+    check(!df2_tree_dedup_env_enabled(nullptr) && !df2_tree_dedup_env_enabled("0") &&
+              df2_tree_dedup_env_enabled("1"),
+          "dedup env gate parser");
+
+    std::array<int32_t, 7> drafts{101, 102, 103, 104, 105, 106, 107};
+    std::array<float, 7> probs{0.95f, 0.90f, 0.40f, 0.80f, 0.80f, 0.80f, 0.80f};
+    std::array<int32_t, 7 * kDf2TreeSelectorTopK> toptok{};
+    std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+    toptok.fill(-1);
+    seltab.fill(-100.0f);
+    for (int r = 0; r < 7; ++r) {
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0] = drafts[static_cast<size_t>(r)];
+        seltab[(static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 0] = 0.0f;
+    }
+    // Cut at c=2: slot 1 collides with prefix token drafts[1]=102, slot 2 collides with anchor=99,
+    // slot 3 collides with later top-1 drafts[5]=106, slot 4 is distinct token 303 (with duplicate at slot 5).
+    const size_t base2 = (2u * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+    toptok[2 * kDf2TreeSelectorTopK + 1] = 102;
+    toptok[2 * kDf2TreeSelectorTopK + 2] = 99;
+    toptok[2 * kDf2TreeSelectorTopK + 3] = 106;
+    toptok[2 * kDf2TreeSelectorTopK + 4] = 303;
+    toptok[2 * kDf2TreeSelectorTopK + 5] = 303;
+    seltab[base2 + 0] = 1.0f;
+    seltab[base2 + 1] = 0.5f;
+    seltab[base2 + 2] = 0.4f;
+    seltab[base2 + 3] = 0.3f;
+    seltab[base2 + 4] = -0.3f;
+    seltab[base2 + 5] = -0.3f;
+
+    Df2TreeBuildOptions opts;
+    opts.draft_conf = 0.5;
+    opts.min_branch_p = 0.10f;
+    opts.max_fanout = 2;
+    opts.max_nodes = 8;
+
+    opts.dedup_siblings = false;
+    const Df2TreeSpec no_dedup = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                 toptok.data(), seltab.data(), opts);
+    check(no_dedup.token[4] == 102, "without dedup, prefix-colliding runner-up 102 is selected");
+
+    opts.dedup_siblings = true;
+    const Df2TreeSpec with_dedup = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                   toptok.data(), seltab.data(), opts);
+    check(with_dedup.valid() && with_dedup.branch_node == 2 && with_dedup.token[4] == 303,
+          "with dedup, colliding candidates (102, 99, 106) are skipped in favor of distinct 303");
+
+    // If every runner-up collides -> linear fallback
+    toptok[2 * kDf2TreeSelectorTopK + 4] = 101;
+    toptok[2 * kDf2TreeSelectorTopK + 5] = 104;
+    const Df2TreeSpec all_coll = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                 toptok.data(), seltab.data(), opts);
+    check(all_coll.is_linear() && all_coll.count == 8, "all-colliding runner-ups fall back to linear");
+}
+
+void test_extended_telemetry_and_runner_hit() {
+    // PrefixFanout at cut=1, F=2, plus primary tail: 0->1(10); 1->2(20), 1->3(21); 2->4(30)->5(31)
+    const int32_t prefix[1] = {10};
+    const int32_t br[2] = {20, 21};
+    const int32_t tail[2] = {30, 31};
+    const Df2TreeSpec pf = make_prefix_fanout_tree(1, prefix, 1, br, 2, tail, 2);
+
+    // Primary tail win (0->1->2->4->5): path[2]=2, path[3]=4 != 3 => branch_hit=true, runner_up_hit=false!
+    const int32_t arg_tail[6] = {10, 20, 30, 0, 31, 999};
+    const Df2TreeCommitWalk w_tail = df2_tree_greedy_accept(pf, arg_tail);
+    check(w_tail.branch_hit && !w_tail.runner_up_hit && w_tail.accepted_drafts() == 4,
+          "primary-tail win separates branch_hit=true from runner_up_hit=false");
+
+    // Runner-up win (0->1->3): runner_up_hit=true
+    const int32_t arg_run[6] = {10, 21, 0, 888, 0, 0};
+    const Df2TreeCommitWalk w_run = df2_tree_greedy_accept(pf, arg_run);
+    check(w_run.branch_hit && w_run.runner_up_hit && w_run.accepted_drafts() == 2,
+          "runner-up win sets runner_up_hit=true");
+
+    Df2TreeAcceptHist hist;
+    hist.observe(pf, w_tail);
+    hist.observe(pf, w_run);
+    check(hist.tree_rounds == 2 && hist.branch_hits == 2 && hist.runner_hits == 1 && hist.total_offered == 10,
+          "extended telemetry tracks runner_hits separately from branch_hits and sums total_offered");
+    // Round 1 (w_tail): node 3 (runner) reached (parent 1 accepted), rejected; Round 2 (w_run): node 3 reached, accepted -> 1/2
+    check(hist.runner_reached == 2 && hist.runner_accepted == 1,
+          "runner_reached and runner_accepted isolate sibling recovery rate");
+    // Depth 1 (node 1): 2/2; Depth 2 (nodes 2,3): 4 reached, 2 accepted; Depth 3 (node 4): 1/1; Depth 4 (node 5): 1/1
+    check(hist.depth_reached[0] == 2 && hist.depth_accepted[0] == 2 &&
+              hist.depth_reached[1] == 4 && hist.depth_accepted[1] == 2 &&
+              hist.depth_reached[2] == 1 && hist.depth_accepted[2] == 1 &&
+              hist.depth_reached[3] == 1 && hist.depth_accepted[3] == 1,
+          "depth_reached/depth_accepted track true depth-indexed acceptance");
+    check(hist.cut_hist[1] == 2, "cut_hist records branch_node=1");
+
+    const std::string formatted = hist.format_accept_hist_fields();
+    Df2TreeAcceptHist parsed;
+    check(parse_accept_hist_fields(formatted, parsed), "extended accept-hist fields parse cleanly");
+    check(parsed.runner_hits == 1 && parsed.total_offered == 10 &&
+              parsed.runner_reached == 2 && parsed.runner_accepted == 1 &&
+              parsed.depth_reached == hist.depth_reached &&
+              parsed.depth_accepted == hist.depth_accepted &&
+              parsed.cut_hist == hist.cut_hist,
+          "extended accept-hist round-trip preserves all fields");
+
+    // Legacy 4-field log format still parses cleanly with zero-initialized new fields.
+    Df2TreeAcceptHist legacy;
+    const std::string legacy_line =
+        "[accept-hist] req=1 df2_pos_reached=1,0,0,0,0,0,0 df2_pos_accept=1,0,0,0,0,0,0 "
+        "lookup_rows=0 lookup_accept=0 chain_rows=0 chain_accept=0 "
+        "tree_rounds=5 tree_branch_hits=2 tree_node_reached=5,5,4,2,0,0,0,0 tree_node_accept=5,3,2,1,0,0,0,0";
+    check(parse_accept_hist_fields(legacy_line, legacy) &&
+              legacy.tree_rounds == 5 && legacy.branch_hits == 2 && legacy.runner_hits == 0,
+          "legacy 4-field accept-hist line remains backward-compatible");
+}
+
 void test_gdn_order_ple_taps_and_remap_invariants() {
     const int32_t prefix[2] = {10, 11};
     const int32_t br[3] = {20, 21, 22};
@@ -369,6 +628,10 @@ int main() {
     test_acceptance_walks_and_branch_kill();
     test_serialization_and_telemetry_roundtrip();
     test_env_gate_and_selector_builder();
+    test_ev_budget_ordering_and_cut_drop();
+    test_adaptive_cut_choice();
+    test_sibling_dedup();
+    test_extended_telemetry_and_runner_hit();
     test_gdn_order_ple_taps_and_remap_invariants();
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;

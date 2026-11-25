@@ -62,13 +62,16 @@ int main() {
     if (f_tree == nullptr) return 9;
     h.emit(f_tree, true, 9, &tree_hist);
     std::rewind(f_tree);
-    char line_tree[512] = {};
+    char line_tree[1024] = {};
     const bool read_tree = std::fgets(line_tree, sizeof(line_tree), f_tree) != nullptr;
     std::fclose(f_tree);
     if (!read_tree) return 10;
     strata::spec::Df2TreeAcceptHist parsed_tree;
     if (!strata::spec::parse_accept_hist_fields(line_tree, parsed_tree) ||
         parsed_tree.tree_rounds != 1 || parsed_tree.branch_hits != 1 ||
+        parsed_tree.runner_hits != 1 || parsed_tree.total_offered != 5 ||
+        parsed_tree.runner_reached != 1 || parsed_tree.runner_accepted != 1 ||
+        parsed_tree.cut_hist[3] != 1 ||
         std::strstr(line_tree, "df2_pos_reached=3,3,1,0,0,0,0") == nullptr) {
         return 11;
     }
