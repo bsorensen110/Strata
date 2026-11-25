@@ -173,6 +173,7 @@
 #include "strata/core/gpu_pause_time.hpp"
 #include "strata/core/vram_request_notice.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/tail_skip_policy.hpp"
 #include "strata/core/emulate.hpp"
 #ifndef NOMINMAX
 #define NOMINMAX   // gguf_reader.hpp includes windows.h
@@ -23388,7 +23389,9 @@ int main(int argc, char** argv) {
             // (the drafter writes max_t - 1 drafts: 8 rows with --pipeline-windows 2)
             const size_t DS = (size_t) std::max(S, use_mtp ? mtp.max_t() : 0);
             const size_t WS = (size_t) std::max(S, merge_T);
+            const size_t WS_meta = std::max<size_t>(WS, (size_t) strata::kernels::kVerifyNarrowT);
             std::vector<int32_t> drafts(DS, 0), window(WS), outv(WS);
+            std::vector<uint8_t> solo_row_is_draft(WS_meta, 0), solo_row_rank(WS_meta, 0);
             std::vector<float> dprob(DS, 0.0f);
             std::array<float, 8> dwin_s{};   // the probabilities the current window was chosen from (STRATA_SPEC_COST)
             // STRATA_SPEC_TRACE=<file> in serve (bench only, off by default): per round "R p T a sfx ms k match | probs | drafts | lookup draft | committed tokens"
@@ -24950,6 +24953,15 @@ int main(int argc, char** argv) {
                     n_stages <= 1 && admit_slot < 0 && !first_window && !merged;
                 ScopedDecodeTapsReady scoped_dec_taps(ver, &df2, legacy_tap_overlap || decode_tap_overlap, decode_tap_overlap);
 #endif
+                const int meta_rows = tree_round
+                    ? strata::spec::df2_tree_select_width(T, strata::spec::df2_tree_var_t_on())
+                    : T;
+                const bool has_draft_rows = !first_window && !merged && meta_rows > 1;
+                strata::core::fill_solo_row_is_draft(
+                    solo_row_is_draft.data(), solo_row_rank.data(), meta_rows, has_draft_rows);
+                const strata::core::ScopedDraftRowPointers scoped_draft_rows(
+                    drive.d.row_is_draft, drive.d.row_rank_in_slot,
+                    solo_row_is_draft.data(), solo_row_rank.data());
                 const bool win_ok = tree_round
                     ? ver.run_tree(tree_spec, p, decode_pool_fn, win_pool_user, outv.data(), err)
                     : ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err);
@@ -27053,6 +27065,9 @@ int main(int argc, char** argv) {
             }
         }
         std::vector<int32_t> window((size_t) o.spec), outv((size_t) o.spec);
+        std::vector<uint8_t> solo_row_is_draft(
+            std::max<size_t>((size_t) o.spec, (size_t) strata::kernels::kVerifyNarrowT), 0);
+        std::vector<uint8_t> solo_row_rank(solo_row_is_draft.size(), 0);
         std::vector<uint8_t> fdiff((size_t) o.spec, 0);
         std::FILE* hashes = o.window_hashes.empty() ? nullptr : std::fopen(o.window_hashes.c_str(), "w");
         if (!o.window_hashes.empty() && hashes == nullptr) {
@@ -27385,6 +27400,12 @@ int main(int argc, char** argv) {
             const auto decode_pool_fn = strata::spec::mtp_window_invariant_applies(use_mtp, spec_uses_df2, use_mtp && mtp.prob())
                 ? &drive_pool_multi_invariant
                 : &drive_pool_multi;
+            const bool has_draft_rows = !first_window && T > 1;
+            strata::core::fill_solo_row_is_draft(
+                solo_row_is_draft.data(), solo_row_rank.data(), T, has_draft_rows);
+            const strata::core::ScopedDraftRowPointers scoped_draft_rows(
+                drive.d.row_is_draft, drive.d.row_rank_in_slot,
+                solo_row_is_draft.data(), solo_row_rank.data());
             if (!ver.run(T, window.data(), p, decode_pool_fn, &drive, outv.data(), err)) {
                 // The graph of a window size is captured the first time it is used, and the draft source took VRAM: when the capture runs
                 // out of memory the window gets one row narrower (the widths below it are already captured) instead of the run failing.
