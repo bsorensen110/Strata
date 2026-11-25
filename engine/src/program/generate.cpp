@@ -24680,7 +24680,21 @@ int main(int argc, char** argv) {
                     if (tree_cap >= 4) {
                         strata::spec::Df2TreeBuildOptions tree_opts;
                         tree_opts.draft_conf = o.draft_conf;
-                        tree_opts.min_branch_p = strata::spec::df2_tree_min_branch_p();
+                        const float raw_min_branch_p = strata::spec::df2_tree_min_branch_p();
+                        const float eff_min_branch_p = strata::spec::df2_tree_effective_min_branch_p(
+                            raw_min_branch_p, strata::spec::df2_tree_var_t_on(),
+                            strata::spec::df2_tree_branch_guard_on());
+                        if (eff_min_branch_p != raw_min_branch_p) {
+                            static bool warned_min_branch_guard = false;
+                            if (!warned_min_branch_guard) {
+                                warned_min_branch_guard = true;
+                                std::fprintf(stderr,
+                                             "strata serve: NOTE: STRATA_DF2_TREE_VAR_T is off; clamping "
+                                             "min_branch_p from %.2f to %.2f to guard against fixed T=8 regression\n",
+                                             raw_min_branch_p, eff_min_branch_p);
+                            }
+                        }
+                        tree_opts.min_branch_p = eff_min_branch_p;
                         tree_opts.max_fanout = strata::spec::df2_tree_max_fanout();
                         tree_opts.max_nodes = tree_cap;
                         tree_opts.ev_cut = strata::spec::df2_tree_ev_cut();

@@ -983,6 +983,116 @@ void test_max_cut_and_row_ema_cost_gates() {
           "cost-normalized gate catches low dAcc/dRow=0.20 < 0.332 even when local ratio 1.8/31.4 > 1/20");
 }
 
+void test_engagement_shaping_envelope() {
+    // 1. Safety guard parser & VAR_T=0 clamp semantics
+    check(!df2_tree_branch_guard_env_enabled(nullptr) &&
+              !df2_tree_branch_guard_env_enabled("") &&
+              !df2_tree_branch_guard_env_enabled("0") &&
+              !df2_tree_branch_guard_env_enabled("true") &&
+              df2_tree_branch_guard_env_enabled("1"),
+          "branch guard env gate parser");
+    check(df2_tree_effective_min_branch_p(0.10f, false, false) == 0.10f &&
+              df2_tree_effective_min_branch_p(0.30f, false, false) == 0.30f,
+          "guard off keeps min_branch_p < 0.45 unchanged when VAR_T=0 (bit-identical HEAD / Run 1)");
+    check(df2_tree_effective_min_branch_p(0.10f, false, true) == kDf2TreeSafeMinBranchP &&
+              df2_tree_effective_min_branch_p(0.30f, false, true) == kDf2TreeSafeMinBranchP &&
+              df2_tree_effective_min_branch_p(0.50f, false, true) == 0.50f,
+          "guard on clamps min_branch_p < 0.45 to 0.45 when VAR_T=0");
+    check(df2_tree_effective_min_branch_p(0.30f, true, true) == 0.30f &&
+              df2_tree_effective_min_branch_p(0.35f, true, true) == 0.35f,
+          "guard on preserves min_branch_p=0.30..0.35 when VAR_T=1");
+
+    // 2. Variable-T ON engagement ladder: MIN_BRANCH_P=0.30..0.35 + MAX_FANOUT=2 + DEDUP=1 + EV_CUT=0.35
+    // produces M in [4, 6] across cut=0, 1, 2 so exec_tree_[4..6] get used without T=8 padding.
+    constexpr int32_t kAnchor = 99;
+    std::array<int32_t, 7> drafts{101, 102, 103, 104, 105, 106, 107};
+    std::array<int32_t, 7 * kDf2TreeSelectorTopK> toptok{};
+    std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+    auto init_tables = [&](int cut, float runner_p, bool add_anchor_collision) {
+        toptok.fill(-1);
+        seltab.fill(-100.0f);
+        for (int r = 0; r < 7; ++r) {
+            toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0] = drafts[static_cast<size_t>(r)];
+            toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 1] = 200 + r;
+            const size_t base = (static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+            seltab[base + 0] = 0.0f;
+            if (r == cut) {
+                if (add_anchor_collision) {
+                    // Put colliding anchor token at slot 1 (higher logit) and distinct 200+r at slot 2.
+                    toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 1] = kAnchor;
+                    toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 2] = 200 + r;
+                    const float rem = 1.0f - 2.0f * runner_p;
+                    seltab[base + 0] = std::log(std::max(0.05f, rem) / runner_p);
+                    seltab[base + 1] = 0.1f;  // colliding anchor slightly higher score
+                    seltab[base + 2] = 0.0f;  // distinct runner at p ~= runner_p / (rem+exp(0.1)*runner_p+runner_p)
+                } else {
+                    const float p0 = 1.0f - runner_p;
+                    seltab[base + 0] = std::log(p0 / runner_p);
+                    seltab[base + 1] = 0.0f;
+                }
+            }
+        }
+    };
+
+    auto check_var_t_band = [&](int cut, const std::array<float, 7>& probs, float runner_p, int expected_m,
+                                bool add_collision, const char* label) {
+        init_tables(cut, runner_p, add_collision);
+        for (float min_bp : {0.30f, 0.35f}) {
+            Df2TreeBuildOptions opts;
+            opts.draft_conf = 0.7;
+            opts.min_branch_p = df2_tree_effective_min_branch_p(min_bp, /*var_t_on=*/true, /*guard_on=*/true);
+            opts.max_fanout = 2;
+            opts.max_nodes = 8;
+            opts.ev_cut = 0.35f;
+            opts.dedup_siblings = true;
+            opts.max_cut = 3;
+            const Df2TreeSpec tree = df2_tree_build_from_selector_ex(kAnchor, drafts.data(), probs.data(), 7,
+                                                                     toptok.data(), seltab.data(), opts);
+            check(tree.valid() && !tree.is_linear() && tree.is_caterpillar(), label);
+            check(tree.count == expected_m && tree.count >= 4 && tree.count <= 6, label);
+            const int exec_t = df2_tree_select_width(tree.count, /*var_t_on=*/true);
+            check(exec_t == expected_m && exec_t >= 4 && exec_t <= 6, label);
+            int32_t gdn_order[8] = {}, is_spine[8] = {};
+            check(df2_tree_caterpillar_gdn_order(tree, gdn_order, is_spine, exec_t), label);
+        }
+    };
+
+    // cut=0: S1=0.55, S2=0.385, S3=0.173(<0.35), leaf(0)=0.36 -> M=4 (T=4), with colliding anchor stripped by DEDUP=1
+    check_var_t_band(0, {0.55f, 0.70f, 0.45f, 0.35f, 0.30f, 0.30f, 0.30f}, 0.38f, 4, true,
+                     "engagement ladder cut=0 with dedup=1 + ev_cut=0.35 lands at M=4 (T=4)");
+    // cut=1: S1=0.90, S2=0.585, S3=0.468, S4=0.187(<0.35), leaf(1)=0.90*0.40=0.36 -> M=5 (T=5)
+    check_var_t_band(1, {0.90f, 0.65f, 0.80f, 0.40f, 0.30f, 0.30f, 0.30f}, 0.40f, 5, false,
+                     "engagement ladder cut=1 with ev_cut=0.35 lands at M=5 (T=5)");
+    // cut=2: S1=0.92, S2=0.828, S3=0.538, S4=0.430, S5=0.172(<0.35), leaf(2)=0.828*0.43=0.356 -> M=6 (T=6)
+    check_var_t_band(2, {0.92f, 0.90f, 0.65f, 0.80f, 0.40f, 0.30f, 0.30f}, 0.43f, 6, false,
+                     "engagement ladder cut=2 with ev_cut=0.35 lands at M=6 (T=6)");
+
+    // 3. Run 1 -12.3% trap check: VAR_T=0 with min_branch_p < 0.45 (and guard off) reproduces legacy behavior
+    // bit-exactly and executes padded T=8; enabling the guard clamps to 0.45 and prevents the trap.
+    init_tables(1, 0.38f, false);
+    const std::array<float, 7> run1_probs{0.90f, 0.65f, 0.80f, 0.40f, 0.30f, 0.30f, 0.30f};
+    Df2TreeBuildOptions trap_opts;
+    trap_opts.draft_conf = 0.7;
+    trap_opts.min_branch_p = df2_tree_effective_min_branch_p(0.30f, /*var_t_on=*/false, /*guard_on=*/false);
+    trap_opts.max_fanout = 2;
+    trap_opts.max_nodes = 8;
+    const Df2TreeSpec t_trap = df2_tree_build_from_selector_ex(kAnchor, drafts.data(), run1_probs.data(), 7,
+                                                               toptok.data(), seltab.data(), trap_opts);
+    const Df2TreeSpec t_legacy = df2_tree_build_from_selector(kAnchor, drafts.data(), run1_probs.data(), 7,
+                                                              toptok.data(), seltab.data(), 0.7, 0.30f, 2, 8);
+    check(!t_trap.is_linear() && t_trap.count == t_legacy.count && t_trap.token == t_legacy.token &&
+              t_trap.parent == t_legacy.parent &&
+              df2_tree_select_width(t_trap.count, /*var_t_on=*/false) == 8,
+          "VAR_T=0 with min_branch_p=0.30 (guard off) reproduces legacy tree bit-exactly at fixed T=8");
+
+    Df2TreeBuildOptions guarded_opts = trap_opts;
+    guarded_opts.min_branch_p = df2_tree_effective_min_branch_p(0.30f, /*var_t_on=*/false, /*guard_on=*/true);
+    const Df2TreeSpec t_guarded = df2_tree_build_from_selector_ex(kAnchor, drafts.data(), run1_probs.data(), 7,
+                                                                  toptok.data(), seltab.data(), guarded_opts);
+    check(t_guarded.is_linear(),
+          "VAR_T=0 with guard on clamps min_branch_p=0.30 -> 0.45 and suppresses sub-0.45 branch");
+}
+
 }  // namespace
 
 int main() {
@@ -1002,6 +1112,7 @@ int main() {
     test_spine_skip_predicate();
     test_composable_ev_adaptive_matrix_and_no_inflation();
     test_max_cut_and_row_ema_cost_gates();
+    test_engagement_shaping_envelope();
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }

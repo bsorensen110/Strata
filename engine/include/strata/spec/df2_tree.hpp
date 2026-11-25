@@ -46,6 +46,31 @@ inline float df2_tree_min_branch_p() noexcept {
     return v;
 }
 
+/// Safe min_branch_p floor when STRATA_DF2_TREE_VAR_T=0 (avoids Run 1 -12.3% T=8 padding regression).
+inline constexpr float kDf2TreeSafeMinBranchP = 0.45f;
+
+/// Parses STRATA_DF2_TREE_MIN_BRANCH_GUARD ("1" clamps min_branch_p >= 0.45 when VAR_T is off; default OFF).
+inline bool df2_tree_branch_guard_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+/// Process-wide gate for the VAR_T=0 min_branch_p >= 0.45 safety guard (default OFF).
+inline bool df2_tree_branch_guard_on() noexcept {
+    static const bool on = df2_tree_branch_guard_env_enabled(std::getenv("STRATA_DF2_TREE_MIN_BRANCH_GUARD"));
+    return on;
+}
+
+/// NOTE: With STRATA_DF2_TREE_VAR_T=0 (fixed T=8 verify padding), min_branch_p < 0.45 reproduces the
+/// Run 1 -12.3% regression trap (frequent low-yield trees at full T=8 cost).
+/// When `guard_on` is true and `!var_t_on`, clamps `min_branch_p` up to kDf2TreeSafeMinBranchP (0.45f).
+/// When `guard_on` is false (default), returns `min_branch_p` unchanged for bit-identical HEAD/Run-1 parity.
+inline constexpr float df2_tree_effective_min_branch_p(float min_branch_p, bool var_t_on,
+                                                       bool guard_on) noexcept {
+    return (guard_on && !var_t_on && min_branch_p < kDf2TreeSafeMinBranchP)
+        ? kDf2TreeSafeMinBranchP
+        : min_branch_p;
+}
+
 /// Maximum sibling count at the confidence cut (primary + runner-ups capped by node budget).
 /// STRATA_DF2_TREE_MAX_FANOUT (int >= 2, default 3).
 inline int df2_tree_max_fanout() noexcept {
