@@ -95,5 +95,69 @@ int main() {
         std::strstr(line_sampled, "tree_sampled_rounds=1 tree_reject_resamples=2") == nullptr) {
         return 14;
     }
+
+    // P5: When sampled_req_active is set, unconditional telemetry prints even when tree_rounds == 0 and round-trips.
+    {
+        strata::spec::Df2TreeAcceptHist zero_sampled;
+        zero_sampled.sampled_req_active = true;
+        for (int i = 0; i < 12; ++i) zero_sampled.observe_eligible();
+        for (int i = 0; i < 4; ++i) zero_sampled.observe_reject(strata::spec::Df2TreeRejReason::MinP);
+        for (int i = 0; i < 3; ++i) zero_sampled.observe_reject(strata::spec::Df2TreeRejReason::Ev);
+        for (int i = 0; i < 2; ++i) zero_sampled.observe_reject(strata::spec::Df2TreeRejReason::Cut);
+        zero_sampled.observe_reject(strata::spec::Df2TreeRejReason::Ema);
+        for (int i = 0; i < 2; ++i) zero_sampled.observe_reject(strata::spec::Df2TreeRejReason::Dedup);
+
+        FILE* f_zero = std::tmpfile();
+        if (f_zero == nullptr) return 15;
+        h.emit(f_zero, true, 9, &zero_sampled);
+        std::rewind(f_zero);
+        char line_zero[1024] = {};
+        const bool read_zero = std::fgets(line_zero, sizeof(line_zero), f_zero) != nullptr;
+        std::fclose(f_zero);
+        if (!read_zero) return 16;
+
+        strata::spec::Df2TreeAcceptHist parsed_zero;
+        if (!strata::spec::parse_accept_hist_fields(line_zero, parsed_zero) ||
+            !parsed_zero.sampled_req_active || parsed_zero.tree_rounds != 0 ||
+            parsed_zero.sampled_tree_rounds != 0 || parsed_zero.reject_resamples != 0 ||
+            parsed_zero.elig_rounds != 12 ||
+            parsed_zero.rej_reason != std::array<int64_t, 5>{4, 3, 2, 1, 2} ||
+            parsed_zero.width_hist != std::array<int64_t, 6>{0, 0, 0, 0, 0, 0} ||
+            std::strstr(line_zero, "tree_sampled_rounds=0 tree_reject_resamples=0 tree_elig_rounds=12 "
+                                   "tree_rej_reason=4,3,2,1,2 tree_width_hist=0,0,0,0,0,0") == nullptr) {
+            return 17;
+        }
+    }
+
+    // P5: Executed graph widths (T=3..8) accumulate into tree_width_hist and round-trip cleanly.
+    {
+        strata::spec::Df2TreeAcceptHist active_sampled;
+        active_sampled.sampled_req_active = true;
+        active_sampled.observe_eligible();
+        active_sampled.observe(tree, strata::spec::df2_tree_greedy_accept(tree, arg), true, 0, 3);
+        active_sampled.observe_eligible();
+        active_sampled.observe(tree, strata::spec::df2_tree_greedy_accept(tree, arg), true, 1, 5);
+        active_sampled.observe_eligible();
+        active_sampled.observe(tree, strata::spec::df2_tree_greedy_accept(tree, arg), true, 2, 8);
+
+        FILE* f_act = std::tmpfile();
+        if (f_act == nullptr) return 18;
+        h.emit(f_act, true, 9, &active_sampled);
+        std::rewind(f_act);
+        char line_act[1024] = {};
+        const bool read_act = std::fgets(line_act, sizeof(line_act), f_act) != nullptr;
+        std::fclose(f_act);
+        if (!read_act) return 19;
+
+        strata::spec::Df2TreeAcceptHist parsed_act;
+        if (!strata::spec::parse_accept_hist_fields(line_act, parsed_act) ||
+            !parsed_act.sampled_req_active || parsed_act.tree_rounds != 3 ||
+            parsed_act.sampled_tree_rounds != 3 || parsed_act.reject_resamples != 3 ||
+            parsed_act.elig_rounds != 3 ||
+            parsed_act.width_hist != std::array<int64_t, 6>{1, 0, 1, 0, 0, 1} ||
+            std::strstr(line_act, "tree_width_hist=1,0,1,0,0,1") == nullptr) {
+            return 20;
+        }
+    }
     return 0;
 }

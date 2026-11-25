@@ -25,6 +25,17 @@ inline constexpr int kDf2TreeMaxDrafts = 7;  ///< matches Dflash2Drafter::kDraft
 inline constexpr int8_t kDf2TreeNoParent = -1;
 inline constexpr int kDf2TreeSelectorTopK = 16;
 inline constexpr float kDf2TreeDefaultMinBranchP = 0.10f;
+inline constexpr int kDf2TreeRejReasonCount = 5;  ///< minp, ev, cut, ema, dedup
+inline constexpr int kDf2TreeWidthBins = 6;       ///< executed graph widths T=3..8 (index T - 3)
+
+enum class Df2TreeRejReason : uint8_t {
+    MinP = 0,
+    Ev = 1,
+    Cut = 2,
+    Ema = 3,
+    Dedup = 4,
+    None = 5,
+};
 
 /// Parses STRATA_DF2_TREE value ("1" enables tree drafting; anything else keeps default off).
 inline bool df2_tree_env_enabled(const char* value) noexcept {
@@ -557,7 +568,8 @@ class Df2TreeAdaptivePolicy;
 inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t* drafts, const float* probs,
                                                     int n_drafts, const int32_t* toptok, const float* seltab,
                                                     const Df2TreeBuildOptions& opts,
-                                                    const Df2TreeAdaptivePolicy* adaptive = nullptr) noexcept;
+                                                    const Df2TreeAdaptivePolicy* adaptive = nullptr,
+                                                    Df2TreeRejReason* reject_reason = nullptr) noexcept;
 
 /// Builds a PrefixFanout caterpillar tree directly from DF2's primary path (`drafts`, `probs`) and
 /// selector tables (`toptok[n_drafts][16]`, `seltab[n_drafts][16][16]`), fanning out 2..max_fanout
@@ -1460,7 +1472,9 @@ inline int extract_selector_runners(int step, int32_t anchor, const int32_t* dra
                                     float min_branch_p, bool dedup_siblings,
                                     std::array<Df2SelectorCand, kDf2TreeSelectorTopK>& out,
                                     bool sample_walk = false, float temperature = 1.0f,
-                                    const float* logit_bias = nullptr, int logit_bias_len = 0) noexcept {
+                                    const float* logit_bias = nullptr, int logit_bias_len = 0,
+                                    bool* saw_dedup_drop = nullptr) noexcept {
+    if (saw_dedup_drop != nullptr) *saw_dedup_drop = false;
     if (step < 0 || step >= nd || drafts == nullptr || toptok == nullptr || seltab == nullptr) return 0;
 
     int prev_slot = 0;
@@ -1525,18 +1539,17 @@ inline int extract_selector_runners(int step, int32_t anchor, const int32_t* dra
         for (int k = 0; k < n_u; ++k) {
             if (k == argmax_k) continue;
             const int32_t tok = u_tok[static_cast<size_t>(k)];
-            if (dedup_siblings) {
-                if (tok == anchor) continue;
-                bool in_prefix = false;
-                for (int i = 0; i < step; ++i) {
-                    if (drafts[i] == tok) {
-                        in_prefix = true;
-                        break;
-                    }
-                }
-                if (in_prefix) continue;
-            }
             const float p = static_cast<float>(u_weight[static_cast<size_t>(k)] / total);
+            if (dedup_siblings) {
+                bool in_prefix = (tok == anchor);
+                for (int i = 0; i < step && !in_prefix; ++i) {
+                    if (drafts[i] == tok) in_prefix = true;
+                }
+                if (in_prefix) {
+                    if (saw_dedup_drop != nullptr && p >= min_branch_p) *saw_dedup_drop = true;
+                    continue;
+                }
+            }
             if (p < min_branch_p) continue;
             out[static_cast<size_t>(n_runners++)] = Df2SelectorCand{u_slot[static_cast<size_t>(k)], tok, p};
         }
@@ -1595,17 +1608,17 @@ inline int extract_selector_runners(int step, int32_t anchor, const int32_t* dra
         }
         for (int k = 0; k < n_u; ++k) {
             const int32_t tok = u_tok[static_cast<size_t>(k)];
-            if (tok == primary_tok || tok == anchor) continue;
-            bool in_prefix = false;
-            // Exclude only anchor and drafts[0..step], never future spine drafts[step+1..nd-1].
-            for (int i = 0; i <= step; ++i) {
-                if (drafts[i] == tok) {
-                    in_prefix = true;
-                    break;
-                }
-            }
-            if (in_prefix) continue;
+            if (tok == primary_tok) continue;
             const float p = static_cast<float>(u_weight[static_cast<size_t>(k)] / total);
+            bool in_prefix = (tok == anchor);
+            // Exclude only anchor and drafts[0..step], never future spine drafts[step+1..nd-1].
+            for (int i = 0; i <= step && !in_prefix; ++i) {
+                if (drafts[i] == tok) in_prefix = true;
+            }
+            if (in_prefix) {
+                if (saw_dedup_drop != nullptr && p >= min_branch_p) *saw_dedup_drop = true;
+                continue;
+            }
             if (p < min_branch_p) continue;
             out[static_cast<size_t>(n_runners++)] = Df2SelectorCand{u_slot[static_cast<size_t>(k)], tok, p};
         }
@@ -1627,16 +1640,23 @@ inline int extract_selector_runners(int step, int32_t anchor, const int32_t* dra
 inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t* drafts, const float* probs,
                                                     int n_drafts, const int32_t* toptok, const float* seltab,
                                                     const Df2TreeBuildOptions& opts,
-                                                    const Df2TreeAdaptivePolicy* adaptive) noexcept {
+                                                    const Df2TreeAdaptivePolicy* adaptive,
+                                                    Df2TreeRejReason* reject_reason) noexcept {
+    auto set_rej = [&](Df2TreeRejReason r) noexcept {
+        if (reject_reason != nullptr) *reject_reason = r;
+    };
+    set_rej(Df2TreeRejReason::None);
     const int cap = std::clamp(opts.max_nodes, 1, kDf2TreeMaxNodes);
     const int nd = (drafts != nullptr) ? std::clamp(n_drafts, 0, kDf2TreeMaxDrafts) : 0;
     const int lin_n = std::min(nd, cap - 1);
     if (nd < 2 || cap < 4 || drafts == nullptr || probs == nullptr || toptok == nullptr || seltab == nullptr) {
+        set_rej(Df2TreeRejReason::Cut);
         return make_linear_tree(anchor, drafts, lin_n);
     }
 
     const int conf_cut = (opts.draft_conf > 0.0) ? df2_tree_cut_depth(probs, nd, opts.draft_conf) : -1;
     if (opts.max_cut >= 0 && conf_cut >= 0 && conf_cut > opts.max_cut) {
+        set_rej(Df2TreeRejReason::Cut);
         return make_linear_tree(anchor, drafts, lin_n);
     }
 
@@ -1678,6 +1698,8 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
         int n_cands = 0;
         const int max_runners = std::max(1, opts.max_fanout - 1);
         const int ev_d_lim = (opts.sample_walk && conf_cut >= 0) ? std::min(nd, conf_cut + 1) : nd;
+        bool any_runners_before_ev = false;
+        bool any_dedup_drop = false;
 
         for (int d = 0; d < ev_d_lim; ++d) {
             const double spine_ev = ev_surv[static_cast<size_t>(d + 1)];
@@ -1688,10 +1710,14 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
             }
             if (opts.max_cut >= 0 && d > opts.max_cut) continue;
             std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
+            bool step_dedup_drop = false;
             const int n_run = detail::extract_selector_runners(d, anchor, drafts, nd, toptok, seltab,
                                                                opts.min_branch_p, opts.dedup_siblings, runs,
                                                                opts.sample_walk, opts.q_temperature,
-                                                               opts.logit_bias, opts.logit_bias_len);
+                                                               opts.logit_bias, opts.logit_bias_len,
+                                                               &step_dedup_drop);
+            if (n_run > 0) any_runners_before_ev = true;
+            if (step_dedup_drop) any_dedup_drop = true;
             const int take = std::min(n_run, max_runners);
             for (int k = 0; k < take && n_cands < kMaxCands; ++k) {
                 const double p_run = static_cast<double>(runs[static_cast<size_t>(k)].p);
@@ -1744,7 +1770,11 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
                 kept_leaves[static_cast<size_t>(n_leaves++)] = cands[static_cast<size_t>(i)];
             }
         }
-        if (n_leaves == 0) return make_linear_tree(anchor, drafts, lin_n);
+        if (n_leaves == 0) {
+            set_rej(any_runners_before_ev ? Df2TreeRejReason::Ev
+                                          : (any_dedup_drop ? Df2TreeRejReason::Dedup : Df2TreeRejReason::MinP));
+            return make_linear_tree(anchor, drafts, lin_n);
+        }
 
         for (int i = 1; i < n_leaves; ++i) {
             const EvCand key = kept_leaves[static_cast<size_t>(i)];
@@ -1807,6 +1837,8 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
             }
         }
         if (branch_parents == 0) {
+            set_rej(any_runners_before_ev ? Df2TreeRejReason::Ev
+                                          : (any_dedup_drop ? Df2TreeRejReason::Dedup : Df2TreeRejReason::MinP));
             return make_linear_tree(anchor, drafts, lin_n);
         }
 
@@ -1819,6 +1851,7 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
             const double net_tree_cal = e_tree_cal - ev_thresh * static_cast<double>(t.count - 1);
             const double net_lin_cal = e_lin_cal - ev_thresh * static_cast<double>(lin_cf);
             if (net_tree_cal <= net_lin_cal + 1e-6) {
+                set_rej(Df2TreeRejReason::Ev);
                 return make_linear_tree(anchor, drafts, lin_n);
             }
         }
@@ -1842,13 +1875,19 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
         int max_cut = std::min(nd - 1, cap - 3);
         if (opts.max_cut >= 0) max_cut = std::min(max_cut, opts.max_cut);
         if (opts.sample_walk && conf_cut >= 0) max_cut = std::min(max_cut, conf_cut);
+        bool any_runners = false;
+        bool any_dedup_drop = false;
         for (int c = 0; c <= max_cut; ++c) {
             std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
+            bool step_dedup_drop = false;
             const int n_run = detail::extract_selector_runners(c, anchor, drafts, nd, toptok, seltab,
                                                                opts.min_branch_p, opts.dedup_siblings, runs,
                                                                opts.sample_walk, opts.q_temperature,
-                                                               opts.logit_bias, opts.logit_bias_len);
+                                                               opts.logit_bias, opts.logit_bias_len,
+                                                               &step_dedup_drop);
+            if (step_dedup_drop) any_dedup_drop = true;
             if (n_run == 0) continue;
+            any_runners = true;
 
             const int max_f = std::min({std::max(2, opts.max_fanout), n_run + 1, cap - (1 + c)});
             if (max_f < 2) continue;
@@ -1874,7 +1913,12 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
                 }
             }
         }
-        if (best_cut < 0) return make_linear_tree(anchor, drafts, lin_n);
+        if (best_cut < 0) {
+            if (max_cut < 0) set_rej(Df2TreeRejReason::Cut);
+            else set_rej(any_runners ? Df2TreeRejReason::Ev
+                                     : (any_dedup_drop ? Df2TreeRejReason::Dedup : Df2TreeRejReason::MinP));
+            return make_linear_tree(anchor, drafts, lin_n);
+        }
         const int tail_len = std::max(0, nd - (best_cut + 1));
         return make_prefix_fanout_tree(anchor, drafts, best_cut, best_branch_tokens.data(), best_fanout,
                                        tail_len > 0 ? drafts + best_cut + 1 : nullptr, tail_len, cap);
@@ -1885,6 +1929,7 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
     if (opts.draft_conf > 0.0) {
         cut = df2_tree_cut_depth(probs, nd, opts.draft_conf);
         if (cut > cap - 3 || cut >= nd) {
+            set_rej(Df2TreeRejReason::Cut);
             return make_linear_tree(anchor, drafts, lin_n);
         }
     } else {
@@ -1898,16 +1943,22 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
             }
         }
         if (opts.max_cut >= 0 && cut > opts.max_cut) {
+            set_rej(Df2TreeRejReason::Cut);
             return make_linear_tree(anchor, drafts, lin_n);
         }
     }
 
     std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runners{};
+    bool dedup_drop = false;
     const int n_runners = detail::extract_selector_runners(cut, anchor, drafts, nd, toptok, seltab,
                                                            opts.min_branch_p, opts.dedup_siblings, runners,
                                                            opts.sample_walk, opts.q_temperature,
-                                                           opts.logit_bias, opts.logit_bias_len);
-    if (n_runners == 0) return make_linear_tree(anchor, drafts, lin_n);
+                                                           opts.logit_bias, opts.logit_bias_len,
+                                                           &dedup_drop);
+    if (n_runners == 0) {
+        set_rej(dedup_drop ? Df2TreeRejReason::Dedup : Df2TreeRejReason::MinP);
+        return make_linear_tree(anchor, drafts, lin_n);
+    }
 
     const int fan_budget = std::clamp(opts.max_fanout, 2, std::min(kDf2TreeMaxNodes - (1 + cut), cap - (1 + cut)));
     std::array<int32_t, kDf2TreeMaxNodes> branch_tokens{};
@@ -1916,7 +1967,10 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
     for (int k = 0; k < n_runners && fanout < fan_budget; ++k) {
         branch_tokens[static_cast<size_t>(fanout++)] = runners[static_cast<size_t>(k)].tok;
     }
-    if (fanout < 2) return make_linear_tree(anchor, drafts, lin_n);
+    if (fanout < 2) {
+        set_rej(dedup_drop ? Df2TreeRejReason::Dedup : Df2TreeRejReason::MinP);
+        return make_linear_tree(anchor, drafts, lin_n);
+    }
 
     const int tail_len = std::max(0, nd - (cut + 1));
     return make_prefix_fanout_tree(anchor, drafts, cut, branch_tokens.data(), fanout,
@@ -1939,15 +1993,30 @@ struct Df2TreeAcceptHist {
     std::array<int64_t, kDf2TreeMaxNodes> cut_hist{};  ///< 0..6 = single branch_node, 7 = multi-branch Caterpillar
     int64_t sampled_tree_rounds = 0;
     int64_t reject_resamples = 0;
+    bool sampled_req_active = false;
+    int64_t elig_rounds = 0;
+    std::array<int64_t, kDf2TreeRejReasonCount> rej_reason{};  ///< minp, ev, cut, ema, dedup
+    std::array<int64_t, kDf2TreeWidthBins> width_hist{};       ///< executed tree graph widths T=3..8
+
+    void observe_eligible() noexcept { ++elig_rounds; }
+
+    void observe_reject(Df2TreeRejReason reason) noexcept {
+        const size_t idx = static_cast<size_t>(reason);
+        if (idx < rej_reason.size()) ++rej_reason[idx];
+    }
 
     /// Records one verified tree round. Node `i` is counted as reached iff `i == 0` or its parent was accepted
     /// along `walk.path` (conditional reachability with branch-kill).
     void observe(const Df2TreeSpec& tree, const Df2TreeCommitWalk& walk,
-                 bool sampled_round = false, int64_t round_resamples = 0) noexcept {
+                 bool sampled_round = false, int64_t round_resamples = 0,
+                 int exec_width = 0) noexcept {
         if (!tree.valid() || walk.n_keep <= 0) return;
         ++tree_rounds;
         if (sampled_round) ++sampled_tree_rounds;
         if (round_resamples > 0) reject_resamples += round_resamples;
+        if (exec_width >= kDf2TreeMinVerifyT && exec_width <= kDf2TreeMaxNodes) {
+            ++width_hist[static_cast<size_t>(exec_width - kDf2TreeMinVerifyT)];
+        }
         if (walk.branch_hit) ++branch_hits;
         if (walk.runner_up_hit) ++runner_hits;
         total_accepted += walk.accepted_drafts();
@@ -2019,9 +2088,21 @@ struct Df2TreeAcceptHist {
             if (i > 0) s += ',';
             s += std::to_string(cut_hist[static_cast<size_t>(i)]);
         }
-        if (sampled_tree_rounds > 0 || reject_resamples > 0) {
+        if (sampled_req_active || sampled_tree_rounds > 0 || reject_resamples > 0) {
             s += " tree_sampled_rounds=" + std::to_string(sampled_tree_rounds) +
                  " tree_reject_resamples=" + std::to_string(reject_resamples);
+        }
+        if (sampled_req_active) {
+            s += " tree_elig_rounds=" + std::to_string(elig_rounds) + " tree_rej_reason=";
+            for (int i = 0; i < kDf2TreeRejReasonCount; ++i) {
+                if (i > 0) s += ',';
+                s += std::to_string(rej_reason[static_cast<size_t>(i)]);
+            }
+            s += " tree_width_hist=";
+            for (int i = 0; i < kDf2TreeWidthBins; ++i) {
+                if (i > 0) s += ',';
+                s += std::to_string(width_hist[static_cast<size_t>(i)]);
+            }
         }
         return s;
     }
@@ -2094,6 +2175,14 @@ inline bool parse_accept_hist_fields(const std::string& line, Df2TreeAcceptHist&
         !detail::parse_kv_i64(line, "tree_sampled_rounds=", tmp.sampled_tree_rounds)) return false;
     if (line.find("tree_reject_resamples=") != std::string::npos &&
         !detail::parse_kv_i64(line, "tree_reject_resamples=", tmp.reject_resamples)) return false;
+    if (line.find("tree_elig_rounds=") != std::string::npos) {
+        if (!detail::parse_kv_i64(line, "tree_elig_rounds=", tmp.elig_rounds)) return false;
+        tmp.sampled_req_active = true;
+    }
+    if (line.find("tree_rej_reason=") != std::string::npos &&
+        !detail::parse_csv_ints(line, "tree_rej_reason=", tmp.rej_reason, kDf2TreeRejReasonCount)) return false;
+    if (line.find("tree_width_hist=") != std::string::npos &&
+        !detail::parse_csv_ints(line, "tree_width_hist=", tmp.width_hist, kDf2TreeWidthBins)) return false;
     out = tmp;
     return true;
 }

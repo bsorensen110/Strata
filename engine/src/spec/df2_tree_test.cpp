@@ -1305,6 +1305,55 @@ int main() {
               "logit_bias -inf ban removes candidate from q_T support");
     }
 
+    // P5: Rejection-reason classification in df2_tree_build_from_selector_ex (Cut, MinP, Ev, Dedup).
+    {
+        std::array<int32_t, 7> drafts{101, 102, 103, 104, 105, 106, 107};
+        std::array<float, 7> probs{0.95f, 0.90f, 0.85f, 0.40f, 0.40f, 0.40f, 0.40f};
+        std::array<int32_t, 7 * kDf2TreeSelectorTopK> toptok{};
+        std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+        toptok.fill(-1);
+        seltab.fill(-100.0f);
+        for (int r = 0; r < 7; ++r) {
+            toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0] = drafts[static_cast<size_t>(r)];
+            toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 1] = 200 + r;
+            seltab[(static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 0] = 2.0f;
+            seltab[(static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 1] = 0.0f;
+        }
+        Df2TreeBuildOptions ropts;
+        ropts.draft_conf = 0.7;
+        ropts.min_branch_p = 0.25f;
+        ropts.max_fanout = 2;
+        ropts.max_nodes = 8;
+        ropts.max_cut = 1;  // conf_cut=3 > max_cut=1 -> Cut
+        Df2TreeRejReason rej = Df2TreeRejReason::None;
+        (void) df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7, toptok.data(), seltab.data(),
+                                               ropts, nullptr, &rej);
+        check(rej == Df2TreeRejReason::Cut, "max_cut exceeded records Cut rejection reason");
+
+        ropts.max_cut = -1;
+        // At cut=3, exp(2.0)/(exp(2.0)+1) ~ 0.88 vs runner ~ 0.12 < min_branch_p=0.25 -> MinP
+        (void) df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7, toptok.data(), seltab.data(),
+                                               ropts, nullptr, &rej);
+        check(rej == Df2TreeRejReason::MinP, "runner below min_branch_p records MinP rejection reason");
+
+        // Boost runner at cut=3 to p ~ 0.45 >= 0.25, then apply ev_cut=0.50 -> Ev
+        const size_t base3 = (3u * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+        seltab[base3 + 0] = 0.2f;
+        seltab[base3 + 1] = 0.0f;
+        ropts.ev_cut = 0.50f;
+        (void) df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7, toptok.data(), seltab.data(),
+                                               ropts, nullptr, &rej);
+        check(rej == Df2TreeRejReason::Ev, "runners surviving min_branch_p but dropped by ev_cut record Ev");
+
+        // Colliding runner with dedup_siblings=true -> Dedup
+        ropts.ev_cut = 0.0f;
+        ropts.dedup_siblings = true;
+        toptok[3 * kDf2TreeSelectorTopK + 1] = 99;  // anchor collision
+        (void) df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7, toptok.data(), seltab.data(),
+                                               ropts, nullptr, &rej);
+        check(rej == Df2TreeRejReason::Dedup, "runner stripped by dedup_siblings records Dedup");
+    }
+
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }

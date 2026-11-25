@@ -23551,6 +23551,7 @@ int main(int argc, char** argv) {
                 o.batch == 0 && n_stages <= 1 && !o.draft_auto && strata::core::Dflash2Drafter::head_native() &&
                 (tree_greedy_req || tree_sampled_req) &&
                 !gated_proposal && !pipe && fol == nullptr && req_logprobs < 0;
+            tree_accept_hist.sampled_req_active = strata::spec::df2_tree_on() && tree_sampled_req;
 #else
             const bool tree_req_eligible = false;
 #endif
@@ -24706,6 +24707,7 @@ int main(int argc, char** argv) {
                     const int tree_cap = (int) std::min<int64_t>(
                         std::min(S_mtp, strata::spec::kDf2TreeMaxNodes), o.max_context - p);
                     if (tree_cap >= 4) {
+                        if (accept_hist_on) tree_accept_hist.observe_eligible();
                         strata::spec::Df2TreeBuildOptions tree_opts;
                         tree_opts.draft_conf = o.draft_conf;
                         const float raw_min_branch_p = strata::spec::df2_tree_min_branch_p();
@@ -24735,13 +24737,22 @@ int main(int argc, char** argv) {
                         tree_opts.q_temperature = df2_q_temp;
                         tree_opts.logit_bias = df2_logit_bias;
                         tree_opts.logit_bias_len = df2_logit_bias_len;
+                        strata::spec::Df2TreeRejReason build_rej = strata::spec::Df2TreeRejReason::None;
                         tree_spec = strata::spec::df2_tree_build_from_selector_ex(
                             x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(), df2.tree_seltab(),
-                            tree_opts, tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr);
+                            tree_opts, tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr, &build_rej);
                         const float row_ema_thresh = strata::spec::df2_tree_row_ema();
-                        if (tree_spec.valid() && !tree_spec.is_linear() && tree_spec.is_caterpillar() &&
-                            (row_ema_thresh <= 0.0f ||
-                             tree_row_ema_policy.allow_tree(static_cast<double>(row_ema_thresh)))) {
+                        if (!tree_spec.valid() || tree_spec.is_linear() || !tree_spec.is_caterpillar()) {
+                            if (accept_hist_on) {
+                                tree_accept_hist.observe_reject(
+                                    build_rej == strata::spec::Df2TreeRejReason::None
+                                        ? strata::spec::Df2TreeRejReason::MinP
+                                        : build_rej);
+                            }
+                        } else if (row_ema_thresh > 0.0f &&
+                                   !tree_row_ema_policy.allow_tree(static_cast<double>(row_ema_thresh))) {
+                            if (accept_hist_on) tree_accept_hist.observe_reject(strata::spec::Df2TreeRejReason::Ema);
+                        } else {
                             bool q_ok = true;
                             if (df2_sample_active && strata::spec::df2_tree_sampled_on()) {
                                 q_ok = strata::spec::df2_tree_populate_sampled_q(
@@ -24755,11 +24766,16 @@ int main(int argc, char** argv) {
                                 tree_sampled_round = strata::spec::df2_tree_sampled_on() &&
                                                      !req_sp.greedy && req_sp.temperature > 0.0f;
                                 T = tree_spec.count;
-                            } else if (df2_sample_active && q_ok && tree_spec.valid() && tree_spec.is_linear()) {
-                                // Preserve the draw-independent spine count if dedup_siblings pruned all runner-ups.
-                                T = std::min(tree_cap, tree_spec.count);
-                                T_mtp = T;
-                                df2_prefix_n = std::min(std::max(T - 1, 0), df2_q_count);
+                            } else {
+                                if (accept_hist_on) {
+                                    tree_accept_hist.observe_reject(strata::spec::Df2TreeRejReason::Dedup);
+                                }
+                                if (df2_sample_active && q_ok && tree_spec.valid() && tree_spec.is_linear()) {
+                                    // Preserve the draw-independent spine count if dedup_siblings pruned all runner-ups.
+                                    T = std::min(tree_cap, tree_spec.count);
+                                    T_mtp = T;
+                                    df2_prefix_n = std::min(std::max(T - 1, 0), df2_q_count);
+                                }
                             }
                         }
                     }
@@ -25106,7 +25122,7 @@ int main(int argc, char** argv) {
                         a = std::max(0, tree_walk.n_keep - 1);
                     }
                     if (accept_hist_on) {
-                        tree_accept_hist.observe(tree_spec, tree_walk, tree_sampled_round, tree_resamples);
+                        tree_accept_hist.observe(tree_spec, tree_walk, tree_sampled_round, tree_resamples, meta_rows);
                     }
                     if (strata::spec::df2_tree_adaptive_on()) tree_adaptive_policy.observe_tree(tree_spec, tree_walk);
                     if (strata::spec::df2_tree_row_ema() > 0.0f) {
@@ -26064,8 +26080,10 @@ int main(int argc, char** argv) {
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
             accept_hist.emit(stderr, accept_hist_on, telemetry_req,
-                             (strata::spec::df2_tree_on() && tree_accept_hist.tree_rounds > 0) ? &tree_accept_hist
-                                                                                                : nullptr);
+                             (strata::spec::df2_tree_on() &&
+                              (tree_accept_hist.tree_rounds > 0 || tree_accept_hist.sampled_req_active))
+                                 ? &tree_accept_hist
+                                 : nullptr);
             if (ck_from_pool + ck_fresh > 0)
                 std::fprintf(stderr, "strata serve: checkpoint pool: this request took %zu checkpoint%s ready from the pool and allocated %zu fresh\n",
                              ck_from_pool, ck_from_pool == 1 ? "" : "s", ck_fresh);

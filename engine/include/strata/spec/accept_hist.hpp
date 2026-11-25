@@ -55,7 +55,7 @@ struct Df2AcceptHist {
         std::fprintf(out, " lookup_rows=%lld lookup_accept=%lld chain_rows=%lld chain_accept=%lld",
                      (long long) lookup_rows, (long long) lookup_accept,
                      (long long) chain_rows, (long long) chain_accept);
-        if (tree != nullptr && tree->tree_rounds > 0) {
+        if (tree != nullptr && (tree->tree_rounds > 0 || tree->sampled_req_active)) {
             std::fprintf(out, " %s", tree->format_accept_hist_fields().c_str());
         }
         std::fprintf(out, "\n");
