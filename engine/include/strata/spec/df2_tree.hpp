@@ -127,6 +127,32 @@ inline constexpr int df2_tree_select_width(int node_count, bool var_t_on,
     return kDf2TreeMaxNodes;
 }
 
+/// Parses STRATA_DF2_TREE_SPINE_SKIP ("1" skips provably-identity KV compaction on contiguous spine commits; default OFF).
+inline bool df2_tree_spine_skip_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+/// Process-wide gate for skipping KV tree-compaction on contiguous-spine commits (default OFF).
+inline bool df2_tree_spine_skip_on() noexcept {
+    static const bool on = df2_tree_spine_skip_env_enabled(std::getenv("STRATA_DF2_TREE_SPINE_SKIP"));
+    return on;
+}
+
+/// Returns true iff `path[0..n_keep-1]` is the contiguous primary spine `path[k] == k`.
+inline bool df2_tree_is_contiguous_spine(const uint8_t* path, int n_keep) noexcept {
+    if (path == nullptr || n_keep < 1 || n_keep > kDf2TreeMaxNodes) return false;
+    for (int k = 0; k < n_keep; ++k) {
+        if (static_cast<int>(path[k]) != k) return false;
+    }
+    return true;
+}
+
+/// Returns true iff KV tree compaction (`kv_compact_tree`) is an exact identity on `path[0..n_keep-1]`
+/// and STRATA_DF2_TREE_SPINE_SKIP is enabled.
+inline bool df2_tree_can_skip_kv_compact(bool spine_skip_on, const uint8_t* path, int n_keep) noexcept {
+    return spine_skip_on && df2_tree_is_contiguous_spine(path, n_keep);
+}
+
 enum class Df2TreeShape : uint8_t {
     Linear = 0,
     PrefixFanout = 1,

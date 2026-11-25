@@ -743,10 +743,12 @@ private:
     cudaGraphExec_t exec_tree_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     cudaGraphExec_t exec_tree_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     cudaGraphExec_t commit_tree_exec_ = nullptr;
+    cudaGraphExec_t commit_tree_spine_exec_ = nullptr;
     bool launched_tree_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     bool launched_tree_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     bool ensure_tree_buffers(std::string& err);
     bool capture_tree(int T, std::string& err);
+    bool capture_commit_tree_graph(cudaGraphExec_t& out_exec, bool include_kv_compact, std::string& err);
     bool capture_commit_tree(std::string& err);
     void stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t pos0, int T);
 

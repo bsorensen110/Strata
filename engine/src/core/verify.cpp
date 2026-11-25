@@ -841,6 +841,7 @@ Verifier::~Verifier() {
             for (auto& e : row)
                 if (e) cudaGraphExecDestroy(e);
         if (commit_tree_exec_) cudaGraphExecDestroy(commit_tree_exec_);
+        if (commit_tree_spine_exec_) cudaGraphExecDestroy(commit_tree_spine_exec_);
         if (d_tree_) cudaFree(d_tree_);
         if (d_tree_commit_) cudaFree(d_tree_commit_);
         if (h_tree_) cudaFreeHost(h_tree_);
@@ -7218,8 +7219,8 @@ bool Verifier::capture_tree(int T, std::string& err) {
     return true;
 }
 
-bool Verifier::capture_commit_tree(std::string& err) {
-    if (commit_tree_exec_ != nullptr) return true;
+bool Verifier::capture_commit_tree_graph(cudaGraphExec_t& out_exec, bool include_kv_compact, std::string& err) {
+    if (out_exec != nullptr) return true;
 #if defined(STRATA_GPU_METAL)
     err = "verify: tree commit unsupported on Metal";
     return false;
@@ -7247,6 +7248,18 @@ bool Verifier::capture_commit_tree(std::string& err) {
         for (int64_t l = lb_; l < le_; ++l) {
             if (!is_qsa_layer(g, l)) ++n_gdn;
         }
+        // Contiguous-spine commit (path[k] == k) identity audit (STRATA_DF2_TREE_SPINE_SKIP=1):
+        //   1. GDN (`gdn_commit_tree_layers`): NOT an identity. During `run_tree`, `gdn_conv_*_tree` and
+        //      `gdn_step_norm_tree` treat persistent `ss.gdn_state` as read-only and save node intermediates in
+        //      per-layer scratch (`qkv_L_`, `h_L_`, `gate_L_`, `beta_L_`). Must always run to advance conv + S.
+        //   2. QSA KV (`kv_compact_tree`): EXACT IDENTITY when `path[k] == k` for all 0 <= k < n_keep, because
+        //      `run_tree` already wrote node k's K/V into physical cell `pos0 + k` with RoPE pos `pos0 + k`, and
+        //      `kv_compact_tree_kernel` skips every `row == k`. Safe to omit from the spine-only graph.
+        //   3. QSA indexer (`native_qsa_indexer_append_tree_layers`): NOT an identity. `record_window` skips
+        //      `idx_append` when `tree_mode == true`, leaving `idx_tail`/`idx_pooled`/`idx_dead` at `pos0 - 1`.
+        //      Must always run (with identity `path[k] == k` still writing slots `pos0..pos0+n_keep-1`).
+        //   4. PLE history (`copy_indexed` into `ss.ple.hist`): NOT an identity. `native_ple_postops_tree_snap`
+        //      leaves `ss.ple.hist` at `pos0 - 1` and stages normalized rows in `hist_snap_`. Must always run.
         if (n_gdn > 0) {
             if (!gdn_commit_tree_layers(
                     ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats, (int64_t) gdn_floats,
@@ -7258,11 +7271,13 @@ bool Verifier::capture_commit_tree(std::string& err) {
                 ok = false;
             }
         }
-        for (int64_t l = lb_, qi = qsa_index; l < le_ && ok; ++l) {
-            if (!is_qsa_layer(g, l)) continue;
-            const QsaState& st = ss.qsa_states[qi];
-            kv_compact_tree(qsa_attn_pools(st), st.host, qsa_kv_format(st), d_tree_commit_, s, cs_);
-            ++qi;
+        if (include_kv_compact) {
+            for (int64_t l = lb_, qi = qsa_index; l < le_ && ok; ++l) {
+                if (!is_qsa_layer(g, l)) continue;
+                const QsaState& st = ss.qsa_states[qi];
+                kv_compact_tree(qsa_attn_pools(st), st.host, qsa_kv_format(st), d_tree_commit_, s, cs_);
+                ++qi;
+            }
         }
         if (ok) {
             QsaIndexerLayers il{};
@@ -7313,9 +7328,19 @@ bool Verifier::capture_commit_tree(std::string& err) {
         err = std::string("verify: tree commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
-    const bool made = instantiate_evicting(commit_tree_exec_, graph, {}, "verify: tree commit instantiate: ", err, 0);
+    const bool made = instantiate_evicting(
+        out_exec, graph, {}, include_kv_compact ? "verify: tree commit instantiate: " : "verify: tree spine commit instantiate: ",
+        err, 0);
     cudaGraphDestroy(graph);
     return made;
+}
+
+bool Verifier::capture_commit_tree(std::string& err) {
+    if (!capture_commit_tree_graph(commit_tree_exec_, true, err)) return false;
+    if (strata::spec::df2_tree_spine_skip_on()) {
+        if (!capture_commit_tree_graph(commit_tree_spine_exec_, false, err)) return false;
+    }
+    return true;
 }
 
 bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, PoolMultiFn pool, void* user,
@@ -7547,7 +7572,10 @@ bool Verifier::commit_tree(const uint8_t* path, int n_keep, std::string& err) {
         h_tree_commit_[3 + k] = k < n_keep ? (int32_t) path[k] : 0;
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    const cudaError_t le = cudaGraphLaunch(commit_tree_exec_, cs_);
+    const bool skip_kv = strata::spec::df2_tree_can_skip_kv_compact(
+        strata::spec::df2_tree_spine_skip_on(), path, n_keep);
+    cudaGraphExec_t exec_commit = skip_kv ? commit_tree_spine_exec_ : commit_tree_exec_;
+    const cudaError_t le = cudaGraphLaunch(exec_commit, cs_);
     if (le != cudaSuccess) { err = std::string("verify: tree commit launch: ") + cudaGetErrorString(le); return false; }
     if (!g_commit_async || next_ != nullptr) {
         const cudaError_t se = cudaStreamSynchronize(cs_);

@@ -675,6 +675,56 @@ void test_var_t_width_ladder() {
           "gdn_order(T=5) keeps leaf-before-spine without dummy leaves in [0,5)");
 }
 
+void test_spine_skip_predicate() {
+    check(!df2_tree_spine_skip_env_enabled(nullptr), "spine_skip env null is off");
+    check(!df2_tree_spine_skip_env_enabled(""), "spine_skip env empty is off");
+    check(!df2_tree_spine_skip_env_enabled("0"), "spine_skip env 0 is off");
+    check(!df2_tree_spine_skip_env_enabled("true"), "spine_skip env non-1 is off");
+    check(df2_tree_spine_skip_env_enabled("1"), "spine_skip env 1 is on");
+
+    const uint8_t contig[8] = {0, 1, 2, 3, 4, 5, 6, 7};
+    check(!df2_tree_is_contiguous_spine(nullptr, 1), "null path rejected");
+    check(!df2_tree_is_contiguous_spine(contig, 0), "n_keep=0 rejected");
+    check(!df2_tree_is_contiguous_spine(contig, 9), "n_keep>8 rejected");
+    for (int k = 1; k <= 8; ++k) {
+        check(df2_tree_is_contiguous_spine(contig, k), "contiguous spine prefix detected");
+        check(!df2_tree_can_skip_kv_compact(false, contig, k), "knob off never skips kv_compact_tree");
+        check(df2_tree_can_skip_kv_compact(true, contig, k), "knob on + contiguous spine skips kv_compact_tree");
+    }
+
+    const uint8_t bad_root[2] = {1, 2};
+    const uint8_t branched2[2] = {0, 2};
+    const uint8_t branched4[4] = {0, 1, 2, 5};
+    const uint8_t branched5[5] = {0, 1, 3, 4, 5};
+    check(!df2_tree_is_contiguous_spine(bad_root, 1), "non-zero root rejected");
+    check(!df2_tree_is_contiguous_spine(branched2, 2), "depth-1 branch rejected");
+    check(!df2_tree_is_contiguous_spine(branched4, 4), "deep runner-up branch rejected");
+    check(!df2_tree_is_contiguous_spine(branched5, 5), "shifted branch tail rejected");
+    check(!df2_tree_can_skip_kv_compact(true, branched4, 4), "knob on never skips kv_compact_tree when branched");
+
+    // Cross-check against df2_tree_greedy_accept walks on a 7-node fanout tree.
+    const int32_t prefix[2] = {10, 11};
+    const int32_t br[3] = {20, 21, 22};
+    const int32_t ptail[1] = {30};
+    const Df2TreeSpec t = make_prefix_fanout_tree(1, prefix, 2, br, 3, ptail, 1);
+
+    // Contiguous spine acceptance (0->1->2->3->6 => n_keep=5, path={0,1,2,3,6}? Wait: node 6!=4!).
+    // Primary prefix+branch up to node 3 is contiguous {0,1,2,3}; tail node 6 has index 6 != depth 4!
+    const int32_t argmax_spine3[7] = {10, 11, 20, 999, 0, 0, 0};
+    const Df2TreeCommitWalk walk_s3 = df2_tree_greedy_accept(t, argmax_spine3);
+    check(walk_s3.n_keep == 4 && !walk_s3.needs_compaction(), "primary walk 0->1->2->3 needs no compaction");
+    check(df2_tree_can_skip_kv_compact(true, walk_s3.path.data(), walk_s3.n_keep),
+          "primary walk 0->1->2->3 qualifies for spine KV skip");
+
+    // Primary walk continuing to ptail node 6 skips over runner-up leaves 4,5 -> path[4]==6 != 4!
+    const int32_t argmax_tail[7] = {10, 11, 20, 30, 0, 0, 999};
+    const Df2TreeCommitWalk walk_tail = df2_tree_greedy_accept(t, argmax_tail);
+    check(walk_tail.n_keep == 5 && walk_tail.path[4] == 6 && walk_tail.needs_compaction(),
+          "tail past fanout branch shifts physical index (6 != 4) and requires compaction");
+    check(!df2_tree_can_skip_kv_compact(true, walk_tail.path.data(), walk_tail.n_keep),
+          "non-contiguous tail after fanout does NOT skip kv_compact_tree");
+}
+
 }  // namespace
 
 int main() {
@@ -691,6 +741,7 @@ int main() {
     test_extended_telemetry_and_runner_hit();
     test_gdn_order_ple_taps_and_remap_invariants();
     test_var_t_width_ladder();
+    test_spine_skip_predicate();
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }
