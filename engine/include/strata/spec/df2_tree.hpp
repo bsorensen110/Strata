@@ -74,14 +74,25 @@ inline float df2_tree_ev_cut() noexcept {
     return v;
 }
 
-/// Parses STRATA_DF2_TREE_ADAPTIVE ("1" enables EWMA-calibrated branch cut / EV probabilities; default OFF).
+/// Parses STRATA_DF2_TREE_ADAPTIVE ("1" enables EWMA-calibrated branch cut / adaptive gating; default OFF).
 inline bool df2_tree_adaptive_env_enabled(const char* value) noexcept {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
-/// Process-wide gate for adaptive EWMA tree branch-cut selection (default OFF).
+/// Process-wide gate for adaptive EWMA tree branch-cut / gating selection (default OFF).
 inline bool df2_tree_adaptive_on() noexcept {
     static const bool on = df2_tree_adaptive_env_enabled(std::getenv("STRATA_DF2_TREE_ADAPTIVE"));
+    return on;
+}
+
+/// Parses STRATA_DF2_TREE_ADAPTIVE_INFLATE ("1" opts in to legacy upward EMA inflation of low selector_p; default OFF).
+inline bool df2_tree_adaptive_inflate_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+/// Process-wide gate allowing adaptive EMA blending to inflate low selector probabilities (default OFF).
+inline bool df2_tree_adaptive_inflate_on() noexcept {
+    static const bool on = df2_tree_adaptive_inflate_env_enabled(std::getenv("STRATA_DF2_TREE_ADAPTIVE_INFLATE"));
     return on;
 }
 
@@ -459,6 +470,8 @@ struct Df2TreeBuildOptions {
     float ev_cut = 0.0f;
     bool adaptive_cut = false;
     bool dedup_siblings = false;
+    bool adaptive_inflate = false;       ///< opt-in: allow effective_prob to raise low selector_p toward EMA
+    bool ev_use_adaptive_probs = false;  ///< opt-in: price EV node candidates with effective_prob instead of raw p
 };
 
 class Df2TreeAdaptivePolicy;
@@ -856,15 +869,18 @@ public:
         return depth_seen_[static_cast<size_t>(d)];
     }
 
-    /// Blends raw selector confidence with EWMA empirical depth acceptance as observations accumulate.
-    double effective_prob(int d, float selector_p) const noexcept {
+    /// Calibrates raw selector confidence with EWMA empirical depth acceptance as observations accumulate.
+    /// By default (`allow_inflate == false`), never inflates low-confidence `selector_p` above raw p
+    /// (only discounts overconfident drafts when empirical depth acceptance falls below `selector_p`).
+    double effective_prob(int d, float selector_p, bool allow_inflate = false) const noexcept {
         const double sp = std::clamp(static_cast<double>(selector_p), 0.0, 1.0);
         if (d < 0 || d >= kDf2TreeMaxDrafts) return sp;
         const double seen = depth_seen_[static_cast<size_t>(d)];
         if (!(seen > 0.0)) return sp;
         const double emp = empirical_rate(d);
         const double w = 0.65 * (seen / (seen + kPriorWeight));
-        return std::clamp((1.0 - w) * sp + w * emp, 0.0, 1.0);
+        const double blended = std::clamp((1.0 - w) * sp + w * emp, 0.0, 1.0);
+        return allow_inflate ? blended : std::min(sp, blended);
     }
 
 private:
@@ -994,9 +1010,10 @@ inline int extract_selector_runners(int step, int32_t anchor, const int32_t* dra
 
 }  // namespace detail
 
-/// Extended selector-table tree builder supporting EV-budget caterpillar allocation (`ev_cut > 0`),
-/// EWMA-calibrated branch-cut selection (`adaptive_cut`), and sibling deduplication (`dedup_siblings`).
-/// When `ev_cut <= 0`, `!adaptive_cut`, and `!dedup_siblings`, reproduces legacy behavior identically.
+/// Extended selector-table tree builder supporting composable EV-budget caterpillar allocation (`ev_cut > 0`),
+/// EWMA-calibrated branch-cut / net-EV adaptive gating (`adaptive_cut`), and sibling deduplication (`dedup_siblings`).
+/// EV decisions price raw `probs` by default unless opted in; when `ev_cut <= 0`, `!adaptive_cut`, and
+/// `!dedup_siblings`, reproduces legacy behavior identically.
 inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t* drafts, const float* probs,
                                                     int n_drafts, const int32_t* toptok, const float* seltab,
                                                     const Df2TreeBuildOptions& opts,
@@ -1008,17 +1025,30 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
         return make_linear_tree(anchor, drafts, lin_n);
     }
 
+    std::array<double, kDf2TreeMaxDrafts> p_raw{};
+    std::array<double, kDf2TreeMaxDrafts + 1> surv_raw{};
+    std::array<double, kDf2TreeMaxDrafts> p_cal{};
+    std::array<double, kDf2TreeMaxDrafts + 1> surv_cal{};
+    surv_raw[0] = 1.0;
+    surv_cal[0] = 1.0;
+    for (int d = 0; d < nd; ++d) {
+        const double rp = std::clamp(static_cast<double>(probs[d]), 0.0, 1.0);
+        p_raw[static_cast<size_t>(d)] = rp;
+        surv_raw[static_cast<size_t>(d + 1)] = surv_raw[static_cast<size_t>(d)] * rp;
+        const double cp = (opts.adaptive_cut && adaptive != nullptr)
+            ? adaptive->effective_prob(d, probs[d], opts.adaptive_inflate)
+            : rp;
+        p_cal[static_cast<size_t>(d)] = cp;
+        surv_cal[static_cast<size_t>(d + 1)] = surv_cal[static_cast<size_t>(d)] * cp;
+    }
+
     // Policy 1: Expected-value node budget (caterpillar optimal under linearity of expectation).
+    // Prices raw `probs` by default (`!ev_use_adaptive_probs`); when `adaptive_cut` is also enabled,
+    // composes with Policy 2 calibrated filtering and adaptive net-EV gating instead of bypassing Policy 2.
     if (opts.ev_cut > 0.0f) {
-        std::array<double, kDf2TreeMaxDrafts> p_prim{};
-        std::array<double, kDf2TreeMaxDrafts + 1> surv{};
-        surv[0] = 1.0;
-        for (int d = 0; d < nd; ++d) {
-            p_prim[static_cast<size_t>(d)] = (opts.adaptive_cut && adaptive != nullptr)
-                ? adaptive->effective_prob(d, probs[d])
-                : std::clamp(static_cast<double>(probs[d]), 0.0, 1.0);
-            surv[static_cast<size_t>(d + 1)] = surv[static_cast<size_t>(d)] * p_prim[static_cast<size_t>(d)];
-        }
+        const auto& ev_surv =
+            (opts.ev_use_adaptive_probs && opts.adaptive_cut && adaptive != nullptr) ? surv_cal : surv_raw;
+        const double ev_thresh = static_cast<double>(opts.ev_cut);
 
         struct EvCand {
             int parent_depth;
@@ -1026,6 +1056,7 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
             uint8_t rank;
             int32_t tok;
             double ev;
+            double cal_ev;
         };
         constexpr int kMaxCands = kDf2TreeMaxDrafts * kDf2TreeMaxNodes;
         std::array<EvCand, kMaxCands> cands{};
@@ -1033,19 +1064,24 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
         const int max_runners = std::max(1, opts.max_fanout - 1);
 
         for (int d = 0; d < nd; ++d) {
-            const double spine_ev = surv[static_cast<size_t>(d + 1)];
-            if (spine_ev >= static_cast<double>(opts.ev_cut) && n_cands < kMaxCands) {
-                cands[static_cast<size_t>(n_cands++)] = EvCand{d, true, 0, drafts[d], spine_ev};
+            const double spine_ev = ev_surv[static_cast<size_t>(d + 1)];
+            const double spine_cal_ev = surv_cal[static_cast<size_t>(d + 1)];
+            if (spine_ev >= ev_thresh && (!opts.adaptive_cut || spine_cal_ev >= ev_thresh) && n_cands < kMaxCands) {
+                cands[static_cast<size_t>(n_cands++)] =
+                    EvCand{d, true, 0, drafts[d], opts.adaptive_cut ? spine_cal_ev : spine_ev, spine_cal_ev};
             }
             std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
             const int n_run = detail::extract_selector_runners(d, anchor, drafts, nd, toptok, seltab,
                                                                opts.min_branch_p, opts.dedup_siblings, runs);
             const int take = std::min(n_run, max_runners);
             for (int k = 0; k < take && n_cands < kMaxCands; ++k) {
-                const double leaf_ev = surv[static_cast<size_t>(d)] * static_cast<double>(runs[static_cast<size_t>(k)].p);
-                if (leaf_ev >= static_cast<double>(opts.ev_cut)) {
+                const double p_run = static_cast<double>(runs[static_cast<size_t>(k)].p);
+                const double leaf_ev = ev_surv[static_cast<size_t>(d)] * p_run;
+                const double leaf_cal_ev = surv_cal[static_cast<size_t>(d)] * p_run;
+                if (leaf_ev >= ev_thresh && (!opts.adaptive_cut || leaf_cal_ev >= ev_thresh)) {
                     cands[static_cast<size_t>(n_cands++)] = EvCand{
-                        d, false, static_cast<uint8_t>(k + 1), runs[static_cast<size_t>(k)].tok, leaf_ev};
+                        d, false, static_cast<uint8_t>(k + 1), runs[static_cast<size_t>(k)].tok,
+                        opts.adaptive_cut ? leaf_cal_ev : leaf_ev, leaf_cal_ev};
                 }
             }
         }
@@ -1103,23 +1139,22 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
             kept_leaves[static_cast<size_t>(j + 1)] = key;
         }
 
-        // Build canonical caterpillar: primary spine nodes first (1..spine_len), then leaves by parent depth.
-        // Wait: to keep topological order AND lowest-index primary-first tie-breaking cleanly in canonical order,
-        // emit nodes depth-by-depth with primary spine child before runner-up leaves? No: in canonicalize,
-        // parent < child is required; placing spine 1..spine_len first and leaves after ALWAYS satisfies
-        // parent < child AND guarantees primary spine children have lower node indices than runner-ups!
+        // Placing spine 1..spine_len first and leaves after always satisfies parent < child AND guarantees
+        // primary spine children have lower node indices than runner-ups.
         Df2TreeSpec t;
         t.count = 1;
         t.token[0] = anchor;
         t.parent[0] = kDf2TreeNoParent;
         t.depth[0] = 0;
         t.slot_rank[0] = 0;
+        double e_tree_cal = 0.0;
         for (int d = 0; d < spine_len && t.count < cap; ++d) {
             const int idx = t.count++;
             t.token[static_cast<size_t>(idx)] = drafts[d];
             t.parent[static_cast<size_t>(idx)] = static_cast<int8_t>(idx - 1);
             t.depth[static_cast<size_t>(idx)] = static_cast<uint8_t>(idx);
             t.slot_rank[static_cast<size_t>(idx)] = 0;
+            e_tree_cal += surv_cal[static_cast<size_t>(d + 1)];
         }
         for (int k = 0; k < n_leaves && t.count < cap; ++k) {
             const EvCand& lc = kept_leaves[static_cast<size_t>(k)];
@@ -1137,6 +1172,7 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
             t.parent[static_cast<size_t>(idx)] = static_cast<int8_t>(p_node);
             t.depth[static_cast<size_t>(idx)] = static_cast<uint8_t>(t.depth[static_cast<size_t>(p_node)] + 1);
             t.slot_rank[static_cast<size_t>(idx)] = lc.rank;
+            e_tree_cal += lc.cal_ev;
         }
 
         std::array<int, kDf2TreeMaxNodes> child_cnt{};
@@ -1154,6 +1190,20 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
         if (branch_parents == 0) {
             return make_linear_tree(anchor, drafts, lin_n);
         }
+
+        if (opts.adaptive_cut) {
+            const int lin_cf = (opts.draft_conf > 0.0)
+                ? std::min(lin_n, df2_tree_cut_depth(probs, nd, opts.draft_conf))
+                : lin_n;
+            double e_lin_cal = 0.0;
+            for (int d = 0; d < lin_cf; ++d) e_lin_cal += surv_cal[static_cast<size_t>(d + 1)];
+            const double net_tree_cal = e_tree_cal - ev_thresh * static_cast<double>(t.count - 1);
+            const double net_lin_cal = e_lin_cal - ev_thresh * static_cast<double>(lin_cf);
+            if (net_tree_cal <= net_lin_cal + 1e-6) {
+                return make_linear_tree(anchor, drafts, lin_n);
+            }
+        }
+
         t.shape = (branch_parents == 1) ? Df2TreeShape::PrefixFanout : Df2TreeShape::Caterpillar;
         t.branch_node = (branch_parents == 1) ? static_cast<int8_t>(only_bp) : -1;
         t.build_anc();
@@ -1162,17 +1212,8 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
 
     // Policy 2: Adaptive branch-cut & fanout selection maximizing calibrated expected accepted rows.
     if (opts.adaptive_cut) {
-        std::array<double, kDf2TreeMaxDrafts> p_prim{};
-        std::array<double, kDf2TreeMaxDrafts + 1> surv{};
-        surv[0] = 1.0;
-        for (int d = 0; d < nd; ++d) {
-            p_prim[static_cast<size_t>(d)] = (adaptive != nullptr)
-                ? adaptive->effective_prob(d, probs[d])
-                : std::clamp(static_cast<double>(probs[d]), 0.0, 1.0);
-            surv[static_cast<size_t>(d + 1)] = surv[static_cast<size_t>(d)] * p_prim[static_cast<size_t>(d)];
-        }
         double e_lin = 0.0;
-        for (int d = 0; d < lin_n; ++d) e_lin += surv[static_cast<size_t>(d + 1)];
+        for (int d = 0; d < lin_n; ++d) e_lin += surv_cal[static_cast<size_t>(d + 1)];
 
         double best_e = e_lin + 1e-6;
         int best_cut = -1;
@@ -1190,15 +1231,15 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
             if (max_f < 2) continue;
 
             double prefix_e = 0.0;
-            for (int i = 0; i < c; ++i) prefix_e += surv[static_cast<size_t>(i + 1)];
+            for (int i = 0; i < c; ++i) prefix_e += surv_cal[static_cast<size_t>(i + 1)];
 
             double runner_sum = 0.0;
             for (int f = 2; f <= max_f; ++f) {
-                runner_sum += surv[static_cast<size_t>(c)] * static_cast<double>(runs[static_cast<size_t>(f - 2)].p);
+                runner_sum += surv_cal[static_cast<size_t>(c)] * static_cast<double>(runs[static_cast<size_t>(f - 2)].p);
                 const int tail_len = std::min(std::max(0, nd - (c + 1)), std::max(0, cap - (1 + c + f)));
                 double tail_e = 0.0;
-                for (int j = 1; j <= tail_len; ++j) tail_e += surv[static_cast<size_t>(c + 1 + j)];
-                const double cand_e = prefix_e + surv[static_cast<size_t>(c + 1)] + runner_sum + tail_e;
+                for (int j = 1; j <= tail_len; ++j) tail_e += surv_cal[static_cast<size_t>(c + 1 + j)];
+                const double cand_e = prefix_e + surv_cal[static_cast<size_t>(c + 1)] + runner_sum + tail_e;
                 if (cand_e > best_e) {
                     best_e = cand_e;
                     best_cut = c;

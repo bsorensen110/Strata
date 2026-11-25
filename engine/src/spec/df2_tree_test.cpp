@@ -725,6 +725,128 @@ void test_spine_skip_predicate() {
           "non-contiguous tail after fanout does NOT skip kv_compact_tree");
 }
 
+void test_composable_ev_adaptive_matrix_and_no_inflation() {
+    check(!df2_tree_adaptive_inflate_env_enabled(nullptr) &&
+              !df2_tree_adaptive_inflate_env_enabled("") &&
+              !df2_tree_adaptive_inflate_env_enabled("0") &&
+              df2_tree_adaptive_inflate_env_enabled("1"),
+          "adaptive_inflate env gate parser");
+
+    Df2TreeAdaptivePolicy high_pol;
+    for (int i = 0; i < 30; ++i) high_pol.observe_linear(7, 7);
+    // Non-inflating effective_prob must never inflate low selector_p above raw p unless opted in.
+    check(high_pol.effective_prob(0, 0.20f) == static_cast<double>(0.20f),
+          "default effective_prob clamps upward inflation to raw selector_p");
+    check(high_pol.effective_prob(0, 0.20f, true) > 0.45,
+          "opt-in allow_inflate=true reproduces upward EMA blend");
+
+    Df2TreeAdaptivePolicy low_pol;
+    for (int i = 0; i < 30; ++i) low_pol.observe_linear(7, 1);
+    check(low_pol.effective_prob(1, 0.85f) < 0.60,
+          "default effective_prob still discounts overconfident collapsed depth");
+
+    // 1. 2x2 selection matrix (ev_cut x adaptive) on a standard profile with collapsed depth-1 history.
+    std::array<int32_t, 7> drafts{101, 102, 103, 104, 105, 106, 107};
+    std::array<float, 7> probs{0.90f, 0.85f, 0.80f, 0.35f, 0.35f, 0.30f, 0.30f};
+    std::array<int32_t, 7 * kDf2TreeSelectorTopK> toptok{};
+    std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+    toptok.fill(-1);
+    seltab.fill(-100.0f);
+    for (int r = 0; r < 7; ++r) {
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0] = drafts[static_cast<size_t>(r)];
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 1] = 200 + r;
+        seltab[(static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 0] = 0.0f;
+    }
+    // Depth-2 runner-up has p_run ~ 0.40 -> raw leaf_ev = 0.90*0.85*0.40 = 0.306 (>= 0.25).
+    // Under low_pol (emp(1) ~ 0.068 -> p_cal[1] < 0.56), cal leaf_ev = 0.90*0.54*0.40 < 0.25.
+    const size_t base2 = (2u * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+    seltab[base2 + 0] = 0.4055f;  // exp(0.4055) = 1.50 -> runner = 1/2.5 = 0.40
+    seltab[base2 + 1] = 0.0f;
+
+    // Cell (0,0): ev_cut=0, adaptive=false => legacy draft_conf cut at c=2 (0.90*0.85=0.765 >= 0.7, *0.80=0.612 < 0.7).
+    Df2TreeBuildOptions opts;
+    opts.draft_conf = 0.7;
+    opts.min_branch_p = 0.10f;
+    opts.max_fanout = 2;
+    opts.max_nodes = 8;
+    const Df2TreeSpec cell00 = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                               toptok.data(), seltab.data(), opts, &low_pol);
+    const Df2TreeSpec cell00_leg = df2_tree_build_from_selector(99, drafts.data(), probs.data(), 7,
+                                                                toptok.data(), seltab.data(), 0.7, 0.10f, 2, 8);
+    check(cell00.count == 8 && cell00.shape == Df2TreeShape::PrefixFanout && cell00.branch_node == 2 &&
+              cell00.token == cell00_leg.token && cell00.parent == cell00_leg.parent,
+          "matrix (ev=0, adaptive=0): bit-identical legacy PrefixFanout regardless of adaptive pointer");
+
+    // Cell (1,0): ev_cut=0.25, adaptive=false => pure EV ignores low_pol and keeps depth-2 leaf.
+    opts.ev_cut = 0.25f;
+    opts.adaptive_cut = false;
+    const Df2TreeSpec cell10_null = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                    toptok.data(), seltab.data(), opts, nullptr);
+    const Df2TreeSpec cell10_low = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                   toptok.data(), seltab.data(), opts, &low_pol);
+    check(!cell10_null.is_linear() && cell10_null.count == cell10_low.count &&
+              cell10_null.token == cell10_low.token && cell10_null.parent == cell10_low.parent,
+          "matrix (ev>0, adaptive=0): pure EV ignores adaptive state identically to nullptr");
+
+    // Cell (0,1): ev_cut=0, adaptive=true => Policy 2 uses calibrated survival, detects low_pol collapse.
+    opts.ev_cut = 0.0f;
+    opts.adaptive_cut = true;
+    const Df2TreeSpec cell01_high = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                    toptok.data(), seltab.data(), opts, &high_pol);
+    check(cell01_high.shape == Df2TreeShape::PrefixFanout && cell01_high.branch_node == 2,
+          "matrix (ev=0, adaptive=1): Policy 2 builds branch at depth 2 under high_pol");
+
+    // Cell (1,1): ev_cut=0.25, adaptive=true => Policy 2 is consulted on top of EV:
+    // - under high_pol: calibrated leaf_ev stays >= 0.25 and net EV beats linear -> keeps pruned tree (count < 8).
+    // - under low_pol: calibrated leaf_ev drops below 0.25 -> Policy 2 suppresses collapsed tree -> linear!
+    opts.ev_cut = 0.25f;
+    opts.adaptive_cut = true;
+    const Df2TreeSpec cell11_high = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                    toptok.data(), seltab.data(), opts, &high_pol);
+    const Df2TreeSpec cell11_low = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                   toptok.data(), seltab.data(), opts, &low_pol);
+    check(!cell11_high.is_linear() && cell11_high.count == 5,
+          "matrix (ev=0.25, adaptive=1): high_pol keeps EV-pruned 5-node tree (0,101,102,103,202)");
+    check(cell11_low.is_linear() && cell11_low.count == 8,
+          "matrix (ev=0.25, adaptive=1): Policy 2 suppresses collapsed depth-2 EV tree to linear");
+
+    // 2. EA-style low-confidence inflation regression test:
+    // Low selector confidence probs={0.20, 0.85, 0.85, ...} with high_pol and depth-1 runner-up p=0.33:
+    // - Legacy EA (adaptive_inflate=true, ev_use_adaptive_probs=true) inflates 0.20 -> ~0.52, making
+    //   depth-1 leaf_ev = 0.52 * 0.33 = 0.172 >= 0.15 and firing a low-yield tree!
+    // - Fixed EA (default adaptive_inflate=false, ev_use_adaptive_probs=false) prices raw 0.20:
+    //   depth-1 leaf_ev = 0.20 * 0.33 = 0.066 < 0.15 -> stays linear (no double-counted EMA inflation!).
+    const std::array<float, 7> low_start_probs{0.20f, 0.85f, 0.85f, 0.80f, 0.30f, 0.20f, 0.20f};
+    std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> ea_seltab{};
+    ea_seltab.fill(-100.0f);
+    for (int r = 0; r < 7; ++r) {
+        ea_seltab[(static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 0] = 0.0f;
+    }
+    const size_t ea_base1 = (1u * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+    ea_seltab[ea_base1 + 0] = 0.708f;  // exp(0.708) = 2.030 -> runner = 1/3.030 = 0.330
+    ea_seltab[ea_base1 + 1] = 0.0f;
+
+    Df2TreeBuildOptions ea_fixed;
+    ea_fixed.draft_conf = 0.7;
+    ea_fixed.min_branch_p = 0.20f;
+    ea_fixed.max_fanout = 2;
+    ea_fixed.max_nodes = 8;
+    ea_fixed.ev_cut = 0.15f;
+    ea_fixed.adaptive_cut = true;
+    const Df2TreeSpec t_ea_fixed = df2_tree_build_from_selector_ex(99, drafts.data(), low_start_probs.data(), 7,
+                                                                   toptok.data(), ea_seltab.data(), ea_fixed, &high_pol);
+    check(t_ea_fixed.is_linear(),
+          "fixed EA combo prices raw p=0.20 without inflating depth-1 leaf EV >= 0.15");
+
+    Df2TreeBuildOptions ea_legacy = ea_fixed;
+    ea_legacy.adaptive_inflate = true;
+    ea_legacy.ev_use_adaptive_probs = true;
+    const Df2TreeSpec t_ea_legacy = df2_tree_build_from_selector_ex(99, drafts.data(), low_start_probs.data(), 7,
+                                                                    toptok.data(), ea_seltab.data(), ea_legacy, &high_pol);
+    check(!t_ea_legacy.is_linear() && t_ea_legacy.count >= 4,
+          "opt-in legacy inflation reproduces old EA low-yield tree trigger");
+}
+
 }  // namespace
 
 int main() {
@@ -742,6 +864,7 @@ int main() {
     test_gdn_order_ple_taps_and_remap_invariants();
     test_var_t_width_ladder();
     test_spine_skip_predicate();
+    test_composable_ev_adaptive_matrix_and_no_inflation();
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }

@@ -24684,6 +24684,8 @@ int main(int argc, char** argv) {
                         tree_opts.ev_cut = strata::spec::df2_tree_ev_cut();
                         tree_opts.adaptive_cut = strata::spec::df2_tree_adaptive_on();
                         tree_opts.dedup_siblings = strata::spec::df2_tree_dedup_on();
+                        tree_opts.adaptive_inflate = strata::spec::df2_tree_adaptive_inflate_on();
+                        tree_opts.ev_use_adaptive_probs = tree_opts.adaptive_inflate;
                         tree_spec = strata::spec::df2_tree_build_from_selector_ex(
                             x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(), df2.tree_seltab(),
                             tree_opts, tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr);
