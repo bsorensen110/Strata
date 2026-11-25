@@ -92,10 +92,19 @@ bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const in
 bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
                         void* stream);
-/// Extracts each row's exact post-chain target probability list (`SpecPRow`) to `h_out` without copying full logits.
+/// Extracts each row's exact post-chain target probability list (`SpecPRow`) into `d_out` (and optionally copies
+/// to `h_out` when `h_out != nullptr`; pass `nullptr` when consuming `d_out` on device via `launch_df2_tree_sample_accept`).
 bool extract_spec_probs(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, strata::core::SpecPRow* d_out, strata::core::SpecPRow* h_out,
                         void* stream);
+
+/// Launches 1-warp GPU-side lossless sampled-tree rejection walk matching `df2_tree_sample_accept` bit-for-bit
+/// in FP64, writing the packed 16-byte result to `d_result` (device or mapped host pointer).
+bool launch_df2_tree_sample_accept(const strata::core::SpecPRow* d_probs,
+                                   const strata::core::TreeSampleAcceptDesc* d_desc,
+                                   const strata::core::TreeSampleAcceptQ* d_q,
+                                   strata::core::TreeSampleAcceptResult* d_result,
+                                   void* stream);
 
 // #4590: which tokens the repeat / frequency / presence penalties count.  By default only the current reply: the
 // tokens the answer has written (the window starts at the last prompt token, the one the first decode step feeds in).

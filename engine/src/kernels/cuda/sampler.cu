@@ -960,6 +960,182 @@ extract_spec_probs_merge_kernel(const int2* __restrict__ cand, int n_blocks, int
     }
 }
 
+__device__ __forceinline__ uint64_t dev_tree_branch_accept_counter(uint64_t pos_u, int sib_idx) {
+    if (sib_idx <= 0) return pos_u | strata::core::kSpecCtrAccept;
+    return (pos_u & strata::core::kTreeBranchCounterMask) | (0x3ull << 61) |
+           (static_cast<uint64_t>(sib_idx & 0x1F) << 56);
+}
+
+/// 1-warp GPU-side lossless tree rejection walk replicating `df2_tree.hpp::df2_tree_sample_accept` bit-for-bit in FP64.
+__global__ void __launch_bounds__(32)
+df2_tree_sample_accept_kernel(const strata::core::SpecPRow* __restrict__ d_probs,
+                              const strata::core::TreeSampleAcceptDesc* __restrict__ d_desc,
+                              const strata::core::TreeSampleAcceptQ* __restrict__ d_q,
+                              strata::core::TreeSampleAcceptResult* __restrict__ out) {
+    const int lane = (int) (threadIdx.x & 31);
+    __shared__ double w_res[strata::core::kSpecQEntries];
+    __shared__ double next_w[strata::core::kSpecQEntries];
+
+    const int count = d_desc->count;
+    if (d_probs == nullptr || count < 1 || count > 8 || d_desc->parent[0] != -1 || d_desc->depth[0] != 0) {
+        if (lane == 0) {
+            strata::core::TreeSampleAcceptResult empty{};
+            *out = empty;
+            __threadfence_system();
+        }
+        return;
+    }
+
+    const uint64_t seed = d_desc->seed;
+    const uint64_t pos0 = d_desc->pos0;
+    uint8_t path[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int n_keep = 1;
+    uint8_t flags = 0;
+    uint16_t resamples = 0;
+    int32_t bonus = 0;
+    int u = 0;
+
+    while (n_keep <= 8) {
+        const strata::core::SpecPRow& Pu = d_probs[u];
+        const int n_p = Pu.n < strata::core::kSpecQEntries ? Pu.n : strata::core::kSpecQEntries;
+        if (n_p <= 0) {
+            bonus = 0;
+            break;
+        }
+        for (int i = lane; i < n_p; i += 32) {
+            const double pi = Pu.p[i];
+            w_res[i] = pi > 0.0 ? pi : 0.0;
+        }
+        __syncwarp();
+        double z = 0.0;
+        if (lane == 0) {
+            for (int i = 0; i < n_p; ++i) z += w_res[i];
+        }
+        z = __shfl_sync(kFullMask, z, 0);
+        if (!(z > 0.0)) {
+            bonus = Pu.id[0];
+            break;
+        }
+
+        const uint64_t pos_u = pos0 + static_cast<uint64_t>(d_desc->depth[u]);
+        int accepted_child = -1;
+        int sib_idx = 0;
+
+        for (int c = u + 1; c < count; ++c) {
+            if ((int) d_desc->parent[c] != u) continue;
+            const int32_t d = d_desc->token[c];
+            const int qn = (d_q != nullptr) ? d_q->n[c] : -1;
+            const int32_t* q_id = (qn >= 0) ? d_q->id[c] : nullptr;
+            const float* q_pr = (qn >= 0) ? d_q->q[c] : nullptr;
+
+            int acc_now = 0;
+            int point_now = 1;
+            if (lane == 0) {
+                double pd = 0.0;
+                for (int i = 0; i < n_p; ++i) {
+                    if (Pu.id[i] == d) { pd = w_res[i] / z; break; }
+                }
+                double qd = -1.0;
+                if (qn >= 0 && q_id != nullptr && q_pr != nullptr) {
+                    for (int j = 0; j < qn; ++j) {
+                        if (q_id[j] == d) qd += (qd < 0.0 ? 1.0 : 0.0) + static_cast<double>(q_pr[j]);
+                    }
+                }
+                point_now = !(qd > 0.0) ? 1 : 0;
+                const float u_accept = philox_uniform(seed, dev_tree_branch_accept_counter(pos_u, sib_idx));
+                const bool accept = pd > 0.0 && (point_now ? static_cast<double>(u_accept) < pd
+                                                           : static_cast<double>(u_accept) * qd < pd);
+                acc_now = accept ? 1 : 0;
+            }
+            acc_now = __shfl_sync(kFullMask, acc_now, 0);
+            point_now = __shfl_sync(kFullMask, point_now, 0);
+            if (acc_now) {
+                accepted_child = c;
+                break;
+            }
+
+            for (int i = lane; i < n_p; i += 32) {
+                const double p_i = w_res[i] / z;
+                double q_i = 0.0;
+                if (point_now) {
+                    if (Pu.id[i] == d) q_i = 1.0;
+                } else {
+                    for (int j = 0; j < qn; ++j) {
+                        if (q_id[j] == Pu.id[i]) q_i += static_cast<double>(q_pr[j]);
+                    }
+                }
+                const double diff = p_i > q_i ? (p_i - q_i) : 0.0;
+                next_w[i] = diff;
+            }
+            __syncwarp();
+            double next_z = 0.0;
+            if (lane == 0) {
+                for (int i = 0; i < n_p; ++i) next_z += next_w[i];
+            }
+            next_z = __shfl_sync(kFullMask, next_z, 0);
+            if (!(next_z > 0.0)) {
+                accepted_child = c;
+                break;
+            }
+            for (int i = lane; i < n_p; i += 32) w_res[i] = next_w[i];
+            __syncwarp();
+            z = next_z;
+            ++sib_idx;
+        }
+
+        if (accepted_child < 0) {
+            if (lane == 0) {
+                if (sib_idx > 0) ++resamples;
+                const uint64_t bonus_ctr = (sib_idx == 0) ? pos_u : (pos_u | strata::core::kSpecCtrResid);
+                const float u_bonus = philox_uniform(seed, bonus_ctr);
+                if (sib_idx == 0) {
+                    double cum = 0.0;
+                    int32_t pick = Pu.id[n_p > 0 ? n_p - 1 : 0];
+                    for (int i = 0; i < n_p; ++i) {
+                        cum += Pu.p[i];
+                        if (static_cast<double>(u_bonus) < cum) { pick = Pu.id[i]; break; }
+                    }
+                    bonus = pick;
+                } else {
+                    double cum = 0.0;
+                    int last = -1;
+                    int32_t pick = Pu.id[n_p > 0 ? n_p - 1 : 0];
+                    for (int i = 0; i < n_p; ++i) {
+                        if (!(w_res[i] > 0.0)) continue;
+                        last = i;
+                        cum += w_res[i] / z;
+                        if (static_cast<double>(u_bonus) < cum) { pick = Pu.id[i]; last = -2; break; }
+                    }
+                    if (last >= 0) pick = Pu.id[last];
+                    bonus = pick;
+                }
+            }
+            break;
+        }
+
+        if (n_keep >= 8) break;
+        if (lane == 0) {
+            const int k = n_keep;
+            path[k] = static_cast<uint8_t>(accepted_child);
+            if (accepted_child != k || d_desc->slot_rank[accepted_child] > 0) flags |= 1u;
+            if (d_desc->slot_rank[accepted_child] > 0) flags |= 2u;
+        }
+        ++n_keep;
+        u = accepted_child;
+    }
+
+    if (lane == 0) {
+        strata::core::TreeSampleAcceptResult res{};
+        for (int k = 0; k < 8; ++k) res.path[k] = k < n_keep ? path[k] : 0;
+        res.n_keep = static_cast<uint8_t>(n_keep);
+        res.flags = flags;
+        res.resamples = resamples;
+        res.bonus_token = bonus;
+        *out = res;
+        __threadfence_system();
+    }
+}
+
 /// One-block fallback extracting post-chain probabilities when the split path cannot run.
 __global__ void __launch_bounds__(1024)
 extract_spec_probs_one_block_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
@@ -1517,7 +1693,7 @@ bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, cons
 bool extract_spec_probs(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, strata::core::SpecPRow* d_out, strata::core::SpecPRow* h_out,
                         void* stream) {
-    if (logits == nullptr || d_out == nullptr || h_out == nullptr || n_tokens <= 0 || n_vocab <= 0 ||
+    if (logits == nullptr || d_out == nullptr || n_tokens <= 0 || n_vocab <= 0 ||
         p.greedy || p.temperature <= 0.0f) {
         return false;
     }
@@ -1542,11 +1718,27 @@ bool extract_spec_probs(const float* logits, int n_tokens, int n_vocab, const in
         extract_spec_probs_one_block_kernel<<<(unsigned) n_tokens, 1024, shmem, s>>>(
             logits, n_vocab, history, history_len, p, d_out);
     }
-    if (cudaMemcpyAsync(h_out, d_out, (size_t) n_tokens * sizeof(strata::core::SpecPRow),
+    if (h_out != nullptr &&
+        cudaMemcpyAsync(h_out, d_out, (size_t) n_tokens * sizeof(strata::core::SpecPRow),
                         cudaMemcpyDeviceToHost, s) != cudaSuccess) {
         (void) cudaGetLastError();
         return false;
     }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return false;
+    if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) return false;
+    return true;
+}
+
+bool launch_df2_tree_sample_accept(const strata::core::SpecPRow* d_probs,
+                                   const strata::core::TreeSampleAcceptDesc* d_desc,
+                                   const strata::core::TreeSampleAcceptQ* d_q,
+                                   strata::core::TreeSampleAcceptResult* d_result,
+                                   void* stream) {
+    if (d_probs == nullptr || d_desc == nullptr || d_result == nullptr) return false;
+    if (stream_capturing(stream)) return false;
+    const cudaStream_t s = (cudaStream_t) stream;
+    df2_tree_sample_accept_kernel<<<1, 32, 0, s>>>(d_probs, d_desc, d_q, d_result);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return false;
     if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) return false;

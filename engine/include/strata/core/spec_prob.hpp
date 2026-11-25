@@ -87,6 +87,34 @@ struct SpecPRow {
     int32_t n;
 };
 
+/// Packed 16-byte result of GPU-side lossless sampled-tree rejection walk (`df2_tree_sample_accept`).
+struct alignas(16) TreeSampleAcceptResult {
+    uint8_t path[8];      ///< accepted physical node indices [0..n_keep-1]
+    uint8_t n_keep;       ///< number of kept nodes (1..8; 0 on invalid)
+    uint8_t flags;        ///< bit 0 = branch_hit, bit 1 = runner_up_hit
+    uint16_t resamples;   ///< reject resample count (0 or 1 per walk)
+    int32_t bonus_token;  ///< bonus token sampled at deepest kept node
+};
+static_assert(sizeof(TreeSampleAcceptResult) == 16, "TreeSampleAcceptResult must be packed 16 bytes");
+
+/// Compact tree descriptor staged to mapped host memory for `launch_df2_tree_sample_accept`.
+struct TreeSampleAcceptDesc {
+    uint64_t seed;
+    uint64_t pos0;
+    int32_t token[8];
+    int32_t count;
+    int8_t parent[8];
+    uint8_t depth[8];
+    uint8_t slot_rank[8];
+};
+
+/// Optional per-node stochastic proposal distributions for `launch_df2_tree_sample_accept` (`n[c] < 0` => point mass).
+struct TreeSampleAcceptQ {
+    int32_t n[8];
+    int32_t id[8][kSpecQEntries];
+    float q[8][kSpecQEntries];
+};
+
 /// Host Philox 4x32-10 draw matching `sampler.cu::philox_uniform` bit-for-bit in `[0, 1)`.
 inline float philox_uniform_host(uint64_t seed, uint64_t counter) noexcept {
     uint32_t c0 = static_cast<uint32_t>(counter);

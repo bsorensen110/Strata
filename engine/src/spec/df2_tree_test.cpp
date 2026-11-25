@@ -1591,6 +1591,58 @@ int main() {
               "min_branch_p >= ev_cut_samp with VAR_T=1 leaves both thresholds untouched");
     }
 
+    // P7: GPU accept staging/unpacking helpers & STRATA_DF2_TREE_GPU_ACCEPT gate tests.
+    {
+        check(!df2_tree_gpu_accept_env_enabled(nullptr) &&
+                  !df2_tree_gpu_accept_env_enabled("") &&
+                  !df2_tree_gpu_accept_env_enabled("0") &&
+                  !df2_tree_gpu_accept_env_enabled("true") &&
+                  df2_tree_gpu_accept_env_enabled("1"),
+              "STRATA_DF2_TREE_GPU_ACCEPT parser defaults OFF and enables on 1");
+        check(df2_tree_gpu_accept_on() == df2_tree_gpu_accept_env_enabled(std::getenv("STRATA_DF2_TREE_GPU_ACCEPT")),
+              "df2_tree_gpu_accept_on matches env");
+        static_assert(sizeof(strata::core::TreeSampleAcceptResult) == 16,
+                      "TreeSampleAcceptResult must stay packed 16 bytes");
+
+        const int32_t prefix[2] = {10, 11};
+        const int32_t br[2] = {20, 21};
+        const int32_t tail[1] = {30};
+        const Df2TreeSpec tree = make_prefix_fanout_tree(99, prefix, 2, br, 2, tail, 1);
+        Df2TreeSampleQ sq;
+        sq.node[3].n = 2;
+        sq.node[3].id[0] = 20;
+        sq.node[3].id[1] = 21;
+        sq.node[3].q[0] = 0.7f;
+        sq.node[3].q[1] = 0.3f;
+
+        strata::core::TreeSampleAcceptDesc desc{};
+        strata::core::TreeSampleAcceptQ q_pod{};
+        check(df2_tree_pack_gpu_accept_input(tree, &sq, 0xCAFEBABEULL, 1234ULL, desc, &q_pod),
+              "df2_tree_pack_gpu_accept_input succeeds for valid tree");
+        check(desc.seed == 0xCAFEBABEULL && desc.pos0 == 1234ULL && desc.count == tree.count &&
+                  desc.token[0] == 99 && desc.parent[0] == kDf2TreeNoParent &&
+                  desc.parent[4] == 2 && desc.slot_rank[4] == 1 &&
+                  q_pod.n[0] == -1 && q_pod.n[3] == 2 && q_pod.id[3][1] == 21 &&
+                  std::fabs(q_pod.q[3][1] - 0.3f) < 1e-6f,
+              "df2_tree_pack_gpu_accept_input copies tree topology and Q rows faithfully");
+
+        strata::core::TreeSampleAcceptResult res{};
+        res.path[0] = 0;
+        res.path[1] = 1;
+        res.path[2] = 2;
+        res.path[3] = 4;
+        res.n_keep = 4;
+        res.flags = 3u;
+        res.resamples = 1;
+        res.bonus_token = 777;
+        int32_t bonus = -1;
+        int64_t resamp = -1;
+        const Df2TreeCommitWalk walk = df2_tree_walk_from_gpu_result(res, &bonus, &resamp);
+        check(walk.n_keep == 4 && walk.path[0] == 0 && walk.path[3] == 4 &&
+                  walk.branch_hit && walk.runner_up_hit && bonus == 777 && resamp == 1,
+              "df2_tree_walk_from_gpu_result unpacks 16-byte result into Df2TreeCommitWalk");
+    }
+
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }

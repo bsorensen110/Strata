@@ -840,6 +840,12 @@ Verifier::~Verifier() {
         for (auto& row : exec_tree_nr_)
             for (auto& e : row)
                 if (e) cudaGraphExecDestroy(e);
+        for (auto& row : exec_tree_logits_)
+            for (auto& e : row)
+                if (e) cudaGraphExecDestroy(e);
+        for (auto& row : exec_tree_logits_nr_)
+            for (auto& e : row)
+                if (e) cudaGraphExecDestroy(e);
         if (commit_tree_exec_) cudaGraphExecDestroy(commit_tree_exec_);
         if (commit_tree_spine_exec_) cudaGraphExecDestroy(commit_tree_spine_exec_);
         if (d_tree_) cudaFree(d_tree_);
@@ -848,6 +854,9 @@ Verifier::~Verifier() {
         if (h_tree_) cudaFreeHost(h_tree_);
         if (h_tree_commit_) cudaFreeHost(h_tree_commit_);
         if (h_tree_probs_) cudaFreeHost(h_tree_probs_);
+        if (h_tree_accept_desc_) cudaFreeHost(h_tree_accept_desc_);
+        if (h_tree_accept_q_) cudaFreeHost(h_tree_accept_q_);
+        if (h_tree_accept_out_) cudaFreeHost(h_tree_accept_out_);
     }
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
@@ -3597,7 +3606,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         bool il_head_wrote = false;
         static const bool logits_dump = std::getenv("STRATA_LOGITS_DUMP") != nullptr;
         const bool use_bitplane = head_ != nullptr && head_->loaded() && head_->bitplane() != nullptr &&
-                                  T <= 16 && (head_->type() == 8 || T >= 4) && !logits_dump;
+                                  T <= 16 && (head_->type() == 8 || T >= 4) && !logits_dump &&
+                                  !tree_rec_logits_;
       for (int h0 = 0; h0 < T; h0 += head_chunk_t) {
         const int HT = std::min(T - h0, head_chunk_t);   // this chunk's columns: h0 .. h0 + HT
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
@@ -4947,6 +4957,12 @@ void Verifier::megakernel_off() {
         for (auto& row : exec_tree_nr_)
             for (auto& e : row)
                 if (e != nullptr) { (void) cudaGraphExecDestroy(e); e = nullptr; }
+        for (auto& row : exec_tree_logits_)
+            for (auto& e : row)
+                if (e != nullptr) { (void) cudaGraphExecDestroy(e); e = nullptr; }
+        for (auto& row : exec_tree_logits_nr_)
+            for (auto& e : row)
+                if (e != nullptr) { (void) cudaGraphExecDestroy(e); e = nullptr; }
     }
 }
 
@@ -5826,13 +5842,15 @@ bool Verifier::drop_window_graphs(int& dropped, std::string& err) {
     if (strata::spec::df2_tree_on()) {
         for (int s = 0; s < 2; ++s) {
             for (int t = 0; t <= strata::kernels::kVerifyNarrowT; ++t) {
-                for (cudaGraphExec_t* e : {&exec_tree_[s][t], &exec_tree_nr_[s][t]})
+                for (cudaGraphExec_t* e : {&exec_tree_[s][t], &exec_tree_nr_[s][t],
+                                           &exec_tree_logits_[s][t], &exec_tree_logits_nr_[s][t]})
                     if (*e != nullptr) {
                         (void) cudaGraphExecDestroy(*e);
                         *e = nullptr;
                         ++dropped;
                     }
                 launched_tree_[s][t] = launched_tree_nr_[s][t] = false;
+                launched_tree_logits_[s][t] = launched_tree_logits_nr_[s][t] = false;
             }
         }
     }
@@ -7157,12 +7175,45 @@ void Verifier::stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t 
     for (int t = 0; t < M; ++t) last_tokens_[t] = tree.token[(size_t) t];
 }
 
-bool Verifier::capture_tree(int T, std::string& err) {
+bool Verifier::ensure_tree_accept_buffers(std::string& err) {
+    if (!strata::spec::df2_tree_on()) { err = "verify: STRATA_DF2_TREE is off"; return false; }
+    const size_t nbytes = (size_t) strata::kernels::kVerifyNarrowT * sizeof(strata::core::SpecPRow);
+    if (d_tree_probs_ == nullptr && cudaMalloc((void**) &d_tree_probs_, nbytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        d_tree_probs_ = nullptr;
+        err = "verify tree: cannot allocate sampled tree probability buffer";
+        return false;
+    }
+    if (h_tree_accept_desc_ != nullptr && h_tree_accept_q_ != nullptr && h_tree_accept_out_ != nullptr) return true;
+    void* hd = nullptr; void* md = nullptr;
+    void* hq = nullptr; void* mq = nullptr;
+    void* ho = nullptr; void* mo = nullptr;
+    if (!mapped(sizeof(strata::core::TreeSampleAcceptDesc), &hd, &md) ||
+        !mapped(sizeof(strata::core::TreeSampleAcceptQ), &hq, &mq) ||
+        !mapped(sizeof(strata::core::TreeSampleAcceptResult), &ho, &mo)) {
+        if (hd) cudaFreeHost(hd);
+        if (hq) cudaFreeHost(hq);
+        if (ho) cudaFreeHost(ho);
+        err = "verify: GPU tree accept staging buffer allocation failed";
+        return false;
+    }
+    h_tree_accept_desc_ = static_cast<strata::core::TreeSampleAcceptDesc*>(hd);
+    m_tree_accept_desc_ = static_cast<strata::core::TreeSampleAcceptDesc*>(md);
+    h_tree_accept_q_ = static_cast<strata::core::TreeSampleAcceptQ*>(hq);
+    m_tree_accept_q_ = static_cast<strata::core::TreeSampleAcceptQ*>(mq);
+    h_tree_accept_out_ = static_cast<strata::core::TreeSampleAcceptResult*>(ho);
+    m_tree_accept_out_ = static_cast<strata::core::TreeSampleAcceptResult*>(mo);
+    return true;
+}
+
+bool Verifier::capture_tree(int T, std::string& err, bool force_logits) {
     if (T < strata::spec::kDf2TreeMinVerifyT || T > strata::kernels::kVerifyNarrowT || T > max_t_) {
         err = "verify: tree capture width out of range (" + std::to_string(T) + ")";
         return false;
     }
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_tree_nr_[sel_long_][T] : exec_tree_[sel_long_][T];
+    cudaGraphExec_t& exec_t = force_logits
+        ? (ar_off_ ? exec_tree_logits_nr_[sel_long_][T] : exec_tree_logits_[sel_long_][T])
+        : (ar_off_ ? exec_tree_nr_[sel_long_][T] : exec_tree_[sel_long_][T]);
     if (exec_t != nullptr) return true;
 #if defined(STRATA_GPU_METAL)
     err = "verify: tree mode unsupported on Metal";
@@ -7181,9 +7232,11 @@ bool Verifier::capture_tree(int T, std::string& err) {
     }
     struct TreeRecGuard {
         bool& flag;
-        ~TreeRecGuard() { flag = false; }
-    } rec_guard{tree_rec_};
+        bool& logits_flag;
+        ~TreeRecGuard() { flag = false; logits_flag = false; }
+    } rec_guard{tree_rec_, tree_rec_logits_};
     tree_rec_ = true;
+    tree_rec_logits_ = force_logits;
     const bool ok = record_window(T, cs_, err);
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
@@ -7346,9 +7399,13 @@ bool Verifier::capture_commit_tree(std::string& err) {
 }
 
 bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, PoolMultiFn pool, void* user,
-                        int32_t* out, std::string& err, strata::core::SpecPRow* out_probs) {
+                        int32_t* out, std::string& err, strata::core::SpecPRow* out_probs,
+                        const strata::spec::Df2TreeSampleQ* gpu_accept_q,
+                        strata::core::TreeSampleAcceptResult* out_gpu_accept) {
 #if defined(STRATA_GPU_METAL)
     (void) out_probs;
+    (void) gpu_accept_q;
+    (void) out_gpu_accept;
     err = "verify: tree mode unsupported on Metal";
     return false;
 #endif
@@ -7359,7 +7416,8 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
         return false;
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    const bool sampled_tree = out_probs != nullptr;
+    const bool gpu_accept = out_gpu_accept != nullptr;
+    const bool sampled_tree = out_probs != nullptr || gpu_accept;
     if (sampled_tree) {
         if (!strata::spec::df2_tree_sampled_on() || !sampled || !head_sampling_) {
             err = "verify: sampled tree mode requires STRATA_DF2_TREE_SAMPLED=1 and sampled request";
@@ -7391,6 +7449,11 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
     refresh_ar();
     sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;
     if (!ensure_tree_buffers(err)) return false;
+    if (gpu_accept && !ensure_tree_accept_buffers(err)) return false;
+    static const bool logits_dump_flag = std::getenv("STRATA_LOGITS_DUMP") != nullptr;
+    const bool need_logits_graph = gpu_accept && head_ != nullptr && head_->loaded() &&
+                                   head_->bitplane() != nullptr && T <= 16 &&
+                                   (head_->type() == 8 || T >= 4) && !logits_dump_flag;
     static const bool tree_nograph = [] {
         const char* e = std::getenv("STRATA_DF2_TREE_NOGRAPH");
         return e != nullptr && e[0] == '1';
@@ -7398,13 +7461,21 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
     const bool use_nograph = tree_nograph && ar_on();
     if (!use_nograph) {
         // Under STRATA_DF2_TREE_VAR_T=1 never fall back to fixed T=8 if width-T capture fails.
-        if (!capture_tree(T, err) || !capture_commit_tree(err)) return false;
+        if (!capture_tree(T, err, need_logits_graph) || !capture_commit_tree(err)) return false;
     } else {
         if (!capture_commit_tree(err)) return false;
     }
 
     const Clock::time_point t0 = Clock::now();
     stage_tree_inputs(tree, pos0, T);
+    if (gpu_accept) {
+        strata::spec::df2_tree_pack_gpu_accept_input(
+            tree, gpu_accept_q, sampling_.seed, static_cast<uint64_t>(pos0), *h_tree_accept_desc_,
+            gpu_accept_q != nullptr ? h_tree_accept_q_ : nullptr);
+        std::memset(h_tree_accept_out_, 0, sizeof(*h_tree_accept_out_));
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        strata_store_fence();
+    }
     const bool do_ple = ss.ple.ready() && ple_stage();
     uint32_t ple_rows[kVerifyNarrowT * PLE_N_HEADS];
     if (do_ple) {
@@ -7427,7 +7498,9 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
     }
 
     bool flag_raised = false;
-    bool& graph_launched = ar_off_ ? launched_tree_nr_[sel_long_][T] : launched_tree_[sel_long_][T];
+    bool& graph_launched = need_logits_graph
+        ? (ar_off_ ? launched_tree_logits_nr_[sel_long_][T] : launched_tree_logits_[sel_long_][T])
+        : (ar_off_ ? launched_tree_nr_[sel_long_][T] : launched_tree_[sel_long_][T]);
     if (!use_nograph && ar_on() && (early_ple_flag_mode() == 1 || (early_ple_flag_mode() == 2 && !graph_launched))) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
@@ -7457,12 +7530,17 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
         *(volatile uint32_t*) h_flag_ = 1;
         flag_raised = true;
         tree_rec_ = true;
+        tree_rec_logits_ = need_logits_graph;
         const bool ok_rec = record_window(T, cs_, err);
+        tree_rec_logits_ = false;
         tree_rec_ = false;
         if (!ok_rec) return false;
     } else {
         strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
-        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_tree_nr_[sel_long_][T] : exec_tree_[sel_long_][T], cs_);
+        cudaGraphExec_t exec_t = need_logits_graph
+            ? (ar_off_ ? exec_tree_logits_nr_[sel_long_][T] : exec_tree_logits_[sel_long_][T])
+            : (ar_off_ ? exec_tree_nr_[sel_long_][T] : exec_tree_[sel_long_][T]);
+        const cudaError_t le = cudaGraphLaunch(exec_t, cs_);
         graph_launched = true;
         if (le != cudaSuccess) { err = std::string("verify: tree launch: ") + cudaGetErrorString(le); return false; }
         (void) cudaStreamQuery(cs_);
@@ -7541,50 +7619,82 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
     }
 
     if (post_layers_cb_ != nullptr) post_layers_cb_(post_layers_user_);
-    const cudaError_t se = cudaStreamSynchronize(cs_);
-    if (se != cudaSuccess) { err = std::string("verify tree: ") + cudaGetErrorString(se); return false; }
-    if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {
-        *(volatile uint32_t*) h_plan_err_ = 0;
-        err = "verify tree: all-resident plan met an expert not in VRAM";
-        return false;
-    }
-    commit_pending_ = false;
-    if (copy_used_) {
-        cudaStreamSynchronize(copy_);
-        copy_used_ = false;
-    }
-    if (prof_on_) collect_profile();
-    if (sampled_tree) {
+    if (gpu_accept) {
         ensure_full_logits(T, false);
-        ensure_head_logits(M);
-        const size_t nbytes = (size_t) kVerifyNarrowT * sizeof(strata::core::SpecPRow);
-        if (d_tree_probs_ == nullptr && cudaMalloc((void**) &d_tree_probs_, nbytes) != cudaSuccess) {
-            (void) cudaGetLastError();
-            d_tree_probs_ = nullptr;
-            err = "verify tree: cannot allocate sampled tree probability buffer";
-            return false;
-        }
-        if (h_tree_probs_ == nullptr &&
-            cudaHostAlloc((void**) &h_tree_probs_, nbytes, cudaHostAllocDefault) != cudaSuccess) {
-            (void) cudaGetLastError();
-            h_tree_probs_ = nullptr;
-            err = "verify tree: cannot allocate host sampled tree probability buffer";
-            return false;
-        }
+        if (!need_logits_graph) ensure_head_logits(M);
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
-        if (!extract_spec_probs(head_logits_, M, (int) n_vocab_, hist_d_, hist_len_, sp,
-                                d_tree_probs_, h_tree_probs_, cs_) ||
-            cudaStreamSynchronize(cs_) != cudaSuccess) {
-            err = "verify tree: sampled probability extraction failed";
+        const bool launched =
+            extract_spec_probs(head_logits_, M, (int) n_vocab_, hist_d_, hist_len_, sp, d_tree_probs_, nullptr, cs_) &&
+            launch_df2_tree_sample_accept(d_tree_probs_, m_tree_accept_desc_,
+                                          gpu_accept_q != nullptr ? m_tree_accept_q_ : nullptr,
+                                          m_tree_accept_out_, cs_);
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify tree: ") + cudaGetErrorString(se); return false; }
+        if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {
+            *(volatile uint32_t*) h_plan_err_ = 0;
+            err = "verify tree: all-resident plan met an expert not in VRAM";
             return false;
         }
-        for (int t = 0; t < M; ++t) {
-            out_probs[t] = h_tree_probs_[t];
-            out[t] = h_tree_probs_[t].n > 0 ? h_tree_probs_[t].id[0] : ((volatile int32_t*) h_out_)[t];
+        commit_pending_ = false;
+        if (copy_used_) {
+            cudaStreamSynchronize(copy_);
+            copy_used_ = false;
         }
-    } else {
+        if (prof_on_) collect_profile();
+        if (!launched) {
+            err = "verify tree: GPU sampled tree accept failed";
+            return false;
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        *out_gpu_accept = *h_tree_accept_out_;
         for (int t = 0; t < M; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    } else {
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify tree: ") + cudaGetErrorString(se); return false; }
+        if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {
+            *(volatile uint32_t*) h_plan_err_ = 0;
+            err = "verify tree: all-resident plan met an expert not in VRAM";
+            return false;
+        }
+        commit_pending_ = false;
+        if (copy_used_) {
+            cudaStreamSynchronize(copy_);
+            copy_used_ = false;
+        }
+        if (prof_on_) collect_profile();
+        if (sampled_tree) {
+            ensure_full_logits(T, false);
+            ensure_head_logits(M);
+            const size_t nbytes = (size_t) kVerifyNarrowT * sizeof(strata::core::SpecPRow);
+            if (d_tree_probs_ == nullptr && cudaMalloc((void**) &d_tree_probs_, nbytes) != cudaSuccess) {
+                (void) cudaGetLastError();
+                d_tree_probs_ = nullptr;
+                err = "verify tree: cannot allocate sampled tree probability buffer";
+                return false;
+            }
+            if (h_tree_probs_ == nullptr &&
+                cudaHostAlloc((void**) &h_tree_probs_, nbytes, cudaHostAllocDefault) != cudaSuccess) {
+                (void) cudaGetLastError();
+                h_tree_probs_ = nullptr;
+                err = "verify tree: cannot allocate host sampled tree probability buffer";
+                return false;
+            }
+            SamplerParams sp = sampling_;
+            sp.counter = (uint64_t) pos0;
+            if (!extract_spec_probs(head_logits_, M, (int) n_vocab_, hist_d_, hist_len_, sp,
+                                    d_tree_probs_, h_tree_probs_, cs_) ||
+                cudaStreamSynchronize(cs_) != cudaSuccess) {
+                err = "verify tree: sampled probability extraction failed";
+                return false;
+            }
+            for (int t = 0; t < M; ++t) {
+                out_probs[t] = h_tree_probs_[t];
+                out[t] = h_tree_probs_[t].n > 0 ? h_tree_probs_[t].id[0] : ((volatile int32_t*) h_out_)[t];
+            }
+        } else {
+            for (int t = 0; t < M; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+        }
     }
     int64_t pos_b[strata::spec::kDf2TreeMaxNodes] = {};
     for (int t = 0; t < M; ++t) pos_b[t] = pos0 + tree.depth[(size_t) t];

@@ -247,8 +247,12 @@ public:
     /// in a single `G=1` window; `out[t]` receives the post-chain top-1/argmax token after node `t`.
     /// When `out_probs != nullptr` (STRATA_DF2_TREE_SAMPLED=1 on a sampled request), also extracts each node row's
     /// post-chain target probability list `out_probs[0..tree.count-1]` for host-side tree rejection sampling.
+    /// When `out_gpu_accept != nullptr` (STRATA_DF2_TREE_GPU_ACCEPT=1), keeps `SpecPRow` on device, runs the 1-warp
+    /// GPU acceptance walk (`gpu_accept_q` optional), and fuses the two stream syncs into one wait.
     bool run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
-                  std::string& err, strata::core::SpecPRow* out_probs = nullptr);
+                  std::string& err, strata::core::SpecPRow* out_probs = nullptr,
+                  const strata::spec::Df2TreeSampleQ* gpu_accept_q = nullptr,
+                  strata::core::TreeSampleAcceptResult* out_gpu_accept = nullptr);
     /// Pre-captures tree verification graph for width `T` (3..8) without evicting linear graphs (STRATA_DF2_TREE_VAR_T=1).
     bool prepare_tree(int T, bool& no_vram, std::string& err);
     /// Commits a non-contiguous accepted path `path[0..n_keep-1]` (`path[0] == 0`, `path[k] >= k`) from the last `run_tree`.
@@ -739,19 +743,28 @@ private:
     cudaGraphExec_t commit_exec_ = nullptr;
     // STRATA_DF2_TREE=1: parameterized tree verify (fixed T=8 by default; T=3..8 with STRATA_DF2_TREE_VAR_T=1)
     bool tree_rec_ = false;
+    bool tree_rec_logits_ = false;
     bool last_tree_ = false;
     strata::kernels::VerifyTreeMeta *h_tree_ = nullptr, *m_tree_ = nullptr, *d_tree_ = nullptr;
     int32_t *h_tree_commit_ = nullptr, *m_tree_commit_ = nullptr, *d_tree_commit_ = nullptr;
     cudaGraphExec_t exec_tree_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     cudaGraphExec_t exec_tree_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    cudaGraphExec_t exec_tree_logits_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    cudaGraphExec_t exec_tree_logits_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     cudaGraphExec_t commit_tree_exec_ = nullptr;
     cudaGraphExec_t commit_tree_spine_exec_ = nullptr;
     strata::core::SpecPRow* d_tree_probs_ = nullptr;
     strata::core::SpecPRow* h_tree_probs_ = nullptr;
+    strata::core::TreeSampleAcceptDesc *h_tree_accept_desc_ = nullptr, *m_tree_accept_desc_ = nullptr;
+    strata::core::TreeSampleAcceptQ *h_tree_accept_q_ = nullptr, *m_tree_accept_q_ = nullptr;
+    strata::core::TreeSampleAcceptResult *h_tree_accept_out_ = nullptr, *m_tree_accept_out_ = nullptr;
     bool launched_tree_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     bool launched_tree_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    bool launched_tree_logits_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    bool launched_tree_logits_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     bool ensure_tree_buffers(std::string& err);
-    bool capture_tree(int T, std::string& err);
+    bool ensure_tree_accept_buffers(std::string& err);
+    bool capture_tree(int T, std::string& err, bool force_logits = false);
     bool capture_commit_tree_graph(cudaGraphExec_t& out_exec, bool include_kv_compact, std::string& err);
     bool capture_commit_tree(std::string& err);
     void stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t pos0, int T);

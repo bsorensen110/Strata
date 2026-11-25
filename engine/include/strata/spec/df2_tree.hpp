@@ -392,6 +392,17 @@ inline bool df2_tree_sampled_on() noexcept {
     return on;
 }
 
+/// Parses STRATA_DF2_TREE_GPU_ACCEPT ("1" runs df2_tree_sample_accept on GPU and fuses syncs; default OFF).
+inline bool df2_tree_gpu_accept_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+/// Process-wide gate for GPU-side sampled DF2 tree rejection acceptance (default OFF).
+inline bool df2_tree_gpu_accept_on() noexcept {
+    static const bool on = df2_tree_gpu_accept_env_enabled(std::getenv("STRATA_DF2_TREE_GPU_ACCEPT"));
+    return on;
+}
+
 enum class Df2TreeShape : uint8_t {
     Linear = 0,
     PrefixFanout = 1,
@@ -1478,6 +1489,64 @@ inline Df2TreeCommitWalk df2_tree_sample_accept(const Df2TreeSpec& tree, const s
         u = accepted_child;
     }
     if (reject_resamples != nullptr) *reject_resamples = resamples;
+    return walk;
+}
+
+/// Packs `Df2TreeSpec` and optional `Df2TreeSampleQ` into compact POD buffers for `launch_df2_tree_sample_accept`.
+inline bool df2_tree_pack_gpu_accept_input(const Df2TreeSpec& tree, const Df2TreeSampleQ* q_nodes,
+                                           uint64_t seed, uint64_t pos0,
+                                           strata::core::TreeSampleAcceptDesc& desc,
+                                           strata::core::TreeSampleAcceptQ* q_out = nullptr) noexcept {
+    std::memset(&desc, 0, sizeof(desc));
+    for (int i = 0; i < kDf2TreeMaxNodes; ++i) desc.parent[i] = kDf2TreeNoParent;
+    desc.seed = seed;
+    desc.pos0 = pos0;
+    desc.count = tree.count;
+    if (!tree.valid()) {
+        if (q_out != nullptr) {
+            for (int i = 0; i < kDf2TreeMaxNodes; ++i) q_out->n[i] = -1;
+        }
+        return false;
+    }
+    for (int i = 0; i < tree.count; ++i) {
+        const size_t si = static_cast<size_t>(i);
+        desc.token[i] = tree.token[si];
+        desc.parent[i] = tree.parent[si];
+        desc.depth[i] = tree.depth[si];
+        desc.slot_rank[i] = tree.slot_rank[si];
+    }
+    if (q_out != nullptr) {
+        for (int i = 0; i < kDf2TreeMaxNodes; ++i) {
+            if (q_nodes != nullptr && i < tree.count) {
+                const Df2TreeNodeQ& nq = q_nodes->node[static_cast<size_t>(i)];
+                const int n = std::min(nq.n, strata::core::kSpecQEntries);
+                q_out->n[i] = n;
+                for (int j = 0; j < n; ++j) {
+                    q_out->id[i][j] = nq.id[static_cast<size_t>(j)];
+                    q_out->q[i][j] = nq.q[static_cast<size_t>(j)];
+                }
+            } else {
+                q_out->n[i] = -1;
+            }
+        }
+    }
+    return true;
+}
+
+/// Converts packed 16-byte GPU `TreeSampleAcceptResult` into `Df2TreeCommitWalk`, bonus token, and resample count.
+inline Df2TreeCommitWalk df2_tree_walk_from_gpu_result(const strata::core::TreeSampleAcceptResult& res,
+                                                       int32_t* bonus_token = nullptr,
+                                                       int64_t* reject_resamples = nullptr) noexcept {
+    Df2TreeCommitWalk walk;
+    const int n_keep = std::clamp(static_cast<int>(res.n_keep), 0, kDf2TreeMaxNodes);
+    walk.n_keep = n_keep;
+    for (int k = 0; k < n_keep; ++k) {
+        walk.path[static_cast<size_t>(k)] = res.path[k];
+    }
+    walk.branch_hit = (res.flags & 1u) != 0;
+    walk.runner_up_hit = (res.flags & 2u) != 0;
+    if (bonus_token != nullptr) *bonus_token = res.bonus_token;
+    if (reject_resamples != nullptr) *reject_resamples = static_cast<int64_t>(res.resamples);
     return walk;
 }
 

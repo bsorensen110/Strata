@@ -24735,6 +24735,7 @@ int main(int argc, char** argv) {
                 strata::spec::Df2TreeSampleQ tree_sample_q;
                 strata::spec::Df2TreeCommitWalk tree_walk;
                 std::array<strata::core::SpecPRow, strata::spec::kDf2TreeMaxNodes> tree_spec_probs{};
+                strata::core::TreeSampleAcceptResult tree_gpu_accept_res{};
                 int64_t tree_resamples = 0;
                 int32_t tree_bonus = 0;
 #if defined(STRATA_HAVE_DFLASH2)
@@ -25153,9 +25154,12 @@ int main(int argc, char** argv) {
                 const strata::core::ScopedDraftRowPointers scoped_draft_rows(
                     drive.d.row_is_draft, drive.d.row_rank_in_slot,
                     solo_row_is_draft.data(), solo_row_rank.data());
+                const bool tree_use_gpu_accept = tree_sampled_round && strata::spec::df2_tree_gpu_accept_on();
                 const bool win_ok = tree_round
                     ? ver.run_tree(tree_spec, p, decode_pool_fn, win_pool_user, outv.data(), err,
-                                   tree_sampled_round ? tree_spec_probs.data() : nullptr)
+                                   (tree_sampled_round && !tree_use_gpu_accept) ? tree_spec_probs.data() : nullptr,
+                                   (tree_use_gpu_accept && df2_sample_active) ? &tree_sample_q : nullptr,
+                                   tree_use_gpu_accept ? &tree_gpu_accept_res : nullptr)
                     : ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err);
                 if (!win_ok || drive.d.failed) {
                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
@@ -25199,15 +25203,20 @@ int main(int argc, char** argv) {
                 int a = 0;
                 if (tree_round) {
                     if (tree_sampled_round) {
-                        std::array<strata::core::SpecP, strata::spec::kDf2TreeMaxNodes> p_views{};
-                        for (int i = 0; i < tree_spec.count; ++i) {
-                            p_views[(size_t) i] = strata::core::SpecP{tree_spec_probs[(size_t) i].id,
-                                                                      tree_spec_probs[(size_t) i].p,
-                                                                      tree_spec_probs[(size_t) i].n};
+                        if (tree_use_gpu_accept) {
+                            tree_walk = strata::spec::df2_tree_walk_from_gpu_result(
+                                tree_gpu_accept_res, &tree_bonus, &tree_resamples);
+                        } else {
+                            std::array<strata::core::SpecP, strata::spec::kDf2TreeMaxNodes> p_views{};
+                            for (int i = 0; i < tree_spec.count; ++i) {
+                                p_views[(size_t) i] = strata::core::SpecP{tree_spec_probs[(size_t) i].id,
+                                                                          tree_spec_probs[(size_t) i].p,
+                                                                          tree_spec_probs[(size_t) i].n};
+                            }
+                            tree_walk = strata::spec::df2_tree_sample_accept(
+                                tree_spec, p_views.data(), df2_sample_active ? &tree_sample_q : nullptr, req_sp.seed,
+                                static_cast<uint64_t>(p), &tree_bonus, &tree_resamples);
                         }
-                        tree_walk = strata::spec::df2_tree_sample_accept(
-                            tree_spec, p_views.data(), df2_sample_active ? &tree_sample_q : nullptr, req_sp.seed,
-                            static_cast<uint64_t>(p), &tree_bonus, &tree_resamples);
                         a = std::max(0, tree_walk.n_keep - 1);
                         for (int k = 0; k < a; ++k) {
                             outv[(size_t) tree_walk.path[(size_t) k]] =
