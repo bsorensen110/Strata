@@ -23544,15 +23544,50 @@ int main(int argc, char** argv) {
             strata::spec::Df2TreeAdaptivePolicy tree_adaptive_policy;
             strata::spec::Df2TreeRowEmaPolicy tree_row_ema_policy;
 #if defined(STRATA_HAVE_DFLASH2)
-            const bool tree_sampled_req = strata::spec::df2_tree_sampled_on() &&
-                !req_sp.greedy && req_sp.temperature > 0.0f;
+            const bool req_is_sampled = !req_sp.greedy && req_sp.temperature > 0.0f;
+            const auto tree_sampled_gate = strata::spec::df2_tree_sampled_request_gate(
+                strata::spec::df2_tree_sampled_on(), req_sp.greedy, req_sp.temperature, df2_sample_active,
+                strata::spec::df2_tree_max_temp(), strata::spec::df2_tree_no_walk_trees_on());
+            const bool tree_sampled_req = (tree_sampled_gate == strata::spec::Df2TreeSampledGateStatus::Allowed);
+            const auto tree_sampled_env = strata::spec::df2_tree_resolve_sampled_envelope(
+                strata::spec::df2_tree_min_branch_p(), strata::spec::df2_tree_ev_cut(),
+                strata::spec::df2_tree_ev_cut_samp(), strata::spec::df2_tree_var_t_on(),
+                strata::spec::df2_tree_branch_guard_on());
+            if (strata::spec::df2_tree_on() && strata::spec::df2_tree_sampled_on() && req_is_sampled) {
+                if (tree_sampled_env.ev_shadow_clamped) {
+                    static bool warned_samp_shadow = false;
+                    if (!warned_samp_shadow) {
+                        warned_samp_shadow = true;
+                        std::fprintf(stderr,
+                                     "strata serve: NOTE: sampled DF2 tree min_branch_p raised to %.2f to match "
+                                     "ev_cut=%.2f (avoiding silent ev_cut shadowing)\n",
+                                     tree_sampled_env.min_branch_p, tree_sampled_env.ev_cut);
+                    }
+                }
+                if (tree_sampled_env.ev_below_guard) {
+                    static bool warned_samp_guard = false;
+                    if (!warned_samp_guard) {
+                        warned_samp_guard = true;
+                        std::fprintf(stderr,
+                                     "strata serve: NOTE: STRATA_DF2_TREE_MIN_BRANCH_GUARD with VAR_T=0 clamps "
+                                     "sampled min_branch_p to %.2f above ev_cut=%.2f\n",
+                                     tree_sampled_env.min_branch_p, tree_sampled_env.ev_cut);
+                    }
+                }
+            }
             const bool tree_greedy_req = req_sp.greedy && req_sp.temperature <= 0.0f &&
                 hist_n <= 0 && req_bias.empty() && !df2_sample_active;
             bool tree_req_eligible = strata::spec::df2_tree_on() && req_df2 && use_df2 && !batch_df2 &&
                 o.batch == 0 && n_stages <= 1 && !o.draft_auto && strata::core::Dflash2Drafter::head_native() &&
                 (tree_greedy_req || tree_sampled_req) &&
                 !gated_proposal && !pipe && fol == nullptr && req_logprobs < 0;
-            tree_accept_hist.sampled_req_active = strata::spec::df2_tree_on() && tree_sampled_req;
+            tree_accept_hist.sampled_req_active =
+                strata::spec::df2_tree_on() && strata::spec::df2_tree_sampled_on() && req_is_sampled;
+            if (tree_accept_hist.sampled_req_active) {
+                tree_accept_hist.set_sampled_envelope(
+                    tree_sampled_gate, req_sp.temperature, tree_sampled_env.min_branch_p, tree_sampled_env.ev_cut,
+                    strata::spec::df2_tree_max_temp(), strata::spec::df2_tree_no_walk_trees_on(), df2_sample_active);
+            }
 #else
             const bool tree_req_eligible = false;
 #endif
@@ -24725,10 +24760,12 @@ int main(int argc, char** argv) {
                         strata::spec::Df2TreeBuildOptions tree_opts;
                         tree_opts.draft_conf = o.draft_conf;
                         const float raw_min_branch_p = strata::spec::df2_tree_min_branch_p();
-                        const float eff_min_branch_p = strata::spec::df2_tree_effective_min_branch_p(
-                            raw_min_branch_p, strata::spec::df2_tree_var_t_on(),
-                            strata::spec::df2_tree_branch_guard_on());
-                        if (eff_min_branch_p != raw_min_branch_p) {
+                        const float eff_min_branch_p = tree_sampled_req
+                            ? tree_sampled_env.min_branch_p
+                            : strata::spec::df2_tree_effective_min_branch_p(
+                                  raw_min_branch_p, strata::spec::df2_tree_var_t_on(),
+                                  strata::spec::df2_tree_branch_guard_on());
+                        if (!tree_sampled_req && eff_min_branch_p != raw_min_branch_p) {
                             static bool warned_min_branch_guard = false;
                             if (!warned_min_branch_guard) {
                                 warned_min_branch_guard = true;
@@ -24741,7 +24778,7 @@ int main(int argc, char** argv) {
                         tree_opts.min_branch_p = eff_min_branch_p;
                         tree_opts.max_fanout = strata::spec::df2_tree_max_fanout();
                         tree_opts.max_nodes = tree_cap;
-                        tree_opts.ev_cut = strata::spec::df2_tree_ev_cut();
+                        tree_opts.ev_cut = tree_sampled_req ? tree_sampled_env.ev_cut : strata::spec::df2_tree_ev_cut();
                         tree_opts.adaptive_cut = strata::spec::df2_tree_adaptive_on();
                         tree_opts.dedup_siblings = strata::spec::df2_tree_dedup_on();
                         tree_opts.adaptive_inflate = strata::spec::df2_tree_adaptive_inflate_on();

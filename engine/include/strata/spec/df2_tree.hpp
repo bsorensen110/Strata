@@ -126,6 +126,106 @@ inline float df2_tree_ev_cut() noexcept {
     return v;
 }
 
+/// Parses STRATA_DF2_TREE_EV_CUT_SAMP (float in [0, 1]; 0 = inherit STRATA_DF2_TREE_EV_CUT).
+inline float df2_tree_parse_ev_cut_samp(const char* value) noexcept {
+    return df2_tree_parse_ev_cut(value);
+}
+
+/// Sampled-request EV threshold override: STRATA_DF2_TREE_EV_CUT_SAMP (float, default 0 = inherit ev_cut).
+inline float df2_tree_ev_cut_samp() noexcept {
+    static const float v = df2_tree_parse_ev_cut_samp(std::getenv("STRATA_DF2_TREE_EV_CUT_SAMP"));
+    return v;
+}
+
+/// Parses STRATA_DF2_TREE_MAX_TEMP (float > 0; unset/empty/invalid/<=0 => 0 = off).
+inline float df2_tree_parse_max_temp(const char* value) noexcept {
+    if (value == nullptr || *value == '\0') return 0.0f;
+    char* end = nullptr;
+    const float v = std::strtof(value, &end);
+    if (end == value || *end != '\0' || !std::isfinite(v) || v <= 0.0f) return 0.0f;
+    return v;
+}
+
+/// Maximum request temperature allowed to enter sampled DF2 tree mode (0 = off / unlimited).
+inline float df2_tree_max_temp() noexcept {
+    static const float v = df2_tree_parse_max_temp(std::getenv("STRATA_DF2_TREE_MAX_TEMP"));
+    return v;
+}
+
+/// Parses STRATA_DF2_TREE_NO_WALK_TREES ("1" disables caterpillar trees when DF2_SAMPLE_WALK=1 is active; default OFF).
+inline bool df2_tree_no_walk_trees_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+/// Process-wide gate disabling caterpillar trees under STRATA_DF2_SAMPLE_WALK=1 while keeping linear coupled drafting.
+inline bool df2_tree_no_walk_trees_on() noexcept {
+    static const bool on = df2_tree_no_walk_trees_env_enabled(std::getenv("STRATA_DF2_TREE_NO_WALK_TREES"));
+    return on;
+}
+
+enum class Df2TreeSampledGateStatus : uint8_t {
+    Allowed = 0,
+    Disabled = 1,
+    Greedy = 2,
+    MaxTempExceeded = 3,
+    WalkTreesDisabled = 4,
+};
+
+inline const char* df2_tree_sampled_gate_name(Df2TreeSampledGateStatus status) noexcept {
+    switch (status) {
+        case Df2TreeSampledGateStatus::Allowed: return "allowed";
+        case Df2TreeSampledGateStatus::Disabled: return "disabled";
+        case Df2TreeSampledGateStatus::Greedy: return "greedy";
+        case Df2TreeSampledGateStatus::MaxTempExceeded: return "max_temp";
+        case Df2TreeSampledGateStatus::WalkTreesDisabled: return "no_walk_trees";
+    }
+    return "unknown";
+}
+
+/// Evaluates whether sampled-tree mode may engage for a request without disabling linear DF2_SAMPLE_WALK.
+inline constexpr Df2TreeSampledGateStatus df2_tree_sampled_request_gate(bool sampled_tree_on, bool greedy,
+                                                                        float temperature, bool sample_walk_active,
+                                                                        float max_temp, bool no_walk_trees) noexcept {
+    if (!sampled_tree_on) return Df2TreeSampledGateStatus::Disabled;
+    if (greedy || !(temperature > 0.0f)) return Df2TreeSampledGateStatus::Greedy;
+    if (no_walk_trees && sample_walk_active) return Df2TreeSampledGateStatus::WalkTreesDisabled;
+    if (max_temp > 0.0f && temperature > max_temp) return Df2TreeSampledGateStatus::MaxTempExceeded;
+    return Df2TreeSampledGateStatus::Allowed;
+}
+
+struct Df2TreeSampledEnvelope {
+    float min_branch_p = kDf2TreeDefaultMinBranchP;
+    float ev_cut = 0.0f;
+    bool guard_clamped = false;
+    bool ev_shadow_clamped = false;
+    bool ev_below_guard = false;
+};
+
+/// Resolves the sampled-path (min_branch_p, ev_cut) envelope explicitly:
+/// 1) `ev_cut = ev_cut_samp > 0 ? ev_cut_samp : ev_cut_base`;
+/// 2) applies `MIN_BRANCH_GUARD` when `!var_t_on && guard_on` (`guard_clamped`);
+/// 3) if `ev_cut > 0` exceeds `min_branch_p`, raises `min_branch_p = ev_cut` (`ev_shadow_clamped`) so `ev_cut`
+///    never silently shadows `min_branch_p` (since `surv[d] <= 1.0`, runners `< ev_cut` can never pass);
+///    conversely if `guard_clamped && ev_cut < min_branch_p`, marks `ev_below_guard` so the guard clamp is visible.
+inline constexpr Df2TreeSampledEnvelope df2_tree_resolve_sampled_envelope(float raw_min_branch_p, float ev_cut_base,
+                                                                          float ev_cut_samp, bool var_t_on,
+                                                                          bool guard_on) noexcept {
+    Df2TreeSampledEnvelope env;
+    env.ev_cut = ev_cut_samp > 0.0f ? ev_cut_samp : ev_cut_base;
+    const float after_guard = df2_tree_effective_min_branch_p(raw_min_branch_p, var_t_on, guard_on);
+    env.guard_clamped = (after_guard != raw_min_branch_p);
+    env.min_branch_p = after_guard;
+    if (env.ev_cut > 0.0f) {
+        if (env.min_branch_p < env.ev_cut) {
+            env.min_branch_p = env.ev_cut;
+            env.ev_shadow_clamped = true;
+        } else if (env.guard_clamped && env.ev_cut < env.min_branch_p) {
+            env.ev_below_guard = true;
+        }
+    }
+    return env;
+}
+
 /// Parses STRATA_DF2_TREE_MAX_CUT (int >= 0; unset/empty/invalid/negative => -1 = disabled).
 inline int df2_tree_parse_max_cut(const char* value) noexcept {
     if (value == nullptr || *value == '\0') return -1;
@@ -2145,6 +2245,26 @@ struct Df2TreeAcceptHist {
     int64_t elig_rounds = 0;
     std::array<int64_t, kDf2TreeRejReasonCount> rej_reason{};  ///< minp, ev, cut, ema, dedup
     std::array<int64_t, kDf2TreeWidthBins> width_hist{};       ///< executed tree graph widths T=3..8
+    bool has_envelope = false;
+    Df2TreeSampledGateStatus env_gate = Df2TreeSampledGateStatus::Allowed;
+    float env_req_temp = 0.0f;
+    float env_min_branch_p = 0.0f;
+    float env_ev_cut = 0.0f;
+    float env_max_temp = 0.0f;
+    bool env_no_walk_trees = false;
+    bool env_sample_walk = false;
+
+    void set_sampled_envelope(Df2TreeSampledGateStatus gate, float req_temp, float min_branch_p, float ev_cut,
+                              float max_temp, bool no_walk_trees, bool sample_walk) noexcept {
+        has_envelope = true;
+        env_gate = gate;
+        env_req_temp = req_temp;
+        env_min_branch_p = min_branch_p;
+        env_ev_cut = ev_cut;
+        env_max_temp = max_temp;
+        env_no_walk_trees = no_walk_trees;
+        env_sample_walk = sample_walk;
+    }
 
     void observe_eligible() noexcept { ++elig_rounds; }
 
@@ -2251,6 +2371,14 @@ struct Df2TreeAcceptHist {
                 if (i > 0) s += ',';
                 s += std::to_string(width_hist[static_cast<size_t>(i)]);
             }
+            if (has_envelope) {
+                char buf[192];
+                std::snprintf(buf, sizeof(buf),
+                              " tree_env=gate:%s,temp:%.2f,minp:%.2f,ev:%.2f,maxt:%.2f,nowalk:%d,walk:%d",
+                              df2_tree_sampled_gate_name(env_gate), env_req_temp, env_min_branch_p, env_ev_cut,
+                              env_max_temp, env_no_walk_trees ? 1 : 0, env_sample_walk ? 1 : 0);
+                s += buf;
+            }
         }
         return s;
     }
@@ -2331,6 +2459,52 @@ inline bool parse_accept_hist_fields(const std::string& line, Df2TreeAcceptHist&
         !detail::parse_csv_ints(line, "tree_rej_reason=", tmp.rej_reason, kDf2TreeRejReasonCount)) return false;
     if (line.find("tree_width_hist=") != std::string::npos &&
         !detail::parse_csv_ints(line, "tree_width_hist=", tmp.width_hist, kDf2TreeWidthBins)) return false;
+    if (const size_t env_pos = line.find("tree_env="); env_pos != std::string::npos) {
+        const char* p = line.c_str() + env_pos + std::strlen("tree_env=");
+        if (std::strncmp(p, "gate:", 5) != 0) return false;
+        p += 5;
+        const char* comma = std::strchr(p, ',');
+        if (comma == nullptr) return false;
+        const std::string gate_name(p, static_cast<size_t>(comma - p));
+        if (gate_name == "allowed") tmp.env_gate = Df2TreeSampledGateStatus::Allowed;
+        else if (gate_name == "disabled") tmp.env_gate = Df2TreeSampledGateStatus::Disabled;
+        else if (gate_name == "greedy") tmp.env_gate = Df2TreeSampledGateStatus::Greedy;
+        else if (gate_name == "max_temp") tmp.env_gate = Df2TreeSampledGateStatus::MaxTempExceeded;
+        else if (gate_name == "no_walk_trees") tmp.env_gate = Df2TreeSampledGateStatus::WalkTreesDisabled;
+        else return false;
+        p = comma + 1;
+        auto parse_f = [&](const char* prefix, float& dst) noexcept -> bool {
+            const size_t plen = std::strlen(prefix);
+            if (std::strncmp(p, prefix, plen) != 0) return false;
+            p += plen;
+            char* end = nullptr;
+            dst = std::strtof(p, &end);
+            if (end == p || *end != ',') return false;
+            p = end + 1;
+            return true;
+        };
+        int nowalk_v = 0, walk_v = 0;
+        if (!parse_f("temp:", tmp.env_req_temp) || !parse_f("minp:", tmp.env_min_branch_p) ||
+            !parse_f("ev:", tmp.env_ev_cut) || !parse_f("maxt:", tmp.env_max_temp)) {
+            return false;
+        }
+        if (std::strncmp(p, "nowalk:", 7) != 0) return false;
+        p += 7;
+        char* end_nw = nullptr;
+        nowalk_v = static_cast<int>(std::strtol(p, &end_nw, 10));
+        if (end_nw == p || *end_nw != ',') return false;
+        p = end_nw + 1;
+        if (std::strncmp(p, "walk:", 5) != 0) return false;
+        p += 5;
+        char* end_w = nullptr;
+        walk_v = static_cast<int>(std::strtol(p, &end_w, 10));
+        if (end_w == p || (*end_w != '\0' && *end_w != ' ' && *end_w != '\t' && *end_w != '\n' && *end_w != '\r')) {
+            return false;
+        }
+        tmp.env_no_walk_trees = (nowalk_v != 0);
+        tmp.env_sample_walk = (walk_v != 0);
+        tmp.has_envelope = true;
+    }
     out = tmp;
     return true;
 }

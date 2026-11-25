@@ -1520,6 +1520,77 @@ int main() {
         }
     }
 
+    // P6: Temperature- and mode-aware tree gating (MAX_TEMP, NO_WALK_TREES, EV_CUT_SAMP, MIN_BRANCH_GUARD interplay).
+    {
+        check(df2_tree_parse_max_temp(nullptr) == 0.0f &&
+                  df2_tree_parse_max_temp("") == 0.0f &&
+                  df2_tree_parse_max_temp("0") == 0.0f &&
+                  df2_tree_parse_max_temp("-0.5") == 0.0f &&
+                  df2_tree_parse_max_temp("bad") == 0.0f &&
+                  std::fabs(df2_tree_parse_max_temp("0.7") - 0.7f) < 1e-6f,
+              "STRATA_DF2_TREE_MAX_TEMP parser validates positive finite thresholds");
+        check(!df2_tree_no_walk_trees_env_enabled(nullptr) &&
+                  !df2_tree_no_walk_trees_env_enabled("0") &&
+                  df2_tree_no_walk_trees_env_enabled("1"),
+              "STRATA_DF2_TREE_NO_WALK_TREES parser defaults OFF and enables on 1");
+        check(df2_tree_parse_ev_cut_samp(nullptr) == 0.0f &&
+                  df2_tree_parse_ev_cut_samp("0") == 0.0f &&
+                  df2_tree_parse_ev_cut_samp("1.5") == 0.0f &&
+                  std::fabs(df2_tree_parse_ev_cut_samp("0.25") - 0.25f) < 1e-6f,
+              "STRATA_DF2_TREE_EV_CUT_SAMP parser validates [0, 1]");
+        check(std::fabs(df2_tree_max_temp() - df2_tree_parse_max_temp(std::getenv("STRATA_DF2_TREE_MAX_TEMP"))) < 1e-6f,
+              "df2_tree_max_temp matches env");
+        check(df2_tree_no_walk_trees_on() == df2_tree_no_walk_trees_env_enabled(std::getenv("STRATA_DF2_TREE_NO_WALK_TREES")),
+              "df2_tree_no_walk_trees_on matches env");
+        check(std::fabs(df2_tree_ev_cut_samp() -
+                        df2_tree_parse_ev_cut_samp(std::getenv("STRATA_DF2_TREE_EV_CUT_SAMP"))) < 1e-6f,
+              "df2_tree_ev_cut_samp matches env");
+
+        check(df2_tree_sampled_request_gate(false, false, 0.7f, false, 0.7f, false) ==
+                  Df2TreeSampledGateStatus::Disabled,
+              "sampled gate returns Disabled when STRATA_DF2_TREE_SAMPLED=0");
+        check(df2_tree_sampled_request_gate(true, true, 0.0f, false, 0.7f, false) ==
+                  Df2TreeSampledGateStatus::Greedy,
+              "sampled gate returns Greedy for greedy requests");
+        check(df2_tree_sampled_request_gate(true, false, 0.7f, false, 0.7f, true) ==
+                  Df2TreeSampledGateStatus::Allowed,
+              "sampled gate allows point-mass T <= max_temp even with NO_WALK_TREES=1");
+        check(df2_tree_sampled_request_gate(true, false, 0.9f, false, 0.7f, false) ==
+                  Df2TreeSampledGateStatus::MaxTempExceeded,
+              "sampled gate skips sampled-tree entry when temperature > MAX_TEMP");
+        check(df2_tree_sampled_request_gate(true, false, 0.7f, true, 0.7f, true) ==
+                  Df2TreeSampledGateStatus::WalkTreesDisabled,
+              "sampled gate disables trees under DF2_SAMPLE_WALK=1 when NO_WALK_TREES=1");
+        check(df2_tree_sampled_request_gate(true, false, 0.9f, true, 0.0f, false) ==
+                  Df2TreeSampledGateStatus::Allowed,
+              "sampled gate allows DF2_SAMPLE_WALK=1 trees when NO_WALK_TREES=0 and MAX_TEMP=0");
+
+        // EV_CUT_SAMP inheritance + explicit MIN_BRANCH_GUARD / ev_cut interplay.
+        const auto env_inherit = df2_tree_resolve_sampled_envelope(0.30f, 0.35f, 0.0f, true, false);
+        check(std::fabs(env_inherit.ev_cut - 0.35f) < 1e-6f &&
+                  std::fabs(env_inherit.min_branch_p - 0.35f) < 1e-6f &&
+                  env_inherit.ev_shadow_clamped && !env_inherit.guard_clamped,
+              "ev_cut_samp=0 inherits ev_cut and explicitly raises min_branch_p to prevent silent shadowing");
+
+        const auto env_samp = df2_tree_resolve_sampled_envelope(0.10f, 0.35f, 0.25f, true, true);
+        check(std::fabs(env_samp.ev_cut - 0.25f) < 1e-6f &&
+                  std::fabs(env_samp.min_branch_p - 0.25f) < 1e-6f &&
+                  env_samp.ev_shadow_clamped && !env_samp.guard_clamped,
+              "ev_cut_samp=0.25 overrides ev_cut=0.35 and prevents silent shadowing at VAR_T=1");
+
+        const auto env_guard = df2_tree_resolve_sampled_envelope(0.20f, 0.35f, 0.25f, false, true);
+        check(std::fabs(env_guard.ev_cut - 0.25f) < 1e-6f &&
+                  std::fabs(env_guard.min_branch_p - kDf2TreeSafeMinBranchP) < 1e-6f &&
+                  env_guard.guard_clamped && env_guard.ev_below_guard && !env_guard.ev_shadow_clamped,
+              "VAR_T=0 with MIN_BRANCH_GUARD=1 clamps sampled min_branch_p=0.45 and flags ev_below_guard");
+
+        const auto env_ok = df2_tree_resolve_sampled_envelope(0.30f, 0.35f, 0.25f, true, true);
+        check(std::fabs(env_ok.ev_cut - 0.25f) < 1e-6f &&
+                  std::fabs(env_ok.min_branch_p - 0.30f) < 1e-6f &&
+                  !env_ok.ev_shadow_clamped && !env_ok.guard_clamped && !env_ok.ev_below_guard,
+              "min_branch_p >= ev_cut_samp with VAR_T=1 leaves both thresholds untouched");
+    }
+
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }

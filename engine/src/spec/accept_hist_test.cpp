@@ -159,5 +159,35 @@ int main() {
             return 20;
         }
     }
+
+    // P6: Applied sampled-tree envelope round-trips cleanly inside [accept-hist].
+    {
+        strata::spec::Df2TreeAcceptHist env_hist;
+        env_hist.sampled_req_active = true;
+        env_hist.set_sampled_envelope(strata::spec::Df2TreeSampledGateStatus::WalkTreesDisabled,
+                                      0.90f, 0.25f, 0.25f, 0.70f, true, true);
+        FILE* f_env = std::tmpfile();
+        if (f_env == nullptr) return 21;
+        h.emit(f_env, true, 9, &env_hist);
+        std::rewind(f_env);
+        char line_env[1024] = {};
+        const bool read_env = std::fgets(line_env, sizeof(line_env), f_env) != nullptr;
+        std::fclose(f_env);
+        if (!read_env) return 22;
+
+        strata::spec::Df2TreeAcceptHist parsed_env;
+        if (!strata::spec::parse_accept_hist_fields(line_env, parsed_env) ||
+            !parsed_env.has_envelope ||
+            parsed_env.env_gate != strata::spec::Df2TreeSampledGateStatus::WalkTreesDisabled ||
+            parsed_env.env_req_temp < 0.89f || parsed_env.env_req_temp > 0.91f ||
+            parsed_env.env_min_branch_p < 0.24f || parsed_env.env_min_branch_p > 0.26f ||
+            parsed_env.env_ev_cut < 0.24f || parsed_env.env_ev_cut > 0.26f ||
+            parsed_env.env_max_temp < 0.69f || parsed_env.env_max_temp > 0.71f ||
+            !parsed_env.env_no_walk_trees || !parsed_env.env_sample_walk ||
+            std::strstr(line_env, "tree_env=gate:no_walk_trees,temp:0.90,minp:0.25,ev:0.25,maxt:0.70,nowalk:1,walk:1") ==
+                nullptr) {
+            return 23;
+        }
+    }
     return 0;
 }
