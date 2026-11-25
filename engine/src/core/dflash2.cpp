@@ -627,8 +627,10 @@ bool Dflash2Drafter::alloc(std::string& err) {
     m_meta_ = (int32_t*) dd;
     if (!mapped(64 * 4, &hd, &dd)) { err = "dflash2: mapped output"; return false; }
     h_out_ = (int32_t*) hd;
-    out_tok_ = (int32_t*) dd;            // the select kernel writes the 7 picks here (host-visible) ...
-    out_prob_ = (float*) dd + 16;        // ... and their probabilities at +16 ints
+    out_tok_ = (int32_t*) dd;            // [0..15]: the select kernel writes the 7 picks here (host-visible) ...
+    out_prob_ = (float*) dd + 16;        // [16..31]: ... and their probabilities at +16 ints
+    out_tok2_ = (int32_t*) dd + 32;      // [32..47]: runner-up tokens (STRATA_DF2_TREE_PREGRID=1)
+    out_prob2_ = (float*) dd + 48;       // [48..63]: runner-up probabilities (STRATA_DF2_TREE_PREGRID=1)
     if (candidate_dump &&
         (cudaHostAlloc((void**) &h_candidate_tok_, 7 * 16 * sizeof(int32_t), cudaHostAllocPortable) != cudaSuccess ||
          cudaHostAlloc((void**) &h_candidate_score_, 7 * 16 * sizeof(float), cudaHostAllocPortable) != cudaSuccess)) {
@@ -1079,9 +1081,11 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err, bool rope) 
         if (hs_fork) cudaStreamWaitEvent(cs, ev_hs_[1], 0);
         else gemm({"candidate_selector.hidden_projection.weight"}, {hsel_}, ndraft_, cs, xqp_ + N_, xdp_ + N_ / 32);
         stamp("gemm:candidate_selector.hidden_projection");
+        const bool want_top2 = strata::spec::df2_tree_on() && strata::spec::df2_tree_pregrid_on();
         df2_select(hsel_, topval_, toptok_, reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.predecessor_codebook").off),
                    reinterpret_cast<const uint16_t*>(blob_ + find("candidate_selector.successor_codebook").off), rank_, ndraft_, d_meta_ + 16, out_tok_,
-                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0", df2_beam(), df2_select_table() ? seltab_ : nullptr);
+                   out_prob_, cs, find("candidate_selector.predecessor_codebook").dtype == "q4_0", df2_beam(), df2_select_table() ? seltab_ : nullptr,
+                   want_top2 ? out_tok2_ : nullptr, want_top2 ? out_prob2_ : nullptr);
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -2049,7 +2053,13 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
     h_meta_[17] = (int32_t) s;
     h_meta_[24] = anchor;
     for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
-    for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; }
+    for (int i = 0; i < kDrafts; ++i) {
+        ((volatile int32_t*) h_out_)[i] = -1;
+        if (strata::spec::df2_tree_on() && strata::spec::df2_tree_pregrid_on()) {
+            ((volatile int32_t*) h_out_)[32 + i] = -1;
+            ((volatile float*) h_out_)[48 + i] = 0.0f;
+        }
+    }
     std::atomic_thread_fence(std::memory_order_seq_cst);
     log_stage(pos0, n_new);
     if (timing_) cudaEventRecord(ev_a_, cs_);
@@ -2088,9 +2098,14 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
     const int64_t pos0 = launch_pos0_, s = pos0 + n_new;
     const Clock::time_point t0 = launch_t0_;
     const bool candidate_dump = h_candidate_tok_ != nullptr && h_candidate_score_ != nullptr;
-    const bool tree_copy = strata::spec::df2_tree_on() && !sample_walk && h_tree_tok_ != nullptr &&
+    const bool tree_pregrid = strata::spec::df2_tree_on() && strata::spec::df2_tree_pregrid_on() &&
+                              !sample_walk && head_native() && ndraft_ > 0 && seltab_ != nullptr;
+    const bool tree_copy = strata::spec::df2_tree_on() && !tree_pregrid && !sample_walk && h_tree_tok_ != nullptr &&
                            h_tree_seltab_ != nullptr && head_native() && ndraft_ > 0 && seltab_ != nullptr;
-    if (strata::spec::df2_tree_on()) tree_tables_valid_ = false;
+    if (strata::spec::df2_tree_on()) {
+        tree_tables_valid_ = false;
+        tree_top2_valid_ = false;
+    }
     if (candidate_dump) {
         std::fill_n(h_candidate_tok_, 7 * 16, 0);
         std::fill_n(h_candidate_score_, 7 * 16, 0.0f);
@@ -2131,6 +2146,14 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
         if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     }
     if (tree_copy) tree_tables_valid_ = true;
+    if (tree_pregrid) {
+        for (int i = 0; i < kDrafts; ++i) {
+            const bool made = i < ndraft_;
+            tree_top2_tok_[(size_t) i] = made ? ((volatile int32_t*) h_out_)[32 + i] : -1;
+            tree_top2_prob_[(size_t) i] = made ? ((volatile float*) h_out_)[48 + i] : 0.0f;
+        }
+        tree_top2_valid_ = true;
+    }
     log_flush();
     std::array<int32_t, kDrafts> sampled_drafts{};
     std::array<float, kDrafts> sampled_selected_q{};
@@ -2181,6 +2204,26 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
     ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n_new);
     ms_draft += ms_since(t0);
     ++rounds;
+    return true;
+}
+
+bool Dflash2Drafter::fetch_tree_tables(std::string& err) {
+    if (tree_tables_valid_) return true;
+    if (h_tree_tok_ == nullptr || h_tree_seltab_ == nullptr || toptok_ == nullptr || seltab_ == nullptr || ndraft_ <= 0) {
+        err = "dflash2: tree selector tables are unavailable";
+        return false;
+    }
+    const OnDevice on_device(device_);
+    const size_t rows = (size_t) std::clamp(ndraft_, 0, kDrafts);
+    const size_t tok_bytes = rows * 16 * sizeof(int32_t);
+    const size_t tab_bytes = rows * 16 * 16 * sizeof(float);
+    if (cudaMemcpyAsync(h_tree_tok_, toptok_, tok_bytes, cudaMemcpyDeviceToHost, cs_) != cudaSuccess ||
+        cudaMemcpyAsync(h_tree_seltab_, seltab_, tab_bytes, cudaMemcpyDeviceToHost, cs_) != cudaSuccess ||
+        cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = std::string("dflash2 lazy tree selector copy: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    tree_tables_valid_ = true;
     return true;
 }
 

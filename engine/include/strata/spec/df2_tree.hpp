@@ -48,6 +48,17 @@ inline bool df2_tree_on() noexcept {
     return on;
 }
 
+/// Parses STRATA_DF2_TREE_PREGRID value ("1" enables zero-sync GPU top-2 pre-gate; default OFF).
+inline bool df2_tree_pregrid_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+/// Process-wide gate for zero-sync GPU top-2 pre-gate (default OFF).
+inline bool df2_tree_pregrid_on() noexcept {
+    static const bool on = df2_tree_pregrid_env_enabled(std::getenv("STRATA_DF2_TREE_PREGRID"));
+    return on;
+}
+
 /// Minimum runner-up conditional probability to become a tree branch sibling.
 /// STRATA_DF2_TREE_MIN_BRANCH_P (float, default kDf2TreeDefaultMinBranchP).
 inline float df2_tree_min_branch_p() noexcept {
@@ -598,11 +609,61 @@ struct Df2TreeBuildOptions {
 
 class Df2TreeAdaptivePolicy;
 
+/// Safety tolerance when pre-gating lazy seltab_ fetch so FP32 __expf vs FP64 std::exp rounding never drops a borderline runner.
+inline constexpr float kDf2TreePregridFetchEps = 1e-4f;
+
+/// Zero-sync host pre-gate on mapped GPU top-2 runner-ups: returns true iff at least one step `r <= max_cut`
+/// has a valid runner-up token with `top2_prob[r] + eps >= min_branch_p`.
+inline bool df2_tree_pregrid_passes(const int32_t* top2_tok, const float* top2_prob, int n_drafts,
+                                    float min_branch_p, int max_cut = -1, float eps = 0.0f) noexcept {
+    const int nd = std::clamp(n_drafts, 0, kDf2TreeMaxDrafts);
+    if (nd < 2 || top2_tok == nullptr || top2_prob == nullptr) return false;
+    const int r_lim = (max_cut >= 0) ? std::min(nd - 1, max_cut) : (nd - 1);
+    for (int r = 0; r <= r_lim; ++r) {
+        if (top2_tok[r] >= 0 && std::isfinite(top2_prob[r]) && top2_prob[r] + eps >= min_branch_p) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Returns true iff `df2_tree_build_from_top2_ex` can build the exact same tree as `df2_tree_build_from_selector_ex`
+/// without copying `seltab_` from GPU (2-way fanout, non-walk, unscaled T=1.0, no logit_bias, and no dedup collision
+/// on a qualifying rank-2 candidate that could promote a rank-3 candidate).
+inline bool df2_tree_pregrid_can_use_direct_top2(int32_t anchor, const int32_t* drafts, int n_drafts,
+                                                 const int32_t* top2_tok, const float* top2_prob,
+                                                 const Df2TreeBuildOptions& opts) noexcept {
+    if (opts.max_fanout != 2 || opts.sample_walk || opts.q_temperature != 1.0f || opts.logit_bias != nullptr) {
+        return false;
+    }
+    if (drafts == nullptr || top2_tok == nullptr || top2_prob == nullptr) return false;
+    const int nd = std::clamp(n_drafts, 0, kDf2TreeMaxDrafts);
+    if (nd < 2) return false;
+    if (!opts.dedup_siblings) return true;
+    const int r_lim = (opts.max_cut >= 0) ? std::min(nd - 1, opts.max_cut) : (nd - 1);
+    for (int r = 0; r <= r_lim; ++r) {
+        const int32_t tok = top2_tok[r];
+        const float p = top2_prob[r];
+        if (tok < 0 || !std::isfinite(p) || p + kDf2TreePregridFetchEps < opts.min_branch_p) continue;
+        if (tok == anchor) return false;
+        for (int i = 0; i <= r; ++i) {
+            if (drafts[i] == tok) return false;
+        }
+    }
+    return true;
+}
+
 inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t* drafts, const float* probs,
                                                     int n_drafts, const int32_t* toptok, const float* seltab,
                                                     const Df2TreeBuildOptions& opts,
                                                     const Df2TreeAdaptivePolicy* adaptive = nullptr,
                                                     Df2TreeRejReason* reject_reason = nullptr) noexcept;
+
+inline Df2TreeSpec df2_tree_build_from_top2_ex(int32_t anchor, const int32_t* drafts, const float* probs,
+                                                int n_drafts, const int32_t* top2_tok, const float* top2_prob,
+                                                const Df2TreeBuildOptions& opts,
+                                                const Df2TreeAdaptivePolicy* adaptive = nullptr,
+                                                Df2TreeRejReason* reject_reason = nullptr) noexcept;
 
 /// Builds a PrefixFanout caterpillar tree directly from DF2's primary path (`drafts`, `probs`) and
 /// selector tables (`toptok[n_drafts][16]`, `seltab[n_drafts][16][16]`), fanning out 2..max_fanout
@@ -1671,17 +1732,10 @@ inline int extract_selector_runners(int step, int32_t anchor, const int32_t* dra
     return n_runners;
 }
 
-}  // namespace detail
-
-/// Extended selector-table tree builder supporting composable EV-budget caterpillar allocation (`ev_cut > 0`),
-/// EWMA-calibrated branch-cut / net-EV adaptive gating (`adaptive_cut`), and sibling deduplication (`dedup_siblings`).
-/// EV decisions price raw `probs` by default unless opted in; when `ev_cut <= 0`, `!adaptive_cut`, and
-/// `!dedup_siblings`, reproduces legacy behavior identically.
-inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t* drafts, const float* probs,
-                                                    int n_drafts, const int32_t* toptok, const float* seltab,
-                                                    const Df2TreeBuildOptions& opts,
-                                                    const Df2TreeAdaptivePolicy* adaptive,
-                                                    Df2TreeRejReason* reject_reason) noexcept {
+template <typename RunnerFn>
+inline Df2TreeSpec df2_tree_build_core(int32_t anchor, const int32_t* drafts, const float* probs, int n_drafts,
+                                       const Df2TreeBuildOptions& opts, const Df2TreeAdaptivePolicy* adaptive,
+                                       Df2TreeRejReason* reject_reason, RunnerFn&& get_runners) noexcept {
     auto set_rej = [&](Df2TreeRejReason r) noexcept {
         if (reject_reason != nullptr) *reject_reason = r;
     };
@@ -1689,7 +1743,7 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
     const int cap = std::clamp(opts.max_nodes, 1, kDf2TreeMaxNodes);
     const int nd = (drafts != nullptr) ? std::clamp(n_drafts, 0, kDf2TreeMaxDrafts) : 0;
     const int lin_n = std::min(nd, cap - 1);
-    if (nd < 2 || cap < 4 || drafts == nullptr || probs == nullptr || toptok == nullptr || seltab == nullptr) {
+    if (nd < 2 || cap < 4 || drafts == nullptr || probs == nullptr) {
         set_rej(Df2TreeRejReason::Cut);
         return make_linear_tree(anchor, drafts, lin_n);
     }
@@ -1749,13 +1803,9 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
                     EvCand{d, true, 0, drafts[d], opts.adaptive_cut ? spine_cal_ev : spine_ev, spine_cal_ev};
             }
             if (opts.max_cut >= 0 && d > opts.max_cut) continue;
-            std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
+            std::array<Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
             bool step_dedup_drop = false;
-            const int n_run = detail::extract_selector_runners(d, anchor, drafts, nd, toptok, seltab,
-                                                               opts.min_branch_p, opts.dedup_siblings, runs,
-                                                               opts.sample_walk, opts.q_temperature,
-                                                               opts.logit_bias, opts.logit_bias_len,
-                                                               &step_dedup_drop);
+            const int n_run = get_runners(d, runs, &step_dedup_drop);
             if (n_run > 0) any_runners_before_ev = true;
             if (step_dedup_drop) any_dedup_drop = true;
             const int take = std::min(n_run, max_runners);
@@ -1918,13 +1968,9 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
         bool any_runners = false;
         bool any_dedup_drop = false;
         for (int c = 0; c <= max_cut; ++c) {
-            std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
+            std::array<Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
             bool step_dedup_drop = false;
-            const int n_run = detail::extract_selector_runners(c, anchor, drafts, nd, toptok, seltab,
-                                                               opts.min_branch_p, opts.dedup_siblings, runs,
-                                                               opts.sample_walk, opts.q_temperature,
-                                                               opts.logit_bias, opts.logit_bias_len,
-                                                               &step_dedup_drop);
+            const int n_run = get_runners(c, runs, &step_dedup_drop);
             if (step_dedup_drop) any_dedup_drop = true;
             if (n_run == 0) continue;
             any_runners = true;
@@ -1988,13 +2034,9 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
         }
     }
 
-    std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runners{};
+    std::array<Df2SelectorCand, kDf2TreeSelectorTopK> runners{};
     bool dedup_drop = false;
-    const int n_runners = detail::extract_selector_runners(cut, anchor, drafts, nd, toptok, seltab,
-                                                           opts.min_branch_p, opts.dedup_siblings, runners,
-                                                           opts.sample_walk, opts.q_temperature,
-                                                           opts.logit_bias, opts.logit_bias_len,
-                                                           &dedup_drop);
+    const int n_runners = get_runners(cut, runners, &dedup_drop);
     if (n_runners == 0) {
         set_rej(dedup_drop ? Df2TreeRejReason::Dedup : Df2TreeRejReason::MinP);
         return make_linear_tree(anchor, drafts, lin_n);
@@ -2015,6 +2057,72 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
     const int tail_len = std::max(0, nd - (cut + 1));
     return make_prefix_fanout_tree(anchor, drafts, cut, branch_tokens.data(), fanout,
                                    tail_len > 0 ? drafts + cut + 1 : nullptr, tail_len, cap);
+}
+
+}  // namespace detail
+
+/// Extended selector-table tree builder supporting composable EV-budget caterpillar allocation (`ev_cut > 0`),
+/// EWMA-calibrated branch-cut / net-EV adaptive gating (`adaptive_cut`), and sibling deduplication (`dedup_siblings`).
+/// EV decisions price raw `probs` by default unless opted in; when `ev_cut <= 0`, `!adaptive_cut`, and
+/// `!dedup_siblings`, reproduces legacy behavior identically.
+inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t* drafts, const float* probs,
+                                                    int n_drafts, const int32_t* toptok, const float* seltab,
+                                                    const Df2TreeBuildOptions& opts,
+                                                    const Df2TreeAdaptivePolicy* adaptive,
+                                                    Df2TreeRejReason* reject_reason) noexcept {
+    const int cap = std::clamp(opts.max_nodes, 1, kDf2TreeMaxNodes);
+    const int nd = (drafts != nullptr) ? std::clamp(n_drafts, 0, kDf2TreeMaxDrafts) : 0;
+    const int lin_n = std::min(nd, cap - 1);
+    if (toptok == nullptr || seltab == nullptr) {
+        if (reject_reason != nullptr) *reject_reason = Df2TreeRejReason::Cut;
+        return make_linear_tree(anchor, drafts, lin_n);
+    }
+    return detail::df2_tree_build_core(
+        anchor, drafts, probs, n_drafts, opts, adaptive, reject_reason,
+        [&](int step, std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK>& runs,
+            bool* saw_dedup_drop) noexcept -> int {
+            return detail::extract_selector_runners(step, anchor, drafts, nd, toptok, seltab, opts.min_branch_p,
+                                                    opts.dedup_siblings, runs, opts.sample_walk, opts.q_temperature,
+                                                    opts.logit_bias, opts.logit_bias_len, saw_dedup_drop);
+        });
+}
+
+/// Zero-sync top-2 tree builder using mapped `(top2_tok[r], top2_prob[r])` directly without `seltab_` D2H copy.
+inline Df2TreeSpec df2_tree_build_from_top2_ex(int32_t anchor, const int32_t* drafts, const float* probs,
+                                                int n_drafts, const int32_t* top2_tok, const float* top2_prob,
+                                                const Df2TreeBuildOptions& opts,
+                                                const Df2TreeAdaptivePolicy* adaptive,
+                                                Df2TreeRejReason* reject_reason) noexcept {
+    const int cap = std::clamp(opts.max_nodes, 1, kDf2TreeMaxNodes);
+    const int nd = (drafts != nullptr) ? std::clamp(n_drafts, 0, kDf2TreeMaxDrafts) : 0;
+    const int lin_n = std::min(nd, cap - 1);
+    if (top2_tok == nullptr || top2_prob == nullptr) {
+        if (reject_reason != nullptr) *reject_reason = Df2TreeRejReason::Cut;
+        return make_linear_tree(anchor, drafts, lin_n);
+    }
+    return detail::df2_tree_build_core(
+        anchor, drafts, probs, n_drafts, opts, adaptive, reject_reason,
+        [&](int step, std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK>& runs,
+            bool* saw_dedup_drop) noexcept -> int {
+            if (saw_dedup_drop != nullptr) *saw_dedup_drop = false;
+            if (step < 0 || step >= nd || drafts == nullptr) return 0;
+            const int32_t tok = top2_tok[step];
+            const float p = top2_prob[step];
+            if (tok < 0 || tok == drafts[step] || !std::isfinite(p)) return 0;
+            if (opts.dedup_siblings) {
+                bool in_prefix = (tok == anchor);
+                for (int i = 0; i <= step && !in_prefix; ++i) {
+                    if (drafts[i] == tok) in_prefix = true;
+                }
+                if (in_prefix) {
+                    if (saw_dedup_drop != nullptr && p >= opts.min_branch_p) *saw_dedup_drop = true;
+                    return 0;
+                }
+            }
+            if (p < opts.min_branch_p) return 0;
+            runs[0] = detail::Df2SelectorCand{1, tok, p};
+            return 1;
+        });
 }
 
 /// Tree telemetry compatible with [accept-hist] comma-list logging.

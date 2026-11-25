@@ -118,7 +118,8 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 /// `table` (optional, rows * 16 * 16 floats, rows <= 8): score every reachable step in one parallel launch first, then walk the table (bitwise the same picks
 /// and probabilities as without it).
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb, int rank, int rows,
-                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false, int beam = 4, float* table = nullptr);
+                const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream, bool cb_q4 = false, int beam = 4, float* table = nullptr,
+                int32_t* out_tok2 = nullptr, float* out_prob2 = nullptr);
 
 /// Multi-slot candidate selector walk: one threadblock per item (`0 <= s < n_items`).  Item `s` reads
 /// `row_off = batch_meta[s * 4 + 0]`, `rows = batch_meta[s * 4 + 1]`, and `prev0 = batch_meta[s * 4 + 2]`, walks

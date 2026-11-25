@@ -24715,7 +24715,9 @@ int main(int argc, char** argv) {
                     tree_req_eligible = false;
                 }
                 if (tree_req_eligible && !first_window && !merged && !from_sfx && !df2_handoff_round &&
-                    df2_suffix_n == 0 && chain_n == 0 && !win_forced && df2.tree_tables_ready()) {
+                    df2_suffix_n == 0 && chain_n == 0 && !win_forced &&
+                    (df2.tree_tables_ready() ||
+                     (strata::spec::df2_tree_pregrid_on() && !df2_sample_active && df2.tree_top2_ready()))) {
                     const int tree_cap = (int) std::min<int64_t>(
                         std::min(S_mtp, strata::spec::kDf2TreeMaxNodes), o.max_context - p);
                     if (tree_cap >= 4) {
@@ -24750,9 +24752,54 @@ int main(int argc, char** argv) {
                         tree_opts.logit_bias = df2_logit_bias;
                         tree_opts.logit_bias_len = df2_logit_bias_len;
                         strata::spec::Df2TreeRejReason build_rej = strata::spec::Df2TreeRejReason::None;
-                        tree_spec = strata::spec::df2_tree_build_from_selector_ex(
-                            x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(), df2.tree_seltab(),
-                            tree_opts, tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr, &build_rej);
+                        if (df2.tree_tables_ready()) {
+                            tree_spec = strata::spec::df2_tree_build_from_selector_ex(
+                                x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(), df2.tree_seltab(),
+                                tree_opts, tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr, &build_rej);
+                        } else {
+                            const int pre_cut = (tree_opts.draft_conf > 0.0)
+                                ? strata::spec::df2_tree_cut_depth(dprob.data(), df2.max_drafts(), tree_opts.draft_conf)
+                                : -1;
+                            if (tree_opts.max_cut >= 0 && pre_cut >= 0 && pre_cut > tree_opts.max_cut) {
+                                build_rej = strata::spec::Df2TreeRejReason::Cut;
+                                tree_spec = strata::spec::make_linear_tree(
+                                    x, drafts.data(), std::min(df2.max_drafts(), tree_cap - 1));
+                            } else if (tree_opts.q_temperature == 1.0f && tree_opts.logit_bias == nullptr) {
+                                if (!strata::spec::df2_tree_pregrid_passes(
+                                        df2.tree_top2_tok(), df2.tree_top2_prob(), df2.max_drafts(),
+                                        tree_opts.min_branch_p, tree_opts.max_cut,
+                                        strata::spec::kDf2TreePregridFetchEps)) {
+                                    build_rej = strata::spec::Df2TreeRejReason::MinP;
+                                    tree_spec = strata::spec::make_linear_tree(
+                                        x, drafts.data(), std::min(df2.max_drafts(), tree_cap - 1));
+                                } else if (strata::spec::df2_tree_pregrid_can_use_direct_top2(
+                                               x, drafts.data(), df2.max_drafts(),
+                                               df2.tree_top2_tok(), df2.tree_top2_prob(), tree_opts)) {
+                                    tree_spec = strata::spec::df2_tree_build_from_top2_ex(
+                                        x, drafts.data(), dprob.data(), df2.max_drafts(),
+                                        df2.tree_top2_tok(), df2.tree_top2_prob(), tree_opts,
+                                        tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr, &build_rej);
+                                } else {
+                                    if (!df2.fetch_tree_tables(err)) {
+                                        std::printf("ERR %s\n", err.c_str());
+                                        return 1;
+                                    }
+                                    tree_spec = strata::spec::df2_tree_build_from_selector_ex(
+                                        x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(),
+                                        df2.tree_seltab(), tree_opts,
+                                        tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr, &build_rej);
+                                }
+                            } else {
+                                if (!df2.fetch_tree_tables(err)) {
+                                    std::printf("ERR %s\n", err.c_str());
+                                    return 1;
+                                }
+                                tree_spec = strata::spec::df2_tree_build_from_selector_ex(
+                                    x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(),
+                                    df2.tree_seltab(), tree_opts,
+                                    tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr, &build_rej);
+                            }
+                        }
                         const float row_ema_thresh = strata::spec::df2_tree_row_ema();
                         if (!tree_spec.valid() || tree_spec.is_linear() || !tree_spec.is_caterpillar()) {
                             if (accept_hist_on) {

@@ -1417,6 +1417,109 @@ int main() {
               "Gumbel + sampled-tree conflict predicate triggers iff both are enabled");
     }
 
+    // P2: Zero-sync GPU top-2 pre-gate & direct top-2 builder parity tests.
+    {
+        check(!df2_tree_pregrid_env_enabled(nullptr) &&
+                  !df2_tree_pregrid_env_enabled("") &&
+                  !df2_tree_pregrid_env_enabled("0") &&
+                  !df2_tree_pregrid_env_enabled("true") &&
+                  df2_tree_pregrid_env_enabled("1"),
+              "STRATA_DF2_TREE_PREGRID parser defaults OFF and enables on 1");
+        const char* pre_env = std::getenv("STRATA_DF2_TREE_PREGRID");
+        check(df2_tree_pregrid_on() == df2_tree_pregrid_env_enabled(pre_env),
+              "df2_tree_pregrid_on matches STRATA_DF2_TREE_PREGRID env");
+
+        const int32_t top2_tok[7] = {200, 201, 202, 203, 204, 205, 206};
+        const float top2_prob[7] = {0.10f, 0.20f, 0.34f, 0.48f, 0.15f, 0.05f, 0.05f};
+        check(!df2_tree_pregrid_passes(top2_tok, top2_prob, 7, 0.50f, -1, 0.0f),
+              "pregrid rejects when all runner-up probs < min_branch_p");
+        check(df2_tree_pregrid_passes(top2_tok, top2_prob, 7, 0.35f, -1, 0.0f),
+              "pregrid passes when step 3 prob 0.48 >= 0.35");
+        check(!df2_tree_pregrid_passes(top2_tok, top2_prob, 7, 0.35f, 2, 0.0f),
+              "pregrid respects max_cut=2 and ignores step 3 prob 0.48");
+        check(df2_tree_pregrid_passes(top2_tok, top2_prob, 7, 0.34005f, 2, kDf2TreePregridFetchEps),
+              "pregrid fetch eps prevents boundary false negative");
+        const int32_t neg_tok[7] = {-1, -1, -1, -1, -1, -1, -1};
+        check(!df2_tree_pregrid_passes(neg_tok, top2_prob, 7, 0.05f, -1, 0.0f),
+              "pregrid rejects invalid (-1) runner-up tokens");
+
+        const std::array<int32_t, 7> drafts{101, 102, 103, 104, 105, 106, 107};
+        Df2TreeBuildOptions opts;
+        opts.max_fanout = 2;
+        opts.min_branch_p = 0.30f;
+        opts.dedup_siblings = true;
+        check(df2_tree_pregrid_can_use_direct_top2(99, drafts.data(), 7, top2_tok, top2_prob, opts),
+              "direct top-2 builder eligible for max_fanout=2 non-walk without dedup collision");
+        opts.max_fanout = 3;
+        check(!df2_tree_pregrid_can_use_direct_top2(99, drafts.data(), 7, top2_tok, top2_prob, opts),
+              "direct top-2 builder defers to seltab when max_fanout > 2");
+        opts.max_fanout = 2;
+        opts.sample_walk = true;
+        check(!df2_tree_pregrid_can_use_direct_top2(99, drafts.data(), 7, top2_tok, top2_prob, opts),
+              "direct top-2 builder defers when sample_walk=true");
+        opts.sample_walk = false;
+        opts.q_temperature = 0.7f;
+        check(!df2_tree_pregrid_can_use_direct_top2(99, drafts.data(), 7, top2_tok, top2_prob, opts),
+              "direct top-2 builder defers when q_temperature != 1.0f");
+        opts.q_temperature = 1.0f;
+        const int32_t coll_tok[7] = {200, 99, 202, 203, 204, 205, 206};
+        const float coll_prob[7] = {0.10f, 0.40f, 0.10f, 0.10f, 0.10f, 0.10f, 0.10f};
+        check(!df2_tree_pregrid_can_use_direct_top2(99, drafts.data(), 7, coll_tok, coll_prob, opts),
+              "direct top-2 builder defers when qualifying rank-2 collides under dedup_siblings");
+
+        // Parity between df2_tree_build_from_top2_ex and df2_tree_build_from_selector_ex when max_fanout == 2.
+        std::array<int32_t, 7 * kDf2TreeSelectorTopK> toptok{};
+        std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+        toptok.fill(-1);
+        seltab.fill(-100.0f);
+        const std::array<float, 7> probs{0.90f, 0.65f, 0.80f, 0.45f, 0.40f, 0.40f, 0.40f};
+        std::array<int32_t, 7> exact_tok2{};
+        std::array<float, 7> exact_p2{};
+        for (int r = 0; r < 7; ++r) {
+            toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0] = drafts[static_cast<size_t>(r)];
+            toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 1] = 300 + r;
+            toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 2] = 400 + r;
+            const size_t base = (static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+            const float p2 = (r == 1) ? 0.40f : (r == 2 ? 0.36f : 0.12f);
+            const float p3 = 0.05f;
+            const float p1 = 1.0f - p2 - p3;
+            seltab[base + 0] = std::log(p1 / p2);
+            seltab[base + 1] = 0.0f;
+            seltab[base + 2] = std::log(p3 / p2);
+            exact_tok2[static_cast<size_t>(r)] = 300 + r;
+            exact_p2[static_cast<size_t>(r)] = p2;
+        }
+        Df2TreeAdaptivePolicy adapt;
+        adapt.observe_linear(5, 3);
+        for (float ev : {0.0f, 0.35f}) {
+            for (bool ac : {false, true}) {
+                for (int mc : {-1, 1, 3}) {
+                    Df2TreeBuildOptions popts;
+                    popts.draft_conf = 0.7;
+                    popts.min_branch_p = 0.30f;
+                    popts.max_fanout = 2;
+                    popts.max_nodes = 8;
+                    popts.ev_cut = ev;
+                    popts.adaptive_cut = ac;
+                    popts.max_cut = mc;
+                    Df2TreeRejReason rej_sel = Df2TreeRejReason::None;
+                    Df2TreeRejReason rej_top2 = Df2TreeRejReason::None;
+                    const Df2TreeSpec t_sel = df2_tree_build_from_selector_ex(
+                        99, drafts.data(), probs.data(), 7, toptok.data(), seltab.data(), popts,
+                        ac ? &adapt : nullptr, &rej_sel);
+                    const Df2TreeSpec t_top2 = df2_tree_build_from_top2_ex(
+                        99, drafts.data(), probs.data(), 7, exact_tok2.data(), exact_p2.data(), popts,
+                        ac ? &adapt : nullptr, &rej_top2);
+                    check(rej_sel == rej_top2 && t_sel.count == t_top2.count &&
+                              t_sel.token == t_top2.token && t_sel.parent == t_top2.parent &&
+                              t_sel.depth == t_top2.depth && t_sel.slot_rank == t_top2.slot_rank &&
+                              t_sel.shape == t_top2.shape && t_sel.branch_node == t_top2.branch_node,
+                          "df2_tree_build_from_top2_ex matches df2_tree_build_from_selector_ex across policy combos");
+                }
+            }
+        }
+    }
+
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }

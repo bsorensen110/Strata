@@ -192,6 +192,10 @@ public:
     bool tree_tables_ready() const noexcept { return tree_tables_valid_ && h_tree_tok_ != nullptr && h_tree_seltab_ != nullptr; }
     const int32_t* tree_toptok() const noexcept { return h_tree_tok_; }
     const float* tree_seltab() const noexcept { return h_tree_seltab_; }
+    bool tree_top2_ready() const noexcept { return tree_top2_valid_; }
+    const int32_t* tree_top2_tok() const noexcept { return tree_top2_tok_.data(); }
+    const float* tree_top2_prob() const noexcept { return tree_top2_prob_.data(); }
+    bool fetch_tree_tables(std::string& err);
 
     /// Co-drafts `n_items` active slot drafters (1 .. kBatchMaxSlots) in two halves (launch + finish): each slot's
     /// context update and 5-layer transformer body run on its own captured body graph (`body_exec_[n_new]`) on its
@@ -337,12 +341,15 @@ private:
     int32_t* d_meta_ = nullptr;     ///< [0..7] context positions, [8..15] block positions, [16] anchor token, [17] anchor position, [24..31] block tokens
     int32_t* h_meta_ = nullptr;     ///< host staging of d_meta_ (mapped; m_meta_ is its device alias)
     int32_t* m_meta_ = nullptr;
-    int32_t* h_out_ = nullptr;      ///< pinned: 7 draft tokens then 7 probabilities
+    int32_t* h_out_ = nullptr;      ///< mapped pinned: [0..15] tok, [16..31] prob, [32..47] tok2, [48..63] prob2
     int32_t* h_candidate_tok_ = nullptr;  ///< optional pinned [7][16] selector candidates for acceptance telemetry
     float* h_candidate_score_ = nullptr; ///< optional pinned [7][16] candidate head scores
     int32_t* h_tree_tok_ = nullptr;       ///< optional pinned [7][16] top tokens for STRATA_DF2_TREE=1
     float* h_tree_seltab_ = nullptr;      ///< optional pinned [7][16][16] selector table for STRATA_DF2_TREE=1
     bool tree_tables_valid_ = false;
+    bool tree_top2_valid_ = false;
+    std::array<int32_t, kDrafts> tree_top2_tok_{};
+    std::array<float, kDrafts> tree_top2_prob_{};
     float* hp_out_ = nullptr;
     float *kring_[8] = {}, *vring_[8] = {};
     float *rt_ctx_ = nullptr, *rt_blk_ = nullptr;   ///< rope tables of the context rows and of the block rows: one allocation, rt_blk_ = rt_ctx_ + 8 * 128
@@ -363,8 +370,8 @@ private:
     float *h_ = nullptr, *xn_ = nullptr, *xc_ = nullptr, *dyn_ = nullptr, *q_ = nullptr, *qn_ = nullptr, *k_ = nullptr, *v_ = nullptr, *kblk_ = nullptr;
     float *ao_ = nullptr, *o_ = nullptr, *gate_ = nullptr, *up_ = nullptr, *mlp_ = nullptr, *part_ = nullptr, *fn_ = nullptr;
     float *fn_batch_ = nullptr, *hsel_batch_ = nullptr;
-    float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr;
-    int32_t *toptok_ = nullptr, *out_tok_ = nullptr;
+    float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr, *out_prob2_ = nullptr;
+    int32_t *toptok_ = nullptr, *out_tok_ = nullptr, *out_tok2_ = nullptr;
     int32_t *h_bmeta_ = nullptr, *m_bmeta_ = nullptr;
     int32_t *h_bout_ = nullptr, *out_btok_ = nullptr;
     float *out_bprob_ = nullptr;
