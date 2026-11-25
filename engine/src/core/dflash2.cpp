@@ -2131,6 +2131,7 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
     log_flush();
     std::array<int32_t, kDrafts> sampled_drafts{};
     std::array<float, kDrafts> sampled_selected_q{};
+    std::array<float, kDrafts> sampled_max_q{};
     if (sample_walk) {
         std::array<int32_t, kDrafts * strata::spec::kDf2SelectorTopK> sampled_tokens;
         std::array<float, kDrafts * strata::spec::kDf2SelectorTopK * strata::spec::kDf2SelectorTopK> sampled_scores;
@@ -2153,17 +2154,20 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
         std::array<float, kDrafts * strata::spec::kDf2SelectorTopK> row_probs{};
         if (!strata::spec::df2_sample_selector_walk(ndraft_, sampled_tokens.data(), sampled_scores.data(),
                                                     sample_seed, sample_position, sampled_drafts.data(),
-                                                    sampled_selected_q.data(), row_tokens.data(), row_probs.data())) {
+                                                    sampled_selected_q.data(), row_tokens.data(), row_probs.data(),
+                                                    sampled_max_q.data())) {
             err = "dflash2: sampled selector walk encountered an invalid conditional row";
             return false;
         }
         std::copy(row_tokens.begin(), row_tokens.end(), q_tokens);
         std::copy(row_probs.begin(), row_probs.end(), q_probs);
     }
+    // Under sample_walk, probs[i] exports draw-independent max_j q[i][j] (rather than sampled_selected_q[i], the drawn
+    // token's q) so window_rule draft_conf and df2_tree ev_cut gates cannot bias target marginals; non-walk path unchanged.
     for (int i = 0; i < kDrafts; ++i) {
         const bool made = i < ndraft_;
         drafts[i] = !made ? 0 : sample_walk ? sampled_drafts[(size_t) i] : ((volatile int32_t*) h_out_)[i];
-        if (probs) probs[i] = !made ? 0.0f : sample_walk ? sampled_selected_q[(size_t) i] : ((volatile float*) h_out_)[16 + i];
+        if (probs) probs[i] = !made ? 0.0f : sample_walk ? sampled_max_q[(size_t) i] : ((volatile float*) h_out_)[16 + i];
     }
     if (timing_) {
         float ms = 0;

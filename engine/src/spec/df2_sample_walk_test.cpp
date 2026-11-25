@@ -1,5 +1,6 @@
 #include "strata/spec/df2_sample_walk.hpp"
 #include "strata/spec/df2_tree.hpp"
+#include "strata/spec/window_rule.hpp"
 
 #include <array>
 #include <cmath>
@@ -383,6 +384,182 @@ int main() {
                     chi2_lin_det, chi2_lin_stoch, chi2_lin_dedup, chi2_bad,
                     (long long) hist_det.runner_hits, (long long) hist_stoch.runner_hits,
                     (long long) hist_det.reject_resamples, (long long) hist_stoch.reject_resamples);
+
+        // 3. P1 Gated 500k-rollout 3-step Markov oracle (`tree_oracle_gated`):
+        //    exercises the real gating stack (window_rule draft_conf=0.70, ev_cut=0.35, dedup_siblings=true)
+        //    with draw-independent max_q[i] vs negative control gating on drawn selected_q[i].
+        auto fill_gated_selector = [&](int32_t anc, int32_t* toptok_out, float* seltab_out) {
+            const bool high_row0 = (anc % 2) == 0;
+            const double q_row0[4] = {
+                high_row0 ? 0.74 : 0.50,
+                high_row0 ? 0.16 : 0.38,
+                high_row0 ? 0.06 : 0.08,
+                high_row0 ? 0.04 : 0.04,
+            };
+            const double q_row1[4] = {
+                high_row0 ? 0.50 : 0.52,
+                high_row0 ? 0.48 : 0.30,
+                high_row0 ? 0.01 : 0.12,
+                high_row0 ? 0.01 : 0.06,
+            };
+            for (int r = 0; r < 3; ++r) {
+                for (int j = 0; j < strata::spec::kDf2SelectorTopK; ++j) {
+                    const int tok = (j < 4) ? ((anc + 1 + r + j) % 4) : -1;
+                    toptok_out[r * strata::spec::kDf2SelectorTopK + j] = tok;
+                }
+                const double* qv = (r == 0) ? q_row0 : q_row1;
+                for (int prev = 0; prev < strata::spec::kDf2SelectorTopK; ++prev) {
+                    for (int j = 0; j < strata::spec::kDf2SelectorTopK; ++j) {
+                        const int rot = (j + prev) % 4;
+                        seltab_out[(r * strata::spec::kDf2SelectorTopK + prev) * strata::spec::kDf2SelectorTopK + j] =
+                            (j < 4 && prev < 4) ? static_cast<float>(std::log(qv[rot])) : -INFINITY;
+                    }
+                }
+            }
+        };
+
+        auto run_gated_rollout = [&](int mode, float temp, strata::spec::Df2TreeAcceptHist* hist_out) {
+            // mode 0 = linear gated (max_q), 1 = tree gated (max_q + sample_walk=true), 2 = neg ctrl (selected_q)
+            std::array<long long, kSeqs> counts{};
+            for (int r = 0; r < kRollouts; ++r) {
+                const uint64_t seed = 0x6A7E0000ULL + static_cast<uint64_t>(r);
+                int32_t seq[3] = {};
+                int produced = 0;
+                int32_t x = 0;
+                uint64_t pos = 0;
+                uint64_t round_idx = 0;
+                while (produced < 3) {
+                    int32_t toptok_buf[7 * strata::spec::kDf2SelectorTopK] = {};
+                    float seltab_buf[7 * strata::spec::kDf2SelectorTopK * strata::spec::kDf2SelectorTopK] = {};
+                    fill_gated_selector(x, toptok_buf, seltab_buf);
+
+                    int32_t drafts[7] = {};
+                    float selected_q[7] = {};
+                    float max_q[7] = {};
+                    int32_t qtok[7 * strata::spec::kDf2SelectorTopK] = {};
+                    float qprob[7 * strata::spec::kDf2SelectorTopK] = {};
+                    const int nd = std::min(2, 3 - produced);
+                    const uint64_t draft_key = pos ^ (round_idx << 32);
+                    ++round_idx;
+                    (void) temp;
+                    strata::spec::df2_sample_selector_walk(nd, toptok_buf, seltab_buf, seed, draft_key,
+                                                           drafts, selected_q, qtok, qprob, max_q);
+                    const float* gate_probs = (mode == 2) ? selected_q : max_q;
+
+                    strata::spec::WindowRuleIn wr;
+                    wr.draft_on = true;
+                    wr.df2_active = true;
+                    wr.cap = 1 + nd;
+                    wr.start = 1 + nd;
+                    wr.draft_conf = 0.70;
+                    wr.dprob = gate_probs;
+                    int T = strata::spec::choose_window(wr);
+
+                    bool tree_round = false;
+                    strata::spec::Df2TreeSpec tree;
+                    strata::spec::Df2TreeSampleQ sq;
+                    if (mode != 0 && nd >= 2) {
+                        strata::spec::Df2TreeBuildOptions topts;
+                        topts.draft_conf = 0.70;
+                        topts.min_branch_p = 0.20f;
+                        topts.max_fanout = 2;
+                        topts.max_nodes = 5;
+                        topts.ev_cut = 0.35f;
+                        topts.dedup_siblings = true;
+                        topts.sample_walk = (mode == 1);
+                        tree = strata::spec::df2_tree_build_from_selector_ex(
+                            x, drafts, gate_probs, nd, toptok_buf, seltab_buf, topts);
+                        if (tree.valid() && !tree.is_linear() && tree.is_caterpillar()) {
+                            const bool q_ok = strata::spec::df2_tree_populate_sampled_q(
+                                tree, x, drafts, nd, toptok_buf, seltab_buf, true, seed, draft_key, sq);
+                            if (q_ok && tree.valid() && !tree.is_linear() && tree.is_caterpillar()) {
+                                tree_round = true;
+                                T = tree.count;
+                            } else if (mode == 1 && q_ok && tree.valid() && tree.is_linear()) {
+                                T = std::min(5, tree.count);
+                            }
+                        }
+                    }
+
+                    if (!tree_round) {
+                        const int lin_drafts = std::min(nd, std::max(0, T - 1));
+                        int a = 0;
+                        int32_t bonus = -1;
+                        int32_t cur = x;
+                        for (int t = 0; t < lin_drafts; ++t) {
+                            const uint64_t pt = pos + static_cast<uint64_t>(t);
+                            const float ua = strata::core::philox_uniform_host(seed, pt | strata::core::kSpecCtrAccept);
+                            const float ur = strata::core::philox_uniform_host(seed, pt | strata::core::kSpecCtrResid);
+                            const strata::core::SpecP P_t{kIds, kTarget[cur], kVocab};
+                            const strata::core::SpecQ Q_t{
+                                qtok + t * strata::spec::kDf2SelectorTopK,
+                                qprob + t * strata::spec::kDf2SelectorTopK,
+                                4};
+                            const auto vr = strata::core::spec_verify_row(P_t, drafts[t], Q_t, ua, ur);
+                            if (vr.accepted) {
+                                if (produced < 3) seq[produced++] = drafts[t];
+                                cur = drafts[t];
+                                ++a;
+                            } else {
+                                bonus = vr.token;
+                                break;
+                            }
+                        }
+                        if (a == lin_drafts) {
+                            const strata::core::SpecP P_end{kIds, kTarget[cur], kVocab};
+                            const float ub = strata::core::philox_uniform_host(seed, pos + static_cast<uint64_t>(lin_drafts));
+                            bonus = strata::core::spec_sample(P_end, ub);
+                        }
+                        if (produced < 3) seq[produced++] = bonus;
+                        x = bonus;
+                        pos += static_cast<uint64_t>(a + 1);
+                    } else {
+                        std::array<strata::core::SpecP, strata::spec::kDf2TreeMaxNodes> pv{};
+                        for (int i = 0; i < tree.count; ++i) {
+                            pv[static_cast<size_t>(i)] =
+                                strata::core::SpecP{kIds, kTarget[tree.token[static_cast<size_t>(i)]], kVocab};
+                        }
+                        int32_t bonus = -1;
+                        int64_t resamp = 0;
+                        const auto walk = strata::spec::df2_tree_sample_accept(
+                            tree, pv.data(), &sq, seed, pos, &bonus, &resamp);
+                        const int a = walk.accepted_drafts();
+                        if (hist_out != nullptr) hist_out->observe(tree, walk, true, resamp);
+                        for (int k = 1; k <= a && produced < 3; ++k) {
+                            seq[produced++] = tree.token[walk.path[static_cast<size_t>(k)]];
+                        }
+                        if (produced < 3) seq[produced++] = bonus;
+                        x = bonus;
+                        pos += static_cast<uint64_t>(a + 1);
+                    }
+                }
+                ++counts[(seq[0] * 4 + seq[1]) * 4 + seq[2]];
+            }
+            return counts;
+        };
+
+        strata::spec::Df2TreeAcceptHist hist_gated;
+        const auto c_lin_gated = run_gated_rollout(0, 1.0f, nullptr);
+        const auto c_tree_gated = run_gated_rollout(1, 1.0f, &hist_gated);
+        const auto c_neg_drawn = run_gated_rollout(2, 1.0f, nullptr);
+        const double chi2_lin_gated = pearson_chi2(c_lin_gated);
+        const double chi2_tree_gated = pearson_chi2(c_tree_gated);
+        const double chi2_lin_vs_tree_gated = two_sample_chi2(c_lin_gated, c_tree_gated);
+        const double chi2_neg_drawn = pearson_chi2(c_neg_drawn);
+        check(chi2_lin_gated < 103.5, "gated linear oracle (max_q, draft_conf=0.70) matches exact Markov law");
+        check(chi2_tree_gated < 103.5,
+              "gated sampled tree oracle (max_q, ev_cut=0.35, draft_conf=0.70, dedup=1) matches exact Markov law");
+        check(chi2_lin_vs_tree_gated < 103.5, "gated tree matches gated linear oracle two-sample chi2");
+        check(chi2_neg_drawn > 1000.0,
+              "drawn-q gating negative control fails chi-square distribution check by a wide margin");
+        check(hist_gated.sampled_tree_rounds > 0 && hist_gated.runner_hits > 0 && hist_gated.reject_resamples > 0,
+              "gated sampled tree oracle actively engages trees, runner hits, and residual resamples");
+        std::printf("df2_sample_walk_test tree_oracle_gated: %s (lin_gated=%.2f tree_gated=%.2f "
+                    "lin_vs_tree=%.2f neg_drawn_q=%.2f rounds=%lld rhits=%lld resamp=%lld)\n",
+                    failures == 0 ? "OK" : "FAILED", chi2_lin_gated, chi2_tree_gated,
+                    chi2_lin_vs_tree_gated, chi2_neg_drawn,
+                    (long long) hist_gated.sampled_tree_rounds, (long long) hist_gated.runner_hits,
+                    (long long) hist_gated.reject_resamples);
     }
 
     return failures == 0 ? 0 : 1;

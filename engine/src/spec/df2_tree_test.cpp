@@ -475,19 +475,22 @@ void test_sibling_dedup() {
         seltab[(static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 0] = 0.0f;
     }
     // Cut at c=2: slot 1 collides with prefix token drafts[1]=102, slot 2 collides with anchor=99,
-    // slot 3 collides with later top-1 drafts[5]=106, slot 4 is distinct token 303 (with duplicate at slot 5).
+    // slot 3 is future spine token drafts[5]=106 (must NOT be excluded by P1), slot 4 collides with drafts[0]=101,
+    // slot 5 is distinct token 303 (with duplicate at slot 6).
     const size_t base2 = (2u * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
     toptok[2 * kDf2TreeSelectorTopK + 1] = 102;
     toptok[2 * kDf2TreeSelectorTopK + 2] = 99;
     toptok[2 * kDf2TreeSelectorTopK + 3] = 106;
-    toptok[2 * kDf2TreeSelectorTopK + 4] = 303;
+    toptok[2 * kDf2TreeSelectorTopK + 4] = 101;
     toptok[2 * kDf2TreeSelectorTopK + 5] = 303;
+    toptok[2 * kDf2TreeSelectorTopK + 6] = 303;
     seltab[base2 + 0] = 1.0f;
-    seltab[base2 + 1] = 0.5f;
-    seltab[base2 + 2] = 0.4f;
-    seltab[base2 + 3] = 0.3f;
-    seltab[base2 + 4] = -0.3f;
-    seltab[base2 + 5] = -0.3f;
+    seltab[base2 + 1] = 0.8f;
+    seltab[base2 + 2] = 0.7f;
+    seltab[base2 + 3] = 0.6f;   // exp(0.6)=1.822 > 2*exp(-0.5)=1.213 -> 106 beats merged 303
+    seltab[base2 + 4] = 0.5f;
+    seltab[base2 + 5] = -0.5f;
+    seltab[base2 + 6] = -0.5f;
 
     Df2TreeBuildOptions opts;
     opts.draft_conf = 0.5;
@@ -503,15 +506,40 @@ void test_sibling_dedup() {
     opts.dedup_siblings = true;
     const Df2TreeSpec with_dedup = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
                                                                    toptok.data(), seltab.data(), opts);
-    check(with_dedup.valid() && with_dedup.branch_node == 2 && with_dedup.token[4] == 303,
-          "with dedup, colliding candidates (102, 99, 106) are skipped in favor of distinct 303");
+    check(with_dedup.valid() && with_dedup.branch_node == 2 && with_dedup.token[4] == 106,
+          "with dedup, anchor/prefix drafts[0..2] (102, 99) are skipped while future drafts[5]=106 is NOT excluded");
 
-    // If every runner-up collides -> linear fallback
-    toptok[2 * kDf2TreeSelectorTopK + 4] = 101;
-    toptok[2 * kDf2TreeSelectorTopK + 5] = 104;
+    // When slot 3 collides with prefix drafts[0]=101, distinct merged 303 wins.
+    toptok[2 * kDf2TreeSelectorTopK + 3] = 101;
+    const Df2TreeSpec with_distinct = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                                      toptok.data(), seltab.data(), opts);
+    check(with_distinct.valid() && with_distinct.branch_node == 2 && with_distinct.token[4] == 303,
+          "with dedup, colliding prefix candidates (102, 99, 101) are skipped in favor of distinct 303");
+
+    toptok[2 * kDf2TreeSelectorTopK + 5] = 101;
+    toptok[2 * kDf2TreeSelectorTopK + 6] = 102;
     const Df2TreeSpec all_coll = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
                                                                  toptok.data(), seltab.data(), opts);
     check(all_coll.is_linear() && all_coll.count == 8, "all-colliding runner-ups fall back to linear");
+
+    // P1 sample_walk=true topology invariance: changing drafts[cut] must NOT alter runner selection or topology.
+    toptok[2 * kDf2TreeSelectorTopK + 3] = 303;
+    toptok[2 * kDf2TreeSelectorTopK + 5] = 404;
+    toptok[2 * kDf2TreeSelectorTopK + 6] = -1;
+    seltab[base2 + 3] = 0.85f;  // 0.855 * (exp(0.85)/sum) > 0.15 ev_cut
+    seltab[base2 + 5] = -0.5f;
+    Df2TreeBuildOptions sw_opts = opts;
+    sw_opts.sample_walk = true;
+    sw_opts.ev_cut = 0.15f;
+    std::array<int32_t, 7> drafts_alt = drafts;
+    drafts_alt[2] = 303;  // non-argmax draw at cut=2
+    const Df2TreeSpec sw_a = df2_tree_build_from_selector_ex(99, drafts.data(), probs.data(), 7,
+                                                             toptok.data(), seltab.data(), sw_opts);
+    const Df2TreeSpec sw_b = df2_tree_build_from_selector_ex(99, drafts_alt.data(), probs.data(), 7,
+                                                             toptok.data(), seltab.data(), sw_opts);
+    check(!sw_a.is_linear() && sw_a.count == sw_b.count && sw_a.parent == sw_b.parent &&
+              sw_a.slot_rank == sw_b.slot_rank && sw_a.shape == sw_b.shape && sw_a.branch_node == sw_b.branch_node,
+          "sample_walk=true keeps tree topology invariant to which token was drawn at cut depth");
 }
 
 void test_extended_telemetry_and_runner_hit() {

@@ -24679,7 +24679,7 @@ int main(int argc, char** argv) {
                     const int sx = policy.explore_window(T, std::min<int>(S_mtp, (int) drafts.size() + 1));
                     if (sx > 0 && p + sx <= o.max_context) { T = sx; win_forced = true; }
                 }
-                const int T_mtp = T;
+                int T_mtp = T;
                 T += chain_n;
                 bool tree_round = false;
                 bool tree_sampled_round = false;
@@ -24721,6 +24721,7 @@ int main(int argc, char** argv) {
                         tree_opts.adaptive_inflate = strata::spec::df2_tree_adaptive_inflate_on();
                         tree_opts.ev_use_adaptive_probs = tree_opts.adaptive_inflate;
                         tree_opts.max_cut = strata::spec::df2_tree_max_cut();
+                        tree_opts.sample_walk = df2_sample_active;
                         tree_spec = strata::spec::df2_tree_build_from_selector_ex(
                             x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(), df2.tree_seltab(),
                             tree_opts, tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr);
@@ -24740,6 +24741,11 @@ int main(int argc, char** argv) {
                                 tree_sampled_round = strata::spec::df2_tree_sampled_on() &&
                                                      !req_sp.greedy && req_sp.temperature > 0.0f;
                                 T = tree_spec.count;
+                            } else if (df2_sample_active && q_ok && tree_spec.valid() && tree_spec.is_linear()) {
+                                // Preserve the draw-independent spine count if dedup_siblings pruned all runner-ups.
+                                T = std::min(tree_cap, tree_spec.count);
+                                T_mtp = T;
+                                df2_prefix_n = std::min(std::max(T - 1, 0), df2_q_count);
                             }
                         }
                     }

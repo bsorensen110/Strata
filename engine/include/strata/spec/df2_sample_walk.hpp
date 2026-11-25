@@ -35,10 +35,12 @@ inline uint64_t df2_sample_mix(uint64_t x) {
 }
 
 // Scores use [row][previous candidate slot][candidate slot], with previous slot zero at row zero.
+// Optional `max_q[i]` exports the draw-independent row maximum `max_j q[i][j]` before drawing `drafts[i]`
+// so downstream window/tree gates never condition verification participation on the random draw outcome.
 inline bool df2_sample_selector_walk(int rows, const int32_t* candidates, const float* scores,
                                     uint64_t seed, uint64_t position, int32_t* drafts, float* selected_q,
-                                    int32_t* q_tokens, float* q_probs) {
-    if (rows < 0 || rows > 7 || (rows > 0 && (!candidates || !scores || !drafts || !selected_q || !q_tokens || !q_probs)))
+                                    int32_t* q_tokens, float* q_probs, float* max_q = nullptr) {
+    if (rows < 0 || rows > 7 || (rows > 0 && (!candidates || !scores || !drafts || !q_tokens || !q_probs)))
         return false;
     int previous = 0;
     for (int i = 0; i < rows; ++i) {
@@ -66,8 +68,13 @@ inline bool df2_sample_selector_walk(int rows, const int32_t* candidates, const 
             sum_q += q;
         }
         if (!(sum_q > 0.0f) || !std::isfinite(sum_q)) return false;
-        for (int j = 0; j < kDf2SelectorTopK; ++j)
-            q_probs[static_cast<size_t>(i) * kDf2SelectorTopK + j] /= sum_q;
+        float row_max_q = 0.0f;
+        for (int j = 0; j < kDf2SelectorTopK; ++j) {
+            float& q_slot = q_probs[static_cast<size_t>(i) * kDf2SelectorTopK + j];
+            q_slot /= sum_q;
+            if (q_slot > row_max_q) row_max_q = q_slot;
+        }
+        if (max_q != nullptr) max_q[i] = row_max_q;
 
         const uint64_t bits = df2_sample_mix(seed ^ df2_sample_mix(position + static_cast<uint64_t>(i)));
         const double u = (static_cast<double>(bits >> 11) + 0.5) * (1.0 / 9007199254740992.0);
@@ -84,10 +91,21 @@ inline bool df2_sample_selector_walk(int rows, const int32_t* candidates, const 
         if (picked < 0) picked = last;
         if (picked < 0) return false;
         drafts[i] = row_tokens[picked];
-        selected_q[i] = q_probs[static_cast<size_t>(i) * kDf2SelectorTopK + picked];
+        if (selected_q != nullptr) selected_q[i] = q_probs[static_cast<size_t>(i) * kDf2SelectorTopK + picked];
         previous = picked;
     }
     return true;
+}
+
+/// Computes draw-independent prefix-survival products `surv_out[i] = prod_{r=0..i} clamp(max_q[r], 0, 1)`.
+inline void df2_sample_prefix_survival(const float* max_q, int rows, float* surv_out) noexcept {
+    if (rows <= 0 || max_q == nullptr || surv_out == nullptr) return;
+    double prod = 1.0;
+    for (int i = 0; i < rows; ++i) {
+        const double q = std::clamp(static_cast<double>(max_q[i]), 0.0, 1.0);
+        prod *= q;
+        surv_out[i] = static_cast<float>(prod);
+    }
 }
 
 inline void pack_df2_spec_q(int rows, const int32_t* q_tokens, const float* q_probs, int32_t* packed) {

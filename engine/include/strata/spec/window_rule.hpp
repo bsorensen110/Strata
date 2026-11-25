@@ -24,7 +24,7 @@ struct WindowRuleIn {
     int start = 1;               ///< the width before any rule (CLI: cap; serve: cap with the MTP, 1 without)
     double spec_min_p = 0.0;     ///< --spec-min-p: stop at the first draft whose probability is below it (0: off)
     double draft_conf = 0.0;     ///< --draft-conf: DFlash2's window ends where the product of the probabilities falls below it (0: off)
-    const float* dprob = nullptr;   ///< the drafts' probabilities, dprob[j] for draft j (the row j + 1 of the window)
+    const float* dprob = nullptr;   ///< draft probabilities: dprob[j] for draft j (under STRATA_DF2_SAMPLE_WALK=1, draw-independent max_k q[j][k] to prevent selection bias)
 };
 
 /// The cost-aware MTP window applies only to the MTP chain's own candidates.

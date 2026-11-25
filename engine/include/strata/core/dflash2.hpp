@@ -170,9 +170,10 @@ public:
     bool context_wait(std::string& err);
     /// One round: the new context rows (n_new in 1..8: the committed window rows, taps device [n_new][5 * n_embd], positions pos0 ...),
     /// then the block for `anchor` (the last committed token, at pos0 + n_new).  `drafts` / `probs` get kDrafts entries (the
-    /// selector's pick and its probability).  The opt-in sample walk copies the captured selector table after completion,
-    /// draws each row on the host, and optionally writes candidate ids/probabilities as [kDrafts][16].  The taps pointer
-    /// must be the same device buffer on every call (graphs are captured on it).
+    /// selector's pick and its draw-independent confidence summary: `max_j q[i][j]` under `sample_walk`, or `h_out_[16 + i]`
+    /// otherwise).  The opt-in sample walk copies the captured selector table after completion, draws each row on the host, and
+    /// optionally writes candidate ids/probabilities as [kDrafts][16].  The taps pointer must be the same device buffer on every call
+    /// (graphs are captured on it).
     bool draft(const float* taps_dev, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs, std::string& err,
                bool sample_walk = false, uint64_t sample_seed = 0, uint64_t sample_position = 0,
                int32_t* q_tokens = nullptr, float* q_probs = nullptr);
