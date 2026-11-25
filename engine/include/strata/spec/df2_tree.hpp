@@ -34,6 +34,30 @@ inline bool df2_tree_on() noexcept {
     return on;
 }
 
+/// Minimum runner-up conditional probability to become a tree branch sibling.
+/// STRATA_DF2_TREE_MIN_BRANCH_P (float, default kDf2TreeDefaultMinBranchP).
+inline float df2_tree_min_branch_p() noexcept {
+    static const float v = [] {
+        const char* e = std::getenv("STRATA_DF2_TREE_MIN_BRANCH_P");
+        if (e == nullptr || *e == '\0') return kDf2TreeDefaultMinBranchP;
+        const float p = std::strtof(e, nullptr);
+        return (p >= 0.0f && p <= 1.0f) ? p : kDf2TreeDefaultMinBranchP;
+    }();
+    return v;
+}
+
+/// Maximum sibling count at the confidence cut (primary + runner-ups capped by node budget).
+/// STRATA_DF2_TREE_MAX_FANOUT (int >= 2, default 3).
+inline int df2_tree_max_fanout() noexcept {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_DF2_TREE_MAX_FANOUT");
+        if (e == nullptr || *e == '\0') return 3;
+        const int n = std::atoi(e);
+        return n >= 2 ? n : 3;
+    }();
+    return v;
+}
+
 enum class Df2TreeShape : uint8_t {
     Linear = 0,
     PrefixFanout = 1,

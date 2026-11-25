@@ -24640,7 +24640,8 @@ int main(int argc, char** argv) {
                     if (tree_cap >= 4) {
                         tree_spec = strata::spec::df2_tree_build_from_selector(
                             x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(), df2.tree_seltab(),
-                            o.draft_conf, strata::spec::kDf2TreeDefaultMinBranchP, 3, tree_cap);
+                            o.draft_conf, strata::spec::df2_tree_min_branch_p(), strata::spec::df2_tree_max_fanout(),
+                            tree_cap);
                         if (tree_spec.valid() && !tree_spec.is_linear() && tree_spec.is_caterpillar()) {
                             tree_round = true;
                             T = tree_spec.count;
