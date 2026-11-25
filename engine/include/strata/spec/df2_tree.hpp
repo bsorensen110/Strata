@@ -96,6 +96,37 @@ inline bool df2_tree_dedup_on() noexcept {
     return on;
 }
 
+/// Parses STRATA_DF2_TREE_VAR_T ("1" enables variable-width tree verify graphs T in 3..8; default OFF).
+inline bool df2_tree_var_t_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+/// Process-wide gate for variable-width tree verify graphs (default OFF).
+inline bool df2_tree_var_t_on() noexcept {
+    static const bool on = df2_tree_var_t_env_enabled(std::getenv("STRATA_DF2_TREE_VAR_T"));
+    return on;
+}
+
+/// Minimum tree verify graph width T when STRATA_DF2_TREE_VAR_T=1 (covers M=2 and M=3 in one graph).
+inline constexpr int kDf2TreeMinVerifyT = 3;
+
+/// Default bitmask of captured tree graph widths (bits 3..8 set => dense ladder 3..8).
+inline constexpr unsigned kDf2TreeDefaultWidthMask = 0x1F8u;
+
+/// Maps tree node count `node_count` (`2..8`) to launched tree verify graph width `T` (`3..8`).
+/// When `var_t_on` is false (default), always returns kDf2TreeMaxNodes (8) for bit-identical fixed-T=8 behavior.
+/// When `var_t_on` is true, picks the smallest width t >= max(kDf2TreeMinVerifyT, node_count) in `width_mask`.
+inline constexpr int df2_tree_select_width(int node_count, bool var_t_on,
+                                           unsigned width_mask = kDf2TreeDefaultWidthMask) noexcept {
+    if (!var_t_on) return kDf2TreeMaxNodes;
+    const int clamped = node_count < kDf2TreeMinVerifyT ? kDf2TreeMinVerifyT
+                      : (node_count > kDf2TreeMaxNodes ? kDf2TreeMaxNodes : node_count);
+    for (int t = clamped; t <= kDf2TreeMaxNodes; ++t) {
+        if ((width_mask & (1u << t)) != 0u) return t;
+    }
+    return kDf2TreeMaxNodes;
+}
+
 enum class Df2TreeShape : uint8_t {
     Linear = 0,
     PrefixFanout = 1,

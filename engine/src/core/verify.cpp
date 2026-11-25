@@ -834,8 +834,12 @@ Verifier::~Verifier() {
             if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     if (strata::spec::df2_tree_on()) {
-        for (auto& e : exec_tree_) if (e) cudaGraphExecDestroy(e);
-        for (auto& e : exec_tree_nr_) if (e) cudaGraphExecDestroy(e);
+        for (auto& row : exec_tree_)
+            for (auto& e : row)
+                if (e) cudaGraphExecDestroy(e);
+        for (auto& row : exec_tree_nr_)
+            for (auto& e : row)
+                if (e) cudaGraphExecDestroy(e);
         if (commit_tree_exec_) cudaGraphExecDestroy(commit_tree_exec_);
         if (d_tree_) cudaFree(d_tree_);
         if (d_tree_commit_) cudaFree(d_tree_commit_);
@@ -4934,10 +4938,12 @@ void Verifier::megakernel_off() {
         for (auto& e : row)
             if (e != nullptr) { (void) cudaGraphExecDestroy(e); e = nullptr; }
     if (strata::spec::df2_tree_on()) {
-        for (auto& e : exec_tree_)
-            if (e != nullptr) { (void) cudaGraphExecDestroy(e); e = nullptr; }
-        for (auto& e : exec_tree_nr_)
-            if (e != nullptr) { (void) cudaGraphExecDestroy(e); e = nullptr; }
+        for (auto& row : exec_tree_)
+            for (auto& e : row)
+                if (e != nullptr) { (void) cudaGraphExecDestroy(e); e = nullptr; }
+        for (auto& row : exec_tree_nr_)
+            for (auto& e : row)
+                if (e != nullptr) { (void) cudaGraphExecDestroy(e); e = nullptr; }
     }
 }
 
@@ -5816,13 +5822,15 @@ bool Verifier::drop_window_graphs(int& dropped, std::string& err) {
         }
     if (strata::spec::df2_tree_on()) {
         for (int s = 0; s < 2; ++s) {
-            for (cudaGraphExec_t* e : {&exec_tree_[s], &exec_tree_nr_[s]})
-                if (*e != nullptr) {
-                    (void) cudaGraphExecDestroy(*e);
-                    *e = nullptr;
-                    ++dropped;
-                }
-            launched_tree_[s] = launched_tree_nr_[s] = false;
+            for (int t = 0; t <= strata::kernels::kVerifyNarrowT; ++t) {
+                for (cudaGraphExec_t* e : {&exec_tree_[s][t], &exec_tree_nr_[s][t]})
+                    if (*e != nullptr) {
+                        (void) cudaGraphExecDestroy(*e);
+                        *e = nullptr;
+                        ++dropped;
+                    }
+                launched_tree_[s][t] = launched_tree_nr_[s][t] = false;
+            }
         }
     }
     return true;
@@ -6023,6 +6031,34 @@ bool Verifier::prepare(int T, bool& no_vram, std::string& err) {
     if (capture(T, err)) return true;
     no_vram = capture_oom_;
     return false;
+#endif
+}
+
+bool Verifier::prepare_tree(int T, bool& no_vram, std::string& err) {
+    no_vram = false;
+#if defined(STRATA_GPU_METAL)
+    (void) T;
+    err = "verify: tree mode unsupported on Metal";
+    return false;
+#else
+    if (!strata::spec::df2_tree_on()) { err = "verify: STRATA_DF2_TREE is off"; return false; }
+    if (T < strata::spec::kDf2TreeMinVerifyT || T > strata::kernels::kVerifyNarrowT || T > max_t_) {
+        err = "verify: tree window size out of range (" + std::to_string(T) + ")";
+        return false;
+    }
+    if (next_ != nullptr || lb_ > 0) { err = "verify: tree mode requires single-stage verifier"; return false; }
+    const OnDevice on_device(device_);
+    refresh_ar();
+    capture_oom_ = false;
+    if (!capture_tree(T, err)) {
+        no_vram = capture_oom_;
+        return false;
+    }
+    if (!capture_commit_tree(err)) {
+        no_vram = capture_oom_;
+        return false;
+    }
+    return true;
 #endif
 }
 
@@ -7057,19 +7093,24 @@ bool Verifier::ensure_tree_buffers(std::string& err) {
     return true;
 }
 
-void Verifier::stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t pos0) {
+void Verifier::stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t pos0, int T) {
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
-    constexpr int T = kVerifyNarrowT;
     const int M = tree.count;
+    // Always populate all 8 slots of VerifyTreeMeta for safety; h_tok_/h_step_ are bounded by max_t_.
+    // Only rows [0, T) are executed by the launched width-T graph, and gdn_order is scheduled over [0, T)
+    // so padded leaves M..T-1 never bump depth-2+ spine nodes out of the executed window.
+    const int meta_fill = kVerifyNarrowT;
+    const int host_fill = std::min(max_t_, kVerifyNarrowT);
 
     std::memset(h_tree_, 0, sizeof(VerifyTreeMeta));
     h_tree_->count = M;
     h_tree_->pos0 = (int32_t) pos0;
-    for (int t = 0; t < T; ++t) {
+    for (int t = 0; t < meta_fill; ++t) {
+        int32_t tok = tree.token[0];
         if (t < M) {
-            h_tok_[t] = tree.token[(size_t) t];
+            tok = tree.token[(size_t) t];
             h_tree_->parent[t] = (int32_t) tree.parent[(size_t) t];
             h_tree_->depth[t] = (int32_t) tree.depth[(size_t) t];
             for (int d = 0; d < 8; ++d) h_tree_->anc[t][d] = (int32_t) tree.anc[(size_t) t][(size_t) d];
@@ -7078,8 +7119,7 @@ void Verifier::stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t 
             const auto p_taps = strata::spec::df2_tree_ple_conv_taps(tree, t);
             for (int j = 0; j < 3; ++j) h_tree_->ple_taps[t][j] = p_taps[(size_t) j];
         } else {
-            // Padded rows M..7 are dummy leaves off root 0 so T=8 kernels have valid bounded inputs.
-            h_tok_[t] = tree.token[0];
+            // Padded rows M..7 are dummy leaves off root 0 so fixed or T-bounded kernels have valid bounded inputs.
             h_tree_->parent[t] = 0;
             h_tree_->depth[t] = 1;
             h_tree_->anc[t][0] = 0;
@@ -7091,8 +7131,11 @@ void Verifier::stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t 
             h_tree_->ple_taps[t][1] = -5;
             h_tree_->ple_taps[t][2] = -2;
         }
-        qsa_step_fill(h_step_ + t * kStepCount, pos0 + h_tree_->depth[t], s);
-        h_step_[t * kStepCount + kStepPos] = (int32_t) (pos0 + t);
+        if (t < host_fill) {
+            h_tok_[t] = tok;
+            qsa_step_fill(h_step_ + t * kStepCount, pos0 + h_tree_->depth[t], s);
+            h_step_[t * kStepCount + kStepPos] = (int32_t) (pos0 + t);
+        }
     }
     strata::spec::df2_tree_caterpillar_gdn_order(tree, h_tree_->gdn_order, h_tree_->is_spine, T);
 
@@ -7111,17 +7154,23 @@ void Verifier::stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t 
     for (int t = 0; t < M; ++t) last_tokens_[t] = tree.token[(size_t) t];
 }
 
-bool Verifier::capture_tree(std::string& err) {
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_tree_nr_[sel_long_] : exec_tree_[sel_long_];
+bool Verifier::capture_tree(int T, std::string& err) {
+    if (T < strata::spec::kDf2TreeMinVerifyT || T > strata::kernels::kVerifyNarrowT || T > max_t_) {
+        err = "verify: tree capture width out of range (" + std::to_string(T) + ")";
+        return false;
+    }
+    cudaGraphExec_t& exec_t = ar_off_ ? exec_tree_nr_[sel_long_][T] : exec_tree_[sel_long_][T];
     if (exec_t != nullptr) return true;
 #if defined(STRATA_GPU_METAL)
     err = "verify: tree mode unsupported on Metal";
     return false;
 #endif
-    constexpr int T = strata::kernels::kVerifyNarrowT;
     if (!ensure_tree_buffers(err)) return false;
+    size_t free_before = 0, total_b = 0;
+    const bool have_before = strata::spec::df2_tree_var_t_on() &&
+                             cudaMemGetInfo(&free_before, &total_b) == cudaSuccess;
     strata::spec::Df2TreeSpec dummy = strata::spec::make_linear_tree(0, nullptr, 0);
-    stage_tree_inputs(dummy, 0);
+    stage_tree_inputs(dummy, 0, T);
     (void) cudaStreamSynchronize(cs_);
     if (cudaStreamBeginCapture(cs_, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
         err = "verify: begin tree capture failed";
@@ -7146,10 +7195,26 @@ bool Verifier::capture_tree(std::string& err) {
     }
     const bool made = instantiate_evicting(exec_t, graph, {}, "verify: tree instantiate: ", err, 0);
     cudaGraphDestroy(graph);
-    if (!made) return false;
+    if (!made) {
+        if (have_before) {
+            err += " (tree T=" + std::to_string(T) + ", vram_free_before=" +
+                   std::to_string(free_before >> 20) + " MiB)";
+        }
+        return false;
+    }
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
     const cudaError_t us = cudaStreamSynchronize(cs_);
     if (ue != cudaSuccess || us != cudaSuccess) (void) cudaGetLastError();
+    if (have_before) {
+        size_t free_after = 0;
+        if (cudaMemGetInfo(&free_after, &total_b) == cudaSuccess) {
+            const long long delta_mib = ((long long) free_before - (long long) free_after) >> 20;
+            std::fprintf(stderr,
+                         "strata verify: tree graph T=%d%s sel_long=%d: vram free %zu -> %zu MiB (delta %lld MiB)\n",
+                         T, ar_off_ ? " (doorbell)" : " (ar)", sel_long_,
+                         free_before >> 20, free_after >> 20, delta_mib);
+        }
+    }
     return true;
 }
 
@@ -7274,8 +7339,9 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
         return false;
     }
     const int M = tree.count;
-    constexpr int T = kVerifyNarrowT;
-    if (max_t_ < T) { err = "verify: tree mode requires max_t >= 8"; return false; }
+    const bool var_t = strata::spec::df2_tree_var_t_on();
+    const int T = strata::spec::df2_tree_select_width(M, var_t);
+    if (max_t_ < T) { err = "verify: tree mode requires max_t >= " + std::to_string(T); return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
     SessionState& ss = *ss_;
@@ -7294,15 +7360,16 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
     }();
     const bool use_nograph = tree_nograph && ar_on();
     if (!use_nograph) {
-        if (!capture_tree(err) || !capture_commit_tree(err)) return false;
+        // Under STRATA_DF2_TREE_VAR_T=1 never fall back to fixed T=8 if width-T capture fails.
+        if (!capture_tree(T, err) || !capture_commit_tree(err)) return false;
     } else {
         if (!capture_commit_tree(err)) return false;
     }
 
     const Clock::time_point t0 = Clock::now();
-    stage_tree_inputs(tree, pos0);
+    stage_tree_inputs(tree, pos0, T);
     const bool do_ple = ss.ple.ready() && ple_stage();
-    uint32_t ple_rows[T * PLE_N_HEADS];
+    uint32_t ple_rows[kVerifyNarrowT * PLE_N_HEADS];
     if (do_ple) {
         for (int t = 0; t < T; ++t) {
             int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
@@ -7323,7 +7390,7 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
     }
 
     bool flag_raised = false;
-    bool& graph_launched = ar_off_ ? launched_tree_nr_[sel_long_] : launched_tree_[sel_long_];
+    bool& graph_launched = ar_off_ ? launched_tree_nr_[sel_long_][T] : launched_tree_[sel_long_][T];
     if (!use_nograph && ar_on() && (early_ple_flag_mode() == 1 || (early_ple_flag_mode() == 2 && !graph_launched))) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
@@ -7358,7 +7425,7 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
         if (!ok_rec) return false;
     } else {
         strata::dispatch::Stats::get().graph_launch(T, ar_on() ? 0 : 1);
-        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_tree_nr_[sel_long_] : exec_tree_[sel_long_], cs_);
+        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_tree_nr_[sel_long_][T] : exec_tree_[sel_long_][T], cs_);
         graph_launched = true;
         if (le != cudaSuccess) { err = std::string("verify: tree launch: ") + cudaGetErrorString(le); return false; }
         (void) cudaStreamQuery(cs_);

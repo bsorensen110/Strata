@@ -17181,6 +17181,40 @@ int main(int argc, char** argv) {
                 drive.d.experts = 0;
                 drive.d.failed = false;
             }
+            if (strata::spec::df2_tree_on() && strata::spec::df2_tree_var_t_on() &&
+                use_df2 && n_stages == 1 && o.batch <= 0 &&
+                o.spec >= strata::spec::kDf2TreeMinVerifyT) {
+                const int max_tree_t = std::min(o.spec, strata::kernels::kVerifyNarrowT);
+                size_t free_start = 0, free_end = 0, total_b = 0;
+                const bool have_start = cudaMemGetInfo(&free_start, &total_b) == cudaSuccess;
+                const Clock::time_point tw0 = Clock::now();
+                std::string terr;
+                for (int t = strata::spec::kDf2TreeMinVerifyT; t <= max_tree_t; ++t) {
+                    if (!((strata::spec::kDf2TreeDefaultWidthMask >> t) & 1u)) continue;
+                    bool no_vram = false;
+                    if (!ver.prepare_tree(t, no_vram, terr)) {
+                        size_t free_fail = 0;
+                        (void) cudaMemGetInfo(&free_fail, &total_b);
+                        std::fprintf(stderr,
+                                     "strata serve: STRATA_DF2_TREE_VAR_T=1 startup capture FAILED at T=%d "
+                                     "(no_vram=%d, vram_free=%zu MiB): %s\n",
+                                     t, no_vram ? 1 : 0, free_fail >> 20, terr.c_str());
+                        std::fflush(stderr);
+                        return 1;
+                    }
+                }
+                const bool have_end = cudaMemGetInfo(&free_end, &total_b) == cudaSuccess;
+                const long long delta_mib = (have_start && have_end)
+                    ? (((long long) free_start - (long long) free_end) >> 20)
+                    : 0;
+                std::fprintf(stderr,
+                             "strata serve: STRATA_DF2_TREE_VAR_T=1 pre-captured widths %d..%d in %.0f ms, "
+                             "vram free %zu -> %zu MiB (delta %lld MiB)\n",
+                             strata::spec::kDf2TreeMinVerifyT, max_tree_t,
+                             std::chrono::duration<double, std::milli>(Clock::now() - tw0).count(),
+                             have_start ? (free_start >> 20) : 0, have_end ? (free_end >> 20) : 0, delta_mib);
+                std::fflush(stderr);
+            }
         }
         g_gpu_pause_idle.idle(gpu_pause_now());   // AMD on Linux: the gap before the first request starts here (the start-up's own pauses are not a "between")
         std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)

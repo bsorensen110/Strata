@@ -247,6 +247,8 @@ public:
     /// in a single `G=1` window; `out[t]` receives the greedy argmax after node `t`.
     bool run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                   std::string& err);
+    /// Pre-captures tree verification graph for width `T` (3..8) without evicting linear graphs (STRATA_DF2_TREE_VAR_T=1).
+    bool prepare_tree(int T, bool& no_vram, std::string& err);
     /// Commits a non-contiguous accepted path `path[0..n_keep-1]` (`path[0] == 0`, `path[k] >= k`) from the last `run_tree`.
     bool commit_tree(const uint8_t* path, int n_keep, std::string& err);
     /// Compacts accepted tap rows `[path[0..n_keep-1]]` back into `tap_dev_[0..n_keep-1]` using `scratch` (on `wait_stream`).
@@ -733,17 +735,20 @@ private:
     cudaEvent_t pfork_ = nullptr, pjoin_ = nullptr;
     bool capture_oom_ = false;          // the last capture's instantiate found no VRAM (prepare)
     cudaGraphExec_t commit_exec_ = nullptr;
-    // STRATA_DF2_TREE=1: parameterized T=8 tree verify + non-contiguous commit (allocated lazily only when enabled)
+    // STRATA_DF2_TREE=1: parameterized tree verify (fixed T=8 by default; T=3..8 with STRATA_DF2_TREE_VAR_T=1)
     bool tree_rec_ = false;
     bool last_tree_ = false;
     strata::kernels::VerifyTreeMeta *h_tree_ = nullptr, *m_tree_ = nullptr, *d_tree_ = nullptr;
     int32_t *h_tree_commit_ = nullptr, *m_tree_commit_ = nullptr, *d_tree_commit_ = nullptr;
-    cudaGraphExec_t exec_tree_[2] = {}, exec_tree_nr_[2] = {}, commit_tree_exec_ = nullptr;
-    bool launched_tree_[2] = {}, launched_tree_nr_[2] = {};
+    cudaGraphExec_t exec_tree_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    cudaGraphExec_t exec_tree_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    cudaGraphExec_t commit_tree_exec_ = nullptr;
+    bool launched_tree_[2][strata::kernels::kVerifyNarrowT + 1] = {};
+    bool launched_tree_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     bool ensure_tree_buffers(std::string& err);
-    bool capture_tree(std::string& err);
+    bool capture_tree(int T, std::string& err);
     bool capture_commit_tree(std::string& err);
-    void stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t pos0);
+    void stage_tree_inputs(const strata::spec::Df2TreeSpec& tree, int64_t pos0, int T);
 
     // mapped staging (host pointer, device alias)
     int32_t* h_tok_ = nullptr;   int32_t* m_tok_ = nullptr;     // T

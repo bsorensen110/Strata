@@ -618,6 +618,63 @@ void test_gdn_order_ple_taps_and_remap_invariants() {
     }
 }
 
+void test_var_t_width_ladder() {
+    check(!df2_tree_var_t_env_enabled(nullptr), "var_t env null is off");
+    check(!df2_tree_var_t_env_enabled(""), "var_t env empty is off");
+    check(!df2_tree_var_t_env_enabled("0"), "var_t env 0 is off");
+    check(!df2_tree_var_t_env_enabled("true"), "var_t env non-1 is off");
+    check(df2_tree_var_t_env_enabled("1"), "var_t env 1 is on");
+
+    // Default-OFF knob preserves fixed T=8 for every tree node count M in 2..8.
+    for (int m = 1; m <= 10; ++m) {
+        check(df2_tree_select_width(m, false) == kDf2TreeMaxNodes,
+              "var_t=off always selects fixed T=8");
+    }
+
+    // Dense ladder (T in 3..8): M=2 clamps to T=3, M=3..8 map identically.
+    check(df2_tree_select_width(2, true) == 3, "dense var_t maps M=2 -> T=3");
+    for (int m = 3; m <= 8; ++m) {
+        check(df2_tree_select_width(m, true) == m, "dense var_t maps M -> T=M for 3..8");
+    }
+    check(df2_tree_select_width(0, true) == 3, "var_t clamps below-min M to 3");
+    check(df2_tree_select_width(12, true) == 8, "var_t clamps above-max M to 8");
+
+    // Sparse ladder e.g. {4, 6, 8} (bits 4, 6, 8 => 0x150): M->next enabled step >= M.
+    constexpr unsigned kSparseMask = (1u << 4) | (1u << 6) | (1u << 8);
+    check(df2_tree_select_width(2, true, kSparseMask) == 4, "sparse ladder M=2 -> T=4");
+    check(df2_tree_select_width(3, true, kSparseMask) == 4, "sparse ladder M=3 -> T=4");
+    check(df2_tree_select_width(4, true, kSparseMask) == 4, "sparse ladder M=4 -> T=4");
+    check(df2_tree_select_width(5, true, kSparseMask) == 6, "sparse ladder M=5 -> T=6");
+    check(df2_tree_select_width(6, true, kSparseMask) == 6, "sparse ladder M=6 -> T=6");
+    check(df2_tree_select_width(7, true, kSparseMask) == 8, "sparse ladder M=7 -> T=8");
+    check(df2_tree_select_width(8, true, kSparseMask) == 8, "sparse ladder M=8 -> T=8");
+    check(df2_tree_select_width(4, true, 0u) == 8, "empty mask falls back to T=8");
+
+    // Verify gdn_order with pad_to=T keeps all real nodes in [0, T) without dummy leaves bumping spine nodes.
+    const int32_t prefix[1] = {10};
+    const int32_t br[2] = {20, 21};
+    // Nodes: 0->1(10)->2(20), 1->3(21) => M=4 (leaves at depth 2 emitted in index order 2, 3).
+    const Df2TreeSpec t4 = make_prefix_fanout_tree(1, prefix, 1, br, 2, nullptr, 0);
+    check(t4.count == 4, "4-node fanout tree count");
+    const int w4 = df2_tree_select_width(t4.count, true);
+    check(w4 == 4, "4-node tree selects width T=4");
+    int32_t order[8] = {}, is_spine[8] = {};
+    check(df2_tree_caterpillar_gdn_order(t4, order, is_spine, w4), "gdn_order succeeds for pad_to=T=4");
+    check(order[0] == 0 && order[1] == 1 && order[2] == 2 && order[3] == 3,
+          "gdn_order(T=4) schedules all 4 real nodes in [0,4)");
+
+    // With a primary tail child off branch 0 (M=5: 0->1->2->4, 1->3), depth-2 runner-up leaf 3 precedes
+    // depth-2 spine 2, and no dummy leaves precede depth-1 spine 1 when pad_to=T=5.
+    const int32_t ptail[1] = {30};
+    const Df2TreeSpec t5 = make_prefix_fanout_tree(1, prefix, 1, br, 2, ptail, 1);
+    check(t5.count == 5, "5-node fanout tree count");
+    const int w5 = df2_tree_select_width(t5.count, true);
+    check(w5 == 5, "5-node tree selects width T=5");
+    check(df2_tree_caterpillar_gdn_order(t5, order, is_spine, w5), "gdn_order succeeds for pad_to=T=5");
+    check(order[0] == 0 && order[1] == 1 && order[2] == 3 && order[3] == 2 && order[4] == 4,
+          "gdn_order(T=5) keeps leaf-before-spine without dummy leaves in [0,5)");
+}
+
 }  // namespace
 
 int main() {
@@ -633,6 +690,7 @@ int main() {
     test_sibling_dedup();
     test_extended_telemetry_and_runner_hit();
     test_gdn_order_ple_taps_and_remap_invariants();
+    test_var_t_width_ladder();
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }
