@@ -1093,6 +1093,98 @@ void test_engagement_shaping_envelope() {
           "VAR_T=0 with guard on clamps min_branch_p=0.30 -> 0.45 and suppresses sub-0.45 branch");
 }
 
+void test_sampled_tree_gate_penalties_and_q_helpers() {
+    // 1. STRATA_DF2_TREE_SAMPLED env gate parser + default off
+    check(!df2_tree_sampled_env_enabled(nullptr) && !df2_tree_sampled_env_enabled("0") &&
+              !df2_tree_sampled_env_enabled("true") && df2_tree_sampled_env_enabled("1"),
+          "sampled tree env gate parser");
+    check(!df2_tree_sampled_on(), "sampled tree gate defaults OFF");
+
+    // 2. penalty_tree_rows mirrors linear penalty_rows along root-to-node ancestor chain
+    // Tree: 0(99) -> 1(10) -> 2(11), fork 0(99) -> 3(20), 1(10) -> 4(30)
+    Df2TreeSpec tree;
+    tree.count = 5;
+    tree.token = {99, 10, 11, 20, 30, 0, 0, 0};
+    tree.parent = {kDf2TreeNoParent, 0, 1, 0, 1, kDf2TreeNoParent, kDf2TreeNoParent, kDf2TreeNoParent};
+    tree.depth = {0, 1, 2, 1, 2, 0, 0, 0};
+    tree.slot_rank = {0, 0, 0, 1, 1, 0, 0, 0};
+    tree.shape = Df2TreeShape::Caterpillar;
+    tree.build_anc();
+
+    const int32_t tail[3] = {7, 8, 9};
+    constexpr int kT = 6;
+    constexpr int kH = 4;
+    std::array<int32_t, kT * kH> rows{};
+    penalty_tree_rows(tail, 3, tree, kT, kH, rows.data());
+    // row 0: [7, 8, 9, 99]
+    // row 1: [8, 9, 99, 10]
+    // row 2: [9, 99, 10, 11]
+    // row 3: [8, 9, 99, 20]
+    // row 4: [9, 99, 10, 30]
+    // row 5 (padding): [-1, -1, -1, -1]
+    const std::array<int32_t, kT * kH> expected{
+        7, 8, 9, 99,
+        8, 9, 99, 10,
+        9, 99, 10, 11,
+        8, 9, 99, 20,
+        9, 99, 10, 30,
+        -1, -1, -1, -1,
+    };
+    check(rows == expected, "penalty_tree_rows follows exact per-node ancestor chain");
+
+    // 3. df2_tree_populate_sampled_q handles sibling exhaustion by pruning cleanly while preserving validity.
+    const int32_t toptok[7 * kDf2TreeSelectorTopK] = {
+        10, 99, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        11, 21, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+    };
+    std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+    seltab.fill(-INFINITY);
+    seltab[0] = 0.0f;
+    seltab[1] = -0.2f;
+    seltab[(1 * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 0] = 0.0f;
+    seltab[(1 * kDf2TreeSelectorTopK + 0) * kDf2TreeSelectorTopK + 1] = -0.5f;
+    const int32_t drafts[2] = {10, 11};
+    // Build a fork tree whose runner-up at root collides with anchor when dedup=true.
+    Df2TreeSpec t_prune;
+    t_prune.count = 4;
+    t_prune.token = {99, 10, 11, 99};
+    t_prune.parent = {kDf2TreeNoParent, 0, 1, 0};
+    t_prune.depth = {0, 1, 2, 1};
+    t_prune.slot_rank = {0, 0, 0, 1};
+    t_prune.shape = Df2TreeShape::PrefixFanout;
+    t_prune.branch_node = 0;
+    t_prune.build_anc();
+    // Mark duplicate root child? Wait: unique siblings check passes if child 3 is token 11 (`drafts[1]`, valid for dedup test!).
+    t_prune.token[3] = 11;
+    Df2TreeSampleQ sq;
+    check(df2_tree_populate_sampled_q(t_prune, 99, drafts, 2, toptok, seltab.data(), /*dedup=*/true,
+                                      0x1234ULL, 5ULL, sq) &&
+              t_prune.valid() && t_prune.is_linear() && t_prune.count == 3,
+          "populate_sampled_q prunes sibling with 0 non-excluded candidates under dedup=true");
+
+    // 4. Zero-residual rounding guard (fixes hy4_spec.hip.h:430 bug): if residual p_res <= q everywhere
+    //    when testing child c_k, accept c_k cleanly instead of resetting residual mass.
+    const int32_t fork_b[2] = {10, 20};
+    const Df2TreeSpec t_guard = make_prefix_fanout_tree(99, nullptr, 0, fork_b, 2);
+    const int32_t p_ids[2] = {10, 20};
+    const double p0_vec[2] = {0.5, 0.5};
+    const double p_child[2] = {0.5, 0.5};
+    const strata::core::SpecP pv_guard[3] = {
+        {p_ids, p0_vec, 2}, {p_ids, p_child, 2}, {p_ids, p_child, 2}};
+    Df2TreeSampleQ sq_guard;
+    sq_guard.node[1].n = 2;
+    sq_guard.node[1].id[0] = 10; sq_guard.node[1].id[1] = 20;
+    sq_guard.node[1].q[0] = 0.99f; sq_guard.node[1].q[1] = 0.99f;  // covers all residual mass -> next_z == 0
+    for (int pos = 0; pos < 16; ++pos) {
+        int32_t bonus = -1;
+        int64_t resamp = 0;
+        const auto w_g = df2_tree_sample_accept(t_guard, pv_guard, &sq_guard, 0x777ULL, (uint64_t) pos,
+                                                &bonus, &resamp);
+        check(w_g.n_keep == 2 && w_g.path[1] == 1 && resamp == 0,
+              "zero-residual rounding guard accepts covered child instead of resetting residual");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -1113,6 +1205,7 @@ int main() {
     test_composable_ev_adaptive_matrix_and_no_inflation();
     test_max_cut_and_row_ema_cost_gates();
     test_engagement_shaping_envelope();
+    test_sampled_tree_gate_penalties_and_q_helpers();
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }

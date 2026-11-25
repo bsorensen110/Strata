@@ -935,6 +935,109 @@ __device__ int sampled_probs_warp(const float* sel_logit, int k, const SamplerPa
     return n_keep;
 }
 
+/// Extracts each row's exact post-chain probability list into `out[t]` after warp top_k merge.
+__global__ void __launch_bounds__(32)
+extract_spec_probs_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams p,
+                                int k, strata::core::SpecPRow* __restrict__ out) {
+    const int t = blockIdx.x;
+    const int lane = (int) threadIdx.x;
+    __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
+    __shared__ int sel_ids[kSelMax];
+    __shared__ float sel_logit[kSelMax];
+    __shared__ double ex[kSelMax];
+    const int2* src = cand + (size_t) t * n_blocks * k;
+    for (int e = lane; e < n_blocks * k; e += 32) lists[e] = src[e];
+    __syncwarp();
+    warp_merge_lists(lists, n_blocks, k, k, n_vocab, [&](int i, float v, int id) {
+        if (lane == 0) { sel_ids[i] = id < n_vocab ? id : 0; sel_logit[i] = v; }
+    });
+    __syncwarp();
+    const int n_keep = sampled_probs_warp(sel_logit, k, p, ex);
+    if (lane == 0) out[t].n = n_keep;
+    for (int i = lane; i < strata::core::kSpecQEntries; i += 32) {
+        out[t].id[i] = i < n_keep ? sel_ids[i] : -1;
+        out[t].p[i] = i < n_keep ? ex[i] : 0.0;
+    }
+}
+
+/// One-block fallback extracting post-chain probabilities when the split path cannot run.
+__global__ void __launch_bounds__(1024)
+extract_spec_probs_one_block_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
+                                    int history_len, const SamplerParams p,
+                                    strata::core::SpecPRow* __restrict__ out) {
+    const int t = blockIdx.x;
+    const float* l = logits + (size_t) t * n_vocab;
+
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;
+    }
+    extern __shared__ unsigned int penal_bits[];
+    const int bits_words = (int) ((n_vocab + 31) / 32);
+    const bool use_bits = hrow != nullptr && hlen > 0 && bits_words > 0;
+    if (use_bits) {
+        for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < hlen; i += blockDim.x)
+            if (hrow[i] >= 0 && hrow[i] < n_vocab)
+                atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
+        __syncthreads();
+    }
+    auto hit_count = [&](int v) -> int {
+        if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
+        return history_count(hrow, hlen, v);
+    };
+
+    const int k = sampled_k(p.top_k, n_vocab);
+    __shared__ int sel_ids[kSelMax];
+    __shared__ float sel_logit[kSelMax];
+    __shared__ double ex[kSelMax];
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    float prev_v = __int_as_float(0x7f800000);
+    int prev_i = -1;
+    for (int i = 0; i < k; ++i) {
+        float bv = __int_as_float(0xff800000);
+        int best = n_vocab;
+        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+            const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
+            if ((s < prev_v || (s == prev_v && v > prev_i)) && s > bv) { bv = s; best = v; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+            if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+        }
+        if (lane == 0) { sv[warp] = bv; si[warp] = best; }
+        __syncthreads();
+        if (warp == 0) {
+            const int nw = (int) ((blockDim.x + 31) >> 5);
+            float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
+            int wi = lane < nw ? si[lane] : n_vocab;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
+                const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
+                if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+            }
+            if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
+        }
+        __syncthreads();
+        prev_v = sel_logit[i];
+        prev_i = sel_ids[i];
+    }
+    if (warp != 0) return;
+    const int n_keep = sampled_probs_warp(sel_logit, k, p, ex);
+    if (lane == 0) out[t].n = n_keep;
+    for (int i = lane; i < strata::core::kSpecQEntries; i += 32) {
+        out[t].id[i] = i < n_keep ? sel_ids[i] : -1;
+        out[t].p[i] = i < n_keep ? ex[i] : 0.0;
+    }
+}
+
 /// The drafter's last kernel in probabilistic mode (replaces `coupled_merge_kernel`): the merge of the draft head's
 /// block lists, the chain's distribution q over them, ONE draw from q with the drafter's own Philox stream
 /// (counter = the verifying row's position | kSpecCtrDraft - not the verifier's uniform), and q itself - the
@@ -1409,6 +1512,45 @@ bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, cons
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
                         void* stream) {
     return sample_tokens_spec_impl<true>(logits, n_tokens, n_vocab, history, history_len, p, dtok, qbuf, n_q, out, stream);
+}
+
+bool extract_spec_probs(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, strata::core::SpecPRow* d_out, strata::core::SpecPRow* h_out,
+                        void* stream) {
+    if (logits == nullptr || d_out == nullptr || h_out == nullptr || n_tokens <= 0 || n_vocab <= 0 ||
+        p.greedy || p.temperature <= 0.0f) {
+        return false;
+    }
+    if (p.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) return false;
+    if (stream_capturing(stream)) return false;
+
+    const int k = sampled_k(p.top_k, n_vocab);
+    const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
+    int2* scratch = nullptr;
+    if (sampled_path() == SampledPath::Split && n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows) {
+        scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
+    }
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (scratch != nullptr) {
+        sampler_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0, s>>>(
+            logits, n_vocab, history, history_len, p, k, n_blocks, scratch);
+        extract_spec_probs_merge_kernel<<<(unsigned) n_tokens, 32, 0, s>>>(scratch, n_blocks, n_vocab, p, k, d_out);
+    } else {
+        const unsigned shmem = (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
+                                   ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)
+                                   : 0u;
+        extract_spec_probs_one_block_kernel<<<(unsigned) n_tokens, 1024, shmem, s>>>(
+            logits, n_vocab, history, history_len, p, d_out);
+    }
+    if (cudaMemcpyAsync(h_out, d_out, (size_t) n_tokens * sizeof(strata::core::SpecPRow),
+                        cudaMemcpyDeviceToHost, s) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return false;
+    if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) return false;
+    return true;
 }
 
 void spec_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const int32_t* id_to_sub, int id_vocab,

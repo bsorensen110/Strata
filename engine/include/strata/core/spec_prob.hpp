@@ -80,6 +80,50 @@ inline constexpr uint64_t kSpecCtrAccept = 1ull << 62;
 inline constexpr uint64_t kSpecCtrResid = 1ull << 63;
 inline constexpr uint64_t kSpecCtrDraft = 1ull << 61;
 
+/// Post-chain distribution row transferable from GPU to host without copying full logits (`n <= kSpecQEntries`).
+struct SpecPRow {
+    int32_t id[kSpecQEntries];
+    double p[kSpecQEntries];
+    int32_t n;
+};
+
+/// Host Philox 4x32-10 draw matching `sampler.cu::philox_uniform` bit-for-bit in `[0, 1)`.
+inline float philox_uniform_host(uint64_t seed, uint64_t counter) noexcept {
+    uint32_t c0 = static_cast<uint32_t>(counter);
+    uint32_t c1 = static_cast<uint32_t>(counter >> 32);
+    uint32_t c2 = static_cast<uint32_t>(seed);
+    uint32_t c3 = static_cast<uint32_t>(seed >> 32);
+    for (int i = 0; i < 10; ++i) {
+        const uint32_t hi0 = static_cast<uint32_t>((0x9E3779B9ull * static_cast<uint64_t>(c0)) >> 32);
+        const uint32_t hi1 = static_cast<uint32_t>((0xBB67AE85ull * static_cast<uint64_t>(c2)) >> 32);
+        const uint32_t lo0 = 0x9E3779B9u * c0;
+        const uint32_t lo1 = 0xBB67AE85u * c2;
+        const uint32_t n0 = hi1 ^ c1 ^ static_cast<uint32_t>(i);
+        const uint32_t n1 = lo1;
+        const uint32_t n2 = hi0 ^ c3;
+        const uint32_t n3 = lo0;
+        c0 = n0;
+        c1 = n1;
+        c2 = n2;
+        c3 = n3;
+    }
+    return static_cast<float>(c0 >> 8) * (1.0f / 16777216.0f);
+}
+
+/// Disjoint 64-bit Philox counters for tree acceptance checks:
+/// `sib_idx == 0` reuses `pos_u | kSpecCtrAccept` (`010` tag, bit-identical to linear `spec_verify_row`);
+/// `sib_idx > 0` uses top 3-bit tag `011` + 5-bit `sib_idx`, disjoint from plain (`000`), draft (`001`),
+/// accept (`010`), and residual (`100`).
+inline constexpr uint64_t tree_branch_accept_counter(uint64_t pos_u, int sib_idx) noexcept {
+    if (sib_idx <= 0) return pos_u | kSpecCtrAccept;
+    return (pos_u & ((1ull << 56) - 1)) | (0x3ull << 61) | (static_cast<uint64_t>(sib_idx & 0x1F) << 56);
+}
+
+/// Disjoint 64-bit counter key (top 3-bit tag `101`) for host without-replacement branch draws.
+inline constexpr uint64_t tree_branch_draft_counter(uint64_t pos0, int node_idx) noexcept {
+    return (pos0 & ((1ull << 56) - 1)) | (0x5ull << 61) | (static_cast<uint64_t>(node_idx & 0x1F) << 56);
+}
+
 /// The post-chain distribution of a row: `n` ids and their probabilities (double, the sampler's own `ex`).
 struct SpecP {
     const int32_t* id;

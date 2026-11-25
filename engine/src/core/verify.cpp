@@ -844,8 +844,10 @@ Verifier::~Verifier() {
         if (commit_tree_spine_exec_) cudaGraphExecDestroy(commit_tree_spine_exec_);
         if (d_tree_) cudaFree(d_tree_);
         if (d_tree_commit_) cudaFree(d_tree_commit_);
+        if (d_tree_probs_) cudaFree(d_tree_probs_);
         if (h_tree_) cudaFreeHost(h_tree_);
         if (h_tree_commit_) cudaFreeHost(h_tree_commit_);
+        if (h_tree_probs_) cudaFreeHost(h_tree_probs_);
     }
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
@@ -7344,8 +7346,9 @@ bool Verifier::capture_commit_tree(std::string& err) {
 }
 
 bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, PoolMultiFn pool, void* user,
-                        int32_t* out, std::string& err) {
+                        int32_t* out, std::string& err, strata::core::SpecPRow* out_probs) {
 #if defined(STRATA_GPU_METAL)
+    (void) out_probs;
     err = "verify: tree mode unsupported on Metal";
     return false;
 #endif
@@ -7355,10 +7358,19 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
         err = "verify: tree mode requires a single-stage verifier";
         return false;
     }
-    if (!sampling_.greedy || sampling_.temperature > 0.0f || hist_d_ != nullptr || sampling_.logit_bias != nullptr) {
+    const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
+    const bool sampled_tree = out_probs != nullptr;
+    if (sampled_tree) {
+        if (!strata::spec::df2_tree_sampled_on() || !sampled || !head_sampling_) {
+            err = "verify: sampled tree mode requires STRATA_DF2_TREE_SAMPLED=1 and sampled request";
+            return false;
+        }
+    } else if (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr) {
         err = "verify: tree mode is greedy-only";
         return false;
     }
+    spec_q_ = nullptr;
+    spec_nq_ = 0;
     if (!tree.valid() || tree.count < 2 || tree.count > strata::spec::kDf2TreeMaxNodes || !tree.is_caterpillar()) {
         err = "verify: invalid or non-caterpillar tree";
         return false;
@@ -7542,7 +7554,38 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
         copy_used_ = false;
     }
     if (prof_on_) collect_profile();
-    for (int t = 0; t < M; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    if (sampled_tree) {
+        ensure_full_logits(T, false);
+        ensure_head_logits(M);
+        const size_t nbytes = (size_t) kVerifyNarrowT * sizeof(strata::core::SpecPRow);
+        if (d_tree_probs_ == nullptr && cudaMalloc((void**) &d_tree_probs_, nbytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            d_tree_probs_ = nullptr;
+            err = "verify tree: cannot allocate sampled tree probability buffer";
+            return false;
+        }
+        if (h_tree_probs_ == nullptr &&
+            cudaHostAlloc((void**) &h_tree_probs_, nbytes, cudaHostAllocDefault) != cudaSuccess) {
+            (void) cudaGetLastError();
+            h_tree_probs_ = nullptr;
+            err = "verify tree: cannot allocate host sampled tree probability buffer";
+            return false;
+        }
+        SamplerParams sp = sampling_;
+        sp.counter = (uint64_t) pos0;
+        if (!extract_spec_probs(head_logits_, M, (int) n_vocab_, hist_d_, hist_len_, sp,
+                                d_tree_probs_, h_tree_probs_, cs_) ||
+            cudaStreamSynchronize(cs_) != cudaSuccess) {
+            err = "verify tree: sampled probability extraction failed";
+            return false;
+        }
+        for (int t = 0; t < M; ++t) {
+            out_probs[t] = h_tree_probs_[t];
+            out[t] = h_tree_probs_[t].n > 0 ? h_tree_probs_[t].id[0] : ((volatile int32_t*) h_out_)[t];
+        }
+    } else {
+        for (int t = 0; t < M; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    }
     int64_t pos_b[strata::spec::kDf2TreeMaxNodes] = {};
     for (int t = 0; t < M; ++t) pos_b[t] = pos0 + tree.depth[(size_t) t];
     note_nonfinite(M, pos_b);

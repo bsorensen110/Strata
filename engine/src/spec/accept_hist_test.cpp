@@ -72,8 +72,28 @@ int main() {
         parsed_tree.runner_hits != 1 || parsed_tree.total_offered != 5 ||
         parsed_tree.runner_reached != 1 || parsed_tree.runner_accepted != 1 ||
         parsed_tree.cut_hist[3] != 1 ||
+        parsed_tree.sampled_tree_rounds != 0 || parsed_tree.reject_resamples != 0 ||
+        std::strstr(line_tree, "tree_sampled_rounds=") != nullptr ||
         std::strstr(line_tree, "df2_pos_reached=3,3,1,0,0,0,0") == nullptr) {
         return 11;
+    }
+
+    // Sampled tree round appends tree_sampled_rounds and tree_reject_resamples and parses back.
+    tree_hist.observe(tree, strata::spec::df2_tree_greedy_accept(tree, arg), true, 2);
+    FILE* f_sampled = std::tmpfile();
+    if (f_sampled == nullptr) return 12;
+    h.emit(f_sampled, true, 9, &tree_hist);
+    std::rewind(f_sampled);
+    char line_sampled[1024] = {};
+    const bool read_sampled = std::fgets(line_sampled, sizeof(line_sampled), f_sampled) != nullptr;
+    std::fclose(f_sampled);
+    if (!read_sampled) return 13;
+    strata::spec::Df2TreeAcceptHist parsed_sampled;
+    if (!strata::spec::parse_accept_hist_fields(line_sampled, parsed_sampled) ||
+        parsed_sampled.tree_rounds != 2 || parsed_sampled.sampled_tree_rounds != 1 ||
+        parsed_sampled.reject_resamples != 2 ||
+        std::strstr(line_sampled, "tree_sampled_rounds=1 tree_reject_resamples=2") == nullptr) {
+        return 14;
     }
     return 0;
 }

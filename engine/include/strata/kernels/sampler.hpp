@@ -6,6 +6,8 @@
 // top_p cuts before min_p.  `src/kernels/cuda/sampler.cu` has the details and `sampler_parity` pins them.
 #pragma once
 
+#include "strata/core/spec_prob.hpp"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -89,6 +91,10 @@ bool sample_tokens_spec(const float* logits, int n_tokens, int n_vocab, const in
 // work may have been queued; synchronize before releasing buffers. No plain-p fallback.
 bool sample_tokens_proposal(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
                         const SamplerParams& p, const int32_t* dtok, const int32_t* qbuf, int n_q, int* out,
+                        void* stream);
+/// Extracts each row's exact post-chain target probability list (`SpecPRow`) to `h_out` without copying full logits.
+bool extract_spec_probs(const float* logits, int n_tokens, int n_vocab, const int* history, int history_len,
+                        const SamplerParams& p, strata::core::SpecPRow* d_out, strata::core::SpecPRow* h_out,
                         void* stream);
 
 // #4590: which tokens the repeat / frequency / presence penalties count.  By default only the current reply: the

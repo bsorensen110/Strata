@@ -243,10 +243,12 @@ public:
     /// Keep the first `n_keep` (1..T) tokens of the last window; advances `ss.ple_prev` by them.
     bool commit(int n_keep, std::string& err);
 
-    /// DF2 tree-shaped verification (STRATA_DF2_TREE=1): verifies `tree` (`2..8` nodes, caterpillar, greedy, single-stage)
-    /// in a single `G=1` window; `out[t]` receives the greedy argmax after node `t`.
+    /// DF2 tree-shaped verification (STRATA_DF2_TREE=1): verifies `tree` (`2..8` nodes, caterpillar, single-stage)
+    /// in a single `G=1` window; `out[t]` receives the post-chain top-1/argmax token after node `t`.
+    /// When `out_probs != nullptr` (STRATA_DF2_TREE_SAMPLED=1 on a sampled request), also extracts each node row's
+    /// post-chain target probability list `out_probs[0..tree.count-1]` for host-side tree rejection sampling.
     bool run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
-                  std::string& err);
+                  std::string& err, strata::core::SpecPRow* out_probs = nullptr);
     /// Pre-captures tree verification graph for width `T` (3..8) without evicting linear graphs (STRATA_DF2_TREE_VAR_T=1).
     bool prepare_tree(int T, bool& no_vram, std::string& err);
     /// Commits a non-contiguous accepted path `path[0..n_keep-1]` (`path[0] == 0`, `path[k] >= k`) from the last `run_tree`.
@@ -744,6 +746,8 @@ private:
     cudaGraphExec_t exec_tree_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     cudaGraphExec_t commit_tree_exec_ = nullptr;
     cudaGraphExec_t commit_tree_spine_exec_ = nullptr;
+    strata::core::SpecPRow* d_tree_probs_ = nullptr;
+    strata::core::SpecPRow* h_tree_probs_ = nullptr;
     bool launched_tree_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     bool launched_tree_nr_[2][strata::kernels::kVerifyNarrowT + 1] = {};
     bool ensure_tree_buffers(std::string& err);

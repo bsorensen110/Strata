@@ -1622,12 +1622,19 @@ bool df2_context_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier&
 bool df2_draft_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& ver, int n_stages,
                     int rows, int64_t pos0, int32_t anchor, size_t tap_stride,
                     int32_t* dd, float* pp, std::string& err, bool sample_walk = false,
-                    uint64_t sample_seed = 0, int32_t* q_packed = nullptr, int* q_count = nullptr) {
+                    uint64_t sample_seed = 0, int32_t* q_packed = nullptr, int* q_count = nullptr,
+                    uint64_t* sample_key_out = nullptr) {
     if (sample_walk && (q_packed == nullptr || q_count == nullptr)) {
         err = "dflash2: sampled selector walk needs q-row outputs";
         return false;
     }
     if (q_count != nullptr) *q_count = 0;
+    // Key sampled drafts by (pos ^ (round << 32)) when tree sampled mode is enabled so future-step drafts
+    // rejected in round r never share RNG counters with round r+1's depth-0 draft after a = 0 fallback.
+    const uint64_t sample_key = (strata::spec::df2_tree_on() && strata::spec::df2_tree_sampled_on())
+        ? (static_cast<uint64_t>(pos0 + rows) ^ (static_cast<uint64_t>(df2.rounds) << 32))
+        : static_cast<uint64_t>(pos0 + rows);
+    if (sample_key_out != nullptr) *sample_key_out = sample_key;
     const int kR = (int) strata::core::Dflash2Drafter::kRows;
     const auto plan = strata::core::dflash2_plan_tap_rows(rows, kR);
     if (plan.tail_m <= 0) {
@@ -1640,7 +1647,7 @@ bool df2_draft_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& v
     if (n_stages > 1) {
         if (!ver.gather_taps(df2.landing(), df2.device(), plan.head_n, plan.tail_m, 0, df2.stream(), err)) return false;
         const bool ok = df2.draft(df2.landing(), plan.tail_m, pos0 + plan.head_n, anchor, dd, pp, err,
-                                  sample_walk, sample_seed, (uint64_t) (pos0 + rows), q_tokens.data(), q_probs.data());
+                                  sample_walk, sample_seed, sample_key, q_tokens.data(), q_probs.data());
         if (ok && sample_walk && q_packed != nullptr)
             strata::spec::pack_df2_spec_q(df2.max_drafts(), q_tokens.data(), q_probs.data(), q_packed);
         if (ok && q_count != nullptr) *q_count = sample_walk ? df2.max_drafts() : 0;
@@ -1682,7 +1689,7 @@ bool df2_draft_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& v
         }
     }
     const bool ok = df2.draft(tp, plan.tail_m, pos0 + plan.head_n, anchor, dd, pp, err,
-                              sample_walk, sample_seed, (uint64_t) (pos0 + rows), q_tokens.data(), q_probs.data());
+                              sample_walk, sample_seed, sample_key, q_tokens.data(), q_probs.data());
     if (ok && sample_walk && q_packed != nullptr)
         strata::spec::pack_df2_spec_q(df2.max_drafts(), q_tokens.data(), q_probs.data(), q_packed);
     if (ok && q_count != nullptr) *q_count = sample_walk ? df2.max_drafts() : 0;
@@ -23527,10 +23534,14 @@ int main(int argc, char** argv) {
             strata::spec::Df2TreeAdaptivePolicy tree_adaptive_policy;
             strata::spec::Df2TreeRowEmaPolicy tree_row_ema_policy;
 #if defined(STRATA_HAVE_DFLASH2)
+            const bool tree_sampled_req = strata::spec::df2_tree_sampled_on() &&
+                !req_sp.greedy && req_sp.temperature > 0.0f;
+            const bool tree_greedy_req = req_sp.greedy && req_sp.temperature <= 0.0f &&
+                hist_n <= 0 && req_bias.empty() && !df2_sample_active;
             const bool tree_req_eligible = strata::spec::df2_tree_on() && req_df2 && use_df2 && !batch_df2 &&
                 o.batch == 0 && n_stages <= 1 && !o.draft_auto && strata::core::Dflash2Drafter::head_native() &&
-                req_sp.greedy && req_sp.temperature <= 0.0f && hist_n <= 0 && req_bias.empty() &&
-                !df2_sample_active && !gated_proposal && !pipe && fol == nullptr && req_logprobs < 0;
+                (tree_greedy_req || tree_sampled_req) &&
+                !gated_proposal && !pipe && fol == nullptr && req_logprobs < 0;
 #else
             const bool tree_req_eligible = false;
 #endif
@@ -24417,6 +24428,7 @@ int main(int argc, char** argv) {
             int dfr_n = 0;
             int64_t dfr_pos = 0;
             int32_t dfr_anchor = 0;
+            uint64_t df2_sample_key = 0;
             // a long suffix match: the next round's DFlash2 draft is deferred to that round's start (spec/window_rule.hpp skip_draft_for_lookup)
             auto defer_df2 = [&](int a_) -> bool {
                 if (o.suffix_draft <= 0 || df2_skip_min <= 0 || !req_df2 ||
@@ -24432,7 +24444,8 @@ int main(int argc, char** argv) {
                 float pp[strata::core::Dflash2Drafter::kDrafts];
                 const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
                 if (!df2_draft_rows(df2, ver, n_stages, a_ + 1, p, outv[(size_t) a_], tap_stride, dd, pp, err,
-                                    df2_sample_active, req_sp.seed, df2_q_rows.data(), &df2_q_count)) return false;
+                                    df2_sample_active, req_sp.seed, df2_q_rows.data(), &df2_q_count,
+                                    &df2_sample_key)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 if (ss.ple.ready() && ss.ple.table != nullptr) {   // the PLE rows of the next window's tokens, read ahead (as the MTP's draft does)
                     int n_pf = 0;
@@ -24481,7 +24494,8 @@ int main(int argc, char** argv) {
                         int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                         float pp[strata::core::Dflash2Drafter::kDrafts];
                         if (!df2_draft_rows(df2, ver, n_stages, dfr_n, dfr_pos, dfr_anchor, tap_stride, dd, pp, err,
-                                            df2_sample_active, req_sp.seed, df2_q_rows.data(), &df2_q_count)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                                            df2_sample_active, req_sp.seed, df2_q_rows.data(), &df2_q_count,
+                                            &df2_sample_key)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                         for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                     }
                 }
@@ -24668,9 +24682,13 @@ int main(int argc, char** argv) {
                 const int T_mtp = T;
                 T += chain_n;
                 bool tree_round = false;
+                bool tree_sampled_round = false;
                 const int tree_lin_cf_drafts = std::max(0, T - 1);
                 strata::spec::Df2TreeSpec tree_spec;
+                strata::spec::Df2TreeSampleQ tree_sample_q;
                 strata::spec::Df2TreeCommitWalk tree_walk;
+                std::array<strata::core::SpecPRow, strata::spec::kDf2TreeMaxNodes> tree_spec_probs{};
+                int64_t tree_resamples = 0;
                 int32_t tree_bonus = 0;
 #if defined(STRATA_HAVE_DFLASH2)
                 if (tree_req_eligible && !first_window && !merged && !from_sfx && !df2_handoff_round &&
@@ -24710,8 +24728,19 @@ int main(int argc, char** argv) {
                         if (tree_spec.valid() && !tree_spec.is_linear() && tree_spec.is_caterpillar() &&
                             (row_ema_thresh <= 0.0f ||
                              tree_row_ema_policy.allow_tree(static_cast<double>(row_ema_thresh)))) {
-                            tree_round = true;
-                            T = tree_spec.count;
+                            bool q_ok = true;
+                            if (df2_sample_active && strata::spec::df2_tree_sampled_on()) {
+                                q_ok = strata::spec::df2_tree_populate_sampled_q(
+                                    tree_spec, x, drafts.data(), df2.max_drafts(), df2.tree_toptok(),
+                                    df2.tree_seltab(), tree_opts.dedup_siblings, req_sp.seed,
+                                    df2_sample_key, tree_sample_q);
+                            }
+                            if (q_ok && tree_spec.valid() && !tree_spec.is_linear() && tree_spec.is_caterpillar()) {
+                                tree_round = true;
+                                tree_sampled_round = strata::spec::df2_tree_sampled_on() &&
+                                                     !req_sp.greedy && req_sp.temperature > 0.0f;
+                                T = tree_spec.count;
+                            }
                         }
                     }
                 }
@@ -24896,8 +24925,15 @@ int main(int argc, char** argv) {
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
                     // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
                     // was staged, and the drafted rows read unwritten slots.)
-                    strata::kernels::penalty_rows(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), window.data(), T,
-                                                  hist_n, hist_stage.data());
+                    if (tree_round) {
+                        strata::spec::penalty_tree_rows(consumed.data() + pen_gen0,
+                                                        (int64_t) (consumed.size() - pen_gen0), tree_spec, T, hist_n,
+                                                        hist_stage.data());
+                    } else {
+                        strata::kernels::penalty_rows(consumed.data() + pen_gen0,
+                                                      (int64_t) (consumed.size() - pen_gen0), window.data(), T, hist_n,
+                                                      hist_stage.data());
+                    }
                     const strata::core::OnDevice on_h(hist_dev);
                     cudaMemcpy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t),
                                cudaMemcpyHostToDevice);
@@ -24919,7 +24955,7 @@ int main(int argc, char** argv) {
                 // a suffix window and the lookup chain's tail are point masses and keep the exact-match rule
                 // (never on a first window: a merged one holds prompt tokens, not drafts)
                 if (gated_proposal) ver.set_spec_proposal(proposal.n_q ? proposal.mu.data() : nullptr, proposal.n_q);
-                else if (df2_sample_active && req_df2 && !from_sfx && !first_window) {
+                else if (!tree_round && df2_sample_active && req_df2 && !from_sfx && !first_window) {
                     const int nq = std::min(df2_q_count, df2_prefix_n);
                     if (nq > 0) ver.set_spec_q(df2_q_rows.data(), nq);
                 }
@@ -24985,7 +25021,8 @@ int main(int argc, char** argv) {
                     drive.d.row_is_draft, drive.d.row_rank_in_slot,
                     solo_row_is_draft.data(), solo_row_rank.data());
                 const bool win_ok = tree_round
-                    ? ver.run_tree(tree_spec, p, decode_pool_fn, win_pool_user, outv.data(), err)
+                    ? ver.run_tree(tree_spec, p, decode_pool_fn, win_pool_user, outv.data(), err,
+                                   tree_sampled_round ? tree_spec_probs.data() : nullptr)
                     : ver.run(T, window.data(), p, decode_pool_fn, win_pool_user, outv.data(), err);
                 if (!win_ok || drive.d.failed) {
                     exit_if_gpu_fatal(drive.d.failed && drive.d.fail ? drive.d.fail : err);
@@ -25028,9 +25065,29 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 if (tree_round) {
-                    tree_walk = strata::spec::df2_tree_greedy_accept(tree_spec, outv.data(), &tree_bonus);
-                    a = std::max(0, tree_walk.n_keep - 1);
-                    if (accept_hist_on) tree_accept_hist.observe(tree_spec, tree_walk);
+                    if (tree_sampled_round) {
+                        std::array<strata::core::SpecP, strata::spec::kDf2TreeMaxNodes> p_views{};
+                        for (int i = 0; i < tree_spec.count; ++i) {
+                            p_views[(size_t) i] = strata::core::SpecP{tree_spec_probs[(size_t) i].id,
+                                                                      tree_spec_probs[(size_t) i].p,
+                                                                      tree_spec_probs[(size_t) i].n};
+                        }
+                        tree_walk = strata::spec::df2_tree_sample_accept(
+                            tree_spec, p_views.data(), df2_sample_active ? &tree_sample_q : nullptr, req_sp.seed,
+                            static_cast<uint64_t>(p), &tree_bonus, &tree_resamples);
+                        a = std::max(0, tree_walk.n_keep - 1);
+                        for (int k = 0; k < a; ++k) {
+                            outv[(size_t) tree_walk.path[(size_t) k]] =
+                                tree_spec.token[(size_t) tree_walk.path[(size_t) (k + 1)]];
+                        }
+                        outv[(size_t) tree_walk.path[(size_t) a]] = tree_bonus;
+                    } else {
+                        tree_walk = strata::spec::df2_tree_greedy_accept(tree_spec, outv.data(), &tree_bonus);
+                        a = std::max(0, tree_walk.n_keep - 1);
+                    }
+                    if (accept_hist_on) {
+                        tree_accept_hist.observe(tree_spec, tree_walk, tree_sampled_round, tree_resamples);
+                    }
                     if (strata::spec::df2_tree_adaptive_on()) tree_adaptive_policy.observe_tree(tree_spec, tree_walk);
                     if (strata::spec::df2_tree_row_ema() > 0.0f) {
                         const int lin_cf_acc = strata::spec::df2_tree_counterfactual_linear_accept(

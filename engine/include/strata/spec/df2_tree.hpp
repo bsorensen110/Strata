@@ -5,6 +5,9 @@
 // and [accept-hist] comma-list serialization without any device types or runtime wiring.
 #pragma once
 
+#include "strata/core/spec_prob.hpp"
+#include "strata/spec/df2_sample_walk.hpp"
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -221,6 +224,17 @@ inline bool df2_tree_is_contiguous_spine(const uint8_t* path, int n_keep) noexce
 /// and STRATA_DF2_TREE_SPINE_SKIP is enabled.
 inline bool df2_tree_can_skip_kv_compact(bool spine_skip_on, const uint8_t* path, int n_keep) noexcept {
     return spine_skip_on && df2_tree_is_contiguous_spine(path, n_keep);
+}
+
+/// Parses STRATA_DF2_TREE_SAMPLED ("1" enables lossless rejection-sampled tree verification for sampled requests; default OFF).
+inline bool df2_tree_sampled_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+/// Process-wide gate for sampled DF2 tree verification and commit (default OFF).
+inline bool df2_tree_sampled_on() noexcept {
+    static const bool on = df2_tree_sampled_env_enabled(std::getenv("STRATA_DF2_TREE_SAMPLED"));
+    return on;
 }
 
 enum class Df2TreeShape : uint8_t {
@@ -883,6 +897,379 @@ inline Df2TreeCommitWalk df2_tree_greedy_accept(const Df2TreeSpec& tree, const i
     return walk;
 }
 
+/// Populates host-side penalty history rows for a verification tree (`tree.count` rows, padded with -1 for `T > tree.count`).
+/// Row `t` mirrors `penalty_rows`: last `h` tokens of `tail[0..n_tail)` followed by `[tree.token[anc[t][0..depth[t]]]]`.
+inline void penalty_tree_rows(const int32_t* tail, int64_t n_tail, const Df2TreeSpec& tree, int T, int h,
+                              int32_t* out) noexcept {
+    const int n_nodes = tree.valid() ? std::min(tree.count, T) : 0;
+    for (int t = 0; t < T; ++t) {
+        int32_t* row = out + static_cast<size_t>(t) * static_cast<size_t>(h);
+        if (t >= n_nodes) {
+            std::fill(row, row + h, -1);
+            continue;
+        }
+        const int path_len = static_cast<int>(tree.depth[static_cast<size_t>(t)]) + 1;
+        const int64_t avail = n_tail + path_len;
+        const int take = static_cast<int>(std::min<int64_t>(h, avail));
+        std::fill(row, row + (h - take), -1);
+        for (int j = 0; j < take; ++j) {
+            const int64_t i = avail - take + j;
+            if (i < n_tail) {
+                row[h - take + j] = tail[i];
+            } else {
+                const uint8_t anc_node = tree.anc[static_cast<size_t>(t)][static_cast<size_t>(i - n_tail)];
+                row[h - take + j] = tree.token[static_cast<size_t>(anc_node)];
+            }
+        }
+    }
+}
+
+/// Per-node draft proposal distribution for tree rejection sampling (`n < 0` => deterministic point mass).
+struct Df2TreeNodeQ {
+    std::array<int32_t, strata::core::kSpecQEntries> id{};
+    std::array<float, strata::core::kSpecQEntries> q{};
+    int32_t n = -1;
+
+    strata::core::SpecQ view() const noexcept {
+        return strata::core::SpecQ{id.data(), q.data(), n};
+    }
+};
+
+/// Container holding per-node proposal distributions aligned with `Df2TreeSpec` node indices `0..tree.count-1`.
+struct Df2TreeSampleQ {
+    std::array<Df2TreeNodeQ, kDf2TreeMaxNodes> node{};
+};
+
+/// Populates per-node conditional `q` lists for a stochastic-walk DFlash2 tree (`sample_walk` active) and draws
+/// without-replacement sibling tokens for `slot_rank > 0` branch nodes from the matching truncated conditional.
+/// Topology/admission (`tree`) must already be chosen prior to calling this so branch draws remain unbiased.
+inline bool df2_tree_populate_sampled_q(Df2TreeSpec& tree, int32_t anchor, const int32_t* drafts, int n_drafts,
+                                        const int32_t* toptok, const float* seltab, bool dedup_siblings,
+                                        uint64_t seed, uint64_t position, Df2TreeSampleQ& out_q) noexcept {
+    for (auto& nq : out_q.node) nq.n = -1;
+    if (!tree.valid() || drafts == nullptr || n_drafts <= 0 || toptok == nullptr || seltab == nullptr) {
+        return false;
+    }
+
+    const int nd = std::clamp(n_drafts, 0, kDf2TreeMaxDrafts);
+    std::array<std::array<int32_t, kDf2SelectorTopK>, kDf2TreeMaxDrafts> row_uid{};
+    std::array<std::array<float, kDf2SelectorTopK>, kDf2TreeMaxDrafts> row_up{};
+    std::array<int, kDf2TreeMaxDrafts> row_un{};
+
+    for (int s = 0; s < nd; ++s) {
+        int prev_slot = 0;
+        if (s > 0) {
+            prev_slot = -1;
+            const int32_t* prev_toks = toptok + static_cast<size_t>(s - 1) * kDf2SelectorTopK;
+            for (int j = 0; j < kDf2SelectorTopK; ++j) {
+                if (prev_toks[j] == drafts[s - 1]) {
+                    prev_slot = j;
+                    break;
+                }
+            }
+            if (prev_slot < 0) return false;
+        }
+        const int32_t* rtoks = toptok + static_cast<size_t>(s) * kDf2SelectorTopK;
+        const float* rscores = seltab + (static_cast<size_t>(s) * kDf2SelectorTopK + static_cast<size_t>(prev_slot)) *
+                                            kDf2SelectorTopK;
+        float max_s = -INFINITY;
+        for (int j = 0; j < kDf2SelectorTopK; ++j) {
+            if (rtoks[j] >= 0 && std::isfinite(rscores[j])) max_s = std::max(max_s, rscores[j]);
+        }
+        if (!std::isfinite(max_s)) return false;
+
+        double w[kDf2SelectorTopK] = {};
+        double total = 0.0;
+        for (int j = 0; j < kDf2SelectorTopK; ++j) {
+            if (rtoks[j] < 0 || !std::isfinite(rscores[j])) continue;
+            w[j] = std::exp(static_cast<double>(rscores[j] - max_s));
+            total += w[j];
+        }
+        if (!(total > 0.0) || !std::isfinite(total)) return false;
+
+        float qnorm[kDf2SelectorTopK] = {};
+        float qsum = 0.0f;
+        for (int j = 0; j < kDf2SelectorTopK; ++j) {
+            qnorm[j] = static_cast<float>(w[j] / total);
+            qsum += qnorm[j];
+        }
+        if (!(qsum > 0.0f) || !std::isfinite(qsum)) return false;
+        for (int j = 0; j < kDf2SelectorTopK; ++j) qnorm[j] /= qsum;
+
+        int nu = 0;
+        for (int j = 0; j < kDf2SelectorTopK; ++j) {
+            if (rtoks[j] < 0 || !(qnorm[j] > 0.0f)) continue;
+            int found = -1;
+            for (int k = 0; k < nu; ++k) {
+                if (row_uid[static_cast<size_t>(s)][static_cast<size_t>(k)] == rtoks[j]) {
+                    found = k;
+                    break;
+                }
+            }
+            if (found >= 0) {
+                row_up[static_cast<size_t>(s)][static_cast<size_t>(found)] += qnorm[j];
+            } else {
+                row_uid[static_cast<size_t>(s)][static_cast<size_t>(nu)] = rtoks[j];
+                row_up[static_cast<size_t>(s)][static_cast<size_t>(nu)] = qnorm[j];
+                ++nu;
+            }
+        }
+        if (nu <= 0) return false;
+        row_un[static_cast<size_t>(s)] = nu;
+    }
+
+    std::array<bool, kDf2TreeMaxNodes> on_primary_spine{};
+    on_primary_spine[0] = true;
+    std::array<bool, kDf2TreeMaxNodes> alive{};
+    for (int i = 0; i < tree.count; ++i) alive[static_cast<size_t>(i)] = true;
+    bool pruned = false;
+
+    for (int u = 0; u < tree.count; ++u) {
+        if (!alive[static_cast<size_t>(u)] || !on_primary_spine[static_cast<size_t>(u)]) continue;
+        std::array<int32_t, kDf2TreeMaxNodes> chosen_sibs{};
+        int n_chosen_sibs = 0;
+
+        // Pass 1: primary child (slot_rank == 0) keeps its already-drawn token & full row softmax Q_s.
+        for (int c = u + 1; c < tree.count; ++c) {
+            if (static_cast<int>(tree.parent[static_cast<size_t>(c)]) != u) continue;
+            if (tree.slot_rank[static_cast<size_t>(c)] != 0) continue;
+            const int step = static_cast<int>(tree.depth[static_cast<size_t>(c)]) - 1;
+            if (step < 0 || step >= nd) return false;
+            const int nu = row_un[static_cast<size_t>(step)];
+            on_primary_spine[static_cast<size_t>(c)] = true;
+            Df2TreeNodeQ& qnode = out_q.node[static_cast<size_t>(c)];
+            qnode.n = nu;
+            float q_sum = 0.0f;
+            for (int k = 0; k < nu; ++k) {
+                qnode.id[static_cast<size_t>(k)] = row_uid[static_cast<size_t>(step)][static_cast<size_t>(k)];
+                qnode.q[static_cast<size_t>(k)] = row_up[static_cast<size_t>(step)][static_cast<size_t>(k)];
+                q_sum += qnode.q[static_cast<size_t>(k)];
+            }
+            if (!(q_sum > 0.0f)) return false;
+            for (int k = 0; k < nu; ++k) qnode.q[static_cast<size_t>(k)] /= q_sum;
+            chosen_sibs[static_cast<size_t>(n_chosen_sibs++)] = tree.token[static_cast<size_t>(c)];
+        }
+
+        // Pass 2: runner-up leaves (slot_rank > 0) exclude earlier siblings + optional prefix dedup.
+        for (int c = u + 1; c < tree.count; ++c) {
+            if (static_cast<int>(tree.parent[static_cast<size_t>(c)]) != u) continue;
+            if (tree.slot_rank[static_cast<size_t>(c)] == 0) continue;
+            const int step = static_cast<int>(tree.depth[static_cast<size_t>(c)]) - 1;
+            if (step < 0 || step >= nd) return false;
+            const int nu = row_un[static_cast<size_t>(step)];
+
+            Df2TreeNodeQ& qnode = out_q.node[static_cast<size_t>(c)];
+            int rem_n = 0;
+            double rem_sum = 0.0;
+            for (int k = 0; k < nu; ++k) {
+                const int32_t tok = row_uid[static_cast<size_t>(step)][static_cast<size_t>(k)];
+                const float prob = row_up[static_cast<size_t>(step)][static_cast<size_t>(k)];
+                if (!(prob > 0.0f)) continue;
+                bool excl = false;
+                for (int j = 0; j < n_chosen_sibs; ++j) {
+                    if (chosen_sibs[static_cast<size_t>(j)] == tok) { excl = true; break; }
+                }
+                if (!excl && dedup_siblings) {
+                    if (tok == anchor) excl = true;
+                    for (int j = 0; j < nd && !excl; ++j) {
+                        if (drafts[j] == tok) excl = true;
+                    }
+                }
+                if (excl) continue;
+                qnode.id[static_cast<size_t>(rem_n)] = tok;
+                qnode.q[static_cast<size_t>(rem_n)] = prob;
+                rem_sum += static_cast<double>(prob);
+                ++rem_n;
+            }
+            if (rem_n <= 0 || !(rem_sum > 0.0)) {
+                alive[static_cast<size_t>(c)] = false;
+                pruned = true;
+                continue;
+            }
+            float f_sum = 0.0f;
+            for (int k = 0; k < rem_n; ++k) {
+                qnode.q[static_cast<size_t>(k)] = static_cast<float>(static_cast<double>(qnode.q[static_cast<size_t>(k)]) / rem_sum);
+                f_sum += qnode.q[static_cast<size_t>(k)];
+            }
+            if (!(f_sum > 0.0f)) {
+                alive[static_cast<size_t>(c)] = false;
+                pruned = true;
+                continue;
+            }
+            for (int k = 0; k < rem_n; ++k) qnode.q[static_cast<size_t>(k)] /= f_sum;
+            qnode.n = rem_n;
+
+            const uint64_t bits = df2_sample_mix(seed ^ strata::core::tree_branch_draft_counter(position, c));
+            const double u_draw = (static_cast<double>(bits >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+            double cum = 0.0;
+            int picked = rem_n - 1;
+            for (int k = 0; k < rem_n; ++k) {
+                cum += static_cast<double>(qnode.q[static_cast<size_t>(k)]);
+                if (u_draw < cum) { picked = k; break; }
+            }
+            const int32_t draw_tok = qnode.id[static_cast<size_t>(picked)];
+            tree.token[static_cast<size_t>(c)] = draw_tok;
+            chosen_sibs[static_cast<size_t>(n_chosen_sibs++)] = draw_tok;
+        }
+    }
+
+    if (pruned) {
+        Df2TreeSpec compact;
+        Df2TreeSampleQ compact_q;
+        std::array<int, kDf2TreeMaxNodes> remap{};
+        remap.fill(-1);
+        for (int i = 0; i < tree.count; ++i) {
+            if (!alive[static_cast<size_t>(i)]) continue;
+            const int p_old = static_cast<int>(tree.parent[static_cast<size_t>(i)]);
+            if (i > 0 && (p_old < 0 || remap[static_cast<size_t>(p_old)] < 0)) continue;
+            const int ni = compact.count++;
+            remap[static_cast<size_t>(i)] = ni;
+            compact.token[static_cast<size_t>(ni)] = tree.token[static_cast<size_t>(i)];
+            compact.parent[static_cast<size_t>(ni)] = i == 0 ? kDf2TreeNoParent : static_cast<int8_t>(remap[static_cast<size_t>(p_old)]);
+            compact.depth[static_cast<size_t>(ni)] =
+                i == 0 ? 0 : static_cast<uint8_t>(compact.depth[static_cast<size_t>(remap[static_cast<size_t>(p_old)])] + 1);
+            compact.slot_rank[static_cast<size_t>(ni)] = tree.slot_rank[static_cast<size_t>(i)];
+            compact_q.node[static_cast<size_t>(ni)] = out_q.node[static_cast<size_t>(i)];
+        }
+        std::array<int, kDf2TreeMaxNodes> cc{};
+        for (int i = 1; i < compact.count; ++i) ++cc[static_cast<size_t>(compact.parent[static_cast<size_t>(i)])];
+        int bp = 0, only_bp = -1;
+        for (int i = 0; i < compact.count; ++i) {
+            if (cc[static_cast<size_t>(i)] > 1) { ++bp; only_bp = i; }
+        }
+        compact.shape = bp == 0 ? Df2TreeShape::Linear : (bp == 1 ? Df2TreeShape::PrefixFanout : Df2TreeShape::Caterpillar);
+        compact.branch_node = bp == 1 ? static_cast<int8_t>(only_bp) : -1;
+        compact.build_anc();
+        tree = compact;
+        out_q = compact_q;
+    }
+    return tree.valid();
+}
+
+/// Lossless sequential tree rejection sampling walk:
+/// At node `u` (residual initialized to target `P_u`), iterates ordered children `c_0, c_1, ...` of `u`:
+///   accepts `c_k` (`token d`) with prob `min(1, p_res(d) / q_{c_k}(d))` (`q < 0` => point mass at `d`);
+///   on reject, updates `p_res <- norm(max(0, p_res - q_{c_k}))` (accepting `c_k` if rounding leaves residual sum <= 0).
+/// If a child accepts, commits it and descends; if all children reject (or `u` is a leaf), draws `*bonus_token`
+/// from final `p_res` using `pos_u` (leaf) or `pos_u | kSpecCtrResid` (residual fallback).
+inline Df2TreeCommitWalk df2_tree_sample_accept(const Df2TreeSpec& tree, const strata::core::SpecP* target_probs,
+                                                const Df2TreeSampleQ* q_nodes, uint64_t seed, uint64_t pos0,
+                                                int32_t* bonus_token = nullptr,
+                                                int64_t* reject_resamples = nullptr) noexcept {
+    Df2TreeCommitWalk walk;
+    if (reject_resamples != nullptr) *reject_resamples = 0;
+    if (target_probs == nullptr || !tree.valid()) return walk;
+
+    int u = 0;
+    walk.path[0] = 0;
+    walk.n_keep = 1;
+    int64_t resamples = 0;
+
+    while (walk.n_keep <= kDf2TreeMaxNodes) {
+        const strata::core::SpecP& Pu = target_probs[u];
+        const int n_p = std::min(Pu.n, strata::core::kSpecQEntries);
+        if (n_p <= 0 || Pu.id == nullptr || Pu.p == nullptr) {
+            if (bonus_token != nullptr) *bonus_token = 0;
+            break;
+        }
+
+        double w_res[strata::core::kSpecQEntries];
+        double z = 0.0;
+        for (int i = 0; i < n_p; ++i) {
+            const double wi = Pu.p[i] > 0.0 ? Pu.p[i] : 0.0;
+            w_res[i] = wi;
+            z += wi;
+        }
+        if (!(z > 0.0)) {
+            if (bonus_token != nullptr) *bonus_token = Pu.id[0];
+            break;
+        }
+
+        const uint64_t pos_u = pos0 + static_cast<uint64_t>(tree.depth[static_cast<size_t>(u)]);
+        int accepted_child = -1;
+        int sib_idx = 0;
+
+        for (int c = u + 1; c < tree.count; ++c) {
+            if (static_cast<int>(tree.parent[static_cast<size_t>(c)]) != u) continue;
+
+            const int32_t d = tree.token[static_cast<size_t>(c)];
+            const strata::core::SpecQ Q = (q_nodes != nullptr)
+                ? q_nodes->node[static_cast<size_t>(c)].view()
+                : strata::core::SpecQ{nullptr, nullptr, -1};
+
+            double pd = 0.0;
+            for (int i = 0; i < n_p; ++i) {
+                if (Pu.id[i] == d) { pd = w_res[i] / z; break; }
+            }
+
+            double qd = -1.0;
+            if (Q.n >= 0 && Q.id != nullptr && Q.q != nullptr) {
+                for (int j = 0; j < Q.n; ++j) {
+                    if (Q.id[j] == d) qd += (qd < 0.0 ? 1.0 : 0.0) + static_cast<double>(Q.q[j]);
+                }
+            }
+            const bool point = !(qd > 0.0);
+            const float u_accept = strata::core::philox_uniform_host(
+                seed, strata::core::tree_branch_accept_counter(pos_u, sib_idx));
+            const bool accept = pd > 0.0 && (point ? static_cast<double>(u_accept) < pd
+                                                   : static_cast<double>(u_accept) * qd < pd);
+            if (accept) {
+                accepted_child = c;
+                break;
+            }
+
+            double next_w[strata::core::kSpecQEntries];
+            double next_z = 0.0;
+            for (int i = 0; i < n_p; ++i) {
+                const double p_i = w_res[i] / z;
+                double q_i = 0.0;
+                if (point) {
+                    if (Pu.id[i] == d) q_i = 1.0;
+                } else {
+                    for (int j = 0; j < Q.n; ++j) {
+                        if (Q.id[j] == Pu.id[i]) q_i += static_cast<double>(Q.q[j]);
+                    }
+                }
+                const double diff = p_i > q_i ? (p_i - q_i) : 0.0;
+                next_w[i] = diff;
+                next_z += diff;
+            }
+            if (!(next_z > 0.0)) {
+                accepted_child = c;
+                break;
+            }
+            for (int i = 0; i < n_p; ++i) w_res[i] = next_w[i];
+            z = next_z;
+            ++sib_idx;
+        }
+
+        if (accepted_child < 0) {
+            if (sib_idx > 0) ++resamples;
+            const uint64_t bonus_ctr = (sib_idx == 0) ? pos_u : (pos_u | strata::core::kSpecCtrResid);
+            const float u_bonus = strata::core::philox_uniform_host(seed, bonus_ctr);
+            if (bonus_token != nullptr) {
+                *bonus_token = (sib_idx == 0)
+                    ? strata::core::spec_sample(Pu, u_bonus)
+                    : strata::core::spec_pick(Pu, w_res, z, u_bonus);
+            }
+            break;
+        }
+
+        if (walk.n_keep >= kDf2TreeMaxNodes) break;
+        const int k = walk.n_keep++;
+        walk.path[static_cast<size_t>(k)] = static_cast<uint8_t>(accepted_child);
+        if (accepted_child != k || tree.slot_rank[static_cast<size_t>(accepted_child)] > 0) {
+            walk.branch_hit = true;
+        }
+        if (tree.slot_rank[static_cast<size_t>(accepted_child)] > 0) {
+            walk.runner_up_hit = true;
+        }
+        u = accepted_child;
+    }
+    if (reject_resamples != nullptr) *reject_resamples = resamples;
+    return walk;
+}
+
 /// Online per-depth EWMA calibration of primary DF2 acceptance for adaptive branch-cut selection.
 class Df2TreeAdaptivePolicy {
 public:
@@ -1487,12 +1874,17 @@ struct Df2TreeAcceptHist {
     std::array<int64_t, kDf2TreeMaxDrafts> depth_reached{};
     std::array<int64_t, kDf2TreeMaxDrafts> depth_accepted{};
     std::array<int64_t, kDf2TreeMaxNodes> cut_hist{};  ///< 0..6 = single branch_node, 7 = multi-branch Caterpillar
+    int64_t sampled_tree_rounds = 0;
+    int64_t reject_resamples = 0;
 
     /// Records one verified tree round. Node `i` is counted as reached iff `i == 0` or its parent was accepted
     /// along `walk.path` (conditional reachability with branch-kill).
-    void observe(const Df2TreeSpec& tree, const Df2TreeCommitWalk& walk) noexcept {
+    void observe(const Df2TreeSpec& tree, const Df2TreeCommitWalk& walk,
+                 bool sampled_round = false, int64_t round_resamples = 0) noexcept {
         if (!tree.valid() || walk.n_keep <= 0) return;
         ++tree_rounds;
+        if (sampled_round) ++sampled_tree_rounds;
+        if (round_resamples > 0) reject_resamples += round_resamples;
         if (walk.branch_hit) ++branch_hits;
         if (walk.runner_up_hit) ++runner_hits;
         total_accepted += walk.accepted_drafts();
@@ -1564,6 +1956,10 @@ struct Df2TreeAcceptHist {
             if (i > 0) s += ',';
             s += std::to_string(cut_hist[static_cast<size_t>(i)]);
         }
+        if (sampled_tree_rounds > 0 || reject_resamples > 0) {
+            s += " tree_sampled_rounds=" + std::to_string(sampled_tree_rounds) +
+                 " tree_reject_resamples=" + std::to_string(reject_resamples);
+        }
         return s;
     }
 };
@@ -1631,6 +2027,10 @@ inline bool parse_accept_hist_fields(const std::string& line, Df2TreeAcceptHist&
         !detail::parse_csv_ints(line, "tree_depth_accept=", tmp.depth_accepted, kDf2TreeMaxDrafts)) return false;
     if (line.find("tree_cut_hist=") != std::string::npos &&
         !detail::parse_csv_ints(line, "tree_cut_hist=", tmp.cut_hist, kDf2TreeMaxNodes)) return false;
+    if (line.find("tree_sampled_rounds=") != std::string::npos &&
+        !detail::parse_kv_i64(line, "tree_sampled_rounds=", tmp.sampled_tree_rounds)) return false;
+    if (line.find("tree_reject_resamples=") != std::string::npos &&
+        !detail::parse_kv_i64(line, "tree_reject_resamples=", tmp.reject_resamples)) return false;
     out = tmp;
     return true;
 }

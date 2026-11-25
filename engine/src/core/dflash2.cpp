@@ -2141,6 +2141,14 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
             err = std::string("dflash2: sampled selector table copy: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
+        if (strata::spec::df2_tree_on() && strata::spec::df2_tree_sampled_on() && h_tree_tok_ != nullptr &&
+            h_tree_seltab_ != nullptr && head_native() && ndraft_ > 0) {
+            const size_t rows = (size_t) std::clamp(ndraft_, 0, kDrafts);
+            std::copy_n(sampled_tokens.data(), rows * strata::spec::kDf2SelectorTopK, h_tree_tok_);
+            std::copy_n(sampled_scores.data(), rows * strata::spec::kDf2SelectorTopK * strata::spec::kDf2SelectorTopK,
+                        h_tree_seltab_);
+            tree_tables_valid_ = true;
+        }
         std::array<int32_t, kDrafts * strata::spec::kDf2SelectorTopK> row_tokens{};
         std::array<float, kDrafts * strata::spec::kDf2SelectorTopK> row_probs{};
         if (!strata::spec::df2_sample_selector_walk(ndraft_, sampled_tokens.data(), sampled_scores.data(),
