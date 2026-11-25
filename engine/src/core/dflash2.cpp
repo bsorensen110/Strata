@@ -2020,9 +2020,11 @@ bool Dflash2Drafter::context_wait(std::string& err) {
 
 bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t anchor, int32_t* drafts, float* probs,
                            std::string& err, bool sample_walk, uint64_t sample_seed, uint64_t sample_position,
-                           int32_t* q_tokens, float* q_probs) {
+                           int32_t* q_tokens, float* q_probs,
+                           float sample_temperature, const float* logit_bias, int logit_bias_len) {
     return draft_launch(taps, n_new, pos0, anchor, err) &&
-           draft_finish(drafts, probs, err, sample_walk, sample_seed, sample_position, q_tokens, q_probs);
+           draft_finish(drafts, probs, err, sample_walk, sample_seed, sample_position, q_tokens, q_probs,
+                        sample_temperature, logit_bias, logit_bias_len);
 }
 
 bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, int32_t anchor, std::string& err) {
@@ -2073,7 +2075,8 @@ bool Dflash2Drafter::draft_launch(const float* taps, int n_new, int64_t pos0, in
 
 bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& err, bool sample_walk,
                                   uint64_t sample_seed, uint64_t sample_position,
-                                  int32_t* q_tokens, float* q_probs) {
+                                  int32_t* q_tokens, float* q_probs,
+                                  float sample_temperature, const float* logit_bias, int logit_bias_len) {
     if (!launched_) { err = "dflash2: draft_finish without draft_launch"; return false; }
     if (sample_walk && (drafts == nullptr || probs == nullptr || q_tokens == nullptr || q_probs == nullptr)) {
         err = "dflash2: sampled selector walk needs draft, probability, and q outputs";
@@ -2155,7 +2158,8 @@ bool Dflash2Drafter::draft_finish(int32_t* drafts, float* probs, std::string& er
         if (!strata::spec::df2_sample_selector_walk(ndraft_, sampled_tokens.data(), sampled_scores.data(),
                                                     sample_seed, sample_position, sampled_drafts.data(),
                                                     sampled_selected_q.data(), row_tokens.data(), row_probs.data(),
-                                                    sampled_max_q.data())) {
+                                                    sampled_max_q.data(), sample_temperature, logit_bias,
+                                                    logit_bias_len)) {
             err = "dflash2: sampled selector walk encountered an invalid conditional row";
             return false;
         }

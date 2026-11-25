@@ -1234,6 +1234,77 @@ int main() {
     test_max_cut_and_row_ema_cost_gates();
     test_engagement_shaping_envelope();
     test_sampled_tree_gate_penalties_and_q_helpers();
+
+    // P4: q_T temperature scaling, logit-shift invariance, logit_bias, and STRATA_DF2_QT_RAW helper tests.
+    {
+        check(!df2_qt_raw_env_enabled(nullptr) && !df2_qt_raw_env_enabled("") &&
+                  !df2_qt_raw_env_enabled("0") && df2_qt_raw_env_enabled("1"),
+              "STRATA_DF2_QT_RAW parser defaults OFF and enables on 1");
+        check(df2_effective_q_temp(0.6f, 0.5f, false) > 0.299f && df2_effective_q_temp(0.6f, 0.5f, false) < 0.301f,
+              "df2_effective_q_temp scales by spec_draft_temp_scale");
+        check(df2_effective_q_temp(0.6f, 0.5f, true) == 1.0f &&
+                  df2_effective_q_temp(0.0f, 1.0f, false) == 1.0f &&
+                  df2_effective_q_temp(-0.5f, 1.0f, false) == 1.0f,
+              "df2_effective_q_temp guards raw_qt=true and non-positive temperature to 1.0f");
+
+        const int32_t toptok[7 * kDf2TreeSelectorTopK] = {
+            10, 20, 30, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+            11, 21, 31, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        };
+        std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> base_s{}, shifted_s{};
+        base_s.fill(-INFINITY);
+        shifted_s.fill(-INFINITY);
+        const float raw0[3] = {2.0f, 1.4f, 0.1f};
+        const float raw1[3] = {1.5f, 1.0f, -0.5f};
+        for (int j = 0; j < 3; ++j) {
+            base_s[j] = raw0[j];
+            shifted_s[j] = raw0[j] + 17.25f;
+            for (int prev = 0; prev < 3; ++prev) {
+                base_s[(1 * kDf2TreeSelectorTopK + prev) * kDf2TreeSelectorTopK + j] = raw1[j];
+                shifted_s[(1 * kDf2TreeSelectorTopK + prev) * kDf2TreeSelectorTopK + j] = raw1[j] - 42.5f;
+            }
+        }
+        const int32_t drafts[2] = {10, 11};
+        const Df2TreeSpec tree = make_prefix_fanout_tree(99, nullptr, 0, toptok, 2);
+
+        for (float T : {0.3f, 1.0f, 1.5f}) {
+            Df2TreeSpec t_base = tree, t_shift = tree;
+            Df2TreeSampleQ q_base, q_shift;
+            check(df2_tree_populate_sampled_q(t_base, 99, drafts, 2, toptok, base_s.data(), false, 0x11ULL, 3ULL,
+                                              q_base, T),
+                  "populate_sampled_q base succeeds");
+            check(df2_tree_populate_sampled_q(t_shift, 99, drafts, 2, toptok, shifted_s.data(), false, 0x11ULL, 3ULL,
+                                              q_shift, T),
+                  "populate_sampled_q shifted succeeds");
+            check(q_base.node[1].n == 3 && q_shift.node[1].n == 3, "q_T preserves support count");
+            for (int k = 0; k < 3; ++k) {
+                check(std::fabs(q_base.node[1].q[k] - q_shift.node[1].q[k]) < 1e-6f,
+                      "df2_tree_populate_sampled_q q_T is invariant under constant logit shifts");
+            }
+            std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> r_base{}, r_shift{};
+            const int nb = detail::extract_selector_runners(0, 99, drafts, 2, toptok, base_s.data(), 0.01f, false,
+                                                            r_base, true, T);
+            const int ns = detail::extract_selector_runners(0, 99, drafts, 2, toptok, shifted_s.data(), 0.01f, false,
+                                                            r_shift, true, T);
+            check(nb == ns && nb > 0 && std::fabs(r_base[0].p - r_shift[0].p) < 1e-6f,
+                  "extract_selector_runners q_T is invariant under constant logit shifts");
+        }
+
+        // Verify temperature sharpening and logit_bias (-inf ban).
+        Df2TreeSpec t_hot = tree, t_cold = tree, t_bias = tree;
+        Df2TreeSampleQ q_hot, q_cold, q_bias;
+        df2_tree_populate_sampled_q(t_cold, 99, drafts, 2, toptok, base_s.data(), false, 0x11ULL, 3ULL, q_cold, 0.3f);
+        df2_tree_populate_sampled_q(t_hot, 99, drafts, 2, toptok, base_s.data(), false, 0x11ULL, 3ULL, q_hot, 1.5f);
+        check(q_cold.node[1].q[0] > q_hot.node[1].q[0], "lower temperature sharpens q_T primary probability");
+
+        std::array<float, 64> bias{};
+        bias[20] = -INFINITY;  // ban runner-up token 20
+        df2_tree_populate_sampled_q(t_bias, 99, drafts, 2, toptok, base_s.data(), false, 0x11ULL, 3ULL, q_bias, 0.7f,
+                                    bias.data(), static_cast<int>(bias.size()));
+        check(q_bias.node[1].n == 2 && q_bias.node[1].id[0] == 10 && q_bias.node[1].id[1] == 30,
+              "logit_bias -inf ban removes candidate from q_T support");
+    }
+
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }

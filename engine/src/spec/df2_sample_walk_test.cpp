@@ -78,6 +78,26 @@ int main() {
         greedy_output = drafts[0];
     check(greedy_output == greedy_sentinel, "disabled and greedy sampling leave the existing draft path untouched");
 
+    // P4: q_T invariance under constant logit shifts across T=0.3, 1.0, 1.5.
+    {
+        float shift_scores[strata::spec::kDf2SelectorTopK * strata::spec::kDf2SelectorTopK];
+        for (int i = 0; i < strata::spec::kDf2SelectorTopK * strata::spec::kDf2SelectorTopK; ++i)
+            shift_scores[i] = std::isfinite(scores[i]) ? (scores[i] + 25.0f) : -INFINITY;
+        for (float T : {0.3f, 1.0f, 1.5f}) {
+            int32_t d_a[1] = {}, d_b[1] = {}, qt_a[16] = {}, qt_b[16] = {};
+            float sq_a[1] = {}, sq_b[1] = {}, mq_a[1] = {}, mq_b[1] = {}, qp_a[16] = {}, qp_b[16] = {};
+            check(strata::spec::df2_sample_selector_walk(1, candidates, scores, 0x1234u, 7u, d_a, sq_a, qt_a, qp_a,
+                                                         mq_a, T),
+                  "q_T selector walk base succeeds");
+            check(strata::spec::df2_sample_selector_walk(1, candidates, shift_scores, 0x1234u, 7u, d_b, sq_b, qt_b,
+                                                         qp_b, mq_b, T),
+                  "q_T selector walk shifted succeeds");
+            check(d_a[0] == d_b[0] && std::fabs(mq_a[0] - mq_b[0]) < 1e-6f &&
+                      std::fabs(qp_a[0] - qp_b[0]) < 1e-6f && std::fabs(qp_a[1] - qp_b[1]) < 1e-6f,
+                  "df2_sample_selector_walk q_T is invariant under constant logit shift");
+        }
+    }
+
     std::printf("df2_sample_walk_test: %s (q %.4f, target %.4f)\n", failures == 0 ? "OK" : "FAILED",
                 (double) q_count[0] / trials, (double) p_count[0] / trials);
 
@@ -441,9 +461,8 @@ int main() {
                     const int nd = std::min(2, 3 - produced);
                     const uint64_t draft_key = pos ^ (round_idx << 32);
                     ++round_idx;
-                    (void) temp;
                     strata::spec::df2_sample_selector_walk(nd, toptok_buf, seltab_buf, seed, draft_key,
-                                                           drafts, selected_q, qtok, qprob, max_q);
+                                                           drafts, selected_q, qtok, qprob, max_q, temp);
                     const float* gate_probs = (mode == 2) ? selected_q : max_q;
 
                     strata::spec::WindowRuleIn wr;
@@ -467,11 +486,12 @@ int main() {
                         topts.ev_cut = 0.35f;
                         topts.dedup_siblings = true;
                         topts.sample_walk = (mode == 1);
+                        topts.q_temperature = temp;
                         tree = strata::spec::df2_tree_build_from_selector_ex(
                             x, drafts, gate_probs, nd, toptok_buf, seltab_buf, topts);
                         if (tree.valid() && !tree.is_linear() && tree.is_caterpillar()) {
                             const bool q_ok = strata::spec::df2_tree_populate_sampled_q(
-                                tree, x, drafts, nd, toptok_buf, seltab_buf, true, seed, draft_key, sq);
+                                tree, x, drafts, nd, toptok_buf, seltab_buf, true, seed, draft_key, sq, temp);
                             if (q_ok && tree.valid() && !tree.is_linear() && tree.is_caterpillar()) {
                                 tree_round = true;
                                 T = tree.count;
@@ -560,6 +580,26 @@ int main() {
                     chi2_lin_vs_tree_gated, chi2_neg_drawn,
                     (long long) hist_gated.sampled_tree_rounds, (long long) hist_gated.runner_hits,
                     (long long) hist_gated.reject_resamples);
+
+        // P4: T=0.3 and T=1.5 gated chi-square oracle runs under q_T scaling.
+        for (float temp : {0.3f, 1.5f}) {
+            strata::spec::Df2TreeAcceptHist hist_t;
+            const auto c_lin_t = run_gated_rollout(0, temp, nullptr);
+            const auto c_tree_t = run_gated_rollout(1, temp, &hist_t);
+            const double chi2_lin_t = pearson_chi2(c_lin_t);
+            const double chi2_tree_t = pearson_chi2(c_tree_t);
+            const double chi2_vs_t = two_sample_chi2(c_lin_t, c_tree_t);
+            check(chi2_lin_t < 103.5, "gated linear q_T oracle matches exact Markov law at T!=1");
+            check(chi2_tree_t < 103.5, "gated tree q_T oracle matches exact Markov law at T!=1");
+            check(chi2_vs_t < 103.5, "gated tree q_T matches gated linear q_T two-sample chi2");
+            check(hist_t.sampled_tree_rounds > 0 && hist_t.runner_hits > 0,
+                  "gated q_T oracle engages trees and runner hits at T!=1");
+            std::printf("df2_sample_walk_test tree_oracle_gated T=%.1f: %s (lin=%.2f tree=%.2f "
+                        "lin_vs_tree=%.2f rounds=%lld rhits=%lld resamp=%lld)\n",
+                        temp, failures == 0 ? "OK" : "FAILED", chi2_lin_t, chi2_tree_t, chi2_vs_t,
+                        (long long) hist_t.sampled_tree_rounds, (long long) hist_t.runner_hits,
+                        (long long) hist_t.reject_resamples);
+        }
     }
 
     return failures == 0 ? 0 : 1;

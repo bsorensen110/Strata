@@ -547,6 +547,9 @@ struct Df2TreeBuildOptions {
     bool ev_use_adaptive_probs = false;  ///< opt-in: price EV node candidates with effective_prob instead of raw p
     int max_cut = -1;                    ///< maximum cut depth allowed for tree entry (-1 = off / unlimited)
     bool sample_walk = false;            ///< STRATA_DF2_SAMPLE_WALK=1: select tree topology without conditioning on drafts[d]
+    float q_temperature = 1.0f;          ///< effective drafter softmax temperature (1.0f = unscaled)
+    const float* logit_bias = nullptr;   ///< optional host logit_bias array [logit_bias_len]
+    int logit_bias_len = 0;
 };
 
 class Df2TreeAdaptivePolicy;
@@ -946,7 +949,9 @@ struct Df2TreeSampleQ {
 /// Topology/admission (`tree`) must already be chosen prior to calling this so branch draws remain unbiased.
 inline bool df2_tree_populate_sampled_q(Df2TreeSpec& tree, int32_t anchor, const int32_t* drafts, int n_drafts,
                                         const int32_t* toptok, const float* seltab, bool dedup_siblings,
-                                        uint64_t seed, uint64_t position, Df2TreeSampleQ& out_q) noexcept {
+                                        uint64_t seed, uint64_t position, Df2TreeSampleQ& out_q,
+                                        float temperature = 1.0f, const float* logit_bias = nullptr,
+                                        int logit_bias_len = 0) noexcept {
     for (auto& nq : out_q.node) nq.n = -1;
     if (!tree.valid() || drafts == nullptr || n_drafts <= 0 || toptok == nullptr || seltab == nullptr) {
         return false;
@@ -973,20 +978,11 @@ inline bool df2_tree_populate_sampled_q(Df2TreeSpec& tree, int32_t anchor, const
         const int32_t* rtoks = toptok + static_cast<size_t>(s) * kDf2SelectorTopK;
         const float* rscores = seltab + (static_cast<size_t>(s) * kDf2SelectorTopK + static_cast<size_t>(prev_slot)) *
                                             kDf2SelectorTopK;
-        float max_s = -INFINITY;
-        for (int j = 0; j < kDf2SelectorTopK; ++j) {
-            if (rtoks[j] >= 0 && std::isfinite(rscores[j])) max_s = std::max(max_s, rscores[j]);
-        }
-        if (!std::isfinite(max_s)) return false;
-
         double w[kDf2SelectorTopK] = {};
         double total = 0.0;
-        for (int j = 0; j < kDf2SelectorTopK; ++j) {
-            if (rtoks[j] < 0 || !std::isfinite(rscores[j])) continue;
-            w[j] = std::exp(static_cast<double>(rscores[j] - max_s));
-            total += w[j];
+        if (!df2_selector_row_weights(rtoks, rscores, temperature, logit_bias, logit_bias_len, w, total)) {
+            return false;
         }
-        if (!(total > 0.0) || !std::isfinite(total)) return false;
 
         float qnorm[kDf2SelectorTopK] = {};
         float qsum = 0.0f;
@@ -1463,7 +1459,8 @@ inline int extract_selector_runners(int step, int32_t anchor, const int32_t* dra
                                     const int32_t* toptok, const float* seltab,
                                     float min_branch_p, bool dedup_siblings,
                                     std::array<Df2SelectorCand, kDf2TreeSelectorTopK>& out,
-                                    bool sample_walk = false) noexcept {
+                                    bool sample_walk = false, float temperature = 1.0f,
+                                    const float* logit_bias = nullptr, int logit_bias_len = 0) noexcept {
     if (step < 0 || step >= nd || drafts == nullptr || toptok == nullptr || seltab == nullptr) return 0;
 
     int prev_slot = 0;
@@ -1484,22 +1481,12 @@ inline int extract_selector_runners(int step, int32_t anchor, const int32_t* dra
     const float* row_scores = seltab + (static_cast<size_t>(step) * kDf2TreeSelectorTopK + static_cast<size_t>(prev_slot)) *
                                            kDf2TreeSelectorTopK;
 
-    float max_score = -INFINITY;
-    for (int j = 0; j < kDf2SelectorTopK; ++j) {
-        if (row_toks[j] >= 0 && std::isfinite(row_scores[j])) {
-            max_score = std::max(max_score, row_scores[j]);
-        }
-    }
-    if (!std::isfinite(max_score)) return 0;
-
     std::array<double, kDf2TreeSelectorTopK> weights{};
     double total = 0.0;
-    for (int j = 0; j < kDf2TreeSelectorTopK; ++j) {
-        if (row_toks[j] < 0 || !std::isfinite(row_scores[j])) continue;
-        weights[static_cast<size_t>(j)] = std::exp(static_cast<double>(row_scores[j] - max_score));
-        total += weights[static_cast<size_t>(j)];
+    if (!df2_selector_row_weights(row_toks, row_scores, temperature, logit_bias, logit_bias_len,
+                                  weights.data(), total)) {
+        return 0;
     }
-    if (!(total > 0.0) || !std::isfinite(total)) return 0;
 
     int n_runners = 0;
     const int32_t primary_tok = drafts[step];
@@ -1513,7 +1500,7 @@ inline int extract_selector_runners(int step, int32_t anchor, const int32_t* dra
         int n_u = 0;
         for (int j = 0; j < kDf2TreeSelectorTopK; ++j) {
             const int32_t tok = row_toks[j];
-            if (tok < 0 || !std::isfinite(row_scores[j])) continue;
+            if (tok < 0 || !(weights[static_cast<size_t>(j)] > 0.0)) continue;
             int found = -1;
             for (int k = 0; k < n_u; ++k) {
                 if (u_tok[static_cast<size_t>(k)] == tok) {
@@ -1589,7 +1576,7 @@ inline int extract_selector_runners(int step, int32_t anchor, const int32_t* dra
         int n_u = 0;
         for (int j = 0; j < kDf2TreeSelectorTopK; ++j) {
             const int32_t tok = row_toks[j];
-            if (tok < 0 || !std::isfinite(row_scores[j])) continue;
+            if (tok < 0 || !(weights[static_cast<size_t>(j)] > 0.0)) continue;
             int found = -1;
             for (int k = 0; k < n_u; ++k) {
                 if (u_tok[static_cast<size_t>(k)] == tok) {
@@ -1703,7 +1690,8 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
             std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
             const int n_run = detail::extract_selector_runners(d, anchor, drafts, nd, toptok, seltab,
                                                                opts.min_branch_p, opts.dedup_siblings, runs,
-                                                               opts.sample_walk);
+                                                               opts.sample_walk, opts.q_temperature,
+                                                               opts.logit_bias, opts.logit_bias_len);
             const int take = std::min(n_run, max_runners);
             for (int k = 0; k < take && n_cands < kMaxCands; ++k) {
                 const double p_run = static_cast<double>(runs[static_cast<size_t>(k)].p);
@@ -1858,7 +1846,8 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
             std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
             const int n_run = detail::extract_selector_runners(c, anchor, drafts, nd, toptok, seltab,
                                                                opts.min_branch_p, opts.dedup_siblings, runs,
-                                                               opts.sample_walk);
+                                                               opts.sample_walk, opts.q_temperature,
+                                                               opts.logit_bias, opts.logit_bias_len);
             if (n_run == 0) continue;
 
             const int max_f = std::min({std::max(2, opts.max_fanout), n_run + 1, cap - (1 + c)});
@@ -1916,7 +1905,8 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
     std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runners{};
     const int n_runners = detail::extract_selector_runners(cut, anchor, drafts, nd, toptok, seltab,
                                                            opts.min_branch_p, opts.dedup_siblings, runners,
-                                                           opts.sample_walk);
+                                                           opts.sample_walk, opts.q_temperature,
+                                                           opts.logit_bias, opts.logit_bias_len);
     if (n_runners == 0) return make_linear_tree(anchor, drafts, lin_n);
 
     const int fan_budget = std::clamp(opts.max_fanout, 2, std::min(kDf2TreeMaxNodes - (1 + cut), cap - (1 + cut)));

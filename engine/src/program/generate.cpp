@@ -1623,7 +1623,8 @@ bool df2_draft_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& v
                     int rows, int64_t pos0, int32_t anchor, size_t tap_stride,
                     int32_t* dd, float* pp, std::string& err, bool sample_walk = false,
                     uint64_t sample_seed = 0, int32_t* q_packed = nullptr, int* q_count = nullptr,
-                    uint64_t* sample_key_out = nullptr) {
+                    uint64_t* sample_key_out = nullptr, float sample_temperature = 1.0f,
+                    const float* logit_bias = nullptr, int logit_bias_len = 0) {
     if (sample_walk && (q_packed == nullptr || q_count == nullptr)) {
         err = "dflash2: sampled selector walk needs q-row outputs";
         return false;
@@ -1647,7 +1648,8 @@ bool df2_draft_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& v
     if (n_stages > 1) {
         if (!ver.gather_taps(df2.landing(), df2.device(), plan.head_n, plan.tail_m, 0, df2.stream(), err)) return false;
         const bool ok = df2.draft(df2.landing(), plan.tail_m, pos0 + plan.head_n, anchor, dd, pp, err,
-                                  sample_walk, sample_seed, sample_key, q_tokens.data(), q_probs.data());
+                                  sample_walk, sample_seed, sample_key, q_tokens.data(), q_probs.data(),
+                                  sample_temperature, logit_bias, logit_bias_len);
         if (ok && sample_walk && q_packed != nullptr)
             strata::spec::pack_df2_spec_q(df2.max_drafts(), q_tokens.data(), q_probs.data(), q_packed);
         if (ok && q_count != nullptr) *q_count = sample_walk ? df2.max_drafts() : 0;
@@ -1689,7 +1691,8 @@ bool df2_draft_rows(strata::core::Dflash2Drafter& df2, strata::core::Verifier& v
         }
     }
     const bool ok = df2.draft(tp, plan.tail_m, pos0 + plan.head_n, anchor, dd, pp, err,
-                              sample_walk, sample_seed, sample_key, q_tokens.data(), q_probs.data());
+                              sample_walk, sample_seed, sample_key, q_tokens.data(), q_probs.data(),
+                              sample_temperature, logit_bias, logit_bias_len);
     if (ok && sample_walk && q_packed != nullptr)
         strata::spec::pack_df2_spec_q(df2.max_drafts(), q_tokens.data(), q_probs.data(), q_packed);
     if (ok && q_count != nullptr) *q_count = sample_walk ? df2.max_drafts() : 0;
@@ -23411,6 +23414,12 @@ int main(int argc, char** argv) {
             const bool df2_sample_active = strata::spec::df2_sample_walk_for_request(
                 strata::spec::df2_sample_walk_env(), req_sp.greedy, req_sp.temperature) &&
                 req_df2 && use_df2 && !batch_df2 && n_stages <= 1;
+            const float df2_q_temp = (!req_sp.greedy && req_sp.temperature > 0.0f)
+                ? strata::spec::df2_effective_q_temp(
+                      req_sp.temperature, strata::core::spec_draft_temp_scale(), strata::spec::df2_qt_raw_env())
+                : 1.0f;
+            const float* df2_logit_bias = req_bias.empty() ? nullptr : req_bias.data();
+            const int df2_logit_bias_len = static_cast<int>(req_bias.size());
             std::array<int32_t, 7 * strata::spec::kDf2SampleQStride> df2_q_rows{};
             int df2_q_count = 0;
             const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0 ||
@@ -24445,7 +24454,7 @@ int main(int argc, char** argv) {
                 const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
                 if (!df2_draft_rows(df2, ver, n_stages, a_ + 1, p, outv[(size_t) a_], tap_stride, dd, pp, err,
                                     df2_sample_active, req_sp.seed, df2_q_rows.data(), &df2_q_count,
-                                    &df2_sample_key)) return false;
+                                    &df2_sample_key, df2_q_temp, df2_logit_bias, df2_logit_bias_len)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 if (ss.ple.ready() && ss.ple.table != nullptr) {   // the PLE rows of the next window's tokens, read ahead (as the MTP's draft does)
                     int n_pf = 0;
@@ -24495,7 +24504,8 @@ int main(int argc, char** argv) {
                         float pp[strata::core::Dflash2Drafter::kDrafts];
                         if (!df2_draft_rows(df2, ver, n_stages, dfr_n, dfr_pos, dfr_anchor, tap_stride, dd, pp, err,
                                             df2_sample_active, req_sp.seed, df2_q_rows.data(), &df2_q_count,
-                                            &df2_sample_key)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                                            &df2_sample_key, df2_q_temp, df2_logit_bias,
+                                            df2_logit_bias_len)) { std::printf("ERR %s\n", err.c_str()); return 1; }
                         for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                     }
                 }
@@ -24722,6 +24732,9 @@ int main(int argc, char** argv) {
                         tree_opts.ev_use_adaptive_probs = tree_opts.adaptive_inflate;
                         tree_opts.max_cut = strata::spec::df2_tree_max_cut();
                         tree_opts.sample_walk = df2_sample_active;
+                        tree_opts.q_temperature = df2_q_temp;
+                        tree_opts.logit_bias = df2_logit_bias;
+                        tree_opts.logit_bias_len = df2_logit_bias_len;
                         tree_spec = strata::spec::df2_tree_build_from_selector_ex(
                             x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(), df2.tree_seltab(),
                             tree_opts, tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr);
@@ -24734,7 +24747,8 @@ int main(int argc, char** argv) {
                                 q_ok = strata::spec::df2_tree_populate_sampled_q(
                                     tree_spec, x, drafts.data(), df2.max_drafts(), df2.tree_toptok(),
                                     df2.tree_seltab(), tree_opts.dedup_siblings, req_sp.seed,
-                                    df2_sample_key, tree_sample_q);
+                                    df2_sample_key, tree_sample_q, df2_q_temp, df2_logit_bias,
+                                    df2_logit_bias_len);
                             }
                             if (q_ok && tree_spec.valid() && !tree_spec.is_linear() && tree_spec.is_caterpillar()) {
                                 tree_round = true;
@@ -27210,6 +27224,10 @@ int main(int argc, char** argv) {
                             (df2_suffix_fill_enabled() && spec_uses_df2);
         const bool df2_sample_active = strata::spec::df2_sample_walk_for_request(
             strata::spec::df2_sample_walk_env(), sp.greedy, sp.temperature) && spec_uses_df2 && o.spec_corrupt <= 0;
+        const float df2_q_temp = (!sp.greedy && sp.temperature > 0.0f)
+            ? strata::spec::df2_effective_q_temp(
+                  sp.temperature, strata::core::spec_draft_temp_scale(), strata::spec::df2_qt_raw_env())
+            : 1.0f;
         std::array<int32_t, 7 * strata::spec::kDf2SampleQStride> df2_q_rows{};
         int df2_q_count = 0;
         if (sfx_on) {
@@ -27274,7 +27292,8 @@ int main(int argc, char** argv) {
                 float pp[strata::core::Dflash2Drafter::kDrafts];
                 const size_t tap_stride = (size_t) df2.tap_layers().size() * (size_t) g.n_embd;
                 if (!df2_draft_rows(df2, ver, 1, a_ + 1, p, outv[(size_t) a_], tap_stride, dd, pp, err,
-                                    df2_sample_active, sp.seed, df2_q_rows.data(), &df2_q_count)) return false;
+                                    df2_sample_active, sp.seed, df2_q_rows.data(), &df2_q_count, nullptr,
+                                    df2_q_temp)) return false;
                 for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 // what the MTP does while it drafts: the PLE rows of the tokens the next window will hold are read ahead
                 // (the window's gather would otherwise wait for them: 1.8 ms a round on strix)
@@ -27324,7 +27343,8 @@ int main(int argc, char** argv) {
                     int32_t dd[strata::core::Dflash2Drafter::kDrafts];
                     float pp[strata::core::Dflash2Drafter::kDrafts];
                     if (!df2_draft_rows(df2, ver, 1, dfr_n, dfr_pos, dfr_anchor, tap_stride, dd, pp, err,
-                                        df2_sample_active, sp.seed, df2_q_rows.data(), &df2_q_count)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+                                        df2_sample_active, sp.seed, df2_q_rows.data(), &df2_q_count, nullptr,
+                                        df2_q_temp)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
                     for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) { drafts[i] = dd[i]; dprob[i] = pp[i]; }
                 }
             }
