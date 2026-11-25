@@ -111,6 +111,13 @@ bool launch_df2_tree_sample_accept(const strata::core::SpecPRow* d_probs,
 bool eval_gumbel_exp_device(const uint64_t* d_seed, const uint64_t* d_counter, const uint32_t* d_token,
                             int n, double* d_out, void* stream);
 
+/// Samples `n_tokens` (`1..8`) tree rows under Gumbel-Max (`p.gumbel` forced true), keying row `t`'s
+/// Gumbel noise by `(p.seed, p.counter + row_depths[t], token_id)` so each tree row matches solo
+/// Gumbel decode at `pos0 + depth[t]` bit-for-bit.
+bool sample_tokens_tree_gumbel(const float* logits, int n_tokens, int n_vocab, const int* history,
+                               int history_len, const SamplerParams& p, const uint8_t* row_depths,
+                               int* out, void* stream);
+
 // #4590: which tokens the repeat / frequency / presence penalties count.  By default only the current reply: the
 // tokens the answer has written (the window starts at the last prompt token, the one the first decode step feeds in).
 // The prompt, including earlier assistant turns in it, is not counted, so a number or a quoted answer in the new

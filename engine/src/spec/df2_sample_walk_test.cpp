@@ -600,6 +600,192 @@ int main() {
                         (long long) hist_t.sampled_tree_rounds, (long long) hist_t.runner_hits,
                         (long long) hist_t.reject_resamples);
         }
+
+        // 4. P3 Gumbel-Max Photo-Finish 2-Way Tree Oracle (500k rollouts, 3-step Markov, df=63, cutoff 103.5):
+        //    verifies exact distributional (and per-rollout sequence) equivalence vs SOLO Gumbel-Max decode
+        //    at delta=0.35 and delta=1.5, monotonic branch-fire rate, and Gate C negative controls.
+        {
+            auto solo_gumbel_pick = [&](const double* p, int n, uint64_t seed, uint64_t counter) -> int32_t {
+                double best = -1.0;
+                int32_t pick = kIds[n - 1];
+                for (int i = 0; i < n; ++i) {
+                    if (!(p[i] > 0.0)) continue;
+                    const double e = strata::core::gumbel_exp_host(seed, counter, static_cast<uint32_t>(kIds[i]));
+                    const double r = p[i] / e;
+                    if (r > best) {
+                        best = r;
+                        pick = kIds[i];
+                    }
+                }
+                return pick;
+            };
+
+            std::vector<std::array<int32_t, 3>> solo_seqs(static_cast<size_t>(kRollouts));
+            std::array<long long, kSeqs> c_solo{};
+            for (int r = 0; r < kRollouts; ++r) {
+                const uint64_t seed = 0x93A00000ULL + static_cast<uint64_t>(r);
+                const int32_t a = solo_gumbel_pick(kTarget[0], kVocab, seed, 0ULL);
+                const int32_t b = solo_gumbel_pick(kTarget[a], kVocab, seed, 1ULL);
+                const int32_t c = solo_gumbel_pick(kTarget[b], kVocab, seed, 2ULL);
+                solo_seqs[static_cast<size_t>(r)] = {a, b, c};
+                ++c_solo[(a * 4 + b) * 4 + c];
+            }
+            const double chi2_solo = pearson_chi2(c_solo);
+            check(chi2_solo < 103.5, "solo Gumbel-Max baseline matches exact 3-step Markov distribution");
+
+            enum class GmNegMode { None, PointMassNoResidual };
+            auto run_gm_rollout = [&](float delta, GmNegMode neg_mode,
+                                      strata::spec::Df2TreeAcceptHist* hist_out,
+                                      int* solo_seq_mismatches_out) {
+                std::array<long long, kSeqs> counts{};
+                int seq_mismatches = 0;
+                for (int r = 0; r < kRollouts; ++r) {
+                    const uint64_t seed = 0x93A00000ULL + static_cast<uint64_t>(r);
+                    int32_t seq[3] = {};
+                    int produced = 0;
+                    int32_t x = 0;
+                    uint64_t pos = 0;
+                    while (produced < 3) {
+                        int32_t toptok_buf[7 * strata::spec::kDf2SelectorTopK] = {};
+                        float seltab_buf[7 * strata::spec::kDf2SelectorTopK * strata::spec::kDf2SelectorTopK] = {};
+                        int32_t g_drafts[7] = {};
+                        float g_probs[7] = {};
+                        fill_selector_for_anchor(x, toptok_buf, seltab_buf, g_drafts, g_probs);
+
+                        const int nd = std::min(2, 3 - produced);
+                        strata::spec::Df2GmBuildOptions gm_opts;
+                        gm_opts.delta = delta;
+                        gm_opts.max_nodes = 5;
+                        gm_opts.q_temperature = 1.0f;
+                        strata::spec::Df2GmBuildStats gm_stats;
+                        const strata::spec::Df2TreeSpec tree = strata::spec::df2_tree_build_gm_photo_finish(
+                            x, nd, toptok_buf, seltab_buf, seed, pos, gm_opts, &gm_stats);
+                        if (hist_out != nullptr) hist_out->observe_gm_round(gm_stats);
+
+                        if (tree.is_linear() || !tree.is_caterpillar()) {
+                            int a = 0;
+                            int32_t bonus = -1;
+                            int32_t cur = x;
+                            for (int t = 0; t < gm_stats.spine_len; ++t) {
+                                const int32_t pick =
+                                    solo_gumbel_pick(kTarget[cur], kVocab, seed, pos + static_cast<uint64_t>(t));
+                                if (pick == gm_stats.spine_tokens[static_cast<size_t>(t)]) {
+                                    if (produced < 3) seq[produced++] = pick;
+                                    cur = pick;
+                                    ++a;
+                                } else {
+                                    bonus = pick;
+                                    break;
+                                }
+                            }
+                            if (a == gm_stats.spine_len) {
+                                bonus = solo_gumbel_pick(
+                                    kTarget[cur], kVocab, seed, pos + static_cast<uint64_t>(gm_stats.spine_len));
+                            }
+                            if (produced < 3) seq[produced++] = bonus;
+                            x = bonus;
+                            pos += static_cast<uint64_t>(a + 1);
+                        } else {
+                            std::array<int32_t, strata::spec::kDf2TreeMaxNodes> outv{};
+                            for (int u = 0; u < tree.count; ++u) {
+                                const uint64_t ctr = pos + static_cast<uint64_t>(tree.depth[static_cast<size_t>(u)]);
+                                outv[static_cast<size_t>(u)] =
+                                    solo_gumbel_pick(kTarget[tree.token[static_cast<size_t>(u)]], kVocab, seed, ctr);
+                            }
+
+                            strata::spec::Df2TreeCommitWalk walk;
+                            int32_t bonus = -1;
+                            if (neg_mode == GmNegMode::PointMassNoResidual) {
+                                // Negative control: accept children with point-mass u < P(c) while falling back
+                                // to the unadjusted Gumbel target pick outv[u] (no residual subtraction).
+                                int u = 0;
+                                walk.path[0] = 0;
+                                walk.n_keep = 1;
+                                while (walk.n_keep < strata::spec::kDf2TreeMaxNodes) {
+                                    const uint64_t pos_u = pos + static_cast<uint64_t>(tree.depth[static_cast<size_t>(u)]);
+                                    int hit = -1;
+                                    int sib = 0;
+                                    for (int c = u + 1; c < tree.count; ++c) {
+                                        if (static_cast<int>(tree.parent[static_cast<size_t>(c)]) != u) continue;
+                                        const double p_c = kTarget[tree.token[static_cast<size_t>(u)]]
+                                                                  [tree.token[static_cast<size_t>(c)]];
+                                        const float u_acc = strata::core::philox_uniform_host(
+                                            seed, strata::core::tree_branch_accept_counter(pos_u, sib++));
+                                        if (static_cast<double>(u_acc) < p_c) {
+                                            hit = c;
+                                            break;
+                                        }
+                                    }
+                                    if (hit < 0) break;
+                                    walk.path[static_cast<size_t>(walk.n_keep++)] = static_cast<uint8_t>(hit);
+                                    u = hit;
+                                }
+                                bonus = outv[static_cast<size_t>(u)];
+                            } else {
+                                walk = strata::spec::df2_tree_greedy_accept(tree, outv.data(), &bonus);
+                            }
+
+                            const int a = walk.accepted_drafts();
+                            if (hist_out != nullptr) {
+                                hist_out->observe(tree, walk, true, 0);
+                                hist_out->observe_gm_tree(walk);
+                            }
+                            for (int k = 1; k <= a && produced < 3; ++k) {
+                                seq[produced++] = tree.token[walk.path[static_cast<size_t>(k)]];
+                            }
+                            if (produced < 3) seq[produced++] = bonus;
+                            x = bonus;
+                            pos += static_cast<uint64_t>(a + 1);
+                        }
+                    }
+                    if (seq[0] != solo_seqs[static_cast<size_t>(r)][0] ||
+                        seq[1] != solo_seqs[static_cast<size_t>(r)][1] ||
+                        seq[2] != solo_seqs[static_cast<size_t>(r)][2]) {
+                        ++seq_mismatches;
+                    }
+                    ++counts[(seq[0] * 4 + seq[1]) * 4 + seq[2]];
+                }
+                if (solo_seq_mismatches_out != nullptr) *solo_seq_mismatches_out = seq_mismatches;
+                return counts;
+            };
+
+            strata::spec::Df2TreeAcceptHist hist_gm_035, hist_gm_150;
+            int mismatch_035 = -1, mismatch_150 = -1;
+            const auto c_gm_035 = run_gm_rollout(0.35f, GmNegMode::None, &hist_gm_035, &mismatch_035);
+            const auto c_gm_150 = run_gm_rollout(1.50f, GmNegMode::None, &hist_gm_150, &mismatch_150);
+            const auto c_gm_neg_pm = run_gm_rollout(1.50f, GmNegMode::PointMassNoResidual, nullptr, nullptr);
+
+            const double chi2_gm_035 = pearson_chi2(c_gm_035);
+            const double chi2_gm_150 = pearson_chi2(c_gm_150);
+            const double chi2_gm_neg_pm = pearson_chi2(c_gm_neg_pm);
+            const double fire_rate_035 = hist_gm_035.gm_rounds > 0
+                ? static_cast<double>(hist_gm_035.gm_branch_fires) / static_cast<double>(hist_gm_035.gm_rounds)
+                : 0.0;
+            const double fire_rate_150 = hist_gm_150.gm_rounds > 0
+                ? static_cast<double>(hist_gm_150.gm_branch_fires) / static_cast<double>(hist_gm_150.gm_rounds)
+                : 0.0;
+
+            check(mismatch_035 == 0, "GM photo-finish tree (delta=0.35) is sequence-identical to solo Gumbel-Max");
+            check(mismatch_150 == 0, "GM photo-finish tree (delta=1.50) is sequence-identical to solo Gumbel-Max");
+            check(chi2_gm_035 < 103.5, "GM photo-finish tree (delta=0.35) matches exact 3-step Markov distribution");
+            check(chi2_gm_150 < 103.5, "GM photo-finish tree (delta=1.50) matches exact 3-step Markov distribution");
+            check(fire_rate_035 > 0.0 && fire_rate_150 > fire_rate_035,
+                  "GM photo-finish branch-fire rate rises strictly from delta=0.35 to delta=1.50");
+            check(hist_gm_035.gm_branch_accepts > 0 && hist_gm_150.gm_branch_accepts > 0,
+                  "GM photo-finish runner-up branches actively accept");
+            check(chi2_gm_neg_pm > 1000.0,
+                  "GM point-mass accept negative control blows up chi-square (> 1000)");
+
+            std::printf("df2_sample_walk_test gm_oracle: %s (solo_chi2=%.2f gm035_chi2=%.2f gm150_chi2=%.2f "
+                        "mismatch035=%d mismatch150=%d fire035=%.4f (%lld/%lld acc=%lld) "
+                        "fire150=%.4f (%lld/%lld acc=%lld) neg_pointmass_chi2=%.2f)\n",
+                        failures == 0 ? "OK" : "FAILED", chi2_solo, chi2_gm_035, chi2_gm_150,
+                        mismatch_035, mismatch_150, fire_rate_035,
+                        (long long) hist_gm_035.gm_branch_fires, (long long) hist_gm_035.gm_rounds,
+                        (long long) hist_gm_035.gm_branch_accepts, fire_rate_150,
+                        (long long) hist_gm_150.gm_branch_fires, (long long) hist_gm_150.gm_rounds,
+                        (long long) hist_gm_150.gm_branch_accepts, chi2_gm_neg_pm);
+        }
     }
 
     return failures == 0 ? 0 : 1;

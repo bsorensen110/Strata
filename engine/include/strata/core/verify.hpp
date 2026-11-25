@@ -249,10 +249,13 @@ public:
     /// post-chain target probability list `out_probs[0..tree.count-1]` for host-side tree rejection sampling.
     /// When `out_gpu_accept != nullptr` (STRATA_DF2_TREE_GPU_ACCEPT=1), keeps `SpecPRow` on device, runs the 1-warp
     /// GPU acceptance walk (`gpu_accept_q` optional), and fuses the two stream syncs into one wait.
+    /// When `gm_tree` is true (STRATA_DF2_TREE_GM=1), samples each node row `t` under Gumbel-Max with counter
+    /// `pos0 + tree.depth[t]` into `out[t]`, bypassing `extract_spec_probs` and `Df2TreeSampleQ`.
     bool run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                   std::string& err, strata::core::SpecPRow* out_probs = nullptr,
                   const strata::spec::Df2TreeSampleQ* gpu_accept_q = nullptr,
-                  strata::core::TreeSampleAcceptResult* out_gpu_accept = nullptr);
+                  strata::core::TreeSampleAcceptResult* out_gpu_accept = nullptr,
+                  bool gm_tree = false);
     /// Pre-captures tree verification graph for width `T` (3..8) without evicting linear graphs (STRATA_DF2_TREE_VAR_T=1).
     bool prepare_tree(int T, bool& no_vram, std::string& err);
     /// Commits a non-contiguous accepted path `path[0..n_keep-1]` (`path[0] == 0`, `path[k] >= k`) from the last `run_tree`.

@@ -1413,8 +1413,10 @@ int main() {
         check(!df2_tree_sampled_conflict_with_gumbel(false, false) &&
                   !df2_tree_sampled_conflict_with_gumbel(true, false) &&
                   !df2_tree_sampled_conflict_with_gumbel(false, true) &&
-                  df2_tree_sampled_conflict_with_gumbel(true, true),
-              "Gumbel + sampled-tree conflict predicate triggers iff both are enabled");
+                  df2_tree_sampled_conflict_with_gumbel(true, true) &&
+                  df2_tree_sampled_conflict_with_gumbel(true, true, false) &&
+                  !df2_tree_sampled_conflict_with_gumbel(true, true, true),
+              "Gumbel + sampled-tree conflict predicate triggers iff both are enabled and TREE_GM is off");
     }
 
     // P2: Zero-sync GPU top-2 pre-gate & direct top-2 builder parity tests.
@@ -1677,6 +1679,78 @@ int main() {
         const auto rs = df2_gm_row_top2(single_tok.data(), scores.data(), 0x51A7ULL, 11ULL, 1.0f);
         check(rs.valid && !rs.has_runner && !df2_gm_photo_finish_fires(rs, 10.0f),
               "single-candidate row never fires photo-finish gate");
+    }
+
+    // P3 Commit 2: GM knobs, guard relaxation, delta histogram binning, and photo-finish caterpillar builder.
+    {
+        check(!df2_tree_gm_env_enabled(nullptr) &&
+                  !df2_tree_gm_env_enabled("") &&
+                  !df2_tree_gm_env_enabled("0") &&
+                  !df2_tree_gm_env_enabled("true") &&
+                  df2_tree_gm_env_enabled("1"),
+              "STRATA_DF2_TREE_GM parser defaults OFF and enables on 1");
+        check(df2_tree_gm_on() == df2_tree_gm_env_enabled(std::getenv("STRATA_DF2_TREE_GM")),
+              "df2_tree_gm_on matches STRATA_DF2_TREE_GM env");
+        check(std::fabs(df2_tree_parse_gm_delta(nullptr) - kDf2TreeDefaultGmDelta) < 1e-6f &&
+                  std::fabs(df2_tree_parse_gm_delta("") - kDf2TreeDefaultGmDelta) < 1e-6f &&
+                  std::fabs(df2_tree_parse_gm_delta("0") - kDf2TreeDefaultGmDelta) < 1e-6f &&
+                  std::fabs(df2_tree_parse_gm_delta("-0.5") - kDf2TreeDefaultGmDelta) < 1e-6f &&
+                  std::fabs(df2_tree_parse_gm_delta("bad") - kDf2TreeDefaultGmDelta) < 1e-6f &&
+                  std::fabs(df2_tree_parse_gm_delta("1.5") - 1.5f) < 1e-6f,
+              "STRATA_DF2_GM_DELTA parser validates positive finite thresholds");
+        check(std::fabs(df2_tree_gm_delta() - df2_tree_parse_gm_delta(std::getenv("STRATA_DF2_GM_DELTA"))) < 1e-6f,
+              "df2_tree_gm_delta matches STRATA_DF2_GM_DELTA env");
+
+        check(df2_tree_gm_delta_bin(0.0) == 0 && df2_tree_gm_delta_bin(0.1499) == 0 &&
+                  df2_tree_gm_delta_bin(0.15) == 1 && df2_tree_gm_delta_bin(0.3499) == 1 &&
+                  df2_tree_gm_delta_bin(0.35) == 2 && df2_tree_gm_delta_bin(0.6999) == 2 &&
+                  df2_tree_gm_delta_bin(0.70) == 3 && df2_tree_gm_delta_bin(1.4999) == 3 &&
+                  df2_tree_gm_delta_bin(1.50) == 4 && df2_tree_gm_delta_bin(INFINITY) == 4,
+              "df2_tree_gm_delta_bin buckets [0,0.15,0.35,0.7,1.5,inf) accurately");
+
+        // Build GM photo-finish tree and verify depth-d topology never depends on depth > d scores.
+        std::array<int32_t, 7 * kDf2TreeSelectorTopK> toptok{};
+        toptok.fill(-1);
+        std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab_a{};
+        seltab_a.fill(-INFINITY);
+        for (int r = 0; r < 4; ++r) {
+            for (int j = 0; j < 4; ++j) {
+                toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + static_cast<size_t>(j)] = 100 + r * 10 + j;
+            }
+            for (int prev = 0; prev < 4; ++prev) {
+                const size_t base = (static_cast<size_t>(r) * kDf2TreeSelectorTopK + static_cast<size_t>(prev)) *
+                                    kDf2TreeSelectorTopK;
+                seltab_a[base + 0] = std::log(0.42f);
+                seltab_a[base + 1] = std::log(0.38f);
+                seltab_a[base + 2] = std::log(0.12f);
+                seltab_a[base + 3] = std::log(0.08f);
+            }
+        }
+        auto seltab_b = seltab_a;
+        for (int prev = 0; prev < 4; ++prev) {
+            const size_t base = (static_cast<size_t>(1) * kDf2TreeSelectorTopK + static_cast<size_t>(prev)) *
+                                kDf2TreeSelectorTopK;
+            seltab_b[base + 0] = std::log(0.90f);
+            seltab_b[base + 1] = std::log(0.05f);
+            seltab_b[base + 2] = std::log(0.03f);
+            seltab_b[base + 3] = std::log(0.02f);
+        }
+
+        Df2GmBuildOptions opts;
+        opts.delta = 2.0f;
+        opts.max_nodes = 8;
+        opts.q_temperature = 0.8f;
+        Df2GmBuildStats st_a, st_b;
+        const Df2TreeSpec tree_a = df2_tree_build_gm_photo_finish(
+            50, 4, toptok.data(), seltab_a.data(), 0xFACEULL, 100ULL, opts, &st_a);
+        const Df2TreeSpec tree_b = df2_tree_build_gm_photo_finish(
+            50, 4, toptok.data(), seltab_b.data(), 0xFACEULL, 100ULL, opts, &st_b);
+        check(tree_a.valid() && tree_a.is_caterpillar() && tree_a.count <= 8 &&
+                  tree_b.valid() && tree_b.is_caterpillar() && tree_b.count <= 8,
+              "df2_tree_build_gm_photo_finish builds valid caterpillars within max_nodes");
+        check(st_a.spine_tokens[0] == st_b.spine_tokens[0] &&
+                  std::fabs(st_a.decision_deltas[0] - st_b.decision_deltas[0]) < 1e-12,
+              "depth-0 GM decision is independent of depth >= 1 scores");
     }
 
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");

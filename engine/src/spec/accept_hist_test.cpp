@@ -189,5 +189,61 @@ int main() {
             return 23;
         }
     }
+
+    // P3: GM telemetry emits unconditionally when gm_req_active=true (including zero rounds) and round-trips.
+    {
+        strata::spec::Df2TreeAcceptHist gm_zero;
+        gm_zero.sampled_req_active = true;
+        gm_zero.gm_req_active = true;
+        FILE* f_gm0 = std::tmpfile();
+        if (f_gm0 == nullptr) return 24;
+        h.emit(f_gm0, true, 9, &gm_zero);
+        std::rewind(f_gm0);
+        char line_gm0[1024] = {};
+        const bool read_gm0 = std::fgets(line_gm0, sizeof(line_gm0), f_gm0) != nullptr;
+        std::fclose(f_gm0);
+        if (!read_gm0) return 25;
+        strata::spec::Df2TreeAcceptHist parsed_gm0;
+        if (!strata::spec::parse_accept_hist_fields(line_gm0, parsed_gm0) ||
+            !parsed_gm0.gm_req_active || parsed_gm0.gm_rounds != 0 ||
+            parsed_gm0.gm_branch_fires != 0 || parsed_gm0.gm_branch_accepts != 0 ||
+            parsed_gm0.gm_delta_hist != std::array<int64_t, 5>{0, 0, 0, 0, 0} ||
+            std::strstr(line_gm0, "gm_rounds=0 gm_branch_fires=0 gm_branch_accepts=0 gm_delta_hist=0,0,0,0,0") ==
+                nullptr) {
+            return 26;
+        }
+
+        strata::spec::Df2TreeAcceptHist gm_act;
+        gm_act.sampled_req_active = true;
+        gm_act.gm_req_active = true;
+        strata::spec::Df2GmBuildStats st1;
+        st1.n_decisions = 3;
+        st1.decision_deltas = {0.05, 0.25, 0.90};
+        gm_act.observe_gm_round(st1);
+        strata::spec::Df2GmBuildStats st2;
+        st2.n_decisions = 2;
+        st2.decision_deltas = {0.40, 2.10};
+        gm_act.observe_gm_round(st2);
+        gm_act.observe(tree, strata::spec::df2_tree_greedy_accept(tree, arg), true, 0, 5);
+        gm_act.observe_gm_tree(strata::spec::df2_tree_greedy_accept(tree, arg));
+
+        FILE* f_gm1 = std::tmpfile();
+        if (f_gm1 == nullptr) return 27;
+        h.emit(f_gm1, true, 9, &gm_act);
+        std::rewind(f_gm1);
+        char line_gm1[1024] = {};
+        const bool read_gm1 = std::fgets(line_gm1, sizeof(line_gm1), f_gm1) != nullptr;
+        std::fclose(f_gm1);
+        if (!read_gm1) return 28;
+        strata::spec::Df2TreeAcceptHist parsed_gm1;
+        if (!strata::spec::parse_accept_hist_fields(line_gm1, parsed_gm1) ||
+            !parsed_gm1.gm_req_active || parsed_gm1.gm_rounds != 2 ||
+            parsed_gm1.gm_branch_fires != 1 || parsed_gm1.gm_branch_accepts != 1 ||
+            parsed_gm1.gm_delta_hist != std::array<int64_t, 5>{1, 1, 1, 1, 1} ||
+            std::strstr(line_gm1, "gm_rounds=2 gm_branch_fires=1 gm_branch_accepts=1 gm_delta_hist=1,1,1,1,1") ==
+                nullptr) {
+            return 29;
+        }
+    }
     return 0;
 }

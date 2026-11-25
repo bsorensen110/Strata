@@ -363,8 +363,36 @@ inline bool spec_gumbel_env_enabled(const char* value) noexcept {
     return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
 }
 
-inline bool df2_tree_sampled_conflict_with_gumbel(bool sampled_on, bool gumbel_on) noexcept {
-    return sampled_on && gumbel_on;
+inline constexpr float kDf2TreeDefaultGmDelta = 0.35f;
+
+/// Parses STRATA_DF2_TREE_GM ("1" enables Gumbel-Max photo-finish 2-way DF2 trees; default OFF).
+inline bool df2_tree_gm_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+/// Process-wide gate for Gumbel-Max photo-finish DF2 trees (default OFF).
+inline bool df2_tree_gm_on() noexcept {
+    static const bool on = df2_tree_gm_env_enabled(std::getenv("STRATA_DF2_TREE_GM"));
+    return on;
+}
+
+/// Parses STRATA_DF2_GM_DELTA (float > 0; unset/empty/invalid/<=0 => kDf2TreeDefaultGmDelta = 0.35f).
+inline float df2_tree_parse_gm_delta(const char* value) noexcept {
+    if (value == nullptr || *value == '\0') return kDf2TreeDefaultGmDelta;
+    char* end = nullptr;
+    const float v = std::strtof(value, &end);
+    if (end == value || *end != '\0' || !std::isfinite(v) || v <= 0.0f) return kDf2TreeDefaultGmDelta;
+    return v;
+}
+
+/// Photo-finish margin threshold δ for Gumbel-Max 2-way DF2 trees: STRATA_DF2_GM_DELTA (default 0.35).
+inline float df2_tree_gm_delta() noexcept {
+    static const float v = df2_tree_parse_gm_delta(std::getenv("STRATA_DF2_GM_DELTA"));
+    return v;
+}
+
+inline bool df2_tree_sampled_conflict_with_gumbel(bool sampled_on, bool gumbel_on, bool gm_on = false) noexcept {
+    return sampled_on && gumbel_on && !gm_on;
 }
 
 /// Parses STRATA_DF2_TREE_SAMPLED ("1" enables lossless rejection-sampled tree verification for sampled requests; default OFF).
@@ -373,17 +401,18 @@ inline bool df2_tree_sampled_env_enabled(const char* value) noexcept {
 }
 
 /// Process-wide gate for sampled DF2 tree verification and commit (default OFF).
-/// Incompatible with STRATA_SPEC_GUMBEL=1 (sampler.cu ignores p.gumbel in extract_spec_probs while tree accept
-/// uses inverse-CDF): logs a loud error and disables sampled trees if both are set.
+/// Incompatible with STRATA_SPEC_GUMBEL=1 unless STRATA_DF2_TREE_GM=1 (sampler.cu ignores p.gumbel in
+/// extract_spec_probs while non-GM tree accept uses inverse-CDF): logs a loud error and disables sampled trees.
 inline bool df2_tree_sampled_on() noexcept {
     static const bool on = [] {
         const bool sampled = df2_tree_sampled_env_enabled(std::getenv("STRATA_DF2_TREE_SAMPLED"));
         const bool gumbel = spec_gumbel_env_enabled(std::getenv("STRATA_SPEC_GUMBEL"));
-        if (df2_tree_sampled_conflict_with_gumbel(sampled, gumbel)) {
+        const bool gm = df2_tree_gm_on();
+        if (df2_tree_sampled_conflict_with_gumbel(sampled, gumbel, gm)) {
             std::fprintf(stderr,
                          "strata: ERROR: STRATA_SPEC_GUMBEL=1 is incompatible with STRATA_DF2_TREE_SAMPLED=1 "
-                         "(extract_spec_probs/df2_tree_sample_accept use inverse-CDF, not Gumbel-Max); "
-                         "disabling sampled DF2 trees\n");
+                         "(extract_spec_probs/df2_tree_sample_accept use inverse-CDF, not Gumbel-Max; set "
+                         "STRATA_DF2_TREE_GM=1 to use Gumbel-Max trees); disabling sampled DF2 trees\n");
             std::fflush(stderr);
             return false;
         }
@@ -1647,6 +1676,94 @@ inline bool df2_gm_photo_finish_fires(const Df2GmRowTop2& row, float delta) noex
            std::isfinite(row.delta_g) && row.delta_g < static_cast<double>(delta);
 }
 
+inline constexpr int kDf2TreeGmDeltaBins = 5;  ///< [0,0.15), [0.15,0.35), [0.35,0.7), [0.7,1.5), [1.5,inf)
+
+/// Maps photo-finish margin Δg to histogram bin [0, 4]: [0,0.15,0.35,0.7,1.5,inf).
+inline int df2_tree_gm_delta_bin(double delta_g) noexcept {
+    if (!std::isfinite(delta_g) || delta_g >= 1.5) return 4;
+    if (delta_g < 0.15) return 0;
+    if (delta_g < 0.35) return 1;
+    if (delta_g < 0.70) return 2;
+    return 3;
+}
+
+struct Df2GmBuildOptions {
+    float delta = kDf2TreeDefaultGmDelta;
+    int max_nodes = kDf2TreeMaxNodes;
+    int max_cut = -1;
+    double draft_conf = 0.0;
+    float q_temperature = 1.0f;
+    const float* logit_bias = nullptr;
+    int logit_bias_len = 0;
+};
+
+struct Df2GmBuildStats {
+    int spine_len = 0;
+    std::array<int32_t, kDf2TreeMaxDrafts> spine_tokens{};
+    std::array<float, kDf2TreeMaxDrafts> spine_max_q{};
+    int n_decisions = 0;
+    std::array<double, kDf2TreeMaxDrafts> decision_deltas{};
+    int branches_added = 0;
+};
+
+/// Builds a Gumbel-Max photo-finish 2-way caterpillar tree from selector tables (`toptok`, `seltab`).
+/// Depth `d` consumes ONLY `gumbel_exp_host(seed, pos0 + d, ·)` for its row's top-2 Gumbel-perturbed scores;
+/// future depths' noise is never touched when deciding depth `d`'s topology.
+inline Df2TreeSpec df2_tree_build_gm_photo_finish(int32_t anchor, int n_drafts, const int32_t* toptok,
+                                                  const float* seltab, uint64_t seed, uint64_t pos0,
+                                                  const Df2GmBuildOptions& opts,
+                                                  Df2GmBuildStats* stats_out = nullptr) noexcept {
+    Df2GmBuildStats stats;
+    const int cap = std::clamp(opts.max_nodes, 1, kDf2TreeMaxNodes);
+    const int nd = (toptok != nullptr && seltab != nullptr) ? std::clamp(n_drafts, 0, kDf2TreeMaxDrafts) : 0;
+    if (nd <= 0 || cap < 2) {
+        if (stats_out != nullptr) *stats_out = stats;
+        return make_linear_tree(anchor, nullptr, 0);
+    }
+
+    std::array<int32_t, kDf2TreeMaxDrafts> spine_tok{};
+    std::array<int32_t, kDf2TreeMaxDrafts> runner_ups{};
+    std::array<uint8_t, kDf2TreeMaxDrafts> branch_mask{};
+    int prev_slot = 0;
+    int nodes_used = 1;  // root anchor
+    double surv_prod = 1.0;
+
+    for (int d = 0; d < nd && nodes_used < cap; ++d) {
+        const int32_t* row_toks = toptok + static_cast<size_t>(d) * kDf2TreeSelectorTopK;
+        const float* row_scores = seltab + (static_cast<size_t>(d) * kDf2TreeSelectorTopK +
+                                            static_cast<size_t>(prev_slot)) * kDf2TreeSelectorTopK;
+        const Df2GmRowTop2 r = df2_gm_row_top2(row_toks, row_scores, seed, pos0 + static_cast<uint64_t>(d),
+                                               opts.q_temperature, opts.logit_bias, opts.logit_bias_len);
+        if (!r.valid) break;
+
+        spine_tok[static_cast<size_t>(d)] = r.tok0;
+        stats.spine_tokens[static_cast<size_t>(d)] = r.tok0;
+        stats.spine_max_q[static_cast<size_t>(d)] = r.max_q;
+        ++stats.spine_len;
+        ++nodes_used;
+
+        if (r.has_runner && (opts.max_cut < 0 || d <= opts.max_cut) && nodes_used < cap) {
+            stats.decision_deltas[static_cast<size_t>(stats.n_decisions++)] = r.delta_g;
+            if (df2_gm_photo_finish_fires(r, opts.delta)) {
+                branch_mask[static_cast<size_t>(d)] = 1;
+                runner_ups[static_cast<size_t>(d)] = r.tok1;
+                ++stats.branches_added;
+                ++nodes_used;
+            }
+        }
+
+        prev_slot = r.slot0;
+        if (opts.draft_conf > 0.0) {
+            surv_prod *= std::clamp(static_cast<double>(r.max_q), 0.0, 1.0);
+            if (surv_prod < opts.draft_conf) break;
+        }
+    }
+
+    if (stats_out != nullptr) *stats_out = stats;
+    return make_caterpillar_tree(anchor, spine_tok.data(), stats.spine_len,
+                                 runner_ups.data(), branch_mask.data());
+}
+
 /// Online per-depth EWMA calibration of primary DF2 acceptance for adaptive branch-cut selection.
 class Df2TreeAdaptivePolicy {
 public:
@@ -2419,6 +2536,11 @@ struct Df2TreeAcceptHist {
     float env_max_temp = 0.0f;
     bool env_no_walk_trees = false;
     bool env_sample_walk = false;
+    bool gm_req_active = false;
+    int64_t gm_rounds = 0;
+    int64_t gm_branch_fires = 0;
+    int64_t gm_branch_accepts = 0;
+    std::array<int64_t, kDf2TreeGmDeltaBins> gm_delta_hist{};  ///< Δg bins [0,0.15,0.35,0.7,1.5,inf]
 
     void set_sampled_envelope(Df2TreeSampledGateStatus gate, float req_temp, float min_branch_p, float ev_cut,
                               float max_temp, bool no_walk_trees, bool sample_walk) noexcept {
@@ -2437,6 +2559,19 @@ struct Df2TreeAcceptHist {
     void observe_reject(Df2TreeRejReason reason) noexcept {
         const size_t idx = static_cast<size_t>(reason);
         if (idx < rej_reason.size()) ++rej_reason[idx];
+    }
+
+    void observe_gm_round(const Df2GmBuildStats& st) noexcept {
+        ++gm_rounds;
+        for (int i = 0; i < st.n_decisions; ++i) {
+            const int bin = df2_tree_gm_delta_bin(st.decision_deltas[static_cast<size_t>(i)]);
+            ++gm_delta_hist[static_cast<size_t>(bin)];
+        }
+    }
+
+    void observe_gm_tree(const Df2TreeCommitWalk& walk) noexcept {
+        ++gm_branch_fires;
+        if (walk.runner_up_hit) ++gm_branch_accepts;
     }
 
     /// Records one verified tree round. Node `i` is counted as reached iff `i == 0` or its parent was accepted
@@ -2544,6 +2679,16 @@ struct Df2TreeAcceptHist {
                               df2_tree_sampled_gate_name(env_gate), env_req_temp, env_min_branch_p, env_ev_cut,
                               env_max_temp, env_no_walk_trees ? 1 : 0, env_sample_walk ? 1 : 0);
                 s += buf;
+            }
+        }
+        if (gm_req_active || gm_rounds > 0 || gm_branch_fires > 0 || gm_branch_accepts > 0) {
+            s += " gm_rounds=" + std::to_string(gm_rounds) +
+                 " gm_branch_fires=" + std::to_string(gm_branch_fires) +
+                 " gm_branch_accepts=" + std::to_string(gm_branch_accepts) +
+                 " gm_delta_hist=";
+            for (int i = 0; i < kDf2TreeGmDeltaBins; ++i) {
+                if (i > 0) s += ',';
+                s += std::to_string(gm_delta_hist[static_cast<size_t>(i)]);
             }
         }
         return s;
@@ -2671,6 +2816,16 @@ inline bool parse_accept_hist_fields(const std::string& line, Df2TreeAcceptHist&
         tmp.env_sample_walk = (walk_v != 0);
         tmp.has_envelope = true;
     }
+    if (line.find("gm_rounds=") != std::string::npos) {
+        if (!detail::parse_kv_i64(line, "gm_rounds=", tmp.gm_rounds)) return false;
+        tmp.gm_req_active = true;
+    }
+    if (line.find("gm_branch_fires=") != std::string::npos &&
+        !detail::parse_kv_i64(line, "gm_branch_fires=", tmp.gm_branch_fires)) return false;
+    if (line.find("gm_branch_accepts=") != std::string::npos &&
+        !detail::parse_kv_i64(line, "gm_branch_accepts=", tmp.gm_branch_accepts)) return false;
+    if (line.find("gm_delta_hist=") != std::string::npos &&
+        !detail::parse_csv_ints(line, "gm_delta_hist=", tmp.gm_delta_hist, kDf2TreeGmDeltaBins)) return false;
     out = tmp;
     return true;
 }

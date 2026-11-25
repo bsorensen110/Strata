@@ -7401,11 +7401,13 @@ bool Verifier::capture_commit_tree(std::string& err) {
 bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, PoolMultiFn pool, void* user,
                         int32_t* out, std::string& err, strata::core::SpecPRow* out_probs,
                         const strata::spec::Df2TreeSampleQ* gpu_accept_q,
-                        strata::core::TreeSampleAcceptResult* out_gpu_accept) {
+                        strata::core::TreeSampleAcceptResult* out_gpu_accept,
+                        bool gm_tree) {
 #if defined(STRATA_GPU_METAL)
     (void) out_probs;
     (void) gpu_accept_q;
     (void) out_gpu_accept;
+    (void) gm_tree;
     err = "verify: tree mode unsupported on Metal";
     return false;
 #endif
@@ -7417,7 +7419,11 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
     const bool gpu_accept = out_gpu_accept != nullptr;
-    const bool sampled_tree = out_probs != nullptr || gpu_accept;
+    if (gm_tree && (out_probs != nullptr || gpu_accept)) {
+        err = "verify: gm_tree cannot be combined with out_probs or gpu_accept";
+        return false;
+    }
+    const bool sampled_tree = out_probs != nullptr || gpu_accept || gm_tree;
     if (sampled_tree) {
         if (!strata::spec::df2_tree_sampled_on() || !sampled || !head_sampling_) {
             err = "verify: sampled tree mode requires STRATA_DF2_TREE_SAMPLED=1 and sampled request";
@@ -7451,7 +7457,7 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
     if (!ensure_tree_buffers(err)) return false;
     if (gpu_accept && !ensure_tree_accept_buffers(err)) return false;
     static const bool logits_dump_flag = std::getenv("STRATA_LOGITS_DUMP") != nullptr;
-    const bool need_logits_graph = gpu_accept && head_ != nullptr && head_->loaded() &&
+    const bool need_logits_graph = (gpu_accept || gm_tree) && head_ != nullptr && head_->loaded() &&
                                    head_->bitplane() != nullptr && T <= 16 &&
                                    (head_->type() == 8 || T >= 4) && !logits_dump_flag;
     static const bool tree_nograph = [] {
@@ -7619,7 +7625,33 @@ bool Verifier::run_tree(const strata::spec::Df2TreeSpec& tree, int64_t pos0, Poo
     }
 
     if (post_layers_cb_ != nullptr) post_layers_cb_(post_layers_user_);
-    if (gpu_accept) {
+    if (gm_tree) {
+        ensure_full_logits(T, false);
+        if (!need_logits_graph) ensure_head_logits(M);
+        SamplerParams sp = sampling_;
+        sp.counter = (uint64_t) pos0;
+        sp.gumbel = true;
+        const bool launched = sample_tokens_tree_gumbel(
+            head_logits_, M, (int) n_vocab_, hist_d_, hist_len_, sp, tree.depth.data(), m_out_, cs_);
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify tree: ") + cudaGetErrorString(se); return false; }
+        if (ar_on() && h_plan_err_ != nullptr && *(volatile uint32_t*) h_plan_err_ != 0) {
+            *(volatile uint32_t*) h_plan_err_ = 0;
+            err = "verify tree: all-resident plan met an expert not in VRAM";
+            return false;
+        }
+        commit_pending_ = false;
+        if (copy_used_) {
+            cudaStreamSynchronize(copy_);
+            copy_used_ = false;
+        }
+        if (prof_on_) collect_profile();
+        if (!launched) {
+            err = "verify tree: Gumbel-Max tree sampling failed";
+            return false;
+        }
+        for (int t = 0; t < M; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
+    } else if (gpu_accept) {
         ensure_full_logits(T, false);
         if (!need_logits_graph) ensure_head_logits(M);
         SamplerParams sp = sampling_;

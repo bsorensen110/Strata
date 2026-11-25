@@ -485,10 +485,10 @@ __device__ __forceinline__ void warp_first(float& bv, int& bi) {
 /// callers clamp, read `sel_ids[-1]` in the old tail; it reads `sel_ids[0]` here.)
 /// kProb (the coupled draft only): lane 0 also writes the pick's probability under the final distribution to
 /// `*prob_out`.  The sampler's own calls take kProb = false, whose code is the tail above, unchanged.
-template <bool kProb = false>
+template <bool kProb = false, bool kCustomCtr = false>
 __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, int k, const SamplerParams& p, int t,
                                   int* __restrict__ out, double* ex, float* prob_out = nullptr,
-                                  const int32_t* __restrict__ sub_to_id = nullptr) {
+                                  const int32_t* __restrict__ sub_to_id = nullptr, uint64_t custom_ctr = 0) {
     const int lane = (int) (threadIdx.x & 31);
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
     int n_keep = k;
@@ -538,15 +538,16 @@ __device__ void sampled_tail_warp(const int* sel_ids, const float* sel_logit, in
     if (lane == 0) {
         int pi = n_keep > 0 ? n_keep - 1 : 0;
         int pick = sel_ids[pi];
+        const uint64_t row_ctr = kCustomCtr ? custom_ctr : (p.counter + (uint64_t) t);
         if (p.gumbel) {
             double best = -1.0;
             for (int i = 0; i < n_keep; ++i) {
                 const int id = sub_to_id != nullptr ? sub_to_id[sel_ids[i]] : sel_ids[i];
-                const double r = ex[i] / gumbel_exp(p.seed, p.counter + (uint64_t) t, (uint32_t) id);
+                const double r = ex[i] / gumbel_exp(p.seed, row_ctr, (uint32_t) id);
                 if (r > best) { best = r; pick = sel_ids[i]; pi = i; }
             }
         } else {
-            const float u = philox_uniform(p.seed, p.counter + (uint64_t) t);
+            const float u = philox_uniform(p.seed, row_ctr);
             double cum = 0.0;
             for (int i = 0; i < n_keep; ++i) {
                 cum += ex[i];
@@ -636,6 +637,83 @@ sampler_one_block_kernel(const float* __restrict__ logits, int n_vocab, const in
     }
     if (warp != 0) return;
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
+}
+
+struct TreeRowDepths {
+    uint8_t d[8];
+};
+
+__global__ void __launch_bounds__(1024)
+sampler_one_block_tree_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
+                              int history_len, const SamplerParams p, TreeRowDepths depths,
+                              int* __restrict__ out) {
+    const int t = blockIdx.x;
+    const float* l = logits + (size_t) t * n_vocab;
+
+    const int* hrow = history ? history + (size_t) t * history_len : nullptr;
+    int hlen = 0;
+    if (hrow) {
+        hlen = p.penalty_last_n < history_len ? p.penalty_last_n : history_len;
+        if (hlen < 0) hlen = 0;
+        hrow += history_len - hlen;
+    }
+    extern __shared__ unsigned int penal_bits[];
+    const int bits_words = (int) ((n_vocab + 31) / 32);
+    const bool use_bits = hrow != nullptr && hlen > 0 && bits_words > 0;
+    if (use_bits) {
+        for (int w = threadIdx.x; w < bits_words; w += blockDim.x) penal_bits[w] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < hlen; i += blockDim.x)
+            if (hrow[i] >= 0 && hrow[i] < n_vocab)
+                atomicOr(&penal_bits[hrow[i] >> 5], 1u << (hrow[i] & 31));
+        __syncthreads();
+    }
+    auto hit_count = [&](int v) -> int {
+        if (!use_bits || !(penal_bits[v >> 5] & (1u << (v & 31)))) return 0;
+        return history_count(hrow, hlen, v);
+    };
+
+    const int k = sampled_k(p.top_k, n_vocab);
+    __shared__ int sel_ids[kSelMax];
+    __shared__ float sel_logit[kSelMax];
+    __shared__ double ex[kSelMax];
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
+    float prev_v = __int_as_float(0x7f800000);
+    int prev_i = -1;
+    for (int i = 0; i < k; ++i) {
+        float bv = __int_as_float(0xff800000);
+        int best = n_vocab;
+        for (int v = threadIdx.x; v < n_vocab; v += blockDim.x) {
+            const float s = apply_penalties(p.logit_bias ? l[v] + p.logit_bias[v] : l[v], hit_count(v), p);
+            if ((s < prev_v || (s == prev_v && v > prev_i)) && s > bv) { bv = s; best = v; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = __shfl_down_sync(0xFFFFFFFFu, bv, off);
+            const int oi = __shfl_down_sync(0xFFFFFFFFu, best, off);
+            if (ov > bv || (ov == bv && oi < best)) { bv = ov; best = oi; }
+        }
+        if (lane == 0) { sv[warp] = bv; si[warp] = best; }
+        __syncthreads();
+        if (warp == 0) {
+            const int nw = (int) ((blockDim.x + 31) >> 5);
+            float wv = lane < nw ? sv[lane] : __int_as_float(0xff800000);
+            int wi = lane < nw ? si[lane] : n_vocab;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = __shfl_down_sync(0xFFFFFFFFu, wv, off);
+                const int oi = __shfl_down_sync(0xFFFFFFFFu, wi, off);
+                if (ov > wv || (ov == wv && oi < wi)) { wv = ov; wi = oi; }
+            }
+            if (lane == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
+        }
+        __syncthreads();
+        prev_v = sel_logit[i];
+        prev_i = sel_ids[i];
+    }
+    if (warp != 0) return;
+    sampled_tail_warp<false, true>(sel_ids, sel_logit, k, p, t, out, ex, nullptr, nullptr,
+                                   p.counter + (uint64_t) depths.d[t]);
 }
 
 // ---- THE SPLIT top_k.  `sampler_kernel` and the one-block kernel keep a row on ONE SM of 170 (5090) and walk its
@@ -800,6 +878,26 @@ sampler_split_merge_kernel(const int2* __restrict__ cand, int n_blocks, int n_vo
     });
     __syncwarp();
     sampled_tail_warp(sel_ids, sel_logit, k, p, t, out, ex);
+}
+
+__global__ void __launch_bounds__(32)
+sampler_split_merge_tree_kernel(const int2* __restrict__ cand, int n_blocks, int n_vocab, const SamplerParams p, int k,
+                                TreeRowDepths depths, int* __restrict__ out) {
+    const int t = blockIdx.x;
+    const int lane = (int) threadIdx.x;
+    __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
+    __shared__ int sel_ids[kSelMax];
+    __shared__ float sel_logit[kSelMax];
+    __shared__ double ex[kSelMax];
+    const int2* src = cand + (size_t) t * n_blocks * k;
+    for (int e = lane; e < n_blocks * k; e += 32) lists[e] = src[e];
+    __syncwarp();
+    warp_merge_lists(lists, n_blocks, k, k, n_vocab, [&](int i, float v, int id) {
+        if (lane == 0) { sel_ids[i] = id < n_vocab ? id : 0; sel_logit[i] = v; }
+    });
+    __syncwarp();
+    sampled_tail_warp<false, true>(sel_ids, sel_logit, k, p, t, out, ex, nullptr, nullptr,
+                                   p.counter + (uint64_t) depths.d[t]);
 }
 
 // ---- COUPLED DRAFT SAMPLING (include/strata/core/coupled_draft.hpp): the MTP draft layer samples its draft with the
@@ -1758,6 +1856,46 @@ bool eval_gumbel_exp_device(const uint64_t* d_seed, const uint64_t* d_counter, c
     if (stream_capturing(stream)) return false;
     const cudaStream_t s = (cudaStream_t) stream;
     eval_gumbel_exp_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(d_seed, d_counter, d_token, n, d_out);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return false;
+    if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) return false;
+    return true;
+}
+
+bool sample_tokens_tree_gumbel(const float* logits, int n_tokens, int n_vocab, const int* history,
+                               int history_len, const SamplerParams& p_in, const uint8_t* row_depths,
+                               int* out, void* stream) {
+    if (logits == nullptr || out == nullptr || row_depths == nullptr ||
+        n_tokens <= 0 || n_tokens > 8 || n_vocab <= 0 ||
+        p_in.greedy || p_in.temperature <= 0.0f || stream_capturing(stream)) {
+        return false;
+    }
+    if (p_in.penalty_last_n > 0 && (history == nullptr || history_len <= 0)) return false;
+
+    SamplerParams p = p_in;
+    p.gumbel = true;
+    TreeRowDepths depths{};
+    for (int i = 0; i < n_tokens; ++i) depths.d[i] = row_depths[i];
+
+    const int k = sampled_k(p.top_k, n_vocab);
+    const int n_blocks = (n_vocab + kSplitBlockSpan - 1) / kSplitBlockSpan;
+    int2* scratch = nullptr;
+    if (sampled_path() == SampledPath::Split && n_blocks <= kSplitMaxBlocks && n_tokens <= kSplitMaxRows) {
+        scratch = split_scratch(stream, (size_t) (n_tokens > 16 ? n_tokens : 16) * n_blocks * kSelMax);
+    }
+    const cudaStream_t s = (cudaStream_t) stream;
+    if (scratch != nullptr) {
+        sampler_split_part_kernel<<<dim3((unsigned) n_blocks, (unsigned) n_tokens), kSplitWarps * 32, 0, s>>>(
+            logits, n_vocab, history, history_len, p, k, n_blocks, scratch);
+        sampler_split_merge_tree_kernel<<<(unsigned) n_tokens, 32, 0, s>>>(
+            scratch, n_blocks, n_vocab, p, k, depths, out);
+    } else {
+        const unsigned shmem = (history != nullptr && history_len > 0 && p.penalty_last_n > 0)
+                                   ? (unsigned) ((n_vocab + 31) / 32) * sizeof(unsigned)
+                                   : 0u;
+        sampler_one_block_tree_kernel<<<(unsigned) n_tokens, 1024, shmem, s>>>(
+            logits, n_vocab, history, history_len, p, depths, out);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return false;
     if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) return false;
