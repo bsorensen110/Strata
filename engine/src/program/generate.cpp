@@ -23525,6 +23525,7 @@ int main(int argc, char** argv) {
             strata::spec::Df2AcceptHist accept_hist;
             strata::spec::Df2TreeAcceptHist tree_accept_hist;
             strata::spec::Df2TreeAdaptivePolicy tree_adaptive_policy;
+            strata::spec::Df2TreeRowEmaPolicy tree_row_ema_policy;
 #if defined(STRATA_HAVE_DFLASH2)
             const bool tree_req_eligible = strata::spec::df2_tree_on() && req_df2 && use_df2 && !batch_df2 &&
                 o.batch == 0 && n_stages <= 1 && !o.draft_auto && strata::core::Dflash2Drafter::head_native() &&
@@ -24667,6 +24668,7 @@ int main(int argc, char** argv) {
                 const int T_mtp = T;
                 T += chain_n;
                 bool tree_round = false;
+                const int tree_lin_cf_drafts = std::max(0, T - 1);
                 strata::spec::Df2TreeSpec tree_spec;
                 strata::spec::Df2TreeCommitWalk tree_walk;
                 int32_t tree_bonus = 0;
@@ -24686,10 +24688,14 @@ int main(int argc, char** argv) {
                         tree_opts.dedup_siblings = strata::spec::df2_tree_dedup_on();
                         tree_opts.adaptive_inflate = strata::spec::df2_tree_adaptive_inflate_on();
                         tree_opts.ev_use_adaptive_probs = tree_opts.adaptive_inflate;
+                        tree_opts.max_cut = strata::spec::df2_tree_max_cut();
                         tree_spec = strata::spec::df2_tree_build_from_selector_ex(
                             x, drafts.data(), dprob.data(), df2.max_drafts(), df2.tree_toptok(), df2.tree_seltab(),
                             tree_opts, tree_opts.adaptive_cut ? &tree_adaptive_policy : nullptr);
-                        if (tree_spec.valid() && !tree_spec.is_linear() && tree_spec.is_caterpillar()) {
+                        const float row_ema_thresh = strata::spec::df2_tree_row_ema();
+                        if (tree_spec.valid() && !tree_spec.is_linear() && tree_spec.is_caterpillar() &&
+                            (row_ema_thresh <= 0.0f ||
+                             tree_row_ema_policy.allow_tree(static_cast<double>(row_ema_thresh)))) {
                             tree_round = true;
                             T = tree_spec.count;
                         }
@@ -25012,6 +25018,15 @@ int main(int argc, char** argv) {
                     a = std::max(0, tree_walk.n_keep - 1);
                     if (accept_hist_on) tree_accept_hist.observe(tree_spec, tree_walk);
                     if (strata::spec::df2_tree_adaptive_on()) tree_adaptive_policy.observe_tree(tree_spec, tree_walk);
+                    if (strata::spec::df2_tree_row_ema() > 0.0f) {
+                        const int lin_cf_acc = strata::spec::df2_tree_counterfactual_linear_accept(
+                            tree_spec, tree_walk, tree_lin_cf_drafts);
+                        const int tree_exec_T = strata::spec::df2_tree_select_width(
+                            tree_spec.count, strata::spec::df2_tree_var_t_on());
+                        tree_row_ema_policy.observe(
+                            a - lin_cf_acc, std::max(0, tree_exec_T - (1 + tree_lin_cf_drafts)),
+                            static_cast<double>(strata::spec::df2_tree_row_ema()));
+                    }
                 } else {
                     a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                     while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;

@@ -69,8 +69,42 @@ inline float df2_tree_parse_ev_cut(const char* value) noexcept {
 
 /// Minimum expected acceptance value per tree node when EV-budget allocation is active.
 /// STRATA_DF2_TREE_EV_CUT (float, default 0 = off).
+/// Note: with STRATA_DF2_TREE_VAR_T=1 (no T=8 dummy padding), 0.35 is the calibrated GPU window setting
+/// matching the measured 0.332 accepted-tokens-per-extra-routed-row break-even.
 inline float df2_tree_ev_cut() noexcept {
     static const float v = df2_tree_parse_ev_cut(std::getenv("STRATA_DF2_TREE_EV_CUT"));
+    return v;
+}
+
+/// Parses STRATA_DF2_TREE_MAX_CUT (int >= 0; unset/empty/invalid/negative => -1 = disabled).
+inline int df2_tree_parse_max_cut(const char* value) noexcept {
+    if (value == nullptr || *value == '\0') return -1;
+    char* end = nullptr;
+    const long v = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || v < 0) return -1;
+    return v > kDf2TreeMaxDrafts ? kDf2TreeMaxDrafts : static_cast<int>(v);
+}
+
+/// Maximum confidence-cut depth allowed to enter DF2 tree mode (default -1 = off / unlimited).
+/// Suggested GPU window setting: 3 (stand down on cut >= 4 where linear chains are already long).
+inline int df2_tree_max_cut() noexcept {
+    static const int v = df2_tree_parse_max_cut(std::getenv("STRATA_DF2_TREE_MAX_CUT"));
+    return v;
+}
+
+/// Parses STRATA_DF2_TREE_ROW_EMA (float in (0, 1]; default 0 = off).
+inline float df2_tree_parse_row_ema(const char* value) noexcept {
+    if (value == nullptr || *value == '\0') return 0.0f;
+    char* end = nullptr;
+    const float v = std::strtof(value, &end);
+    if (end == value || *end != '\0' || !std::isfinite(v) || v <= 0.0f || v > 1.0f) return 0.0f;
+    return v;
+}
+
+/// Minimum EWMA marginal accepted-drafts-per-extra-routed-row (`dAcc / dRow`) to keep entering tree mode.
+/// STRATA_DF2_TREE_ROW_EMA (float, default 0 = off; suggested window setting 0.35).
+inline float df2_tree_row_ema() noexcept {
+    static const float v = df2_tree_parse_row_ema(std::getenv("STRATA_DF2_TREE_ROW_EMA"));
     return v;
 }
 
@@ -472,6 +506,7 @@ struct Df2TreeBuildOptions {
     bool dedup_siblings = false;
     bool adaptive_inflate = false;       ///< opt-in: allow effective_prob to raise low selector_p toward EMA
     bool ev_use_adaptive_probs = false;  ///< opt-in: price EV node candidates with effective_prob instead of raw p
+    int max_cut = -1;                    ///< maximum cut depth allowed for tree entry (-1 = off / unlimited)
 };
 
 class Df2TreeAdaptivePolicy;
@@ -894,6 +929,114 @@ private:
     std::array<double, kDf2TreeMaxDrafts> depth_seen_{};
 };
 
+/// Computes how many drafts a linear window of `lin_cf_drafts` primary drafts would have accepted on a tree round.
+/// Walks consecutive primary-rank nodes (`slot_rank == 0` and `depth == k`) along `walk.path`.
+inline int df2_tree_counterfactual_linear_accept(const Df2TreeSpec& tree, const Df2TreeCommitWalk& walk,
+                                                 int lin_cf_drafts) noexcept {
+    if (lin_cf_drafts <= 0 || !tree.valid() || walk.n_keep <= 1) return 0;
+    int spine_acc = 0;
+    for (int k = 1; k < walk.n_keep; ++k) {
+        const int node = static_cast<int>(walk.path[static_cast<size_t>(k)]);
+        if (node <= 0 || node >= tree.count) break;
+        if (tree.slot_rank[static_cast<size_t>(node)] != 0 ||
+            static_cast<int>(tree.depth[static_cast<size_t>(node)]) != k) {
+            break;
+        }
+        ++spine_acc;
+    }
+    return std::min(lin_cf_drafts, spine_acc);
+}
+
+/// Cost-normalized tree-entry predicate reusing Df2AdaptiveSolo's `(1 + E[acc]) / cost(T)` pattern
+/// alongside the empirical marginal `dAcc / dRow` break-even threshold (without assuming T=8 padding).
+inline bool df2_tree_cost_normalized_beats(double e_tree, int t_tree, double cost_tree,
+                                           double e_lin, int t_lin, double cost_lin,
+                                           double min_dacc_per_drow = 0.0) noexcept {
+    const double c_tree = std::max(1e-9, cost_tree);
+    const double c_lin = std::max(1e-9, cost_lin);
+    const double score_tree = (1.0 + e_tree) / c_tree;
+    const double score_lin = (1.0 + e_lin) / c_lin;
+    if (score_tree <= score_lin + 1e-9) return false;
+    if (min_dacc_per_drow > 0.0 && t_tree > t_lin) {
+        const double d_acc = e_tree - e_lin;
+        const double d_row = static_cast<double>(t_tree - t_lin);
+        if (d_acc < min_dacc_per_drow * d_row - 1e-9) return false;
+    }
+    return true;
+}
+
+/// Host-side EWMA suppression gate on per-tree-round marginal `dAcc / dRow`
+/// (reusing Df2AdaptiveSolo's EWMA + 8-round cooldown/hysteresis pattern with zero extra GPU syncs).
+class Df2TreeRowEmaPolicy {
+public:
+    static constexpr double kDecay = 0.95;
+    static constexpr double kIdleDecay = 0.95;
+    static constexpr int kWarmupRounds = 8;
+    static constexpr int kCooldownRounds = 8;
+    static constexpr int kProbeInterval = 16;
+
+    void reset() noexcept {
+        dacc_ema_ = 0.0;
+        drow_ema_ = 0.0;
+        tree_rounds_seen_ = 0;
+        rounds_since_switch_ = 0;
+        probe_countdown_ = 0;
+        suppressed_ = false;
+    }
+
+    void observe(int d_acc, int d_row, double threshold) noexcept {
+        const int extra_rows = std::max(0, d_row);
+        dacc_ema_ = kDecay * dacc_ema_ + static_cast<double>(d_acc);
+        drow_ema_ = kDecay * drow_ema_ + static_cast<double>(extra_rows);
+        ++tree_rounds_seen_;
+        ++rounds_since_switch_;
+        if (!(threshold > 0.0)) return;
+        const double rate = marginal_rate();
+        if (!suppressed_) {
+            if (tree_rounds_seen_ >= kWarmupRounds && rounds_since_switch_ >= kCooldownRounds && rate < threshold) {
+                suppressed_ = true;
+                rounds_since_switch_ = 0;
+                probe_countdown_ = kProbeInterval;
+            }
+        } else if (rounds_since_switch_ >= 1 && rate >= threshold) {
+            suppressed_ = false;
+            rounds_since_switch_ = 0;
+            probe_countdown_ = 0;
+        }
+    }
+
+    /// Returns whether an eligible tree candidate should execute or stand down to linear.
+    /// When suppressed, decays stale EWMA across skipped rounds and admits a periodic probe every `kProbeInterval`.
+    bool allow_tree(double threshold) noexcept {
+        if (!(threshold > 0.0)) return true;
+        if (!suppressed_) return true;
+        dacc_ema_ *= kIdleDecay;
+        drow_ema_ *= kIdleDecay;
+        if (probe_countdown_ > 0) {
+            --probe_countdown_;
+            return false;
+        }
+        probe_countdown_ = kProbeInterval;
+        return true;
+    }
+
+    double marginal_rate() const noexcept {
+        if (drow_ema_ > 1e-9) return dacc_ema_ / drow_ema_;
+        return dacc_ema_ >= 0.0 ? 1.0 : 0.0;
+    }
+
+    bool suppressed() const noexcept { return suppressed_; }
+    int tree_rounds_seen() const noexcept { return tree_rounds_seen_; }
+
+private:
+    double dacc_ema_ = 0.0;
+    double drow_ema_ = 0.0;
+    int tree_rounds_seen_ = 0;
+    int rounds_since_switch_ = 0;
+    int probe_countdown_ = 0;
+    bool suppressed_ = false;
+};
+
 namespace detail {
 
 struct Df2SelectorCand {
@@ -1025,6 +1168,11 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
         return make_linear_tree(anchor, drafts, lin_n);
     }
 
+    const int conf_cut = (opts.draft_conf > 0.0) ? df2_tree_cut_depth(probs, nd, opts.draft_conf) : -1;
+    if (opts.max_cut >= 0 && conf_cut >= 0 && conf_cut > opts.max_cut) {
+        return make_linear_tree(anchor, drafts, lin_n);
+    }
+
     std::array<double, kDf2TreeMaxDrafts> p_raw{};
     std::array<double, kDf2TreeMaxDrafts + 1> surv_raw{};
     std::array<double, kDf2TreeMaxDrafts> p_cal{};
@@ -1070,6 +1218,7 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
                 cands[static_cast<size_t>(n_cands++)] =
                     EvCand{d, true, 0, drafts[d], opts.adaptive_cut ? spine_cal_ev : spine_ev, spine_cal_ev};
             }
+            if (opts.max_cut >= 0 && d > opts.max_cut) continue;
             std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
             const int n_run = detail::extract_selector_runners(d, anchor, drafts, nd, toptok, seltab,
                                                                opts.min_branch_p, opts.dedup_siblings, runs);
@@ -1220,7 +1369,8 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
         int best_fanout = 0;
         std::array<int32_t, kDf2TreeMaxNodes> best_branch_tokens{};
 
-        const int max_cut = std::min(nd - 1, cap - 3);
+        int max_cut = std::min(nd - 1, cap - 3);
+        if (opts.max_cut >= 0) max_cut = std::min(max_cut, opts.max_cut);
         for (int c = 0; c <= max_cut; ++c) {
             std::array<detail::Df2SelectorCand, kDf2TreeSelectorTopK> runs{};
             const int n_run = detail::extract_selector_runners(c, anchor, drafts, nd, toptok, seltab,
@@ -1273,6 +1423,9 @@ inline Df2TreeSpec df2_tree_build_from_selector_ex(int32_t anchor, const int32_t
                 best_p = probs[i];
                 cut = i;
             }
+        }
+        if (opts.max_cut >= 0 && cut > opts.max_cut) {
+            return make_linear_tree(anchor, drafts, lin_n);
         }
     }
 

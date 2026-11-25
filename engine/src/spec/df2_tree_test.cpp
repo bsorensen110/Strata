@@ -847,6 +847,142 @@ void test_composable_ev_adaptive_matrix_and_no_inflation() {
           "opt-in legacy inflation reproduces old EA low-yield tree trigger");
 }
 
+void test_max_cut_and_row_ema_cost_gates() {
+    // 1. Env parsers
+    check(df2_tree_parse_max_cut(nullptr) == -1 && df2_tree_parse_max_cut("") == -1 &&
+              df2_tree_parse_max_cut("abc") == -1 && df2_tree_parse_max_cut("-1") == -1,
+          "max_cut parser defaults invalid/unset to -1 (off)");
+    check(df2_tree_parse_max_cut("0") == 0 && df2_tree_parse_max_cut("3") == 3 &&
+              df2_tree_parse_max_cut("9") == kDf2TreeMaxDrafts,
+          "max_cut parser accepts non-negative integers and clamps upper bound");
+
+    check(df2_tree_parse_row_ema(nullptr) == 0.0f && df2_tree_parse_row_ema("") == 0.0f &&
+              df2_tree_parse_row_ema("0") == 0.0f && df2_tree_parse_row_ema("-0.2") == 0.0f &&
+              df2_tree_parse_row_ema("1.5") == 0.0f && df2_tree_parse_row_ema("bad") == 0.0f,
+          "row_ema parser defaults invalid/non-positive/out-of-range to 0 (off)");
+    check(df2_tree_parse_row_ema("0.35") > 0.349f && df2_tree_parse_row_ema("0.35") < 0.351f,
+          "row_ema parser parses 0.35 cleanly");
+
+    // 2. Cut-depth guard (max_cut = 3): cut=4 stands down across Legacy, EV, and Adaptive; cut=2 stays active.
+    std::array<int32_t, 7> drafts{101, 102, 103, 104, 105, 106, 107};
+    // 0.95^4 = 0.8145 >= 0.7, *0.45 = 0.3665 < 0.7 => draft_conf cut = 4
+    const std::array<float, 7> probs_cut4{0.95f, 0.95f, 0.95f, 0.95f, 0.45f, 0.40f, 0.30f};
+    const std::array<float, 7> probs_cut2{0.90f, 0.90f, 0.55f, 0.45f, 0.40f, 0.30f, 0.30f};
+    std::array<int32_t, 7 * kDf2TreeSelectorTopK> toptok{};
+    std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+    toptok.fill(-1);
+    seltab.fill(-100.0f);
+    for (int r = 0; r < 7; ++r) {
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0] = drafts[static_cast<size_t>(r)];
+        toptok[static_cast<size_t>(r) * kDf2TreeSelectorTopK + 1] = 200 + r;
+        const size_t base = (static_cast<size_t>(r) * kDf2TreeSelectorTopK + 0u) * kDf2TreeSelectorTopK;
+        seltab[base + 0] = 0.0f;
+        if (r == 2 || r == 4) {
+            seltab[base + 0] = 0.20f;  // exp(0.20)=1.2214 -> runner p ~ 0.450
+            seltab[base + 1] = 0.0f;
+        }
+    }
+
+    Df2TreeBuildOptions opts;
+    opts.draft_conf = 0.7;
+    opts.min_branch_p = 0.35f;
+    opts.max_fanout = 2;
+    opts.max_nodes = 8;
+
+    // Unset (max_cut = -1): cut=4 enters tree mode in legacy and EV.
+    check(!df2_tree_build_from_selector_ex(99, drafts.data(), probs_cut4.data(), 7,
+                                           toptok.data(), seltab.data(), opts).is_linear(),
+          "max_cut=-1 (off) allows cut=4 legacy tree");
+    opts.ev_cut = 0.35f;
+    check(!df2_tree_build_from_selector_ex(99, drafts.data(), probs_cut4.data(), 7,
+                                           toptok.data(), seltab.data(), opts).is_linear(),
+          "max_cut=-1 (off) allows cut=4 EV tree");
+
+    // max_cut = 3: cut=4 stands down in Legacy, EV, and Adaptive; cut=2 still enters!
+    opts.max_cut = 3;
+    opts.ev_cut = 0.0f;
+    check(df2_tree_build_from_selector_ex(99, drafts.data(), probs_cut4.data(), 7,
+                                          toptok.data(), seltab.data(), opts).is_linear(),
+          "max_cut=3 stands down on cut=4 in legacy mode");
+    opts.ev_cut = 0.35f;
+    check(df2_tree_build_from_selector_ex(99, drafts.data(), probs_cut4.data(), 7,
+                                          toptok.data(), seltab.data(), opts).is_linear(),
+          "max_cut=3 stands down on cut=4 in EV mode");
+    opts.ev_cut = 0.0f;
+    opts.adaptive_cut = true;
+    Df2TreeAdaptivePolicy high_pol;
+    for (int i = 0; i < 30; ++i) high_pol.observe_linear(7, 7);
+    check(df2_tree_build_from_selector_ex(99, drafts.data(), probs_cut4.data(), 7,
+                                          toptok.data(), seltab.data(), opts, &high_pol).is_linear(),
+          "max_cut=3 stands down on cut=4 in adaptive mode");
+
+    opts.adaptive_cut = false;
+    opts.ev_cut = 0.35f;
+    const Df2TreeSpec t_cut2 = df2_tree_build_from_selector_ex(99, drafts.data(), probs_cut2.data(), 7,
+                                                               toptok.data(), seltab.data(), opts);
+    check(!t_cut2.is_linear() && t_cut2.branch_node == 2,
+          "max_cut=3 allows cut=2 EV tree entry");
+
+    // 3. Counterfactual linear accept helper
+    const int32_t prefix[2] = {10, 11};
+    const int32_t br[2] = {20, 21};
+    const int32_t tail[1] = {30};
+    // 0->1(10)->2(11)->3(20)->5(30), 2->4(21)
+    const Df2TreeSpec cf_tree = make_prefix_fanout_tree(1, prefix, 2, br, 2, tail, 1);
+    {
+        const int32_t arg_tail[6] = {10, 11, 20, 30, 0, 999};  // primary walk 0->1->2->3->5 (4 drafts)
+        const Df2TreeCommitWalk w = df2_tree_greedy_accept(cf_tree, arg_tail);
+        check(df2_tree_counterfactual_linear_accept(cf_tree, w, 2) == 2 &&
+                  df2_tree_counterfactual_linear_accept(cf_tree, w, 5) == 4,
+              "counterfactual linear accept caps primary spine acceptance at lin_cf_drafts");
+    }
+    {
+        const int32_t arg_run[6] = {10, 11, 21, 0, 999, 0};  // runner-up hit at node 4 (depth 3, rank 1)
+        const Df2TreeCommitWalk w = df2_tree_greedy_accept(cf_tree, arg_run);
+        check(df2_tree_counterfactual_linear_accept(cf_tree, w, 3) == 2 &&
+                  df2_tree_counterfactual_linear_accept(cf_tree, w, 1) == 1,
+              "counterfactual linear accept stops before runner-up node");
+    }
+
+    // 4. Df2TreeRowEmaPolicy suppression + probe recovery (reusing Df2AdaptiveSolo cadence)
+    Df2TreeRowEmaPolicy ema_pol;
+    check(ema_pol.allow_tree(0.0), "row_ema=0 never suppresses");
+    for (int i = 0; i < 7; ++i) {
+        ema_pol.observe(0, 3, 0.35);
+        check(!ema_pol.suppressed() && ema_pol.allow_tree(0.35),
+              "row_ema stays active during 8-round warmup");
+    }
+    ema_pol.observe(0, 3, 0.35);  // 8th round -> rate 0.0 < 0.35 -> suppressed!
+    check(ema_pol.suppressed(), "row_ema suppresses after 8 low-yield rounds");
+    for (int i = 0; i < Df2TreeRowEmaPolicy::kProbeInterval; ++i) {
+        check(!ema_pol.allow_tree(0.35), "suppressed row_ema skips tree during probe cooldown");
+    }
+    check(ema_pol.allow_tree(0.35), "suppressed row_ema admits one probe after cooldown");
+    // Simulate probe recovery with high-yield tree rounds (d_acc=2, d_row=3 => 0.667 >= 0.35)
+    for (int p = 0; p < 4 && ema_pol.suppressed(); ++p) {
+        ema_pol.observe(2, 3, 0.35);
+        if (ema_pol.suppressed()) {
+            for (int i = 0; i < Df2TreeRowEmaPolicy::kProbeInterval; ++i) {
+                (void) ema_pol.allow_tree(0.35);
+            }
+            check(ema_pol.allow_tree(0.35), "cooldown probe fires");
+        }
+    }
+    check(!ema_pol.suppressed() && ema_pol.marginal_rate() >= 0.35,
+          "row_ema recovers from suppression once probe dAcc/dRow clears 0.35");
+
+    // 5. Cost-normalized predicate (VAR_T=1 vs T=8 padding)
+    // Suppose T_lin=1 (cost 20.0ms, e_lin=0), M=5 tree adds e_tree=1.60:
+    // - Under VAR_T=1: T_tree=5 (cost 31.4ms, +4 rows => 0.40 dAcc/dRow >= 0.35) -> PASS!
+    // - Under T=8 pad: T_tree=8 (cost 40.0ms, +7 rows => 0.229 dAcc/dRow < 0.35) -> FAIL!
+    check(df2_tree_cost_normalized_beats(1.60, 5, 31.4, 0.0, 1, 20.0, 0.35),
+          "cost-normalized gate passes M=5 unpadded tree clearing 0.35 dAcc/dRow");
+    check(!df2_tree_cost_normalized_beats(1.60, 8, 40.0, 0.0, 1, 20.0, 0.35),
+          "cost-normalized gate rejects padded T=8 tree below 0.35 dAcc/dRow");
+    check(!df2_tree_cost_normalized_beats(0.80, 5, 31.4, 0.0, 1, 20.0, 0.332),
+          "cost-normalized gate catches low dAcc/dRow=0.20 < 0.332 even when local ratio 1.8/31.4 > 1/20");
+}
+
 }  // namespace
 
 int main() {
@@ -865,6 +1001,7 @@ int main() {
     test_var_t_width_ladder();
     test_spine_skip_predicate();
     test_composable_ev_adaptive_matrix_and_no_inflation();
+    test_max_cut_and_row_ema_cost_gates();
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }
