@@ -17192,6 +17192,7 @@ int main(int argc, char** argv) {
                 drive.d.experts = 0;
                 drive.d.failed = false;
             }
+            (void) strata::spec::df2_tree_sampled_on();
             if (strata::spec::df2_tree_on() && strata::spec::df2_tree_var_t_on() &&
                 use_df2 && n_stages == 1 && o.batch <= 0 &&
                 o.spec >= strata::spec::kDf2TreeMinVerifyT) {
@@ -23547,7 +23548,7 @@ int main(int argc, char** argv) {
                 !req_sp.greedy && req_sp.temperature > 0.0f;
             const bool tree_greedy_req = req_sp.greedy && req_sp.temperature <= 0.0f &&
                 hist_n <= 0 && req_bias.empty() && !df2_sample_active;
-            const bool tree_req_eligible = strata::spec::df2_tree_on() && req_df2 && use_df2 && !batch_df2 &&
+            bool tree_req_eligible = strata::spec::df2_tree_on() && req_df2 && use_df2 && !batch_df2 &&
                 o.batch == 0 && n_stages <= 1 && !o.draft_auto && strata::core::Dflash2Drafter::head_native() &&
                 (tree_greedy_req || tree_sampled_req) &&
                 !gated_proposal && !pipe && fol == nullptr && req_logprobs < 0;
@@ -24702,6 +24703,17 @@ int main(int argc, char** argv) {
                 int64_t tree_resamples = 0;
                 int32_t tree_bonus = 0;
 #if defined(STRATA_HAVE_DFLASH2)
+                if (tree_req_eligible && tree_sampled_req && df2_sample_active &&
+                    (!strata::core::tree_branch_round_in_bounds(static_cast<uint64_t>(p),
+                                                                static_cast<uint64_t>(df2.rounds)) ||
+                     !strata::core::tree_branch_counter_in_bounds(df2_sample_key,
+                                                                  strata::spec::kDf2TreeMaxNodes - 1))) {
+                    std::fprintf(stderr,
+                                 "strata serve: ERROR: DF2 tree 56-bit counter wrap guard triggered "
+                                 "(pos=%lld rounds=%lld); disabling trees for this request\n",
+                                 (long long) p, (long long) df2.rounds);
+                    tree_req_eligible = false;
+                }
                 if (tree_req_eligible && !first_window && !merged && !from_sfx && !df2_handoff_round &&
                     df2_suffix_n == 0 && chain_n == 0 && !win_forced && df2.tree_tables_ready()) {
                     const int tree_cap = (int) std::min<int64_t>(
@@ -25003,9 +25015,10 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: df2 suffix composition: p=%lld df2=%d suffix=%d lookup=%d match=%d\n",
                                  (long long) p, df2_rows, suffix_rows, lookup_rows, sfx.last_match());
                 }
-                const auto decode_pool_fn = strata::spec::mtp_window_invariant_applies(use_mtp, req_df2, use_mtp && mtp.prob())
-                    ? invariant_win_pool_fn
-                    : win_pool_fn;
+                const bool use_invariant_pool =
+                    strata::spec::mtp_window_invariant_applies(use_mtp, req_df2, use_mtp && mtp.prob()) ||
+                    (tree_sampled_round && strata::spec::df2_tree_invariant_pool_on());
+                const auto decode_pool_fn = use_invariant_pool ? invariant_win_pool_fn : win_pool_fn;
                 exit_if_gpu_fatal("");   // (the test hook counts windows here)
 #if defined(STRATA_HAVE_DFLASH2)
                 static const bool df2_adm_tap_overlap = [] {

@@ -110,18 +110,39 @@ inline float philox_uniform_host(uint64_t seed, uint64_t counter) noexcept {
     return static_cast<float>(c0 >> 8) * (1.0f / 16777216.0f);
 }
 
+inline constexpr uint64_t kTreeBranchCounterMask = (1ull << 56) - 1;
+inline constexpr uint64_t kTreeBranchMaxRounds = 1ull << 24;
+inline constexpr int kTreeBranchMaxNodeIdx = 31;
+
+/// Returns true iff `key` fits inside the 56-bit base field and `idx` fits in the 5-bit slot field [0, 31].
+inline constexpr bool tree_branch_counter_in_bounds(uint64_t key, int idx) noexcept {
+    return (key >> 56) == 0 && idx >= 0 && idx <= kTreeBranchMaxNodeIdx;
+}
+
+/// Returns true iff `(pos, round_idx)` will not wrap in `pos ^ (round_idx << 32)` before 56-bit masking.
+inline constexpr bool tree_branch_round_in_bounds(uint64_t pos, uint64_t round_idx) noexcept {
+    return (pos >> 56) == 0 && round_idx < kTreeBranchMaxRounds;
+}
+
 /// Disjoint 64-bit Philox counters for tree acceptance checks:
 /// `sib_idx == 0` reuses `pos_u | kSpecCtrAccept` (`010` tag, bit-identical to linear `spec_verify_row`);
 /// `sib_idx > 0` uses top 3-bit tag `011` + 5-bit `sib_idx`, disjoint from plain (`000`), draft (`001`),
 /// accept (`010`), and residual (`100`).
 inline constexpr uint64_t tree_branch_accept_counter(uint64_t pos_u, int sib_idx) noexcept {
     if (sib_idx <= 0) return pos_u | kSpecCtrAccept;
-    return (pos_u & ((1ull << 56) - 1)) | (0x3ull << 61) | (static_cast<uint64_t>(sib_idx & 0x1F) << 56);
+    return (pos_u & kTreeBranchCounterMask) | (0x3ull << 61) | (static_cast<uint64_t>(sib_idx & 0x1F) << 56);
 }
 
 /// Disjoint 64-bit counter key (top 3-bit tag `101`) for host without-replacement branch draws.
 inline constexpr uint64_t tree_branch_draft_counter(uint64_t pos0, int node_idx) noexcept {
-    return (pos0 & ((1ull << 56) - 1)) | (0x5ull << 61) | (static_cast<uint64_t>(node_idx & 0x1F) << 56);
+    return (pos0 & kTreeBranchCounterMask) | (0x5ull << 61) | (static_cast<uint64_t>(node_idx & 0x1F) << 56);
+}
+
+/// Checked variant of `tree_branch_draft_counter` that rejects 56-bit key wrap or node-index overflow.
+inline constexpr bool tree_branch_draft_counter_checked(uint64_t pos0, int node_idx, uint64_t& out) noexcept {
+    if (!tree_branch_counter_in_bounds(pos0, node_idx)) return false;
+    out = tree_branch_draft_counter(pos0, node_idx);
+    return true;
 }
 
 /// The post-chain distribution of a row: `n` ids and their probabilities (double, the sampler's own `ex`).

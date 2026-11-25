@@ -237,14 +237,47 @@ inline bool df2_tree_can_skip_kv_compact(bool spine_skip_on, const uint8_t* path
     return spine_skip_on && df2_tree_is_contiguous_spine(path, n_keep);
 }
 
+/// Parses STRATA_DF2_TREE_INVARIANT_POOL ("1" routes sampled tree windows through invariant_win_pool_fn; default OFF).
+inline bool df2_tree_invariant_pool_env_enabled(const char* value) noexcept {
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+inline bool df2_tree_invariant_pool_on() noexcept {
+    static const bool on = df2_tree_invariant_pool_env_enabled(std::getenv("STRATA_DF2_TREE_INVARIANT_POOL"));
+    return on;
+}
+
+/// Matches sampler.cu::env_flag for STRATA_SPEC_GUMBEL (non-empty and not "0").
+inline bool spec_gumbel_env_enabled(const char* value) noexcept {
+    return value != nullptr && *value != '\0' && std::strcmp(value, "0") != 0;
+}
+
+inline bool df2_tree_sampled_conflict_with_gumbel(bool sampled_on, bool gumbel_on) noexcept {
+    return sampled_on && gumbel_on;
+}
+
 /// Parses STRATA_DF2_TREE_SAMPLED ("1" enables lossless rejection-sampled tree verification for sampled requests; default OFF).
 inline bool df2_tree_sampled_env_enabled(const char* value) noexcept {
     return value != nullptr && std::strcmp(value, "1") == 0;
 }
 
 /// Process-wide gate for sampled DF2 tree verification and commit (default OFF).
+/// Incompatible with STRATA_SPEC_GUMBEL=1 (sampler.cu ignores p.gumbel in extract_spec_probs while tree accept
+/// uses inverse-CDF): logs a loud error and disables sampled trees if both are set.
 inline bool df2_tree_sampled_on() noexcept {
-    static const bool on = df2_tree_sampled_env_enabled(std::getenv("STRATA_DF2_TREE_SAMPLED"));
+    static const bool on = [] {
+        const bool sampled = df2_tree_sampled_env_enabled(std::getenv("STRATA_DF2_TREE_SAMPLED"));
+        const bool gumbel = spec_gumbel_env_enabled(std::getenv("STRATA_SPEC_GUMBEL"));
+        if (df2_tree_sampled_conflict_with_gumbel(sampled, gumbel)) {
+            std::fprintf(stderr,
+                         "strata: ERROR: STRATA_SPEC_GUMBEL=1 is incompatible with STRATA_DF2_TREE_SAMPLED=1 "
+                         "(extract_spec_probs/df2_tree_sample_accept use inverse-CDF, not Gumbel-Max); "
+                         "disabling sampled DF2 trees\n");
+            std::fflush(stderr);
+            return false;
+        }
+        return sampled;
+    }();
     return on;
 }
 
@@ -1109,7 +1142,14 @@ inline bool df2_tree_populate_sampled_q(Df2TreeSpec& tree, int32_t anchor, const
             for (int k = 0; k < rem_n; ++k) qnode.q[static_cast<size_t>(k)] /= f_sum;
             qnode.n = rem_n;
 
-            const uint64_t bits = df2_sample_mix(seed ^ strata::core::tree_branch_draft_counter(position, c));
+            uint64_t draft_ctr = 0;
+            if (!strata::core::tree_branch_draft_counter_checked(position, c, draft_ctr)) {
+                std::fprintf(stderr,
+                             "strata: ERROR: tree_branch_draft_counter 56-bit key overflow (key=0x%llx node=%d)\n",
+                             static_cast<unsigned long long>(position), c);
+                return false;
+            }
+            const uint64_t bits = df2_sample_mix(seed ^ draft_ctr);
             const double u_draw = (static_cast<double>(bits >> 11) + 0.5) * (1.0 / 9007199254740992.0);
             double cum = 0.0;
             int picked = rem_n - 1;

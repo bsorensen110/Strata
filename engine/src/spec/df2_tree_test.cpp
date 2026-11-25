@@ -1354,6 +1354,69 @@ int main() {
         check(rej == Df2TreeRejReason::Dedup, "runner stripped by dedup_siblings records Dedup");
     }
 
+    // P8: Hygiene bundle tests (56-bit counter bounds, invariant pool env, Gumbel conflict guard).
+    {
+        using strata::core::kTreeBranchMaxNodeIdx;
+        using strata::core::kTreeBranchMaxRounds;
+        using strata::core::tree_branch_accept_counter;
+        using strata::core::tree_branch_counter_in_bounds;
+        using strata::core::tree_branch_draft_counter_checked;
+        using strata::core::tree_branch_round_in_bounds;
+
+        check(tree_branch_round_in_bounds(0ull, 0ull), "round=0, pos=0 is in bounds");
+        check(tree_branch_round_in_bounds((1ull << 32) - 1ull, kTreeBranchMaxRounds - 1ull),
+              "max 24-bit round and 32-bit pos are in bounds");
+        check(!tree_branch_round_in_bounds(0ull, kTreeBranchMaxRounds), "round=1<<24 wraps 56-bit key");
+        check(!tree_branch_round_in_bounds(0ull, ~0ull), "UINT64_MAX round rejected");
+        check(!tree_branch_round_in_bounds(1ull << 56, 0ull), "pos >= 1<<56 rejected");
+
+        check(tree_branch_counter_in_bounds((1ull << 56) - 1ull, 0) &&
+                  tree_branch_counter_in_bounds((1ull << 56) - 1ull, kTreeBranchMaxNodeIdx),
+              "56-bit max key and 5-bit node_idx [0..31] are in bounds");
+        check(!tree_branch_counter_in_bounds(1ull << 56, 1) &&
+                  !tree_branch_counter_in_bounds(0ull, -1) &&
+                  !tree_branch_counter_in_bounds(0ull, 32),
+              "56-bit key overflow and out-of-range node_idx rejected");
+
+        uint64_t ctr = 0;
+        check(tree_branch_draft_counter_checked(0x123456ull, 5, ctr) && (ctr >> 61) == 0x5ull &&
+                  ((ctr >> 56) & 0x1Full) == 5ull &&
+                  ctr != tree_branch_accept_counter(0x123456ull, 5),
+              "checked draft counter encodes tag 0x5 + node_idx disjoint from accept tag 0x3");
+        check(!tree_branch_draft_counter_checked(1ull << 56, 1, ctr),
+              "checked draft counter refuses 56-bit key wrap");
+
+        // df2_tree_populate_sampled_q refuses 56-bit key overflow rather than wrapping.
+        const int32_t toptok[7 * kDf2TreeSelectorTopK] = {
+            10, 20, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+        };
+        std::array<float, 7 * kDf2TreeSelectorTopK * kDf2TreeSelectorTopK> seltab{};
+        seltab.fill(-INFINITY);
+        seltab[0] = 0.0f;
+        seltab[1] = -0.2f;
+        const int32_t drafts[1] = {10};
+        const int32_t br[2] = {10, 20};
+        Df2TreeSpec t_wrap = make_prefix_fanout_tree(99, nullptr, 0, br, 2);
+        Df2TreeSampleQ sq_wrap;
+        check(!df2_tree_populate_sampled_q(t_wrap, 99, drafts, 1, toptok, seltab.data(), false, 0x1ULL,
+                                           (kTreeBranchMaxRounds << 32), sq_wrap),
+              "populate_sampled_q fails safely on 56-bit counter wrap");
+
+        check(!df2_tree_invariant_pool_env_enabled(nullptr) &&
+                  !df2_tree_invariant_pool_env_enabled("") &&
+                  !df2_tree_invariant_pool_env_enabled("0") &&
+                  df2_tree_invariant_pool_env_enabled("1"),
+              "STRATA_DF2_TREE_INVARIANT_POOL defaults OFF and enables on 1");
+        check(!spec_gumbel_env_enabled(nullptr) && !spec_gumbel_env_enabled("") &&
+                  !spec_gumbel_env_enabled("0") && spec_gumbel_env_enabled("1"),
+              "STRATA_SPEC_GUMBEL env parser matches sampler.cu env_flag");
+        check(!df2_tree_sampled_conflict_with_gumbel(false, false) &&
+                  !df2_tree_sampled_conflict_with_gumbel(true, false) &&
+                  !df2_tree_sampled_conflict_with_gumbel(false, true) &&
+                  df2_tree_sampled_conflict_with_gumbel(true, true),
+              "Gumbel + sampled-tree conflict predicate triggers iff both are enabled");
+    }
+
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }
