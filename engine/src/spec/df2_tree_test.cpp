@@ -1643,6 +1643,42 @@ int main() {
               "df2_tree_walk_from_gpu_result unpacks 16-byte result into Df2TreeCommitWalk");
     }
 
+    // P3 Commit 1: Host gumbel_exp_host + q_T top-2 Gumbel score helper + photo-finish branch-gate tests.
+    {
+        std::array<int32_t, kDf2TreeSelectorTopK> toks{};
+        toks.fill(-1);
+        std::array<float, kDf2TreeSelectorTopK> scores{};
+        std::array<float, kDf2TreeSelectorTopK> shifted{};
+        scores.fill(-INFINITY);
+        shifted.fill(-INFINITY);
+        toks[0] = 10; toks[1] = 20; toks[2] = 30;
+        scores[0] = std::log(0.45f); scores[1] = std::log(0.40f); scores[2] = std::log(0.15f);
+        for (int j = 0; j < 3; ++j) shifted[static_cast<size_t>(j)] = scores[static_cast<size_t>(j)] + 17.5f;
+
+        const auto r0 = df2_gm_row_top2(toks.data(), scores.data(), 0x51A7ULL, 11ULL, 0.7f);
+        const auto r1 = df2_gm_row_top2(toks.data(), shifted.data(), 0x51A7ULL, 11ULL, 0.7f);
+        check(r0.valid && r1.valid && r0.has_runner && r0.tok0 != r0.tok1 &&
+                  r0.tok0 == r1.tok0 && r0.tok1 == r1.tok1 &&
+                  std::fabs(r0.delta_g - r1.delta_g) < 1e-6 &&
+                  std::fabs(r0.q0 - r1.q0) < 1e-6f &&
+                  std::fabs(r0.max_q - r1.max_q) < 1e-6f,
+              "df2_gm_row_top2 is invariant to constant logit shifts");
+
+        const float dg = static_cast<float>(r0.delta_g);
+        check(df2_gm_photo_finish_fires(r0, dg + 1e-3f) &&
+                  !df2_gm_photo_finish_fires(r0, std::max(0.0f, dg - 1e-3f)) &&
+                  !df2_gm_photo_finish_fires(r0, 0.0f),
+              "df2_gm_photo_finish_fires enforces strict Δg < delta boundary");
+
+        // Single-candidate row has no runner-up and never fires branch gate.
+        std::array<int32_t, kDf2TreeSelectorTopK> single_tok{};
+        single_tok.fill(-1);
+        single_tok[0] = 77;
+        const auto rs = df2_gm_row_top2(single_tok.data(), scores.data(), 0x51A7ULL, 11ULL, 1.0f);
+        check(rs.valid && !rs.has_runner && !df2_gm_photo_finish_fires(rs, 10.0f),
+              "single-candidate row never fires photo-finish gate");
+    }
+
     std::printf("df2_tree_test: %s\n", g_failures == 0 ? "OK" : "FAILED");
     return g_failures == 0 ? 0 : 1;
 }

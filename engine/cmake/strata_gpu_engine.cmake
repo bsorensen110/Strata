@@ -1244,6 +1244,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(df2_tree_gpu_accept_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(df2_tree_gpu_accept_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME df2_tree_gpu_accept_parity COMMAND df2_tree_gpu_accept_parity)
+  # P3: Host vs device gumbel_exp bit-equivalence and q_T / photo-finish branch-gate tests
+  add_executable(df2_gumbel_parity src/kernels/df2_gumbel_parity.cpp)
+  target_include_directories(df2_gumbel_parity PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(df2_gumbel_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME df2_gumbel_parity COMMAND df2_gumbel_parity)
   # the same fixtures on the other two sampled paths: the one-block kernel and the 0.1.20 kernel
   add_test(NAME sampler_parity_one_block COMMAND sampler_parity --selftest)
   set_tests_properties(sampler_parity_one_block PROPERTIES ENVIRONMENT "STRATA_OLD_SAMPLER=0;STRATA_SAMPLER_ONE_BLOCK=1")

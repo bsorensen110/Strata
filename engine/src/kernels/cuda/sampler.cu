@@ -80,6 +80,12 @@ __device__ __forceinline__ double gumbel_exp(uint64_t seed, uint64_t counter, ui
     return -log(u);
 }
 
+__global__ void eval_gumbel_exp_kernel(const uint64_t* __restrict__ seed, const uint64_t* __restrict__ counter,
+                                       const uint32_t* __restrict__ token, int n, double* __restrict__ out) {
+    const int i = (int) (blockIdx.x * blockDim.x + threadIdx.x);
+    if (i < n) out[i] = gumbel_exp(seed[i], counter[i], token[i]);
+}
+
 // `count_in_history` and the penalty application, transcribed from `llama_sampler_penalties_apply`.
 // The repeat penalty MULTIPLIES for non-positive logits and DIVIDES for positive ones - dividing
 // unconditionally is the natural reading of the source paper and it INVERTS the penalty on half the
@@ -1739,6 +1745,19 @@ bool launch_df2_tree_sample_accept(const strata::core::SpecPRow* d_probs,
     if (stream_capturing(stream)) return false;
     const cudaStream_t s = (cudaStream_t) stream;
     df2_tree_sample_accept_kernel<<<1, 32, 0, s>>>(d_probs, d_desc, d_q, d_result);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) return false;
+    if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) return false;
+    return true;
+}
+
+bool eval_gumbel_exp_device(const uint64_t* d_seed, const uint64_t* d_counter, const uint32_t* d_token,
+                            int n, double* d_out, void* stream) {
+    if (n <= 0) return true;
+    if (d_seed == nullptr || d_counter == nullptr || d_token == nullptr || d_out == nullptr) return false;
+    if (stream_capturing(stream)) return false;
+    const cudaStream_t s = (cudaStream_t) stream;
+    eval_gumbel_exp_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(d_seed, d_counter, d_token, n, d_out);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) return false;
     if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) return false;

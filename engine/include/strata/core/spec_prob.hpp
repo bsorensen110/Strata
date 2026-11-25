@@ -33,6 +33,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -136,6 +137,18 @@ inline float philox_uniform_host(uint64_t seed, uint64_t counter) noexcept {
         c3 = n3;
     }
     return static_cast<float>(c0 >> 8) * (1.0f / 16777216.0f);
+}
+
+/// Host Gumbel-Max Exp(1) noise matching `sampler.cu::gumbel_exp` bit-for-bit
+/// (splitmix64 hash + FP64 -std::log(u)).
+inline double gumbel_exp_host(uint64_t seed, uint64_t counter, uint32_t token) noexcept {
+    uint64_t z = seed ^ (counter * 0x9E3779B97F4A7C15ull) ^ (static_cast<uint64_t>(token) * 0xD1B54A32D192ED03ull);
+    z += 0x9E3779B97F4A7C15ull;
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    z ^= z >> 31;
+    const double u = (static_cast<double>(z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    return -std::log(u);
 }
 
 inline constexpr uint64_t kTreeBranchCounterMask = (1ull << 56) - 1;

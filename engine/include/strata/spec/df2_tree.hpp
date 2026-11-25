@@ -1550,6 +1550,103 @@ inline Df2TreeCommitWalk df2_tree_walk_from_gpu_result(const strata::core::TreeS
     return walk;
 }
 
+/// Top-2 Gumbel-perturbed drafter candidates at a single selector row (depth d, counter pos_u).
+/// Consumes ONLY `gumbel_exp_host(seed, pos_u, tok)` for unique valid candidates in this row.
+struct Df2GmRowTop2 {
+    bool valid = false;
+    int32_t tok0 = -1;          ///< Gumbel-Max primary pick: argmax_i (log q_T(i) - log E(seed, pos_u, tok_i))
+    int slot0 = -1;             ///< selector slot index of tok0 (drives next step's prev_slot)
+    double g0 = -INFINITY;      ///< top Gumbel-perturbed score
+    float q0 = 0.0f;            ///< q_T(tok0)
+    float max_q = 0.0f;         ///< draw-independent max_k q_T(k) for this row
+    bool has_runner = false;
+    int32_t tok1 = -1;          ///< Gumbel-Max runner-up token (distinct from tok0)
+    int slot1 = -1;
+    double g1 = -INFINITY;      ///< second-highest Gumbel-perturbed score
+    float q1 = 0.0f;            ///< q_T(tok1)
+    double delta_g = INFINITY;  ///< photo-finish margin g0 - g1 (>= 0; +inf if < 2 candidates)
+};
+
+/// Computes temperature-scaled selector probabilities q_T (reusing P4's `df2_selector_row_weights`) and
+/// top-2 Gumbel-perturbed scores `g_i = log q_T(i) - log E(seed, pos_u, tok_i)` for one selector row.
+inline Df2GmRowTop2 df2_gm_row_top2(const int32_t* row_toks, const float* row_scores,
+                                    uint64_t seed, uint64_t pos_u, float temperature = 1.0f,
+                                    const float* logit_bias = nullptr, int logit_bias_len = 0) noexcept {
+    Df2GmRowTop2 res;
+    if (row_toks == nullptr || row_scores == nullptr) return res;
+    double weights[kDf2TreeSelectorTopK] = {};
+    double total = 0.0;
+    if (!df2_selector_row_weights(row_toks, row_scores, temperature, logit_bias, logit_bias_len,
+                                  weights, total)) {
+        return res;
+    }
+    int u_slot[kDf2TreeSelectorTopK];
+    int32_t u_tok[kDf2TreeSelectorTopK];
+    double u_weight[kDf2TreeSelectorTopK];
+    int n_u = 0;
+    for (int j = 0; j < kDf2TreeSelectorTopK; ++j) {
+        const int32_t tok = row_toks[j];
+        if (tok < 0 || !(weights[j] > 0.0)) continue;
+        int found = -1;
+        for (int k = 0; k < n_u; ++k) {
+            if (u_tok[k] == tok) { found = k; break; }
+        }
+        if (found >= 0) {
+            u_weight[found] += weights[j];
+        } else {
+            u_slot[n_u] = j;
+            u_tok[n_u] = tok;
+            u_weight[n_u] = weights[j];
+            ++n_u;
+        }
+    }
+    if (n_u <= 0) return res;
+
+    int best0 = -1, best1 = -1;
+    double g0 = -INFINITY, g1 = -INFINITY;
+    double max_qk = 0.0;
+    for (int k = 0; k < n_u; ++k) {
+        const double qk = u_weight[k] / total;
+        if (!(qk > 0.0)) continue;
+        if (qk > max_qk) max_qk = qk;
+        const double e = strata::core::gumbel_exp_host(seed, pos_u, static_cast<uint32_t>(u_tok[k]));
+        const double log_e = (e > 0.0) ? std::log(e) : -700.0;
+        const double g = std::log(qk) - log_e;
+        if (best0 < 0 || g > g0 || (g == g0 && u_tok[k] < u_tok[best0])) {
+            best1 = best0;
+            g1 = g0;
+            best0 = k;
+            g0 = g;
+        } else if (best1 < 0 || g > g1 || (g == g1 && u_tok[k] < u_tok[best1])) {
+            best1 = k;
+            g1 = g;
+        }
+    }
+    if (best0 < 0) return res;
+    res.valid = true;
+    res.tok0 = u_tok[best0];
+    res.slot0 = u_slot[best0];
+    res.g0 = g0;
+    res.q0 = static_cast<float>(u_weight[best0] / total);
+    res.max_q = static_cast<float>(max_qk);
+    if (best1 >= 0) {
+        res.has_runner = true;
+        res.tok1 = u_tok[best1];
+        res.slot1 = u_slot[best1];
+        res.g1 = g1;
+        res.q1 = static_cast<float>(u_weight[best1] / total);
+        res.delta_g = g0 - g1;
+    }
+    return res;
+}
+
+/// Photo-finish branch gate: adds runner-up iff a distinct runner-up exists and Δg = g_(0) - g_(1) < delta.
+inline bool df2_gm_photo_finish_fires(const Df2GmRowTop2& row, float delta) noexcept {
+    return row.valid && row.has_runner && row.tok1 != row.tok0 &&
+           std::isfinite(delta) && delta > 0.0f &&
+           std::isfinite(row.delta_g) && row.delta_g < static_cast<double>(delta);
+}
+
 /// Online per-depth EWMA calibration of primary DF2 acceptance for adaptive branch-cut selection.
 class Df2TreeAdaptivePolicy {
 public:

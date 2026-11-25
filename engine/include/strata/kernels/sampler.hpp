@@ -106,6 +106,11 @@ bool launch_df2_tree_sample_accept(const strata::core::SpecPRow* d_probs,
                                    strata::core::TreeSampleAcceptResult* d_result,
                                    void* stream);
 
+/// Evaluates device `gumbel_exp(d_seed[i], d_counter[i], d_token[i])` into `d_out[i]` (`n` triples, device pointers).
+/// Test helper for verifying host/device Gumbel-Max noise parity.
+bool eval_gumbel_exp_device(const uint64_t* d_seed, const uint64_t* d_counter, const uint32_t* d_token,
+                            int n, double* d_out, void* stream);
+
 // #4590: which tokens the repeat / frequency / presence penalties count.  By default only the current reply: the
 // tokens the answer has written (the window starts at the last prompt token, the one the first decode step feeds in).
 // The prompt, including earlier assistant turns in it, is not counted, so a number or a quoted answer in the new
