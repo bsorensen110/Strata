@@ -739,7 +739,7 @@ const uint16_t* Gemm::unpad_x(const uint16_t* X, int64_t T, int64_t K, int64_t l
 
 bool gemm_dequant_side() {
 #if defined(__HIPCC__)
-    static const bool on = [] { const char* v = std::getenv("STRATA_PF_DEQSIDE"); return v && v[0] == '1'; }();
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_DEQSIDE"); return v && std::strcmp(v, "1") == 0; }();
     return on;
 #else
     static const bool on = [] { const char* v = std::getenv("STRATA_DEQUANT_SIDE"); return v && v[0] == '1'; }();
