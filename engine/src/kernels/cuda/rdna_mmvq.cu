@@ -157,7 +157,7 @@ template <> struct KFmt<13> { static constexpr int B = 176; };
 template <> struct KFmt<23> { static constexpr int B = 136; };
 template <> struct KFmt<21> { static constexpr int B = 110; };
 
-template <int FMT, int NC, int UNR = (FMT == 21 ? 2 : (NC <= 2 ? 5 : NC <= 4 ? 3 : 2))>
+template <int FMT, int NC, bool SHR = false, int UNR = (FMT == 21 ? 2 : (NC <= 2 ? 5 : NC <= 4 ? 3 : 2))>
 __global__ void __launch_bounds__(256) rdna_kq_kernel(const uint8_t* __restrict__ w, const Q81* __restrict__ x,
                                                       float* __restrict__ y, int n_in, int n_out,
                                                       const uint8_t* __restrict__ w2, float* __restrict__ y2, int n_out2) {
@@ -200,7 +200,17 @@ __global__ void __launch_bounds__(256) rdna_kq_kernel(const uint8_t* __restrict_
             f1 = __half2float(*reinterpret_cast<const __half*>(b)) * (float) (1 + 2 * sc);
         } else if constexpr (FMT == 23) {
             const int hl = l0 >= 16 ? 4 : 0;
-            const uint32_t q0 = ld32u(b + 8 + 16 * j + (l0 & 15)), q1 = ld32u(b + 8 + 16 * j + (l0 & 15) + 4);
+            uint32_t q0, q1;
+            if constexpr (SHR) {
+                const int src_lane = lane & ~2;
+                const uint32_t q0_load = (lane & 2) == 0 ? ld32u(b + 8 + 16 * j + (l0 & 15)) : 0u;
+                const uint32_t q1_load = (lane & 2) == 0 ? ld32u(b + 8 + 16 * j + (l0 & 15) + 4) : 0u;
+                q0 = __shfl(q0_load, src_lane, 4);
+                q1 = __shfl(q1_load, src_lane, 4);
+            } else {
+                q0 = ld32u(b + 8 + 16 * j + (l0 & 15));
+                q1 = ld32u(b + 8 + 16 * j + (l0 & 15) + 4);
+            }
             w0 = (int) iq4_lut4((q0 >> hl) & 0x0f0f0f0fu);
             w1 = (int) iq4_lut4((q1 >> hl) & 0x0f0f0f0fu);
             const uint16_t sh = *reinterpret_cast<const uint16_t*>(b + 2);
@@ -248,19 +258,19 @@ __global__ void __launch_bounds__(256) rdna_kq_kernel(const uint8_t* __restrict_
     }
 }
 
-template <int FMT>
+template <int FMT, bool SHR = false>
 void kq_launch_slice(const uint8_t* wb, const Q81* x, float* y, int n_in, int n_out, int ncols, cudaStream_t s,
                      const uint8_t* w2, float* y2, int n_out2) {
     const unsigned blocks = (unsigned) ((n_out + 7) / 8 + (w2 ? (n_out2 + 7) / 8 : 0));
     switch (ncols) {
-        case 1: rdna_kq_kernel<FMT, 1><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
-        case 2: rdna_kq_kernel<FMT, 2><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
-        case 3: rdna_kq_kernel<FMT, 3><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
-        case 4: rdna_kq_kernel<FMT, 4><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
-        case 5: rdna_kq_kernel<FMT, 5><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
-        case 6: rdna_kq_kernel<FMT, 6><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
-        case 7: rdna_kq_kernel<FMT, 7><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
-        default: rdna_kq_kernel<FMT, 8><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
+        case 1: rdna_kq_kernel<FMT, 1, SHR><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
+        case 2: rdna_kq_kernel<FMT, 2, SHR><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
+        case 3: rdna_kq_kernel<FMT, 3, SHR><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
+        case 4: rdna_kq_kernel<FMT, 4, SHR><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
+        case 5: rdna_kq_kernel<FMT, 5, SHR><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
+        case 6: rdna_kq_kernel<FMT, 6, SHR><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
+        case 7: rdna_kq_kernel<FMT, 7, SHR><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
+        default: rdna_kq_kernel<FMT, 8, SHR><<<blocks, 256, 0, s>>>(wb, x, y, n_in, n_out, w2, y2, n_out2); break;
     }
 }
 
@@ -384,6 +394,11 @@ bool rdna_q6k_enabled() {
     return env == 1 ? true : arch_is_rdna3_or_4();
 }
 
+bool rdna_kq_shared_words_enabled() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_RDNA_KQ_SHR"); return v && v[0] == '1'; }();
+    return on;
+}
+
 bool rdna_kq_mmvq(int type, const void* w, const void* xq, float* y, int n_in, int n_out, int ncols, void* stream) {
     return rdna_kq_mmvq2(type, w, xq, y, n_in, n_out, ncols, stream, nullptr, nullptr, 0);
 }
@@ -412,7 +427,10 @@ bool rdna_kq_mmvq2(int type, const void* w, const void* xq, float* y, int n_in, 
                 kq_launch_slice<13>(wb, xc, yc, n_in, n_out, nc, s, w2, y2c, n_out2);
                 break;
             case 23:
-                kq_launch_slice<23>(wb, xc, yc, n_in, n_out, nc, s, w2, y2c, n_out2);
+                if (rdna_kq_shared_words_enabled())
+                    kq_launch_slice<23, true>(wb, xc, yc, n_in, n_out, nc, s, w2, y2c, n_out2);
+                else
+                    kq_launch_slice<23>(wb, xc, yc, n_in, n_out, nc, s, w2, y2c, n_out2);
                 break;
             case 21:
                 kq_launch_slice<21>(wb, xc, yc, n_in, n_out, nc, s, w2, y2c, n_out2);
