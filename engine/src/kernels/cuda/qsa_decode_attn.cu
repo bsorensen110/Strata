@@ -1277,13 +1277,33 @@ int attn_merge_v2() {
 #endif
 }
 
-// the merge of `n_q` queries' partials: v2 = 0 attn_merge_kernel, 1 attn_merge_v2_kernel (bitwise the same output)
+// STRATA_ATTN_MERGE_U selects v2's staging width (4, 8, 16); unset/unknown uses 16, preserving its original sequence.
+int attn_merge_unroll() {
+    static const int unroll = [] {
+        const char* v = std::getenv("STRATA_ATTN_MERGE_U");
+        if (v != nullptr && std::strcmp(v, "4") == 0) return 4;
+        if (v != nullptr && std::strcmp(v, "8") == 0) return 8;
+        return 16;
+    }();
+    return unroll;
+}
+
 void launch_merge(int v2, const float* part_acc, const float* part_m, const float* part_l, int n_chunks,
                   const int32_t* steps, float* attn, long long stride, unsigned n_head, unsigned n_q, cudaStream_t st) {
-    if (v2)
-        attn_merge_v2_kernel<kMergeU><<<dim3(n_head, n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, steps,
-                                                                         attn, stride);
-    else
+    if (v2) {
+        const dim3 grid(n_head, n_q);
+        switch (attn_merge_unroll()) {
+            case 4:
+                attn_merge_v2_kernel<4><<<grid, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, steps, attn, stride);
+                break;
+            case 8:
+                attn_merge_v2_kernel<8><<<grid, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, steps, attn, stride);
+                break;
+            default:
+                attn_merge_v2_kernel<kMergeU><<<grid, HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, steps, attn, stride);
+                break;
+        }
+    } else
         attn_merge_kernel<<<dim3(n_head, n_q), HD, 0, st>>>(part_acc, part_m, part_l, n_chunks, attn, stride);
 }
 
