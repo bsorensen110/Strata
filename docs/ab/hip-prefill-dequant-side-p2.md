@@ -10,6 +10,8 @@ and readiness/reuse events; `engine/include/strata/hip_compat/cuda_runtime.h` ma
 and event APIs. The same calls are already used by the HIP-side cuBLAS prefill helper in
 `engine/src/hy4flash/run/sk_cublas_ctx.hip.h`. Static inspection therefore shows no apparent HIP stream-shim blocker.
 
-The route is expected to preserve dequant/GEMM values and accumulation order; overlap is opt-in. The parity executable
-was built only. No GPU execution or parity run was performed, so HIP bitwise parity and runtime behavior remain
+The route is expected to preserve dequant/GEMM values and accumulation order; overlap is opt-in. `strata_prefill` was
+built. The existing HIP CMake configuration does not expose `gemm_dequant_side_parity`: its declaration at
+`engine/cmake/strata_gpu_engine.cmake:1059` is inside the CUDA-only block beginning at line 1013. No parity executable
+was built and no GPU execution or parity run was performed, so HIP bitwise parity and runtime behavior remain
 unverified.
