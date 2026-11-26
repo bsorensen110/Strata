@@ -4465,6 +4465,18 @@ void s27_launch_ts(bool ts, const NativeExpertLayout& L, int64_t cap_groups, cud
     if (ts) s27_launch<TG, TD, true, 4, 4, true>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
     else s27_launch<TG, TD, true, 4, 4, false>(L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh);
 }
+template<int TG, int TD>
+void s27_launch_fused(bool ts, const NativeExpertLayout& L, int64_t cap_groups, cudaStream_t s,
+                      const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                      const int32_t* ent_dst, const int32_t* ent_tok, const block_q8_1* X,
+                      block_q8_1* hq, float* out) {
+    const dim3 ggu((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
+    if (ts) s27_gu_swiglu_kernel<TG, true><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+    else    s27_gu_swiglu_kernel<TG, false><<<ggu, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, hq);
+    const dim3 gd((unsigned) (L.n_embd / (8 * 4)), (unsigned) cap_groups);
+    if (ts) s27_down_kernel<TD, true, 4, true><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+    else    s27_down_kernel<TD, true, 4, false><<<gd, 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+}
 
 // ---- EXPDEC launch: knobs, shapes, rows per block
 int env_int_or(const char* name, int dflt) {
@@ -7409,8 +7421,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (v2k && L.had_block == 0 && L.tail_off == 0 && (L.gu_type == 12 || L.gu_type == 13) &&
         (((L.d_type == 7 || L.d_type == 8) && L.n_embd == 2560 && L.n_ff == 640) || q36geo)) {
         static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+        static const bool fused_gu = [] { const char* v = std::getenv("STRATA_V2K_FUSED_GU"); return v != nullptr && v[0] == '1' && v[1] == '\0'; }();
         const long long nh = (long long) cap_entries * L.n_ff;
 #define STRATA_V2K(G, D) s27_launch_ts<G, D>(ts, L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, nh)
+#define STRATA_V2K_FUSED(G, D) s27_launch_fused<G, D>(ts, L, cap_groups, s, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, hq, out)
         if (q36geo) {
             // the gate/up of the V2K path (4 rows per warp, the chunk's activations in LDS) fused with SwiGLU/q8_1,
             // and the old down kernel: for n_ff 512 the new down kernel measured slower (15.1 vs 13.4 us per layer on gfx1201, R9700)
@@ -7420,10 +7434,18 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             const dim3 gd((unsigned) ((L.n_embd + 7) / 8), (unsigned) cap_groups);
             launch_down<13>(gd, s, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         }
+        else if (fused_gu) {
+            // s27_swiglu_q8_1_warp and s26_swiglu_q8_1_kernel share #pragma clang fp contract(off) and identical arithmetic for bit parity.
+            if (L.gu_type == 12 && L.d_type == 7) STRATA_V2K_FUSED(12, 7);
+            else if (L.gu_type == 12) STRATA_V2K_FUSED(12, 8);
+            else if (L.d_type == 7) STRATA_V2K_FUSED(13, 7);
+            else STRATA_V2K_FUSED(13, 8);
+        }
         else if (L.gu_type == 12 && L.d_type == 7) STRATA_V2K(12, 7);
         else if (L.gu_type == 12) STRATA_V2K(12, 8);
         else if (L.d_type == 7) STRATA_V2K(13, 7);
         else STRATA_V2K(13, 8);
+#undef STRATA_V2K_FUSED
 #undef STRATA_V2K
         check("native_expert_grouped (v2k)");
         return;
