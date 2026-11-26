@@ -308,15 +308,28 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
         }
     }
     qda_sync_lds();
+    static_assert(CHUNK_ % 32 == 0 && CHUNK_ >= 32, "attn chunk width must be a positive multiple of 32");
+    constexpr int CPT = CHUNK_ / 32;
     // per-head chunk max and exp-sum: warp w handles heads w and w+8.
     for (int h = warp; h < G; h += WARPS) {
-        const float a = sp[h][lane], b = sp[h][lane + 32];
-        const float m = warp_max(fmaxf(a, b));
-        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
-        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
-        sp[h][lane] = ea;
-        sp[h][lane + 32] = eb;
-        const float l = warp_sum(ea + eb);
+        float s[CPT];
+#pragma unroll
+        for (int j = 0; j < CPT; ++j) s[j] = sp[h][lane + j * 32];
+        float lm = s[0];
+#pragma unroll
+        for (int j = 1; j < CPT; ++j) lm = fmaxf(lm, s[j]);
+        const float m = warp_max(lm);
+        float e[CPT];
+#pragma unroll
+        for (int j = 0; j < CPT; ++j) {
+            const int c = lane + j * 32;
+            e[j] = (c < n_here && srow[c] >= 0) ? __expf(s[j] - m) : 0.0f;
+            sp[h][c] = e[j];
+        }
+        float ls = e[0];
+#pragma unroll
+        for (int j = 1; j < CPT; ++j) ls += e[j];
+        const float l = warp_sum(ls);
         if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
     }
     qda_sync_lds();
@@ -524,14 +537,27 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_v3_kernel(const float* 
         if ((lane & 1) == 0 && head < G) spt[c][head] = score * scale;
     }
     __syncthreads();
+    static_assert(CHUNK_ % 32 == 0 && CHUNK_ >= 32, "attn chunk width must be a positive multiple of 32");
+    constexpr int CPT = CHUNK_ / 32;
     for (int h = warp; h < G; h += WARPS) {
-        const float a = spt[lane][h], b = spt[lane + 32][h];
-        const float m = warp_max(fmaxf(a, b));
-        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
-        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
-        spt[lane][h] = ea;
-        spt[lane + 32][h] = eb;
-        const float l = warp_sum(ea + eb);
+        float s[CPT];
+#pragma unroll
+        for (int j = 0; j < CPT; ++j) s[j] = spt[lane + j * 32][h];
+        float lm = s[0];
+#pragma unroll
+        for (int j = 1; j < CPT; ++j) lm = fmaxf(lm, s[j]);
+        const float m = warp_max(lm);
+        float e[CPT];
+#pragma unroll
+        for (int j = 0; j < CPT; ++j) {
+            const int c = lane + j * 32;
+            e[j] = (c < n_here && srow[c] >= 0) ? __expf(s[j] - m) : 0.0f;
+            spt[c][h] = e[j];
+        }
+        float ls = e[0];
+#pragma unroll
+        for (int j = 1; j < CPT; ++j) ls += e[j];
+        const float l = warp_sum(ls);
         if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
     }
     __syncthreads();
@@ -760,15 +786,28 @@ __device__ __forceinline__ void attn_chunk_pre75_body(const float* __restrict__ 
         }
     }
     qda_sync_lds();
+    static_assert(CHUNK_ % 32 == 0 && CHUNK_ >= 32, "attn chunk width must be a positive multiple of 32");
+    constexpr int CPT = CHUNK_ / 32;
     // per-head chunk max and exp-sum: warp w handles heads w and w+8.
     for (int h = warp; h < G; h += WARPS) {
-        const float a = sp[h][lane], b = sp[h][lane + 32];
-        const float m = warp_max_x<DPP_>(fmaxf(a, b));
-        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
-        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
-        spt[lane][h] = ea;
-        spt[lane + 32][h] = eb;
-        const float l = warp_sum_x<DPP_>(ea + eb);
+        float s[CPT];
+#pragma unroll
+        for (int j = 0; j < CPT; ++j) s[j] = sp[h][lane + j * 32];
+        float lm = s[0];
+#pragma unroll
+        for (int j = 1; j < CPT; ++j) lm = fmaxf(lm, s[j]);
+        const float m = warp_max_x<DPP_>(lm);
+        float e[CPT];
+#pragma unroll
+        for (int j = 0; j < CPT; ++j) {
+            const int c = lane + j * 32;
+            e[j] = (c < n_here && srow[c] >= 0) ? __expf(s[j] - m) : 0.0f;
+            spt[c][h] = e[j];
+        }
+        float ls = e[0];
+#pragma unroll
+        for (int j = 1; j < CPT; ++j) ls += e[j];
+        const float l = warp_sum_x<DPP_>(ls);
         if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
     }
     qda_sync_lds();
