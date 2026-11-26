@@ -588,6 +588,11 @@ if(STRATA_BUILD_TESTS)
              COMMAND ${CMAKE_COMMAND} -E env STRATA_MMQ_STAGED_SORT=${mode} $<TARGET_FILE:mmq_resident_sort_test> ${mode})
   endforeach()
 
+  # The single-step and multi-query attention chunk-cap contract (host/static, no GPU).
+  add_executable(qsa_attn_cap_contract_test src/kernels/qsa_attn_cap_contract_test.cpp)
+  add_test(NAME qsa_attn_cap_contract_test COMMAND qsa_attn_cap_contract_test
+           ${CMAKE_CURRENT_SOURCE_DIR}/src/kernels/cuda/qsa_decode_attn.cu)
+
   # STRATA_SELECT_TWO_PASS: the bound between the single-pass and 3xTF32 QSA block scores and the cut-off rule that
   # keeps the selection (header-only, no GPU)
   add_executable(qsa_two_pass_test tests/prefill/qsa_two_pass_test.cpp)

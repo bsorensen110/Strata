@@ -206,7 +206,7 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
     const int chunk = blockIdx.x, kvh = blockIdx.y;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int c0 = chunk * CHUNK_;
-    const int n_here = min(CHUNK_, n_ids - c0);
+    const int n_here = min(CHUNK_, min(n_ids - c0, cap - c0));
     const int slot = kvh * n_chunks + chunk;
     if (n_here <= 0) {
         if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
@@ -475,7 +475,7 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_q8_v3_kernel(const float* 
     const int chunk = blockIdx.x, kvh = blockIdx.y;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int c0 = chunk * CHUNK_;
-    const int n_here = min(CHUNK_, n_ids - c0);
+    const int n_here = min(CHUNK_, min(n_ids - c0, cap - c0));
     const int slot = kvh * n_chunks + chunk;
     if (n_here <= 0) {
         if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
@@ -681,7 +681,7 @@ __device__ __forceinline__ void attn_chunk_pre75_body(const float* __restrict__ 
     const int chunk = blockIdx.x, kvh = blockIdx.y;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int c0 = chunk * CHUNK_;
-    const int n_here = min(CHUNK_, n_ids - c0);
+    const int n_here = min(CHUNK_, min(n_ids - c0, cap - c0));
     const int slot = kvh * n_chunks + chunk;
     if (n_here <= 0) {
         if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
@@ -1729,24 +1729,24 @@ void qsa_decode_attn_step_impl(const float* q, const QsaAttnPools& pools, const 
 #if !defined(__HIPCC__)
     if (kv_mode == 1 && attn_v3_on())
         attn_chunk_q8_v3_kernel<CHUNK_><<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                          scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+                                                          scale, part_acc, part_m, part_l, n_chunks, (int) cap, 0);
     else
 #endif
     if (kv_mode == 1 && attn_v4_on())
         attn_chunk_kernel<1, false, false, false, true, CHUNK_><<<grid, THREADS, 0, st>>>(
-            q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+            q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, 0);
     else if (kv_mode == 3)
         STRATA_ATTN_CHUNK(3, CHUNK_)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, 0);
     else if (kv_mode == 2)
         STRATA_ATTN_CHUNK(2, CHUNK_)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, 0);
     else if (kv_mode == 1)
         STRATA_ATTN_CHUNK(1, CHUNK_)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, 0);
     else
         STRATA_ATTN_CHUNK(0, CHUNK_)<<<grid, THREADS, 0, st>>>(q, pools, ids, step, (int) s.n_head_kv, (int) s.page_size,
-                                                        scale, part_acc, part_m, part_l, n_chunks, 0, 0);
+                                                        scale, part_acc, part_m, part_l, n_chunks, (int) cap, 0);
     launch_merge(attn_merge_v2(), CHUNK_, part_acc, part_m, part_l, n_chunks, step, attn, 0, (unsigned) s.n_head, 1u, st);
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
