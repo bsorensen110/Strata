@@ -1615,7 +1615,12 @@ void qsa_decode_attn_batch_rows_impl(const float* q, const QsaAttnPoolsRows& row
     const bool lane_cell = lane_cell_attn();
     const bool v4 = kv_mode == 1 && attn_v4_on();
     static const bool lane_cell_rows = [] { const char* v = std::getenv("STRATA_ATTN_LANECELL"); return v && v[0] == '1'; }();
-    bool per_row = lane_cell_rows;
+    // Keep lane-cell's per-row default; batch only when explicitly requested and there is work to combine.
+    static const bool lane_cell_batch = [] {
+        const char* v = std::getenv("STRATA_ATTN_LANECELL_BATCH");
+        return v && v[0] == '1';
+    }();
+    bool per_row = lane_cell_rows && !(lane_cell_batch && n_q > 1);
     for (int64_t r = 0; !per_row && r < n_q; ++r) {
         if (!rows.p[r].page_table || attn_kv_mode(rows.p[r]) != kv_mode) per_row = true;
     }
