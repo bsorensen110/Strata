@@ -1,0 +1,1018 @@
+.. meta::
+   :description: ROCm Compute Profiler analysis: CLI analysis
+   :keywords: ROCm Compute Profiler, ROCm, profiler, tool, Instinct, accelerator, command line, analyze, filtering, metrics, baseline, comparison
+
+************
+CLI analysis
+************
+
+This section provides an overview of ROCm Compute Profiler's CLI analysis features.
+
+* :ref:`Derived metrics <cli-list-available-metrics>`: All of ROCm Compute Profiler's built-in metrics.
+
+* :ref:`Baseline comparison <analysis-baseline-comparison>`: Compare multiple runs in a side-by-side manner.
+
+* :ref:`Metric customization <cli-analysis-options>`: Isolate a subset of built-in metrics or build your own profiling configuration.
+
+* :ref:`Filtering <cli-analysis-options>`: Hone in on a particular kernel, GPU ID, or dispatch ID via post-process filtering.
+
+* :ref:`Per-kernel roofline analysis <per-kernel-roofline>`: Detailed arithmetic intensity and performance analysis for individual kernels.
+
+* :ref:`Roofline HTML generation <roofline-html-generation>`: Generate interactive HTML roofline charts from profiling data.
+
+Run ``rocprof-compute analyze -h`` for more details.
+
+.. _cli-walkthrough:
+
+Walkthrough
+===========
+
+1. To begin, generate a high-level analysis report using ROCm Compute Profiler's ``-b`` (or ``--block``) flag.
+
+.. note::
+
+   By default, analyze only evaluates the profiled blocks. Analyze-mode
+   ``-b`` overrides this and might produce missing-counter warnings for blocks
+   whose counters were not collected.
+
+There are three high-level GPU analysis views:
+
+* System Speed-of-Light: Key GPU performance metrics to show overall GPU performance and utilization.
+* Memory chart: Shows memory transactions and throughput on each cache hierarchical level.
+* Empirical hierarchical roofline: Roofline model that compares achieved throughput with attainable peak hardware limits, more specifically peak compute throughput and memory bandwidth. When combined with kernel filtering, provides detailed per-kernel arithmetic intensity analysis and performance breakdowns.
+
+**System Speed-of-Light:**
+
+.. code-block:: shell-session
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/ -b 2
+
+.. image:: ../../data/analyze/cli/system_speed_of_light.png
+   :align: left
+   :alt: System Speed Of Light
+
+**Memory chart:**
+
+.. code-block:: shell-session
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI350/ -b 3
+
+.. code-block:: text
+
+   3. Memory Chart (Normalization: per_kernel)
+                                                                                                                   ╭──────────────────────╮
+                                                                                                                   │ xGMI (to Peer GPU)   │
+                                                                                                                   ╰──────────────────────╯
+                                                                                                                      ||  Read BW    0.000 GB/s
+                                                                                                                      ||  Write BW   0.000 GB/s
+                                                                                                                      ||  Atomic BW  0.000 GB/s
+   |-------------------------------------------------- GPU (XCD) --------------------------------------------------|------------------------------------------ Fabric / Memory ------------------------------------------|
+
+   ╭── Compute Units ───╮Non-buffer Request╭─────── VL1D ───────╮Read BW      ╭──────── L2 ────────╮               ╭─── Data Fabric ────╮               ╭─────── MALL ───────╮╭─────── UMC ────────╮╭─────── HBM ────────╮
+   │ Wave Occ 75.1%     │Read   : 1.64e+04 │ Hit 62.0%          │1513.097 GB/s│ Hit 34.0%          │               │                    │               │                    ││                    ││ Read BW            │
+   │ vGPRs 4.0          │<---------------  │ ██████░░░░         │<----------- │ ███░░░░░░░         │               │                    │               │                    ││                    ││ 1513.882 GB/s      │
+   │ sGPRs 16.0         │Write  : 1.64e+04 │                    │             │                    │               │                    │               │                    ││                    ││                    │
+   │ Scratch/Wave       │--------------->  │ Coalesce 25.0%     │Write BW     │                    │               │                    │               │                    ││                    ││ Write BW           │
+   │ 0.000 KB           │Atomic :       0  │ ██░░░░░░░░         │1513.097 GB/s│                    │               │                    │               │                    ││                    ││ 1513.097 GB/s      │
+   │ LDS Alloc 0.0 KB   │<-------------->  │                    │-----------> │                    │               │                    │               │                    ││                    ││                    │
+   │ Workgroups/CU 62.1 │Buffer Request    │                    │             │                    │               │                    │               │                    ││                    ││ Atomic BW          │
+   │                    │Read   :       0  │                    │Atomic BW    │                    │               │                    │               │                    ││                    ││ 0.000 GB/s         │
+   │                    │<---------------  │                    │0.000 GB/s   │                    │               │                    │               │                    ││                    ││                    │
+   │                    │Write  :       0  │                    │<----------> │                    │               │                    │               │                    ││                    ││                    │
+   │                    │--------------->  │                    │             │                    │               │                    │               │                    ││                    ││                    │
+   │                    │Atomic :       0  │                    │             │                    │               │                    │               │                    ││                    ││                    │
+   │                    │<-------------->  │                    │             │                    │Read BW        │                    │Read BW        │                    ││                    ││                    │
+   │                    │                  │                    │             │                    │1513.882 GB/s  │                    │1513.882 GB/s  │                    ││                    ││                    │
+   │                    │                  ╰────────────────────╯             │                    │<-----------   │                    │<-----------   │                    ││                    ││                    │
+   │                    │Read   :       0  ╭─────── LDS ────────╮             │                    │               │                    │               │                    ││                    ││                    │
+   │                    │<---------------  │ Util 0.0%          │             │                    │Write/Atomic BW│                    │Write/Atomic BW│                    ││                    ││                    │
+   │                    │Write  :       0  │ ░░░░░░░░░░         │             │                    │1513.097 GB/s  │                    │1513.097 GB/s  │                    ││                    ││                    │
+   │                    │--------------->  │                    │             │                    │----------->   │                    │----------->   │                    ││                    ││                    │
+   │                    │Atomic :       0  │                    │             │                    │               │                    │               │                    ││                    ││                    │
+   │                    │<-------------->  │                    │             │                    │               │                    │               │                    ││                    ││                    │
+   │                    │Instr  :       0  │                    │             │                    │               │                    │               │                    ││                    ││                    │
+   │                    │<-------------->  │                    │             │                    │               │                    │               │                    ││                    ││                    │
+   │                    │                  │                    │             │                    │               │                    │               │                    ││                    ││                    │
+   │                    │                  ╰────────────────────╯             │                    │               │                    │               │                    ││                    ││                    │
+   │                    │SMEM              ╭─────── sL1D ───────╮Read BW      │                    │               │                    │               │                    ││                    ││                    │
+   │                    │Read   : 6.55e+04 │ Hit 93.0%          │1.674 GB/s   │                    │               │                    │               │                    ││                    ││                    │
+   │                    │<---------------  │ █████████░         │<----------- │                    │               │                    │               │                    ││                    ││                    │
+   │                    │                  ╰────────────────────╯             │                    │               │                    │               │                    ││                    ││                    │
+   │                    │ICACHE            ╭─────── L1I ────────╮Read BW      │                    │               │                    │               │                    ││                    ││                    │
+   │                    │Read   : 6.55e+04 │ Hit 93.0%          │6.696 GB/s   │                    │               │                    │               │                    ││                    ││                    │
+   │                    │<---------------  │ █████████░         │<----------- │                    │               │                    │               │                    ││                    ││                    │
+   ╰────────────────────╯                  ╰────────────────────╯             ╰────────────────────╯               ╰────────────────────╯               ╰────────────────────╯╰────────────────────╯╰────────────────────╯
+
+                                                                                                                      ||  Read BW    0.000 GB/s
+                                                                                                                      ||  Write BW   0.000 GB/s
+                                                                                                                      ||  Atomic BW  0.000 GB/s
+                                                                                                        ╭────────────────────────────────────────────╮
+                                                                                                        │ PCIe (to CPU or Non-xGMI connected GPU)    │
+                                                                                                        ╰────────────────────────────────────────────╯
+
+   Legend: <---- Read  ----> Write  <---> Atomic  █ Util  █ Hit%
+
+.. _cli-memory-chart-viewing:
+
+The memory chart is a wide diagram whose width follows its content. It does not
+shrink to fit the terminal, so in a narrow window every chart line wraps and the
+boxes, arrows, and bandwidth labels no longer line up. Widening the window until one
+chart line fits on a single row fixes this. If you cannot resize, use one of the
+following instead.
+
+Pipe the output into ``less``. ``-S`` cuts long lines instead of wrapping them,
+and ``-R`` shows the colored log lines above the chart as color rather than
+escape codes. Use the left and right arrow keys to scroll across the chart:
+
+.. code-block:: shell
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/ -b 3 | less -RS
+
+You can also send the output to an editor, for example Visual Studio Code:
+
+.. code-block:: shell
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/ -b 3 | code -
+
+The chart is colored only when it is printed straight to a terminal, so it is
+plain text in both of the preceding commands.
+
+To print the block as tables instead of the diagram, see :ref:`cli-view-table`.
+
+**Empirical hierarchical roofline:**
+
+.. code-block:: shell-session
+
+   $ rocprof-compute analyze -p workloads/rocflop/MI350/ -b 4
+
+   --------------------------------------------------------------------------------
+   4. Roofline
+
+   Interactive roofline plot saved to /home/user/workloads/rocflop/MI350/empirRoof_gpu-0.html
+
+   (4.1) Per-Kernel Roofline Metrics and (4.2) AI Plot Points
+
+   Kernel 0: matmul_fp32_throughput(float*, float
+   __vector(4)*, int) (25.8%)
+     |
+     ├─ 4.1 Roofline Rate Metrics:
+     |   ╒═════════════╤════════════════════╤═══════════╤═════════╤════════════════════╕
+     |   │ Metric_ID   │ Metric             │     Value │ Unit    │   Peak (Empirical) │
+     |   ╞═════════════╪════════════════════╪═══════════╪═════════╪════════════════════╡
+     |   │ 4.1.0       │ VALU FLOPs (F16)   │      0.00 │ GFLOP/s │          142403.81 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.1       │ VALU FLOPs (F32)   │      0.02 │ GFLOP/s │          139518.41 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.2       │ VALU FLOPs (F64)   │      0.00 │ GFLOP/s │           70917.90 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.3       │ MFMA FLOPs (F64)   │      0.00 │ GFLOP/s │           71377.49 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.4       │ MFMA FLOPs (F32)   │ 136977.38 │ GFLOP/s │          142150.19 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.5       │ MFMA FLOPs (F16)   │      0.00 │ GFLOP/s │         1697415.60 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.6       │ MFMA FLOPs (BF16)  │      0.00 │ GFLOP/s │         1938708.14 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.7       │ MFMA FLOPs (F8)    │      0.00 │ GFLOP/s │         2090034.29 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.8       │ MFMA FLOPs (MXF8)  │      0.00 │ GFLOP/s │         4361892.90 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.9       │ MFMA FLOPs (F6F4)  │      0.00 │ GFLOP/s │         7601929.39 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.10      │ MFMA IOPs (Int8)   │      0.00 │ GIOP/s  │         4034547.20 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.11      │ HBM Bandwidth      │      0.11 │ GB/s    │            6964.63 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.12      │ L2 Cache Bandwidth │      0.18 │ GB/s    │           31643.80 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.13      │ L1 Cache Bandwidth │      0.23 │ GB/s    │           34846.58 │
+     |   ├─────────────┼────────────────────┼───────────┼─────────┼────────────────────┤
+     |   │ 4.1.14      │ LDS Bandwidth      │      0.00 │ GB/s    │           57018.43 │
+     |   ╘═════════════╧════════════════════╧═══════════╧═════════╧════════════════════╛
+     ├─ 4.2 Roofline AI Plot Points:
+     |   ╒═════════════╤══════════════════════╤════════════════════╤════════════╕
+     |   │ Metric_ID   │ Metric               │ Value              │ Unit       │
+     |   ╞═════════════╪══════════════════════╪════════════════════╪════════════╡
+     |   │ 4.2.0       │ AI HBM               │ 1198230.6258325255 │ FLOPs/Byte │
+     |   ├─────────────┼──────────────────────┼────────────────────┼────────────┤
+     |   │ 4.2.1       │ AI L2                │ 762602.760461121   │ FLOPs/Byte │
+     |   ├─────────────┼──────────────────────┼────────────────────┼────────────┤
+     |   │ 4.2.2       │ AI L1                │ 599186.8145721277  │ FLOPs/Byte │
+     |   ├─────────────┼──────────────────────┼────────────────────┼────────────┤
+     |   │ 4.2.3       │ AI LDS               │ N/A                │ FLOPs/Byte │
+     |   ├─────────────┼──────────────────────┼────────────────────┼────────────┤
+     |   │ 4.2.4       │ Performance (GFLOPs) │ 136977.40092136632 │ GFLOP/s    │
+     |   ╘═════════════╧══════════════════════╧════════════════════╧════════════╛
+
+   ...
+
+Open the saved HTML file in a browser for the interactive roofline plot. See :ref:`roofline-html-generation`.
+
+.. note::
+   * Visualized memory chart is only supported in single run analysis. In multiple runs comparison mode, it is switched back to basic table view.
+   * Visualized memory chart is drawn at a fixed width and needs a wide terminal. See :ref:`cli-memory-chart-viewing` if it wraps.
+
+.. _cli-list-available-metrics:
+
+2. Use ``--list-available-metrics`` to generate a list of available metrics for inspection.
+
+   .. code-block:: shell-session
+
+      $ rocprof-compute analyze -p workloads/vcopy/MI200/ --list-available-metrics
+
+                                       __                                       _
+       _ __ ___   ___ _ __  _ __ ___  / _|       ___ ___  _ __ ___  _ __  _   _| |_ ___
+      | '__/ _ \ / __| '_ \| '__/ _ \| |_ _____ / __/ _ \| '_ ` _ \| '_ \| | | | __/ _ \
+      | | | (_) | (__| |_) | | | (_) |  _|_____| (_| (_) | | | | | | |_) | |_| | ||  __/
+      |_|  \___/ \___| .__/|_|  \___/|_|        \___\___/|_| |_| |_| .__/ \__,_|\__\___|
+                     |_|                                           |_|
+
+      Analysis mode = cli
+      [analysis] deriving rocprofiler-compute metrics...
+      0 -> Top Stats
+      1 -> System Info
+      2 -> System Speed-of-Light
+              2.1 -> Speed-of-Light
+                      2.1.0 -> VALU FLOPs
+                      2.1.1 -> MFMA FLOPs (BF16)
+                      2.1.2 -> MFMA FLOPs (F16)
+                      2.1.3 -> MFMA FLOPs (F32)
+                      2.1.4 -> MFMA FLOPs (F64)
+                      2.1.5 -> MFMA IOPs (Int8)
+                      2.1.6 -> SALU Utilization
+                      2.1.7 -> VALU Utilization
+                      2.1.8 -> MFMA Utilization
+                      2.1.9 -> VMEM Utilization
+                      2.1.10 -> Branch Utilization
+                      2.1.11 -> VALU Active Threads
+                      2.1.12 -> IPC
+                      2.1.13 -> Wavefront Occupancy
+                      2.1.14 -> Theoretical LDS Bandwidth
+                      2.1.15 -> LDS Bank Conflicts/Access
+                      2.1.16 -> vL1D Cache Hit Rate
+                      2.1.17 -> vL1D Cache BW
+                      2.1.18 -> L2 Cache Hit Rate
+                      2.1.19 -> L2 Cache BW
+                      2.1.20 -> L2-Fabric Read BW
+                      2.1.21 -> L2-Fabric Write BW
+                      2.1.22 -> L2-Fabric Read Latency
+                      2.1.23 -> L2-Fabric Write Latency
+                      2.1.24 -> sL1D Cache Hit Rate
+                      2.1.25 -> sL1D Cache BW
+                      2.1.26 -> L1I Hit Rate
+                      2.1.27 -> L1I BW
+                      2.1.28 -> L1I Fetch Latency
+      ...
+
+   On MI300 and MI350 series GPUs, block **1 (System Info)** also reports compute
+   and memory partition modes. See :doc:`/conceptual/cdna/compute-memory-partition`
+   for how those fields affect metric normalization.
+
+3. Choose your own customized subset of metrics with the ``-b`` (or ``--block``)
+   option. Or, build your own configuration following
+   `config_template <https://github.com/ROCm/rocm-systems/blob/develop/projects/rocprofiler-compute/src/rocprof_compute_soc/analysis_configs/panel_config_template.yaml>`_.
+   The following snippet shows how to generate a report containing only metric 2
+   (:doc:`System Speed-of-Light </conceptual/cdna/system-speed-of-light>`).
+
+   .. code-block:: shell-session
+
+      $ rocprof-compute analyze -p workloads/vcopy/MI200/ -b 2
+
+      --------
+      Analyze
+      --------
+
+      --------------------------------------------------------------------------------
+      1. Top Stat
+      ╒════╤══════════════════════════════════════════╤═════════╤═══════════╤════════════╤══════════════╤════════╕
+      │    │ KernelName                               │   Count │   Sum(ns) │   Mean(ns) │   Median(ns) │    Pct │
+      ╞════╪══════════════════════════════════════════╪═════════╪═══════════╪════════════╪══════════════╪════════╡
+      │  0 │ vecCopy(double*, double*, double*, int,  │       1 │  20000.00 │   20000.00 │     20000.00 │ 100.00 │
+      │    │ int) [clone .kd]                         │         │           │            │              │        │
+      ╘════╧══════════════════════════════════════════╧═════════╧═══════════╧════════════╧══════════════╧════════╛
+
+
+      --------------------------------------------------------------------------------
+      2. System Speed-of-Light
+      2.1 System Speed-of-Light
+      ╒═════════════╤═══════════════════════════╤═════════╤════════════════════════╤══════════╤═══════════════════╕
+      │ Metric_ID   │ Metric                    │ Avg     │ Unit                   │ Peak     │ Percent of Peak   │
+      ╞═════════════╪═══════════════════════════╪═════════╪════════════════════════╪══════════╪═══════════════════╡
+      │ 2.1.0       │ VALU FLOPs                │ 0.0     │ GFLOP/s                │ 22630.4  │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.1       │ MFMA FLOPs (BF16)         │ 0.0     │ GFLOP/s                │ 181043.2 │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.2       │ MFMA FLOPs (F16)          │ 0.0     │ GFLOP/s                │ 181043.2 │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.3       │ MFMA FLOPs (F32)          │ 0.0     │ GFLOP/s                │ 45260.8  │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.4       │ MFMA FLOPs (F64)          │ 0.0     │ GFLOP/s                │ 45260.8  │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.5       │ MFMA IOPs (Int8)          │ 0.0     │ GIOP/s                 │ 181043.2 │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.6       │ SALU Utilization          │ 2.74    │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.7       │ VALU Utilization          │ 3.91    │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.8       │ MFMA Utilization          │ 0.0     │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.9       │ VMEM Utilization          │ 0.78    │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.10      │ Branch Utilization        │ 0.78    │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.11      │ VALU Active Threads       │ 64.0    │ Work-items             │ 64.0     │ 100.0             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.12      │ IPC                       │ 0.14    │ Instructions per Cycle │ 5.0      │ 2.89              │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.13      │ Wavefront Occupancy       │ 1904.8  │ Wavefronts             │ 3328.0   │ 57.24             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.14      │ Theoretical LDS Bandwidth │ 0.0     │ GB/s                   │ 22630.4  │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.15      │ LDS Bank Conflicts/Access │ N/A     │ Conflicts per Access   │ 32.0     │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.16      │ vL1D Cache Hit Rate       │ 50.0    │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.17      │ vL1D Cache BW             │ 1941.81 │ GB/s                   │ 11315.2  │ 17.16             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.18      │ L2 Cache Hit Rate         │ 34.75   │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.19      │ L2 Cache BW               │ 1488.67 │ GB/s                   │ 3481.6   │ 42.76             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.20      │ L2-Fabric Read BW         │ 485.48  │ GB/s                   │ 1638.4   │ 29.63             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.21      │ L2-Fabric Write BW        │ 386.75  │ GB/s                   │ 1638.4   │ 23.61             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.22      │ L2-Fabric Read Latency    │ 909.82  │ Cycles                 │ N/A      │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.23      │ L2-Fabric Write Latency   │ 606.22  │ Cycles                 │ N/A      │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.24      │ sL1D Cache Hit Rate       │ 99.91   │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.25      │ sL1D Cache BW             │ 242.73  │ GB/s                   │ 6092.8   │ 3.98              │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.26      │ L1I Hit Rate              │ 99.91   │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.27      │ L1I BW                    │ 242.73  │ GB/s                   │ 6092.8   │ 3.98              │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.28      │ L1I Fetch Latency         │ 32.73   │ Cycles                 │ N/A      │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.29      │ CU Utilization            │ 65.01   │ Percent                │ 100.0    │ N/A               │
+      ╘═════════════╧═══════════════════════════╧═════════╧════════════════════════╧══════════╧═══════════════════╛
+
+   Alternatively, use the option ``-b`` (or ``--block``) with block alias(es).
+   The following snippet shows how to generate a report containing only metric 2 with the alias equivalent of ``sol``
+
+   .. code-block:: shell-session
+
+      $ rocprof-compute analyze -p workloads/vcopy/MI200/ -b sol
+
+      --------
+      Analyze
+      --------
+
+      --------------------------------------------------------------------------------
+      1. Top Stat
+      ╒════╤══════════════════════════════════════════╤═════════╤═══════════╤════════════╤══════════════╤════════╕
+      │    │ KernelName                               │   Count │   Sum(ns) │   Mean(ns) │   Median(ns) │    Pct │
+      ╞════╪══════════════════════════════════════════╪═════════╪═══════════╪════════════╪══════════════╪════════╡
+      │  0 │ vecCopy(double*, double*, double*, int,  │       1 │  20000.00 │   20000.00 │     20000.00 │ 100.00 │
+      │    │ int) [clone .kd]                         │         │           │            │              │        │
+      ╘════╧══════════════════════════════════════════╧═════════╧═══════════╧════════════╧══════════════╧════════╛
+
+
+      --------------------------------------------------------------------------------
+      2. System Speed-of-Light
+      2.1 System Speed-of-Light
+      ╒═════════════╤═══════════════════════════╤═════════╤════════════════════════╤══════════╤═══════════════════╕
+      │ Metric_ID   │ Metric                    │ Avg     │ Unit                   │ Peak     │ Percent of Peak   │
+      ╞═════════════╪═══════════════════════════╪═════════╪════════════════════════╪══════════╪═══════════════════╡
+      │ 2.1.0       │ VALU FLOPs                │ 0.0     │ GFLOP/s                │ 22630.4  │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.1       │ MFMA FLOPs (BF16)         │ 0.0     │ GFLOP/s                │ 181043.2 │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.2       │ MFMA FLOPs (F16)          │ 0.0     │ GFLOP/s                │ 181043.2 │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.3       │ MFMA FLOPs (F32)          │ 0.0     │ GFLOP/s                │ 45260.8  │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.4       │ MFMA FLOPs (F64)          │ 0.0     │ GFLOP/s                │ 45260.8  │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.5       │ MFMA IOPs (Int8)          │ 0.0     │ GIOP/s                 │ 181043.2 │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.6       │ SALU Utilization          │ 2.74    │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.7       │ VALU Utilization          │ 3.91    │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.8       │ MFMA Utilization          │ 0.0     │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.9       │ VMEM Utilization          │ 0.78    │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.10      │ Branch Utilization        │ 0.78    │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.11      │ VALU Active Threads       │ 64.0    │ Work-items             │ 64.0     │ 100.0             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.12      │ IPC                       │ 0.14    │ Instructions per Cycle │ 5.0      │ 2.89              │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.13      │ Wavefront Occupancy       │ 1904.8  │ Wavefronts             │ 3328.0   │ 57.24             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.14      │ Theoretical LDS Bandwidth │ 0.0     │ GB/s                   │ 22630.4  │ 0.0               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.15      │ LDS Bank Conflicts/Access │ N/A     │ Conflicts per Access   │ 32.0     │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.16      │ vL1D Cache Hit Rate       │ 50.0    │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.17      │ vL1D Cache BW             │ 1941.81 │ GB/s                   │ 11315.2  │ 17.16             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.18      │ L2 Cache Hit Rate         │ 34.75   │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.19      │ L2 Cache BW               │ 1488.67 │ GB/s                   │ 3481.6   │ 42.76             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.20      │ L2-Fabric Read BW         │ 485.48  │ GB/s                   │ 1638.4   │ 29.63             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.21      │ L2-Fabric Write BW        │ 386.75  │ GB/s                   │ 1638.4   │ 23.61             │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.22      │ L2-Fabric Read Latency    │ 909.82  │ Cycles                 │ N/A      │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.23      │ L2-Fabric Write Latency   │ 606.22  │ Cycles                 │ N/A      │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.24      │ sL1D Cache Hit Rate       │ 99.91   │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.25      │ sL1D Cache BW             │ 242.73  │ GB/s                   │ 6092.8   │ 3.98              │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.26      │ L1I Hit Rate              │ 99.91   │ Percent                │ 100.0    │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.27      │ L1I BW                    │ 242.73  │ GB/s                   │ 6092.8   │ 3.98              │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.28      │ L1I Fetch Latency         │ 32.73   │ Cycles                 │ N/A      │ N/A               │
+      ├─────────────┼───────────────────────────┼─────────┼────────────────────────┼──────────┼───────────────────┤
+      │ 2.1.29      │ CU Utilization            │ 65.01   │ Percent                │ 100.0    │ N/A               │
+      ╘═════════════╧═══════════════════════════╧═════════╧════════════════════════╧══════════╧═══════════════════╛
+   .. note::
+
+      Some cells may be blank indicating a missing or unavailable hardware
+      counter or NULL value.
+
+4. Optimize the application, iterate, and re-profile to inspect performance
+   changes.
+
+5. Redo a comprehensive analysis with ROCm Compute Profiler CLI at any optimization
+   milestone.
+
+.. _cli-analysis-options:
+
+More analysis options
+=====================
+
+**Single run**
+
+.. code-block:: shell
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/
+
+**List top kernels and dispatches**
+
+.. code-block:: shell
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/  --list-stats
+
+.. note::
+
+   ``--list-stats`` supports the default ``stdout`` output and ``--output-format txt``.
+   Combining it with ``--output-format csv`` or ``--output-format db`` exits with an error.
+
+
+**List metrics**
+
+.. code-block:: shell
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/  --list-metrics gfx90a
+
+**List IP blocks**
+
+.. code-block:: shell
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/  --list-blocks gfx90a
+
+
+**Show Description column which is excluded by default in cli output**
+
+.. code-block:: shell
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/  --list-metrics gfx90a --include-cols Description
+
+.. _cli-view-table:
+
+**TTY output view (plain tables)**
+
+Use ``--view table`` to force plain tabular output for all sections and ignore ``cli_style`` from the analysis YAML (for example, memory charts and the per-kernel Roofline layout are shown as tables). Additional ``--view`` values may be added in future releases.
+
+.. code-block:: shell
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/ -b 3 --view table
+
+**Show System Speed-of-Light and CS_Busy blocks only**
+
+.. code-block:: shell
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/  -b 2  5.1.0
+
+.. note::
+
+   You can filter a single metric or the whole hardware component by its ID. In
+   this case, ``1`` is the ID for System Speed-of-Light and ``5.1.0`` the ID for
+   GPU Busy Cycles metric.
+
+
+**Filter kernels**
+
+First, list the top kernels in your application using `--list-stats`.
+
+.. code-block::
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/ --list-stats
+
+   Analysis mode = cli
+   [analysis] deriving rocprofiler-compute metrics...
+
+   --------------------------------------------------------------------------------
+   Detected Kernels (sorted descending by duration)
+   ╒════╤══════════════════════════════════════════════╕
+   │    │ Kernel_Name                                  │
+   ╞════╪══════════════════════════════════════════════╡
+   │  0 │ vecCopy(double*, double*, double*, int, int) │
+   ╘════╧══════════════════════════════════════════════╛
+
+   --------------------------------------------------------------------------------
+   Dispatch list
+   ╒════╤═══════════════╤══════════════════════════════════════════════╤══════════╕
+   │    │   Dispatch_ID │ Kernel_Name                                  │   GPU_ID │
+   ╞════╪═══════════════╪══════════════════════════════════════════════╪══════════╡
+   │  0 │             1 │ vecCopy(double*, double*, double*, int, int) │        0 │
+   ╘════╧═══════════════╧══════════════════════════════════════════════╧══════════╛
+
+Second, select the index of the kernel you would like to filter; for example,
+``vecCopy(double*, double*, double*, int, int) [clone .kd]`` at index ``0``.
+Then, use this index to apply the filter via ``-k`` or ``--kernel``.
+
+.. code-block:: shell-session
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/ -k 0
+
+   Analysis mode = cli
+   [analysis] deriving rocprofiler-compute metrics...
+
+   --------------------------------------------------------------------------------
+   0. Top Stats
+   0.1 Top Kernels
+   ╒════╤══════════════════════════════════════════╤═════════╤═══════════╤════════════╤══════════════╤════════╤═════╕
+   │    │ Kernel_Name                              │   Count │   Sum(ns) │   Mean(ns) │   Median(ns) │    Pct │ S   │
+   ╞════╪══════════════════════════════════════════╪═════════╪═══════════╪════════════╪══════════════╪════════╪═════╡
+   │  0 │ vecCopy(double*, double*, double*, int,  │    1.00 │  18560.00 │   18560.00 │     18560.00 │ 100.00 │ *   │
+   │    │ int)                                     │         │           │            │              │        │     │
+   ╘════╧══════════════════════════════════════════╧═════════╧═══════════╧════════════╧══════════════╧════════╧═════╛
+   ...
+
+You should see your filtered kernels indicated by an asterisk in the **Top
+Stats** table.
+
+.. _per-kernel-roofline:
+
+**Per-kernel roofline analysis**
+
+When analyzing specific kernels, the roofline analysis provides detailed metrics for each filtered kernel:
+
+.. code-block:: shell-session
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/ -k 0 -b 4
+
+This generates enhanced roofline output showing per-kernel performance rates and arithmetic intensity calculations:
+
+.. code-block:: text
+
+   ================================================================================
+   4. Roofline
+   ================================================================================
+   (4.1) Per-Kernel Roofline Metrics and (4.2) AI Plot Points
+   --------------------------------------------------------------------------------
+   Kernel 0: vecCopy(double*, double*, double*, int, int) (100.0%)
+      |
+      ├─ 4.1 Roofline Rate Metrics:
+      |   ╒═════════════╤════════════════════╤═══════════════════╤═════════╤════════════════════╕
+      |   │ Metric_ID   │ Metric             │ Value             │ Unit    │   Peak (Empirical) │
+      |   ╞═════════════╪════════════════════╪═══════════════════╪═════════╪════════════════════╡
+      |   │ 4.1.0       │ VALU FLOPs         │                   │ Gflop/s │           61286.40 │
+      |   ├─────────────┼────────────────────┼───────────────────┼─────────┼────────────────────┤
+      |   │ 4.1.1       │ MFMA FLOPs (F64)   │                   │ Gflop/s │          108544.33 │
+      |   ├─────────────┼────────────────────┼───────────────────┼─────────┼────────────────────┤
+      |   │ 4.1.2       │ MFMA FLOPs (F32)   │                   │ Gflop/s │          104531.42 │
+      |   ├─────────────┼────────────────────┼───────────────────┼─────────┼────────────────────┤
+      |   │ 4.1.3       │ MFMA FLOPs (F16)   │                   │ Gflop/s │          709169.38 │
+      |   ├─────────────┼────────────────────┼───────────────────┼─────────┼────────────────────┤
+      |   │ 4.1.4       │ MFMA FLOPs (BF16)  │ 0.0               │ Gflop/s │          388161.09 │
+      |   ├─────────────┼────────────────────┼───────────────────┼─────────┼────────────────────┤
+      |   │ 4.1.5       │ MFMA FLOPs (F8)    │ 0.0               │ Gflop/s │         1446089.60 │
+      |   ├─────────────┼────────────────────┼───────────────────┼─────────┼────────────────────┤
+      |   │ 4.1.6       │ MFMA IOPs (Int8)   │                   │ Giop/s  │          737317.94 │
+      |   ├─────────────┼────────────────────┼───────────────────┼─────────┼────────────────────┤
+      |   │ 4.1.7       │ HBM Bandwidth      │                   │ Gb/s    │            3231.95 │
+      |   ├─────────────┼────────────────────┼───────────────────┼─────────┼────────────────────┤
+      |   │ 4.1.8       │ L2 Cache Bandwidth │                   │ Gb/s    │           19096.81 │
+      |   ├─────────────┼────────────────────┼───────────────────┼─────────┼────────────────────┤
+      |   │ 4.1.9       │ L1 Cache Bandwidth │ 3880.358726762844 │ Gb/s    │           25006.24 │
+      |   ├─────────────┼────────────────────┼───────────────────┼─────────┼────────────────────┤
+      |   │ 4.1.10      │ LDS Bandwidth      │                   │ Gb/s    │           54920.88 │
+      |   ╘═════════════╧════════════════════╧═══════════════════╧═════════╧════════════════════╛
+      ├─ 4.2 Roofline AI Plot Points:
+      |   ╒═════════════╤══════════════════════╤═════════╤════════════╕
+      |   │ Metric_ID   │ Metric               │ Value   │ Unit       │
+      |   ╞═════════════╪══════════════════════╪═════════╪════════════╡
+      |   │ 4.2.0       │ AI HBM               │         │ Flops/byte │
+      |   ├─────────────┼──────────────────────┼─────────┼────────────┤
+      |   │ 4.2.1       │ AI L2                │         │ Flops/byte │
+      |   ├─────────────┼──────────────────────┼─────────┼────────────┤
+      |   │ 4.2.2       │ AI L1                │         │ Flops/byte │
+      |   ├─────────────┼──────────────────────┼─────────┼────────────┤
+      |   │ 4.2.3       │ AI LDS               │         │ Flops/byte │
+      |   ├─────────────┼──────────────────────┼─────────┼────────────┤
+      |   │ 4.2.4       │ Performance (GFLOPs) │         │ Gflop/s    │
+      |   ╘═════════════╧══════════════════════╧═════════╧════════════╛
+
+The per-kernel analysis uses YAML-based metric evaluation for accurate calculations.
+
+Analyze multiple kernels for comparison:
+
+.. code-block:: shell-session
+
+   $ rocprof-compute analyze -p workloads/vcopy/MI200/ -k 0 1 2 -b 4
+
+.. _roofline-html-generation:
+
+**Roofline HTML generation**
+
+Roofline HTML plots are generated during analyze mode. Profile mode creates
+``roofline.csv`` containing microbenchmark data, and analyze mode uses this
+data to produce interactive HTML roofline charts.
+
+.. note::
+   Matrix multiplication performance data will vary depending on which architecture is profiled:
+
+   * gfx9 (CDNA1/2/3/4) supports Matrix Fused MultiplyAdd (MFMA).
+   * gfx10+ (RDNA3+) supports Wave Matrix Multiply Accumulate (WMMA).
+
+   CDNA4+ also supports Microscaling formats, which can be identified by the "MX" prefix in datatypes. More details and other resources about MX per CDNA architecture can be found at `AMD CDNA Architecture <https://www.amd.com/en/technologies/cdna.html>`_.
+
+   Additionally, the cache level data available for analysis is dependent on the memory hierarchy levels of the architecture. See the :ref:`CDNA Performance Model <cdna-performance-model>` or :ref:`RDNA Performance Model <rdna-performance-model>` pages to view more information about the hardware blocks and cache levels supported in each architecture.
+
+Two-step workflow:
+
+.. code-block:: shell-session
+
+   # Step 1: Profile to generate roofline.csv
+   $ rocprof-compute profile --name vcopy --roof-only -- tests/vcopy -n 1048576 -b 256
+
+   # Step 2: Analyze to generate HTML roofline plots
+   $ rocprof-compute analyze -p workloads/vcopy/MI300A_A1/ -b 4
+
+Interactive Roofline HTML:
+
+* Use the *AI axis* selector to choose one memory level per kernel, *All peaks* to plot every level at once, or *Limited by* to show each kernel's limiting memory-level point (falling back to its leftmost point when no memory-level limiter is available).
+  Isolating one kernel shows it across all available memory levels.
+* Use the *Precision* selector to choose one or more arithmetic precision's peak roofline to display on the plot.
+* Use the *Kernels* and *Bandwidth rooflines* panels to isolate, multi-select, or reset plotted items. The *Runtime shown* slider filters to the heaviest kernels that reach the selected GPU resident-time cutoff.
+* Hover over kernel dots and rooflines to see arithmetic intensity, throughput, roofline percentage, limiter, runtime, bandwidth, and compute-peak details.
+* Drag to pan, scroll to zoom, double-click or use *Reset zoom* to re-frame the chart, use *Export PNG* to save the current view, and use *Theme toggle* to switch between light and dark modes.
+
+Below is an example of the interactive HTML plot:
+
+.. image:: ../../data/analyze/cli/roofline_html_interact.png
+   :align: center
+   :alt: HTML interactive plot
+   :width: 800
+
+.. _analysis-baseline-comparison:
+
+**Baseline comparison**
+
+Baseline comparison allows for checking A/B effect. Currently baseline comparison is limited to the same :ref:`SoC <def-soc>`. Cross-comparison between SoCs is in development.
+
+For both the Current Workload and the Baseline Workload, you can independently setup the following filters to allow fine grained comparisons:
+
+* Workload Name with ``--path``
+* GPU ID filtering (multi-selection) with ``--gpu-id``
+* Kernel Name filtering (multi-selection) with ``--kernel``
+* Dispatch ID filtering (regex filtering) with ``--dispatch``
+* ROCm Compute Profiler panels/blocks (multi-selection) with ``--block``
+
+.. code-block:: shell
+
+   rocprof-compute analyze -p [path1] [path2] … [pathN]
+
+.. code-block:: shell
+
+   rocprof-compute analyze -p [path1] [options for path1] ... -p [pathN] [options for pathN]
+
+Examples:
+
+.. code-block:: shell
+
+   rocprof-compute analyze -p workloads/workload_1/gpu_arch/ -k 0 -b 2 -p workloads/workload_2/gpu_arch/ -k 1 -b 2
+
+.. code-block:: shell
+
+   rocprof-compute analyze -p workloads/workload_1/gpu_arch/ workloads/workload_2/gpu_arch/ ... workloads/workload_7/gpu_arch/ -b 12
+
+.. image:: ../../data/analyze/cli/baseline_comparison.png
+   :align: center
+   :alt: Baseline Comparison example of LDS block among 7 runs
+   :width: 800
+
+
+.. _analysis-output-format:
+
+Analysis output format
+======================
+
+Use the ``--output-format <format>`` analyze mode option to specify the output format of the
+analysis report. Supported formats are ``stdout``, ``txt``, ``csv``, and ``db``. The default output
+format is ``stdout``.
+
+``--list-stats`` is available only with ``stdout`` and ``txt`` output.
+
+* ``stdout`` format:
+   * Print analysis report to the terminal.
+   * NOTE: This option will not generate any file or folder.
+
+* ``txt`` format:
+   * Generate a file named ``rocprof_compute_<uuid>.txt`` in the current working directory.
+   * This file contains the entire analysis report as printed on the terminal.
+   * This is useful in case of searching across long analysis reports.
+   * NOTE: This option will disable output of analysis report to terminal.
+
+* ``csv`` format:
+   * Generate a folder named ``rocprof_compute_<uuid>`` in the current working directory.
+   * This folder contains one CSV file per view defined in the :ref:`analysis database schema <analysis-database>`.
+   * For a PC-sampled workload it also holds each kernel's disassembly and source; see :ref:`pc-sampling-per-kernel-csv`.
+   * This is useful for further programmatic analysis of analysis reports.
+   * NOTE: This option will disable output of analysis report to terminal.
+
+* ``db`` format:
+   * Generate a file named ``rocprof_compute_<uuid>.db`` in the current working directory.
+   * This is a SQLite database file containing all the data in the analysis report structured according to :ref:`analysis database schema <analysis-database>`.
+   * This is useful for further programmatic analysis of analysis reports.
+   * NOTE: This option will disable output of analysis report to terminal.
+
+Default file/folder name ``rocprof_compute_<uuid>`` can be overridden using ``--output-name <name>`` analyze mode option. For ``csv`` format the name is used as the output folder; for ``db`` format the name is used with a ``.db`` suffix.
+
+.. _analysis-database:
+
+Analysis database schema
+========================
+
+Analysis database tables
+
+.. image:: ../../data/analyze/analysis_data_dump_schema.png
+   :align: center
+   :alt: Analysis database tables
+
+Analysis database views
+
+.. image:: ../../data/analyze/analysis_data_dump_views.png
+   :align: center
+   :alt: Analysis database views
+
+Analysis database example
+
+.. note::
+
+   Some metrics cannot be calculated when corresponding counters are missing as shown in the warnings below
+
+.. note::
+
+   It is possible to merge the analysis data dump for multiple workload folders (resulting from multiple profiles) by repeating ``-p`` option for each workload
+
+.. code-block:: shell-session
+
+   $ rocprof-compute analyze --verbose --output-name test --output-format db -p workloads/nbody/MI300X_A1 -p workloads/nbody1/MI300X_A1
+   DEBUG Execution mode = analyze
+
+                                    __                                       _
+   _ __ ___   ___ _ __  _ __ ___  / _|       ___ ___  _ __ ___  _ __  _   _| |_ ___
+   | '__/ _ \ / __| '_ \| '__/ _ \| |_ _____ / __/ _ \| '_ ` _ \| '_ \| | | | __/ _ \
+   | | | (_) | (__| |_) | | | (_) |  _|_____| (_| (_) | | | | | | |_) | |_| | ||  __/
+   |_|  \___/ \___| .__/|_|  \___/|_|        \___\___/|_| |_| |_| .__/ \__,_|\__\___|
+                  |_|                                           |_|
+
+      INFO Analysis mode = db
+      INFO ed45b0b189
+   DEBUG [omnisoc init]
+      INFO ed45b0b189
+   DEBUG [omnisoc init]
+   DEBUG [analysis] prepping to do some analysis
+      INFO [analysis] deriving rocprofiler-compute metrics...
+   DEBUG Collected roofline ceilings
+   WARNING PC sampling data not found for /app/projects/rocprofiler-compute/workloads/nbody/MI300X_A1.
+   WARNING PC sampling data not found for /app/projects/rocprofiler-compute/workloads/nbody1/MI300X_A1.
+   DEBUG Collected dispatch data
+   DEBUG Applied analysis mode filters
+   DEBUG Calculated dispatch data
+   DEBUG Collected metrics data
+   WARNING Failed to evaluate expression for 3.1.39 - Value: to_round((to_avg(
+      (pmc_df.get("pmc_perf_ACCUM") / pmc_df.get("SQC_ICACHE_REQ")).where((pmc_df.get("SQC_ICACHE_REQ") != 0), None)) * 100), 0) - unsupported operand type(s) for /: 'NoneType' and 'float'
+   WARNING Failed to evaluate expression for 3.1.39 - Value: to_round((to_avg(
+      (pmc_df.get("pmc_perf_ACCUM") / pmc_df.get("SQC_ICACHE_REQ")).where((pmc_df.get("SQC_ICACHE_REQ") != 0), None)) * 100), 0) - unsupported operand type(s) for /: 'NoneType' and 'float'
+   DEBUG Calculated metric values
+   DEBUG Calculated roofline data points
+   DEBUG [analysis] generating analysis
+   DEBUG SQLite database initialized with name: test.db
+   DEBUG Initialized database: test.db
+      INFO ed45b0b189
+      INFO ed45b0b189
+   DEBUG Completed writing database
+   WARNING Created file: test.db
+
+
+PyTorch operator analysis
+=========================
+
+.. warning::
+
+   These options require ``--experimental``. After profiling with
+   ``--experimental --torch-trace`` (see :ref:`torch-operator-profiling`),
+   use ``rocprof-compute analyze ... --experimental`` with
+   ``--list-torch-operators`` or ``--torch-operator`` as needed.
+
+These options work only with the default ``--output-format stdout``. If you
+combine ``--list-torch-operators`` with ``--torch-operator``, rocprof-compute
+lists all operators and ignores the filter.
+
+
+List all operators
+---------------------
+
+Display all PyTorch operators captured during profiling:
+
+.. code-block:: shell-session
+
+   $ rocprof-compute analyze --experimental --list-torch-operators --path ./workload
+
+   ================================================================================
+   PyTorch Operator Call Tree: ./workload
+   Sorted by total GPU kernel duration.
+   ================================================================================
+
+   nn.Module.Net.forward main.py:60 (calls: 10, dispatches: 90, total: 42.80 ms, dispatch_mean: 0.48 ms, dispatch_min: 0.01 ms, dispatch_max: 2.10 ms)
+      ├─ aten::convolution (calls: 20)
+      |  └─ conv2d_fwd (id 0) (dispatches: 40, total: 27.08 ms)
+      ├─ aten::addmm (calls: 20)
+      |  └─ gemm (id 1) (dispatches: 20, total: 15.41 ms)
+      └─ aten::relu (calls: 40)
+         └─ relu_kernel (id 2) (dispatches: 30, total: 0.31 ms)
+
+   Operator summary (Min/Max/Mean are per-dispatch over the subtree; sorted by Total):
+   ╒══════════════════════════════════════════════════╤═════════╤══════════════╤══════════╤═══════════╤═════════════╤═════════╤═════════╤═════════╕
+   │ Operator                                         │   Calls │   Dispatches │    Total │   % Total │   Mean/Call │    Mean │     Min │     Max │
+   ╞══════════════════════════════════════════════════╪═════════╪══════════════╪══════════╪═══════════╪═════════════╪═════════╪═════════╪═════════╡
+   │ nn.Module.Net.forward                            │      10 │           90 │ 42.80 ms │    100.00 │     4.28 ms │ 0.48 ms │ 0.01 ms │ 2.10 ms │
+   ├──────────────────────────────────────────────────┼─────────┼──────────────┼──────────┼───────────┼─────────────┼─────────┼─────────┼─────────┤
+   │ nn.Module.Net.forward/aten::convolution          │      20 │           40 │ 27.08 ms │     63.27 │     1.35 ms │ 0.68 ms │ 0.21 ms │ 2.10 ms │
+   ├──────────────────────────────────────────────────┼─────────┼──────────────┼──────────┼───────────┼─────────────┼─────────┼─────────┼─────────┤
+   │ nn.Module.Net.forward/aten::addmm                │      20 │           20 │ 15.41 ms │     36.00 │     0.77 ms │ 0.77 ms │ 0.13 ms │ 1.82 ms │
+   ├──────────────────────────────────────────────────┼─────────┼──────────────┼──────────┼───────────┼─────────────┼─────────┼─────────┼─────────┤
+   │ nn.Module.Net.forward/aten::relu                 │      40 │           30 │  0.31 ms │      0.72 │     7.70 us │ 0.01 ms │ 0.01 ms │ 0.02 ms │
+   ╘══════════════════════════════════════════════════╧═════════╧══════════════╧══════════╧═══════════╧═════════════╧═════════╧═════════╧═════════╛
+
+The call tree is sorted by GPU time. Repeated calls that ran the same
+operators and kernels are shown once, with their combined counts. Each
+operator shows the source file and line it was called from, when available,
+and each kernel appears under the operator that launched it. See
+:ref:`torch-operator-profiling` for how operators are captured.
+
+The flat **Operator summary** table below the call tree has one row per
+operator that ran at least one GPU kernel. Time cells auto-switch between
+milliseconds and microseconds per cell; missing values render as ``N/A``.
+
+* **Operator** — the operator's full call path (for example
+  ``nn.Module.Net.forward/aten::addmm``).
+* **Calls** — how many times the operator was called.
+* **Dispatches** — how many GPU kernels ran while the operator was on the
+  call stack (kernels launched by operators it called also count).
+* **Total** — total GPU time spent while the operator was on the call
+  stack.
+* **% Total** — share of the workload's total GPU time spent while this
+  operator was on the call stack. Because the same kernel time is counted
+  for an operator and for any operator that called it, the column can add
+  up to more than 100%. ``N/A`` when no GPU time was recorded.
+* **Mean/Call** — average GPU time per call to this operator.
+* **Mean / Min / Max** — per-kernel-dispatch timings across all kernels
+  launched while this operator was on the call stack.
+
+When no operator has any recorded dispatches, the table is replaced by the
+line ``Operator summary: (no operators with recorded dispatches)``.
+
+.. _operator-filtering:
+
+Filtering by Operator
+---------------------
+
+``--torch-operator`` selects PyTorch operators with shell-style glob patterns.
+A pattern can match an operator's name or its full call path, such as
+``nn.Module.Net.forward/aten::addmm``. Matching is case-sensitive.
+
+* **Wildcard** — ``*relu*`` matches any operator whose name contains ``relu``.
+* **Call path** — ``*/aten::addmm`` matches ``aten::addmm`` when another
+  operator calls it.
+* **Exact** — ``aten::addmm``
+* **Match all** — no arguments, ``all``, ``*``, or ``**``
+
+rocprof-compute prints the call tree of the matching operators. The metric
+tables then cover only the kernels that those operators launched. To narrow
+the metric tables further:
+
+* ``-k`` keeps only the listed kernels. Use the ``(id N)`` shown next to each
+  kernel in the operator tree.
+* ``-d`` keeps only the listed dispatches that the matching operators
+  launched.
+* ``--list-stats`` lists only the kernels that the matching operators
+  launched.
+
+These options do not change the printed operator tree. Kernel IDs depend on
+``-d``, so use the same ``-d`` when you look up a kernel ID.
+
+.. code-block:: shell-session
+
+   # Wildcard match
+   $ rocprof-compute analyze --experimental --torch-operator "*relu*" --path ./workload
+
+   # Path match
+   $ rocprof-compute analyze --experimental --torch-operator "*/aten::addmm" --path ./workload
+
+   # Match all operators (no arguments)
+   $ rocprof-compute analyze --experimental --torch-operator --path ./workload
+
+**Filter multiple operators** (space or comma separated):
+
+.. code-block:: shell-session
+
+   $ rocprof-compute analyze --experimental \
+       --torch-operator "*relu*,*addmm*" --path ./workload
+
+
+Triton operator analysis
+========================
+
+.. warning::
+
+   Triton operator analysis requires ``--experimental``. After profiling with
+   ``--experimental --triton-trace`` (see :ref:`triton-trace`), use
+   ``rocprof-compute analyze ... --experimental`` with
+   ``--list-triton-operators`` or ``--triton-operator`` as needed.
+
+Triton kernels are analyzed the same way as PyTorch operators.
+``--list-triton-operators`` and ``--triton-operator`` report only the kernels
+that Triton launched, even when the same run also captured PyTorch operators.
+
+List all captured Triton kernels
+---------------------------------
+
+Display all Triton kernels captured during profiling:
+
+.. code-block:: shell-session
+
+   $ rocprof-compute analyze --experimental --list-triton-operators --path ./workload
+
+   ================================================================================
+   Triton Operator Call Tree: ./workload
+   Sorted by total GPU kernel duration.
+   ================================================================================
+
+   triton.JITFunction.matmul_kernel triton_ffn.py:120 (calls: 1, dispatches: 2, total: 0.03 ms, dispatch_mean: 0.01 ms, dispatch_min: 4.40 us, dispatch_max: 0.02 ms)
+   └─ triton.CompiledKernel.matmul_kernel triton_ffn.py:120 (calls: 1, dispatches: 2, total: 0.03 ms, dispatch_mean: 0.01 ms, dispatch_min: 4.40 us, dispatch_max: 0.02 ms)
+      ├─ matmul_kernel (id 0) (dispatches: 1, total: 0.02 ms)
+      └─ __amd_rocclr_initHeap (id 7) (dispatches: 1, total: 4.40 us)
+
+   ...
+
+   Operator summary (Min/Max/Mean are per-dispatch over the subtree; sorted by Total):
+   ╒════════════════════════════════════════════════════════════════════════╤═════════╤══════════════╤═════════╤═══════════╤═════════════╤═════════╤═════════╤═════════╕
+   │ Operator                                                               │   Calls │   Dispatches │   Total │   % Total │   Mean/Call │    Mean │     Min │     Max │
+   ╞════════════════════════════════════════════════════════════════════════╪═════════╪══════════════╪═════════╪═══════════╪═════════════╪═════════╪═════════╪═════════╡
+   │ triton.JITFunction.matmul_kernel                                       │     9.0 │         10.0 │ 0.30 ms │     88.81 │     0.03 ms │ 0.03 ms │ 4.40 us │ 0.06 ms │
+   ├────────────────────────────────────────────────────────────────────────┼─────────┼──────────────┼─────────┼───────────┼─────────────┼─────────┼─────────┼─────────┤
+   │ triton.JITFunction.matmul_kernel/triton.CompiledKernel.matmul_kernel   │     9.0 │         10.0 │ 0.30 ms │     88.81 │     0.03 ms │ 0.03 ms │ 4.40 us │ 0.06 ms │
+   ├────────────────────────────────────────────────────────────────────────┼─────────┼──────────────┼─────────┼───────────┼─────────────┼─────────┼─────────┼─────────┤
+   │ ...                                                                    │         │              │         │           │             │         │         │         │
+   ╘════════════════════════════════════════════════════════════════════════╧═════════╧══════════════╧═════════╧═══════════╧═════════════╧═════════╧═════════╧═════════╛
+
+Filter the Triton kernels
+-------------------------
+
+``--triton-operator`` uses the same patterns and options as
+``--torch-operator``; see :ref:`operator-filtering`.
+
+.. code-block:: shell-session
+
+   # Wildcard match
+   $ rocprof-compute analyze --experimental --triton-operator "*rmsnorm_kernel*" --path ./workload
+
+   # Filter multiple kernels (space or comma separated)
+   $ rocprof-compute analyze --experimental \
+       --triton-operator "*matmul*,*rmsnorm_kernel*" --path ./workload
