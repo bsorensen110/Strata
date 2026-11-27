@@ -634,7 +634,7 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_state_replay_kernel(float* _
         for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
     }
 }
-template<bool OUT>
+template<bool OUT, bool COMMIT = false>
 __global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_groups_kernel(GdnGroups grp,
                                                                              const float* __restrict__ hbuf, int C,
                                                                              const float* __restrict__ gate,
@@ -661,12 +661,12 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_groups_kernel(Gdn
     const int qh = head % h_k;
     const int qk = S * h_k;
     const int value_dim = S * h_v;
-    const int n = OUT ? T : (n_keep ? *n_keep : T);
+    const int n = (!OUT || COMMIT) ? (n_keep ? *n_keep : T) : T;
     float s[RPG];
     float* base = state + ((size_t) (rg * RPG) * h_v + head) * S + col;
     const size_t row_stride = (size_t) h_v * S;
 #pragma unroll
-    for (int r = 0; r < RPG; ++r) s[r] = OUT ? __ldg(&base[r * row_stride]) : base[r * row_stride];
+    for (int r = 0; r < RPG; ++r) s[r] = (OUT && !COMMIT) ? __ldg(&base[r * row_stride]) : base[r * row_stride];
     if (n > 0) {
         sk[0][tid] = hbuf[qk + qh * S + tid];
         sq[0][tid] = OUT ? hbuf[qh * S + tid] : 0.0f;
@@ -708,9 +708,11 @@ __global__ void __launch_bounds__(GS_COLS * RG) gdn_step_split_groups_kernel(Gdn
             y[(size_t) t * value_dim + head * S + col] =
                 (red_o[0][lc] + red_o[1][lc] + red_o[2][lc] + red_o[3][lc]) * rsqrtf((float) S);
     }
-    if (!OUT && n_keep != nullptr && n > 0) {
+    if constexpr (!OUT || COMMIT) {
+        if (n_keep != nullptr && n > 0) {
 #pragma unroll
-        for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+            for (int r = 0; r < RPG; ++r) base[r * row_stride] = s[r];
+        }
     }
 }
 
@@ -1573,7 +1575,7 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
 
 void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_channels, const float* gate, const float* beta,
                           const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
-                          void* stream, int t_out_begin, void* xq_out, void* xq_il_out) {
+                          void* stream, int t_out_begin, void* xq_out, void* xq_il_out, bool self_commit_out) {
     if (groups.n < 1 || groups.n > 8 || !h || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k) {
         std::fprintf(stderr, "gdn_step_norm_groups: invalid arguments\n");
         std::exit(1);
@@ -1594,12 +1596,16 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
     GdnQ81* const xq = static_cast<GdnQ81*>(xq_out);
     if (gsplit) {
         const dim3 grid((unsigned) h_v, S / GS_COLS, (unsigned) groups.n), block(GS_COLS, RG);
-        if (commit) {
-            gdn_step_split_groups_kernel<false><<<grid, block, 0, (cudaStream_t) stream>>>(
+        if (commit && !self_commit_out) {
+            gdn_step_split_groups_kernel<false, true><<<grid, block, 0, (cudaStream_t) stream>>>(
                 groups, h, conv_channels, gate, beta, y, h_k, h_v);
         } else {
-            gdn_step_split_groups_kernel<true><<<grid, block, 0, (cudaStream_t) stream>>>(
-                groups, h, conv_channels, gate, beta, y, h_k, h_v);
+            if (commit)
+                gdn_step_split_groups_kernel<true, true><<<grid, block, 0, (cudaStream_t) stream>>>(
+                    groups, h, conv_channels, gate, beta, y, h_k, h_v);
+            else
+                gdn_step_split_groups_kernel<true, false><<<grid, block, 0, (cudaStream_t) stream>>>(
+                    groups, h, conv_channels, gate, beta, y, h_k, h_v);
             const dim3 ng((unsigned) h_v, (unsigned) max_t, (unsigned) groups.n);
             if (xq != nullptr)
                 gdn_out_norm_groups_kernel<true><<<ng, dim3(S, RG), 0, (cudaStream_t) stream>>>(
@@ -1612,12 +1618,20 @@ void gdn_step_norm_groups(const GdnGroups& groups, const float* h, int conv_chan
         return;
     }
     const dim3 g1((unsigned) h_v, (unsigned) groups.n), b1(S, RG);
-    // the kernel gdn_step_norm_multi picks for these calls: a window's rows (all outputs, no keep) or a commit of
-    // one-row groups (keep, t_out_begin 0)
-    if (commit)
+    // the kernel gdn_step_norm_multi picks for these calls: a window's rows (all outputs, no keep), a self-committing
+    // batch window (keep + outputs), or a commit of one-row groups (keep, no outputs)
+    if (commit && !self_commit_out)
         gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
             nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
-    else if (xq != nullptr)
+    else if (commit) {
+        if (xq != nullptr)
+            gdn_step_norm_multi_kernel<false, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, t_out_begin, xq, groups,
+                make_gdn_q81_il(xq_il_out, S * h_v, out_tok));
+        else
+            gdn_step_norm_multi_kernel<false, false><<<g1, b1, 0, (cudaStream_t) stream>>>(
+                nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, 0, nullptr, groups);
+    } else if (xq != nullptr)
         gdn_step_norm_multi_kernel<true, true><<<g1, b1, 0, (cudaStream_t) stream>>>(
             nullptr, h, conv_channels, gate, beta, z, gamma, eps, y, h_k, h_v, 0, nullptr, t_out_begin, xq, groups,
             make_gdn_q81_il(xq_il_out, S * h_v, out_tok));

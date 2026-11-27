@@ -2276,7 +2276,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     strata::kernels::gdn_step_norm_groups(gg, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS,
                                                           y_, (int) HK, (int) HV, keep_rows, cs, tb,
                                                           gdn_q_done ? (void*) xq_ : nullptr,
-                                                          (gdn_q_done && use_quant_il_wout) ? (void*) xil_ : nullptr);
+                                                          (gdn_q_done && use_quant_il_wout) ? (void*) xil_ : nullptr,
+                                                          keep_rows);
                 } else
                 if (batch_rec_) {   // each slot's recurrence over its own proposed-token group
                     for (int t = tb; t < te;) {

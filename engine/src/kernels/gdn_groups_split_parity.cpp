@@ -53,7 +53,7 @@ void report(const char* what, bool ok) {
     if (!ok) ++bad;
 }
 
-void gdn_groups_case(const std::vector<int>& ntok, bool commit, bool with_qfuse) {
+void gdn_groups_case(const std::vector<int>& ntok, bool commit, bool with_qfuse, bool self_commit_out = false) {
     const int S = 128, h_k = 16, h_v = 48;
     const int qk = S * h_k, C = 2 * qk + S * h_v, vd = S * h_v;
     const float eps = 1e-6f;
@@ -102,9 +102,10 @@ void gdn_groups_case(const std::vector<int>& ntok, bool commit, bool with_qfuse)
     ck(cudaMemset(d_yr, 0, (size_t) T * vd * 4), "memset yr");
 
     const size_t xq_bytes = (size_t) T * (vd / 32) * 36;
+    const bool want_out = !commit || self_commit_out;
     const size_t xq_il_bytes = k::native_q8_1_il_bytes(vd, T);
     uint8_t *d_xq = nullptr, *d_xq_r = nullptr, *d_il = nullptr, *d_il_r = nullptr;
-    if (with_qfuse && !commit) {
+    if (with_qfuse && want_out) {
         ck(cudaMalloc(&d_xq, xq_bytes), "malloc xq");
         ck(cudaMalloc(&d_xq_r, xq_bytes), "malloc xq r");
         ck(cudaMalloc(&d_il, xq_il_bytes), "malloc il");
@@ -117,14 +118,15 @@ void gdn_groups_case(const std::vector<int>& ntok, bool commit, bool with_qfuse)
 
     cudaStream_t st = nullptr;
     ck(cudaStreamCreate(&st), "stream");
-    k::gdn_step_norm_groups(gg, d_h, C, d_gate, d_beta, d_z, d_gm, eps, d_y, h_k, h_v, commit, st, 0, d_xq, d_il);
+    k::gdn_step_norm_groups(gg, d_h, C, d_gate, d_beta, d_z, d_gm, eps, d_y, h_k, h_v, commit, st, 0, d_xq, d_il,
+                            self_commit_out);
     for (int i = 0; i < G; ++i) {
         const int f = gg.first[i];
         k::gdn_step_norm_multi(st_r[i], d_h + (size_t) f * C, C, d_gate + (size_t) f * h_v,
                                d_beta + (size_t) f * h_v, d_z + (size_t) f * vd, d_gm, eps,
                                d_yr + (size_t) f * vd, h_k, h_v, ntok[i], commit ? keep[i] : nullptr, st, 0);
     }
-    if (with_qfuse && !commit) k::native_quantize_q8_1_il(d_yr, d_xq_r, d_il_r, vd, T, st);
+    if (with_qfuse && want_out) k::native_quantize_q8_1_il(d_yr, d_xq_r, d_il_r, vd, T, st);
     ck(cudaStreamSynchronize(st), "sync");
     cudaStreamDestroy(st);
 
@@ -134,11 +136,11 @@ void gdn_groups_case(const std::vector<int>& ntok, bool commit, bool with_qfuse)
         same = same && std::memcmp(a.data(), b.data(), st_n * 4) == 0;
         if (!commit) same = same && std::memcmp(a.data(), st0[i].data(), st_n * 4) == 0;
     }
-    if (!commit && !with_qfuse) {
+    if (want_out && !with_qfuse) {
         const auto a = down(d_y, (size_t) T * vd), b = down(d_yr, (size_t) T * vd);
         same = same && std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
     }
-    if (!commit && with_qfuse) {
+    if (want_out && with_qfuse) {
         const auto q_a = down(d_xq, xq_bytes), q_b = down(d_xq_r, xq_bytes);
         const auto il_a = down(d_il, xq_il_bytes), il_b = down(d_il_r, xq_il_bytes);
         same = same && std::memcmp(q_a.data(), q_b.data(), xq_bytes) == 0;
@@ -149,7 +151,7 @@ void gdn_groups_case(const std::vector<int>& ntok, bool commit, bool with_qfuse)
     for (int i = 0; i < G && i < 8; ++i)
         std::snprintf(rows + std::strlen(rows), sizeof rows - std::strlen(rows), "%s%d", i ? "," : "", ntok[i]);
     std::snprintf(name, sizeof name, "gdn_step_norm_groups(split) %s%s [%s]",
-                  commit ? "commit" : "window", with_qfuse ? "+qfuse" : "", rows);
+                  self_commit_out ? "self-commit" : (commit ? "commit" : "window"), with_qfuse ? "+qfuse" : "", rows);
     report(name, same);
 
     for (int i = 0; i < G; ++i) { cudaFree(st_g[i]); cudaFree(st_r[i]); cudaFree(keep[i]); }
@@ -214,6 +216,8 @@ int main() {
     gdn_groups_case({4, 4}, false, true);
     gdn_groups_case({1, 2, 2, 3}, false, false);
     gdn_groups_case({1, 2, 2, 3}, true, false);
+    gdn_groups_case({1, 1, 1, 1}, true, false, true);
+    gdn_groups_case({1, 1, 1, 1}, true, true, true);
     if constexpr (k::kWindowMaxT > 8) {
         gdn_groups_case({4, 5}, false, false);
         gdn_groups_case({4, 5}, false, true);
@@ -226,6 +230,8 @@ int main() {
         gdn_groups_case({2, 2, 2, 2, 2, 2, 2, 2}, false, false);
         gdn_groups_case({2, 2, 2, 2, 2, 2, 2, 2}, false, true);
         gdn_groups_case({2, 2, 2, 2, 2, 2, 2, 2}, true, false);
+        gdn_groups_case({1, 1, 1, 1, 1, 1, 1, 1}, true, false, true);
+        gdn_groups_case({1, 1, 1, 1, 1, 1, 1, 1}, true, true, true);
     }
     std::printf("gdn_groups_split_parity: %s\n", bad ? "FAILED" : "ok");
     return bad ? 1 : 0;
