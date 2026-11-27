@@ -575,6 +575,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             // inject rows stay bf16 (82 KB).
             for (auto& [name, ref] : table.table_) {
                 if (ref.hc_q8 != nullptr || hc_q8_seen.count(name) != 0 || outside(name) ||
+                    (hc_q8_stage_local() && !in_range(name)) ||
                     !hc_q8_name(name) || !(name.ends_with("_down.weight") || name.ends_with("_up.weight"))) continue;
                 const bool skipped = ref.data == nullptr;
                 if (skipped && ref.resident) continue;
@@ -590,28 +591,26 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
 
         int hc_dev = 0;
         bool need_hc_scratch = false;
-        size_t hc_scratch_slice[2][2] = {};
+        uint64_t hc_scratch_elems = 0;
         if (use_hc_q8) {   // the scratches of hc_bf16_view (rows without a bf16 copy), here and not on first use
-            uint64_t elems = 0;
             for (const auto& [name, ref] : table.table_)
                 if ((ref.hc_q8 != nullptr || hc_q8_seen.count(name) != 0) && ref.data == nullptr)
-                    elems = (std::max)(elems, (uint64_t) ref.elements);
-            if (elems != 0 && cudaGetDevice(&hc_dev) == cudaSuccess && hc_dev >= 0 && hc_dev < 64 &&
+                    hc_scratch_elems = (std::max)(hc_scratch_elems, (uint64_t) ref.elements);
+            if (hc_scratch_elems != 0 && cudaGetDevice(&hc_dev) == cudaSuccess && hc_dev >= 0 && hc_dev < 64 &&
                 g_hc_scratch[hc_dev][0][0] == nullptr) {
                 need_hc_scratch = true;
-                for (int c = 0; c < 2; ++c)
-                    for (int i = 0; i < 2; ++i)
-                        hc_scratch_slice[c][i] = add_slice(elems * 2);
             }
         }
         const size_t scratch_bytes = strata::kernels::native_q8_1_bytes(max_in);
-        const size_t scratch_slice = add_slice((uint64_t) scratch_bytes);
         const ArenaPlan plan = plan_arena(slice_sizes);
 
         // Allocate each slice separately unless the arena is explicitly requested.
+        // Weight-independent scratch buffers stay outside slice_sizes/allocated_ so allocated_bytes() matches
+        // weight_bytes_for() exactly while still being owned and freed by release().
         void* raw_arena = nullptr;
         DevicePtr arena;
         std::vector<DevicePtr> owned_slices;
+        owned_slices.reserve((dense_arena_on() ? 0 : slice_sizes.size()) + 1 + (need_hc_scratch ? 4 : 0));
         std::vector<void*> slices;
         uint64_t allocated = 0;
         if (dense_arena_on()) {
@@ -622,7 +621,6 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 slices.push_back(static_cast<uint8_t*>(raw_arena) + plan.offsets[i]);
             allocated = plan.allocated_bytes;
         } else {
-            owned_slices.reserve(slice_sizes.size());
             slices.reserve(slice_sizes.size());
             for (uint64_t bytes : slice_sizes) {
                 void* p = nullptr;
@@ -632,6 +630,21 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 slices.push_back(p);
                 allocated += alloc_bytes(bytes);
             }
+        }
+        void* scratch_ptr = nullptr;
+        {
+            const auto st = cudaMalloc(&scratch_ptr, scratch_bytes);
+            if (st != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(st); return false; }
+            owned_slices.emplace_back(scratch_ptr);
+        }
+        void* hc_scratch_ptrs[2][2] = {};
+        if (need_hc_scratch) {
+            for (int c = 0; c < 2; ++c)
+                for (int i = 0; i < 2; ++i) {
+                    const auto st = cudaMalloc(&hc_scratch_ptrs[c][i], (size_t) (hc_scratch_elems * 2));
+                    if (st != cudaSuccess) { err = std::string("native dense (STRATA_HC_Q8): scratch allocation: ") + cudaGetErrorString(st); return false; }
+                    owned_slices.emplace_back(hc_scratch_ptrs[c][i]);
+                }
         }
         uint64_t packed_bytes = 0, inplace_bytes = 0;
         size_t packed_count = 0, inplace_count = 0;
@@ -739,7 +752,6 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         }
 
         // All checks, uploads, events, and registrations finished before publishing references.
-        void* const scratch_ptr = slices[scratch_slice];
         for (const auto& d : dense_specs) {
             void* data_ptr = slices[d.data_slice];
             d.ref->native_data = data_ptr;
@@ -758,7 +770,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         if (need_hc_scratch) {
             for (int c = 0; c < 2; ++c)
                 for (int i = 0; i < 2; ++i)
-                    g_hc_scratch[hc_dev][c][i] = slices[hc_scratch_slice[c][i]];
+                    g_hc_scratch[hc_dev][c][i] = hc_scratch_ptrs[c][i];
         }
         if (packed_count)
             std::fprintf(stderr, "native dense: STRATA_Q8_PACKED=1 packed %zu Q8_0 matrices for decode (+%.1f MiB)\n",

@@ -472,7 +472,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(native_dense_arena_test PRIVATE strata_engine)
     add_test(NAME native_dense_arena_test COMMAND native_dense_arena_test)
     set_tests_properties(native_dense_arena_test PROPERTIES TIMEOUT 60
-                         ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HIP_VISIBLE_DEVICES=-1")
+                         ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HIP_VISIBLE_DEVICES=-1;STRATA_NATIVE_DENSE_ARENA=1")
   endif()
   if(STRATA_BUILD_CONVERSATION_TESTS)
     add_executable(conversation_snapshot_test src/core/conversation_snapshot_test.cpp)

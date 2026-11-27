@@ -73,9 +73,11 @@ int main() {
 #if defined(_WIN32)
     _putenv_s("CUDA_VISIBLE_DEVICES", "-1");
     _putenv_s("HIP_VISIBLE_DEVICES", "-1");
+    _putenv_s("STRATA_NATIVE_DENSE_ARENA", "1");
 #else
     setenv("CUDA_VISIBLE_DEVICES", "-1", 1);
     setenv("HIP_VISIBLE_DEVICES", "-1", 1);
+    setenv("STRATA_NATIVE_DENSE_ARENA", "1", 0);
 #endif
 
     constexpr uint64_t MiB = 1ull << 20;
