@@ -6200,6 +6200,85 @@ class SilentEngine(unittest.TestCase):
         self.assertIn("frozen", str(cm.exception))
         engine.proc.kill.assert_called_once()
 
+    def bare_batched(self, silence, slots=2):
+        import collections
+        import queue
+        engine = self.bare(silence)
+        engine.gen = 1
+        engine.batch = slots
+        engine.info = {"batch_slots": slots}
+        engine.slot_order = list(range(slots))
+        engine.slot_group = [0] * slots
+        engine.slot_groups = 1
+        engine.slot_gs = 0
+        engine.slot_q = [queue.Queue() for _ in range(slots)]
+        engine.slot_busy = [False] * slots
+        engine.slot_claims = set()
+        engine.slot_releasing = set()
+        engine._orphan_seen = {}
+        engine.slot_held = [[] for _ in range(slots)]
+        engine.slot_used = [0.0] * slots
+        engine.slot_live = [None] * slots
+        engine.slot_cv = threading.Condition()
+        engine.waiting = 0
+        engine._preparing = 0
+        engine.admitting = 0
+        engine.par_counters = {"queued": 0, "queue_wait_s": 0.0}
+        engine.wait_lens = []
+        engine.arrivals = collections.deque(maxlen=64)
+        engine.ctl_epoch = 0
+        engine.ctl = threading.Lock()
+        engine._ctl_erred = False
+        engine._yielded = None
+        engine.wlock = threading.Lock()
+        engine.max_prompt = 0
+        engine.ended = False
+        engine.closing = False
+        engine.last = None
+        engine.progress = None
+        engine.progress_ms = 0
+        return engine
+
+    def test_frozen_batched_control_is_ended_by_the_stall_watchdog(self):
+        from serve import server
+        from serve.server import EngineSilent
+        engine = self.bare_batched(300.0)
+        engine.lines.put("T 5")
+        engine._activity = lambda: (12.0, 4096)
+        with mock.patch.object(server, "ENGINE_STALL_S", 1.0):
+            gen = engine.generate([1], 10, {}, threading.Event())
+            self.assertEqual(next(gen), 5)
+            t0 = time.monotonic()
+            with self.assertRaises(EngineSilent) as cm:
+                next(gen)
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertIn("frozen", str(cm.exception))
+        engine.proc.kill.assert_called_once()
+        self.assertFalse(engine.ctl.locked())
+
+    def test_frozen_batched_slot_is_ended_by_the_stall_watchdog(self):
+        from serve import server
+        from serve.server import EngineSilent
+        engine = self.bare_batched(300.0)
+        engine.slot_busy[1] = True                              # force BGEN admission onto slot 0
+        engine.lines.put("T 5")
+        engine.lines.put("DONE 1 1 1 1 length")
+        engine.lines.put("BADM 0 1")
+        engine._activity = lambda: (12.0, 4096)
+        with mock.patch.object(server, "ENGINE_STALL_S", 1.0):
+            gen = engine.generate([1], 10, {}, threading.Event())
+            self.assertEqual(next(gen), 5)
+            engine.slot_q[0].put("BT 0 6")
+            self.assertEqual(next(gen), 6)
+            t0 = time.monotonic()
+            with self.assertRaises(EngineSilent) as cm:
+                next(gen)
+        self.assertLess(time.monotonic() - t0, 10)
+        self.assertIn("frozen", str(cm.exception))
+        engine.proc.kill.assert_called_once()
+        self.assertFalse(engine.slot_busy[0])
+        self.assertFalse(engine.ctl.locked())
+
     def test_a_working_silent_engine_is_not_ended_by_the_stall_watchdog(self):
         from serve import server
         engine = self.bare(300.0)

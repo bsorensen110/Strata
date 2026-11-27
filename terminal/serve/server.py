@@ -1494,6 +1494,9 @@ class StrataEngine:
         line here, for the request itself (its own lines: the engine's is shared by the slots' readers)."""
         stopped = False
         beat = time.monotonic()
+        heard = beat
+        stall_s = ENGINE_STALL_S or 0.0
+        stall_state: dict = {}
         held = NO_LINE                               # a line read while looking for a token's LP line
         lines_q = self.lines if lines_q is None else lines_q   # #4451: the request's own engine's lines (a restart makes new ones)
 
@@ -1514,11 +1517,16 @@ class StrataEngine:
                         stopped = True
                     if on_quiet is not None:
                         on_quiet()
+                    if stall_s > 0:
+                        self._stall_check(heard, stall_state, stall_s)
                     if time.monotonic() - beat >= 10.0:
                         beat = time.monotonic()
                         yield None
                     continue
             beat = time.monotonic()
+            heard = beat
+            if stall_state:
+                stall_state.clear()
             if line is None:
                 raise self._engine_died()
             if not line.startswith(("PP ", "INFO")):
@@ -2083,15 +2091,19 @@ class StrataEngine:
                                     self.slot_claims.add(reserved)
                             if reserved is not None:
                                 self._send_for(born, f"BYIELD {reserved}")
-                    for x in self._control(cancel, arrived, stop_when=others, on_quiet=give_way,
-                                           want_lp=want_lp, lines_q=lines_q):
-                        while pending:
-                            t = pending.pop(0)
-                            out.append(t)
-                            yield t
-                        if x is None:                       # a heartbeat (False: a token, flushed above)
-                            give_way()
-                            yield None
+                    try:
+                        for x in self._control(cancel, arrived, stop_when=others, on_quiet=give_way,
+                                               want_lp=want_lp, lines_q=lines_q):
+                            while pending:
+                                t = pending.pop(0)
+                                out.append(t)
+                                yield t
+                            if x is None:                       # a heartbeat (False: a token, flushed above)
+                                give_way()
+                                yield None
+                    except EngineSilent:
+                        phase = "none"
+                        raise
                     phase = "none"                          # its DONE is read
                     while pending:
                         t = pending.pop(0)
@@ -2237,6 +2249,9 @@ class StrataEngine:
                                 ask()
                                 note_progress()
                                 yield None
+                    except EngineSilent:
+                        phase = "none"
+                        raise
                     except ValueError as e:
                         # #1994: the engine says this slot is not free (its view and ours differ for a moment, or a
                         # slot it still holds).  That is not the request's fault and nothing was read: park the slot
@@ -2281,9 +2296,14 @@ class StrataEngine:
                             generated=len(out))
                 gen0 = len(out) - 1 if adm_tok else len(out)   # the admission's own token: the slot feeds it first
                 going_solo = False
+                stall_s = ENGINE_STALL_S or 0.0
+                heard = time.monotonic()
+                beat = heard
+                stall_state: dict = {}
+                wait = 10.0 if stall_s <= 0 else min(10.0, max(0.25, stall_s / 2))
                 while True:
                     try:
-                        line = sq[slot].get(timeout=10.0)
+                        line = sq[slot].get(timeout=wait)
                     except queue.Empty:
                         if self.gen != born:                # #4451: the engine it was admitted on is gone (and so is its slot)
                             phase = "none"
@@ -2291,8 +2311,20 @@ class StrataEngine:
                         if cancel.is_set() and not stop_sent:
                             self._send_for(born, f"BSTOP {slot}")
                             stop_sent = True
-                        yield None
+                        if stall_s > 0:
+                            try:
+                                self._stall_check(heard, stall_state, stall_s)
+                            except EngineSilent:
+                                phase = "none"
+                                raise
+                        if time.monotonic() - beat >= 10.0:
+                            beat = time.monotonic()
+                            yield None
                         continue
+                    heard = time.monotonic()
+                    beat = heard
+                    if stall_state:
+                        stall_state.clear()
                     if line is None:
                         phase = "none"
                         raise self._engine_died()
