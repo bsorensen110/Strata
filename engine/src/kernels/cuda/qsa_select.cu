@@ -2418,14 +2418,22 @@ bool qsa_block_scores_rows(const float* pooled, const float* dead, const float* 
     return true;
 }
 
-void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const int32_t* steps, int64_t nq,
-                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
-    if (nq <= 0) return;
+static bool qsa_scores_16_enabled() noexcept {
     static const bool wide16 = [] {
         const char* v = std::getenv("STRATA_QSA_SCORES_16");
         return v == nullptr || v[0] == '\0' || std::atoi(v) != 0;
     }();
-    const int64_t limit = (wide16 && kWindowMaxT > MQ) ? kWindowMaxT : MQ;
+    return wide16;
+}
+
+int qsa_block_scores_rows_max() noexcept {
+    return (qsa_scores_16_enabled() && kWindowMaxT > MQ) ? kWindowMaxT : MQ;
+}
+
+void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream) {
+    if (nq <= 0) return;
+    const int64_t limit = qsa_block_scores_rows_max();
     if (s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R || nq > limit || rows.n != nq) {
         std::fprintf(stderr, "qsa_block_scores_rows: unsupported geometry\n");
         std::exit(1);

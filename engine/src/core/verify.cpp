@@ -2544,15 +2544,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                             return;
                         }
                         if (rows_ok) {
-                            strata::kernels::QsaScoreRows sr;
-                            sr.n = n_rows;
-                            for (int t = tb; t < te; ++t) {
-                                const QsaState& sx = slot_ss(t).qsa_states[qi];
-                                sr.pooled[t - tb] = sx.idx_pooled;
-                                sr.dead[t - tb] = sx.idx_dead;
+                            const int step = std::min(n_rows, strata::kernels::qsa_block_scores_rows_max());
+                            for (int t0 = tb; t0 < te; t0 += step) {
+                                const int m = std::min(te - t0, step);
+                                strata::kernels::QsaScoreRows sr;
+                                sr.n = m;
+                                for (int t = t0; t < t0 + m; ++t) {
+                                    const QsaState& sx = slot_ss(t).qsa_states[qi];
+                                    sr.pooled[t - t0] = sx.idx_pooled;
+                                    sr.dead[t - t0] = sx.idx_dead;
+                                }
+                                qsa_block_scores_rows(sr, qidx_ + t0 * IQ * ID, step_ + t0 * kStepCount, m,
+                                                      max_blocks_, s, scores_ + (size_t) t0 * max_blocks_, ns);
                             }
-                            qsa_block_scores_rows(sr, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n_rows,
-                                                  max_blocks_, s, scores_ + (size_t) tb * max_blocks_, ns);
                             qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n_rows,
                                            max_blocks_, cap_, s, sel_ + (size_t) tb * cap_, ns);
                             return;

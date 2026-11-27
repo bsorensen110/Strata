@@ -31,8 +31,9 @@ struct QsaScoreRows {
     const float* dead[kWindowMaxT] = {};
     int n = 0;
 };
-/// qsa_block_scores for up to 8 queries of DIFFERENT sequences in one launch (the multi kernel, per query its own
-/// keys; the same arithmetic in the same order: bit-identical scores).
+/// qsa_block_scores for up to qsa_block_scores_rows_max() queries of DIFFERENT sequences in one launch (the multi
+/// kernel, per query its own keys; the same arithmetic in the same order: bit-identical scores).
+int qsa_block_scores_rows_max() noexcept;
 void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const int32_t* steps, int64_t nq,
                            int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
 void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
