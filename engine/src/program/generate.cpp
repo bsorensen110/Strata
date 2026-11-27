@@ -16152,7 +16152,17 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
-            if (aov) {   // 0.1.43: the copies go in layer order and each layer's landing is told to the verify window
+            // the copies back read the cache of the card that owns each layer (see resident_stage_swaps)
+            auto home_of = [&](int64_t layer) -> SwapHome {
+                const int stn = multi_gpu ? stage_of(layer) : 0;
+                if (stn > 0) {
+                    GpuStage* gs = stages[(size_t) stn - 1].get();
+                    return {&gs->cache, gs->adapt_stream, gs->dev};
+                }
+                return {&xcache, adapt_stream, -1};
+            };
+            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
+            if (aov) {   // 0.1.43: populate agate after exchange_capacity filtering so dropped swaps never hang adapt_gate_wait
                 std::stable_sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.layer < b.layer; });
                 agate.landed.store(-1, std::memory_order_release);
                 if (agate.hland != nullptr) *agate.hland = -1;
@@ -16164,16 +16174,6 @@ int main(int argc, char** argv) {
                 agate.peer_has.assign((size_t) g.n_layers, 0);
                 agate.peer_last = -1;
             }
-            // the copies back read the cache of the card that owns each layer (see resident_stage_swaps)
-            auto home_of = [&](int64_t layer) -> SwapHome {
-                const int stn = multi_gpu ? stage_of(layer) : 0;
-                if (stn > 0) {
-                    GpuStage* gs = stages[(size_t) stn - 1].get();
-                    return {&gs->cache, gs->adapt_stream, gs->dev};
-                }
-                return {&xcache, adapt_stream, -1};
-            };
-            if (!resident_stage_swaps(src, host_res, g.n_expert, swaps, home_of)) return false;
             adapt_nswaps += (int64_t) swaps.size();   // (read after the thread's join)
             if (pin_blobs_on()) {   // lock the batch's source pages (a file-backed arena on AMD; see pin_blobs)
                 std::vector<std::pair<uintptr_t, uintptr_t>> spans;
