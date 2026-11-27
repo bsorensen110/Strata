@@ -277,8 +277,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       PROPERTIES COMPILE_OPTIONS "$<IF:$<BOOL:${STRATA_HIP_GFX906}>,,--use_fast_math>")
   elseif(STRATA_ENABLE_HIP)
     # Keep Q8_K's multiply and magic-bias rounding as separate FP32 operations on HIP; contraction to an
-    # FMA changes tie results. The embedding gather also relies on separately rounded operations.
+    # FMA changes tie results. The embedding gather and gated MoE combine also rely on separately rounded ops.
     set_source_files_properties(src/kernels/cuda/elementwise.cu src/kernels/cuda/quantize_act.cu
+      src/kernels/cuda/native_moe.cu
       PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
   endif()
 

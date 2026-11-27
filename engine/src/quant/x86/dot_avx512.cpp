@@ -216,8 +216,7 @@ void dot_q5_K_q8_K_zmm(int n, float* STRATA_RESTRICT s, const void* STRATA_RESTR
         const __m128i q8s = _mm_hadd_epi16(_mm256_extracti128_si256(q8sums, 0), _mm256_extracti128_si256(q8sums, 1));
         const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
         const __m128i hsum = _mm_hadd_epi32(_mm_hadd_epi32(prod, mzero), mzero);
-        summs = _mm_cvtss_f32(_mm_add_ss(_mm_set_ss(summs),
-                              _mm_mul_ss(_mm_set_ss(dmin), _mm_cvtsi32_ss(_mm_setzero_ps(), _mm_extract_epi32(hsum, 0)))));
+        summs += dmin * (float) _mm_extract_epi32(hsum, 0);
 
         const __m512i scales512 = _mm512_broadcast_i32x4(_mm256_castsi256_si128(mins_and_scales));
         const __m512i hbits512 = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*) x[i].qh));
@@ -804,8 +803,7 @@ void dot_q5_K_q8_K_x4(int n, float out[4], const void* STRATA_RESTRICT w_base, s
             const __m256i mins_and_scales = _mm256_cvtepu8_epi16(_mm_set_epi32(utmp[3], utmp[2], utmp[1], utmp[0]));
             const __m128i prod = _mm_madd_epi16(_mm256_extracti128_si256(mins_and_scales, 1), q8s);
             const __m128i hsum = _mm_hadd_epi32(_mm_hadd_epi32(prod, mzero), mzero);
-            summs[r] = _mm_cvtss_f32(_mm_add_ss(_mm_set_ss(summs[r]),
-                                     _mm_mul_ss(_mm_set_ss(dmin), _mm_cvtsi32_ss(_mm_setzero_ps(), _mm_extract_epi32(hsum, 0)))));
+            summs[r] += dmin * (float) _mm_extract_epi32(hsum, 0);
 
             const __m512i scales512 = _mm512_broadcast_i32x4(_mm256_castsi256_si128(mins_and_scales));
             const __m512i hbits512 = _mm512_broadcast_i64x4(_mm256_loadu_si256((const __m256i*) bx.qh));

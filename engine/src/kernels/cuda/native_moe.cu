@@ -37,7 +37,11 @@ static_assert(KU >= 1 && KU <= 16, "native_moe: top-k must be 1..16");
 std::atomic<bool> enabled{false};
 // GATED (S26 STRATA_LFUSE): `shared` is the shared expert's unscaled output and sg its raw gate logit per token;
 // the row is scaled here as shared_expert_multi did (native_scalar_sigmoid_multi_kernel's expression, then one
-// rounded multiply = scale_rows_kernel's `out *= g`), then added as before
+// rounded multiply = scale_rows_kernel's `out *= g`), then added as before. Under HIP, keep explicit fmaf() calls as
+// FMAs while disabling implicit contraction of (__fmul_rn / __fadd_rn) across sh.x * g + sum.x.
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
 template<bool ZADD = false, bool GATED = false>
 __global__ void combine(const float* __restrict__ parts, const float* __restrict__ weights,
                         const float* __restrict__ shared, float* __restrict__ output,
@@ -54,7 +58,7 @@ __global__ void combine(const float* __restrict__ parts, const float* __restrict
     for (int expert = 1; expert < k; ++expert) {
         float p = parts[int64_t(expert) * n_embd + col];
         if (ZADD) p = 0.0f + p;
-        sum += p * weights[expert];
+        sum = fmaf(p, weights[expert], sum);
     }
     if constexpr (GATED) {
         // contraction off in this block only: the product is rounded on its own (scale_rows' store), then added
@@ -67,7 +71,11 @@ __global__ void combine(const float* __restrict__ parts, const float* __restrict
 #else
         const float sh = __fmul_rn(shared[col], g);   // nvcc ignores the clang pragma and fuses the product into the add (#5100): a rounded multiply by hand
 #endif
+#if defined(__HIPCC__)
+        sum = __fadd_rn(sum, sh);
+#else
         sum += sh;
+#endif
     } else {
         if (shared) sum += shared[col];
     }
@@ -262,6 +270,9 @@ __global__ void combine_k10_vec4_hits_mapped(const float4* __restrict__ hits4, c
     sum.w = __fadd_rn(sum.w, sh.w);
     output4[c4] = sum;
 }
+#if defined(__HIPCC__)
+#pragma clang fp contract(on)
+#endif
 bool valid_span(const void* p, size_t bytes) {
     const auto address = reinterpret_cast<uintptr_t>(p);
     return p && address % alignof(float) == 0 && bytes <= UINTPTR_MAX - address;

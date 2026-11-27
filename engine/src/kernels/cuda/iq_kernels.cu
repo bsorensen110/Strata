@@ -6958,6 +6958,9 @@ __global__ void __launch_bounds__(256) native_gu_fused_kernel(const unsigned lon
         }
         __syncthreads();
         if (warp < cn) {   // swiglu_entries_kernel + quantize_q8_1_kernel, one block of 32 h values per entry
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
             const float gg = res[warp][lane] * s_gate, uu = res[warp][32 + lane] * s_up;
 #if defined(__HIPCC__)
             const float xi = (gg / (1.0f + __expf(-gg))) * uu;

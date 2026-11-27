@@ -83,6 +83,11 @@ __device__ __forceinline__ void load8_q8(const QsaAttnPools& p, bool value, long
 #pragma unroll
     for (int j = 0; j < 8; ++j) out[j] = (float) c[j] * sc;
 }
+// Keep (nibble * d) rounded before any downstream dot product so HIP -ffp-contract=fast cannot fold it
+// differently under register pressure (e.g., pre75 NC=8 j=7 vs scalar/NC=2).
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
 __device__ __forceinline__ void load8_q4(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
     constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
     const int b = d0 / QK4_0;
@@ -99,6 +104,9 @@ __device__ __forceinline__ void load8_q4(const QsaAttnPools& p, bool value, long
         for (int k = 0; k < 8; ++k) out[k] = (float) ((int)(bytes[k] >> 4) - 8) * d;
     }
 }
+#if defined(__HIPCC__)
+#pragma clang fp contract(on)
+#endif
 template <int KV_MODE>
 __device__ __forceinline__ void load8(const QsaAttnPools& p, bool value, long long row, int d0, float* out) {
     if constexpr (KV_MODE == 0) load8_f16(p, value, row, d0, out);
@@ -663,6 +671,9 @@ __device__ __forceinline__ int head_of_lane(int lane) {
 }
 
 // One V element of pool row `row`, dimension `d` (the value loop's own thread index), per KV format.
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
 template <int KV_MODE>
 __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, int d) {
     if constexpr (KV_MODE == 0) {
@@ -682,6 +693,9 @@ __device__ __forceinline__ float load_v1(const QsaAttnPools& p, long long row, i
         return (float) nibble * dd;
     }
 }
+#if defined(__HIPCC__)
+#pragma clang fp contract(on)
+#endif
 
 template <int KV_MODE, int NC_ = 2, bool DPP_ = false, int CHUNK_ = CHUNK>
 __device__ __forceinline__ void attn_chunk_pre75_body(const float* __restrict__ q, const QsaAttnPools& p,
