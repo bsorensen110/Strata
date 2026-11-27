@@ -7480,10 +7480,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #endif
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu_23 = !g_old_kernels && !g_no_sub16_gu && em0 == 0 && L.gu_type == 23 && gu_fused_23_on() &&
-                             !expdec_gu_ok(L) && L.n_embd > 0 && L.n_embd % 32 == 0 &&
+    const bool fused_gu_23 = !g_old_kernels && !g_no_sub16_gu && L.had_block == 0 && em0 == 0 && L.gu_type == 23 &&
+                             gu_fused_23_on() && !expdec_gu_ok(L) && L.n_embd > 0 && L.n_embd % 32 == 0 &&
                              (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1) <= 49152;
-    const bool fused_gu_fork = !nib_layout(L) && L.n_ff % 32 == 0 && em0 == 8 &&
+    const bool fused_gu_fork = !nib_layout(L) && L.had_block == 0 && L.n_ff % 32 == 0 && em0 == 8 &&
                                ((kExpLds16 && L.gu_type == 16) || L.gu_type == 17 || L.gu_type == 18 ||
                                 L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23 || L.gu_type == 12 ||
                                 L.gu_type == 13 || L.gu_type == 40);
