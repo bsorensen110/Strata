@@ -249,15 +249,17 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
         }
     }
     float v[GRW_PER];
-    float ss = 0.0f;
     int k = 0;
 #pragma unroll
     for (int d = threadIdx.x; d < N; d += 256, ++k) {
         const float x = fmaf(bo[t * N + d], sc, r[d]);
         r[d] = x;
         v[k] = x;
-        ss += x * x;
+        xs[d] = x;
     }
+    __syncthreads();
+    float ss = 0.0f;
+    for (int d = threadIdx.x; d < N; d += 256) ss += xs[d] * xs[d];
     const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
     if (threadIdx.x == 0) rs_out[row] = rs;
     k = 0;
