@@ -145,6 +145,57 @@ int main() {
         }
     }
 
+    // 1b. Static per-worker slices (STRATA_L3_PF / STRATA_POOL_STATIC): deferred activation quantization must still run.
+    pool.set_static_slices(true);
+    if (pool.static_slices()) {
+        std::vector<cpu::ActQ> def_act(T);
+        std::vector<uint8_t> def_nact((size_t) T * cpu::kNativeActBytes, 0x5a);
+        std::vector<float> out_static((size_t) T * cpu::H, std::numeric_limits<float>::quiet_NaN());
+        std::vector<float> out_ref((size_t) T * cpu::H, std::numeric_limits<float>::quiet_NaN());
+
+        pool.clear_act_quant();
+        pool.defer_act_quant(xf.data(), def_nact.data(), def_act.data(), toks.data(), T, true);
+
+        cpu::ExpertJobMulti sjob;
+        sjob.blob = native_blob.data();
+        sjob.nt = T;
+        for (int t = 0; t < T; ++t) {
+            sjob.nact[t] = def_nact.data() + (size_t) t * cpu::kNativeActBytes;
+            sjob.out[t] = out_static.data() + (size_t) t * cpu::H;
+        }
+        pool.run_split_multi_native(f, &sjob, 1);
+        pool.set_static_slices(false);
+
+        for (int t = 0; t < T; ++t) {
+            if (std::memcmp(def_nact.data() + (size_t) t * cpu::kNativeActBytes,
+                            ref_nact.data() + (size_t) t * cpu::kNativeActBytes, cpu::kNativeActBytes) != 0) {
+                std::fprintf(stderr, "native static_slices defer_act_quant mismatch at row %d/%d\n", t, T);
+                ++fail;
+            }
+        }
+        std::vector<cpu::ExpertJobMulti> chunk_jobs;
+        for (int t0 = 0; t0 < T; t0 += cpu::MAXT) {
+            const int m = (std::min)(cpu::MAXT, T - t0);
+            cpu::ExpertJobMulti cj;
+            cj.blob = native_blob.data();
+            cj.nt = m;
+            for (int t = 0; t < m; ++t) {
+                cj.nact[t] = ref_nact.data() + (size_t) (t0 + t) * cpu::kNativeActBytes;
+                cj.out[t] = out_ref.data() + (size_t) (t0 + t) * cpu::H;
+            }
+            chunk_jobs.push_back(cj);
+        }
+        pool.clear_act_quant();
+        pool.run_split_multi_native(f, chunk_jobs.data(), (int) chunk_jobs.size());
+        for (int t = 0; t < T; ++t) {
+            if (std::memcmp(out_static.data() + (size_t) t * cpu::H,
+                            out_ref.data() + (size_t) t * cpu::H, (size_t) cpu::H * sizeof(float)) != 0) {
+                std::fprintf(stderr, "native static_slices output differs at row %d/%d\n", t, T);
+                ++fail;
+            }
+        }
+    }
+
     // 2. Test s2 path if CPU supports AVX-512 (same check as expert_multi_test): defer_act_quant + run_split_multi.
     if (cpu::cpu_features().usable()) {
         std::vector<cpu::ActQ> def_act(T);

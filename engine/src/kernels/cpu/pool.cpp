@@ -1370,20 +1370,7 @@ void ExpertPool::native_rows(int e, int r0, int r1, bool in_gu) {
 }
 
 void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
-    if (per_worker_) {   // task j on worker j, once per batch; the host has none (it never calls this for such a batch)
-        if (id < 0 || id >= n_) return;
-        wstate_[(size_t) id].store(id, std::memory_order_relaxed);
-        if (mode_ == 9) prefetch_task(id);
-        else {
-            const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
-            const int r0 = (int) ((int64_t) per * id / n_), r1 = (int) ((int64_t) per * (id + 1) / n_);
-            const int nb = (int) (mrows_ / per);
-            if (r1 > r0)
-                for (int e = 0; e < nb; ++e) native_rows(e, r0, r1, mode_ == 5);
-        }
-        done_.fetch_add(1, std::memory_order_release);
-        return;
-    }
+    if (per_worker_ && (id < 0 || id >= n_)) return;   // task j on worker j; the host never calls this for such a batch
     const int s = numa_n_ == 0 ? 0 : id >= 0 ? wslice_[(size_t) id] : hslice_;
     if ((mode_ == 5 || mode_ == 7 || mode_ == 11 || mode_ == 3 || mode_ == 10) && act_count_ > 0) {
         for (;;) {
@@ -1401,6 +1388,19 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             act_done_.fetch_add(1, std::memory_order_release);
         }
         while (act_done_.load(std::memory_order_acquire) < (uint32_t) act_count_) strata_cpu_pause();
+    }
+    if (per_worker_) {   // task j on worker j, once per batch; runs after any deferred activation quantization
+        wstate_[(size_t) id].store(id, std::memory_order_relaxed);
+        if (mode_ == 9) prefetch_task(id);
+        else {
+            const int per = mode_ == 5 ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
+            const int r0 = (int) ((int64_t) per * id / n_), r1 = (int) ((int64_t) per * (id + 1) / n_);
+            const int nb = (int) (mrows_ / per);
+            if (r1 > r0)
+                for (int e = 0; e < nb; ++e) native_rows(e, r0, r1, mode_ == 5);
+        }
+        done_.fetch_add(1, std::memory_order_release);
+        return;
     }
     for (;;) {
         // STRATA_NUMA_SPLIT: a mode-5/6 batch lives on the slice heads, any other on `head_`; the epoch tag makes the
