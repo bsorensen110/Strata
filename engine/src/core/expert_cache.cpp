@@ -1209,25 +1209,36 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     auto refused = [](const char* call, int64_t seg) {
         return ec_test::refuse_segment_call != nullptr && ec_test::refuse_segment_call(call, seg);
     };
-    for (int64_t i = mapped_chunks - 1; i >= keep_chunks; --i) {
-        if (refused("unmap", i)) {
+    const int64_t chunks_per_seg = std::max<int64_t>(1, (int64_t) ((uint64_t) seg_ / gran));
+    const int64_t mapped_segs = (mapped_chunks + chunks_per_seg - 1) / chunks_per_seg;
+    const int64_t keep_segs = (keep_chunks + chunks_per_seg - 1) / chunks_per_seg;
+    for (int64_t seg = mapped_segs - 1; seg >= keep_segs; --seg) {
+        if (refused("unmap", seg)) {
             err = "the driver refused to release an expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
             return false;
         }
-        const VmmChunk h = segmented_vmm_->unmap(i);
-        if (h == 0) {
-            err = "the driver refused to release an expert-cache segment";
-            live_slots_ = slots_within(mapped_bytes());   // segment i is still mapped: [0, i] stay
-            return false;
+        const int64_t lo = seg * chunks_per_seg;
+        const int64_t hi = std::min<int64_t>(mapped_chunks, (seg + 1) * chunks_per_seg);
+        std::vector<VmmChunk> freed;
+        freed.reserve((size_t) std::max<int64_t>(0, hi - lo));
+        for (int64_t i = hi - 1; i >= lo; --i) {
+            const VmmChunk h = segmented_vmm_->unmap(i);
+            if (h == 0) {
+                for (const VmmChunk uh : freed) unmapped_vmm_chunks_.push_back(uh);
+                err = "the driver refused to release an expert-cache segment";
+                live_slots_ = slots_within(mapped_bytes());   // segment seg partially failed: stop shrink here
+                return false;
+            }
+            freed.push_back(h);
         }
-        if (refused("release", i)) {
-            unmapped_vmm_chunks_.push_back(h);
+        if (refused("release", seg)) {
+            for (const VmmChunk uh : freed) unmapped_vmm_chunks_.push_back(uh);
             err = "the driver refused to release an expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
             return false;
         }
-        vmm_chunk_free(h);
+        for (const VmmChunk h : freed) vmm_chunk_free(h);
     }
     live_slots_ = slots_within(mapped_bytes());
     return true;

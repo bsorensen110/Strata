@@ -161,6 +161,7 @@ VmmChunk VmmRange::unmap(int64_t i) {
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #endif
 
@@ -189,9 +190,20 @@ const Api& api() {
     static Api& a = *new Api;   // never destroyed: the K/V pools and the cache release their chunks from static destructors
     static std::once_flag once;
     std::call_once(once, [] {
-        const char* off = std::getenv("STRATA_HIP_VMM");
-        if (off != nullptr && off[0] == '0') return;
+        const char* env = std::getenv("STRATA_HIP_VMM");
+        if (env != nullptr && env[0] == '0') return;
         if (hipGetDevice(&a.dev) != hipSuccess) { (void) hipGetLastError(); return; }
+        hipDeviceProp_t device_prop{};
+        if (hipGetDeviceProperties(&device_prop, a.dev) != hipSuccess) {
+            (void) hipGetLastError();
+            return;
+        }
+        if (std::strncmp(device_prop.gcnArchName, "gfx12", 5) == 0 &&
+            !(env != nullptr && env[0] == '1' && env[1] == '\0')) {
+            // ROCm HIP VMM on gfx12 corrupts live pages across hipMemCreate/hipMemRelease (even across unrelated
+            // allocations); keep VMM disabled on RDNA4 unless STRATA_HIP_VMM=1 is explicitly opted in.
+            return;
+        }
         int vmm = 0;
         if (hipDeviceGetAttribute(&vmm, hipDeviceAttributeVirtualMemoryManagementSupported, a.dev) != hipSuccess || !vmm) {
             (void) hipGetLastError();

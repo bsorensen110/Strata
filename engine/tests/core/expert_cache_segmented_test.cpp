@@ -3,6 +3,7 @@
 // Uniform and sized slots. Needs a VMM-capable CUDA or HIP device (exits 77 without one).
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_cache_refuse.hpp"
+#include "strata/core/vmm.hpp"
 #include "strata/core/residency_trim.hpp"
 
 #include <cuda_runtime.h>
@@ -48,6 +49,10 @@ bool check(const strata::core::ExpertCache& c, int64_t to, int64_t blob) {
 }  // namespace
 
 int main() {
+    if (!strata::core::vmm_available()) {
+        std::puts("HIP/CUDA VMM unavailable: skipped");
+        return 77;
+    }
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
         std::puts("no GPU device: skipped");
