@@ -1198,27 +1198,28 @@ __device__ __forceinline__ void block_scores_rows_body(const float* __restrict__
                                                        const float* __restrict__ q_idx,
                                                        const int32_t* __restrict__ steps, int nq,
                                                        int64_t max_blocks, float* __restrict__ out) {
-    (void) nq;
+    if (nq <= 0) return;
     __shared__ __align__(16) float qs[NQ * IDX_HEADS * IDX_DIM];
     __shared__ int64_t s_nkv[NQ], s_nbid[NQ];
-    if (threadIdx.x < NQ) {
+    if (threadIdx.x < nq) {
         s_nkv[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNKv];
         s_nbid[threadIdx.x] = steps[threadIdx.x * kStepCount + kStepNBid];
     }
     sel_sync_lds();
     int64_t top = 0;
-#pragma unroll
-    for (int q = 0; q < NQ; ++q) top = s_nbid[q] > top ? s_nbid[q] : top;
+    for (int q = 0; q < nq; ++q) top = s_nbid[q] > top ? s_nbid[q] : top;
     if ((int64_t) blockIdx.x * SCORE_WARPS > top) return;   // the multi kernel's early exit (CTA-uniform)
-    for (int i = threadIdx.x; i < NQ * IDX_HEADS * IDX_DIM; i += blockDim.x) qs[i] = q_idx[i];
+    for (int i = threadIdx.x; i < nq * IDX_HEADS * IDX_DIM; i += blockDim.x) qs[i] = q_idx[i];
     sel_sync_lds();
     const int lane = threadIdx.x & 31;
     float4 qr[NQ][IDX_HEADS];
 #pragma unroll
-    for (int qi = 0; qi < NQ; ++qi)
+    for (int qi = 0; qi < NQ; ++qi) {
+        if (qi >= nq) break;
 #pragma unroll
         for (int h = 0; h < IDX_HEADS; ++h)
             qr[qi][h] = *reinterpret_cast<const float4*>(qs + qi * IDX_HEADS * IDX_DIM + h * IDX_DIM + lane * 4);
+    }
     const float4 kd = *reinterpret_cast<const float4*>(dead + lane * 4);
     const bool hi16 = (lane & 16) != 0, hi8 = (lane & 8) != 0;
     const int64_t wstride = (int64_t) gridDim.x * SCORE_WARPS;
@@ -1226,6 +1227,7 @@ __device__ __forceinline__ void block_scores_rows_body(const float* __restrict__
         const float4 kp = *reinterpret_cast<const float4*>(pooled + b * IDX_DIM + lane * 4);
 #pragma unroll
         for (int qi = 0; qi < NQ; ++qi) {
+            if (qi >= nq) break;
             const int64_t n_bid = s_nbid[qi];
             if (b > n_bid) continue;
             const float4 k4 = (b == n_bid) ? kd : kp;

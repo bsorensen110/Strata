@@ -276,6 +276,103 @@ bool check_rows_1_to_8() {
     std::puts("ok   qsa_block_scores_rows & top-k nq=1..8 (consecutive + spread n_bid + partial tails): 48 cases identical");
     return true;
 }
+bool check_slot_groups() {
+    if (std::getenv("STRATA_QSA_ROWS") == nullptr) {
+#if defined(_WIN32)
+        _putenv_s("STRATA_QSA_ROWS", "1");
+#else
+        setenv("STRATA_QSA_ROWS", "1", 0);
+#endif
+    }
+    const auto s = k::qsa_real_shapes();
+    const int64_t D = s.idx_dim, H = s.idx_n_head;
+    const int groups_ntok[][4] = {{1, 3, 0, 0}, {4, 1, 2, 0}};
+    const int groups_cnt[] = {2, 3};
+    for (int ci = 0; ci < 2; ++ci) {
+        const int ng = groups_cnt[ci];
+        int total_q = 0;
+        for (int g = 0; g < ng; ++g) total_q += groups_ntok[ci][g];
+        const int64_t max_blocks = 2048;
+        std::mt19937 rng(77123 + ci * 97);
+        std::normal_distribution<float> nd(0.f, 1.f);
+        std::vector<float> q((size_t) total_q * H * D);
+        for (auto& v : q) v = nd(rng);
+        std::vector<int32_t> steps((size_t) total_q * k::kStepCount);
+        std::vector<float*> pooled_dev(ng, nullptr), dead_dev(ng, nullptr);
+        k::QsaScoreGroups sg;
+        sg.ng = ng;
+        int first = 0;
+        for (int g = 0; g < ng; ++g) {
+            const int ntok = groups_ntok[ci][g];
+            std::vector<float> p((size_t) max_blocks * D), d((size_t) D);
+            for (auto& v : p) v = nd(rng);
+            for (auto& v : d) v = nd(rng);
+            ck(cudaMalloc(&pooled_dev[g], p.size() * 4));
+            ck(cudaMalloc(&dead_dev[g], d.size() * 4));
+            ck(cudaMemcpy(pooled_dev[g], p.data(), p.size() * 4, cudaMemcpyHostToDevice));
+            ck(cudaMemcpy(dead_dev[g], d.data(), d.size() * 4, cudaMemcpyHostToDevice));
+            sg.pooled[g] = pooled_dev[g];
+            sg.dead[g] = dead_dev[g];
+            sg.first[g] = first;
+            sg.ntok[g] = ntok;
+            const int64_t base_ctx = 511 + g * 1300;
+            for (int i = 0; i < ntok; ++i) {
+                int32_t* st = steps.data() + (size_t) (first + i) * k::kStepCount;
+                const int64_t pos = base_ctx + i * 3;
+                st[k::kStepPos] = (int32_t) pos;
+                st[k::kStepNKv] = (int32_t) (pos + 1);
+                st[k::kStepNBid] = (int32_t) ((pos + 1) / s.idx_block);
+                st[k::kStepWidth] = (int32_t) k::qsa_selection_width(pos + 1, s);
+            }
+            first += ntok;
+        }
+        float *dq = nullptr, *da = nullptr, *db = nullptr;
+        int32_t* dt = nullptr;
+        const size_t n_sc = (size_t) total_q * max_blocks;
+        ck(cudaMalloc(&dq, q.size() * 4));
+        ck(cudaMalloc(&dt, steps.size() * 4));
+        ck(cudaMalloc(&da, n_sc * 4));
+        ck(cudaMalloc(&db, n_sc * 4));
+        ck(cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice));
+        ck(cudaMemcpy(dt, steps.data(), steps.size() * 4, cudaMemcpyHostToDevice));
+        ck(cudaMemset(da, 0x7f, n_sc * 4));
+        ck(cudaMemset(db, 0x3e, n_sc * 4));
+        if (!k::qsa_block_scores_slot_groups(sg, dq, dt, max_blocks, s, db, nullptr)) {
+            std::fprintf(stderr, "FAIL qsa_block_scores_slot_groups refused\n");
+            return false;
+        }
+        for (int g = 0; g < ng; ++g) {
+            k::qsa_block_scores(sg.pooled[g], sg.dead[g], dq + (size_t) sg.first[g] * H * D,
+                                dt + (size_t) sg.first[g] * k::kStepCount, sg.ntok[g], max_blocks, s,
+                                da + (size_t) sg.first[g] * max_blocks, nullptr);
+        }
+        ck(cudaDeviceSynchronize());
+        std::vector<uint32_t> a(n_sc), b(n_sc);
+        ck(cudaMemcpy(a.data(), da, n_sc * 4, cudaMemcpyDeviceToHost));
+        ck(cudaMemcpy(b.data(), db, n_sc * 4, cudaMemcpyDeviceToHost));
+        for (int i = 0; i < total_q; ++i) {
+            const int64_t n_bid = steps[(size_t) i * k::kStepCount + k::kStepNBid];
+            for (int64_t j = 0; j <= n_bid; ++j) {
+                const size_t at = (size_t) i * max_blocks + j;
+                if (a[at] != b[at]) {
+                    std::fprintf(stderr, "FAIL slot_groups unequal ntok case=%d q=%d b=%lld\n", ci, i, (long long) j);
+                    return false;
+                }
+            }
+            for (int64_t j = n_bid + 1; j < max_blocks; ++j) {
+                const size_t at = (size_t) i * max_blocks + j;
+                if (b[at] != 0x3e3e3e3eu) {
+                    std::fprintf(stderr, "FAIL slot_groups guard overwritten case=%d q=%d b=%lld\n", ci, i, (long long) j);
+                    return false;
+                }
+            }
+        }
+        for (int g = 0; g < ng; ++g) { cudaFree(pooled_dev[g]); cudaFree(dead_dev[g]); }
+        cudaFree(dq); cudaFree(dt); cudaFree(da); cudaFree(db);
+    }
+    std::puts("ok   qsa_block_scores_slot_groups unequal ntok ([1,3], [4,1,2]): identical + guard clean");
+    return true;
+}
 }  // namespace
 
 int main() {
@@ -291,6 +388,7 @@ int main() {
     };
     for (const auto c : cases) if (!check(c)) return 1;
     if (!check_rows_1_to_8()) return 1;
+    if (!check_slot_groups()) return 1;
     std::puts("PASS: block scores of the thread kernel bitwise identical to block_scores_kernel");
     return 0;
 }
