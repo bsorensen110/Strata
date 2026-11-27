@@ -6400,6 +6400,7 @@ class SilentEngine(unittest.TestCase):
         engine.slot_releasing = set()
         engine._orphan_seen = {}
         engine.slot_held = [[] for _ in range(slots)]
+        engine.slot_prompt = [[] for _ in range(slots)]
         engine.slot_used = [0.0] * slots
         engine.slot_live = [None] * slots
         engine.slot_cv = threading.Condition()
