@@ -273,13 +273,14 @@ __global__ void copy_groups_kernel(KvCopyGroups cg) {
 struct KvCopyArg {
     KvStreamMap map;
     Runs runs;
+    int32_t n_q;
 };
 struct KvCopyArgs {
     KvCopyArg s[kKvAppendMaxSlots];
 };
 __global__ void copy_slots_kernel(KvCopyArgs a) {
     const KvCopyArg& c = a.s[blockIdx.y];
-    copy_body(c.map, c.runs);
+    if (c.n_q > 0) copy_body(c.map, c.runs);
 }
 
 __global__ void reset_kernel(KvStreamMap m) {
@@ -364,7 +365,7 @@ void kv_stream_resolve_slots(const KvResolveSlots& slots, int64_t cap, const Qsa
         const auto& src = slots.s[i];
         validate_resolve_slots(src.map);
         rargs.s[i] = {src.map, src.ids, src.steps, src.n_q};
-        cargs.s[i] = {src.map, runs_of(src.slots, src.host, src.fmt, s)};
+        cargs.s[i] = {src.map, runs_of(src.slots, src.host, src.fmt, s), src.n_q};
     }
     resolve_slots_kernel<<<(unsigned) slots.n, RT, 0, (cudaStream_t) stream>>>(rargs, (int) cap, (int) s.page_size);
     check("resolve_slots");
