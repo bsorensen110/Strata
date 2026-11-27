@@ -165,7 +165,7 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   target_compile_features(nvfp4_recipe_test PRIVATE cxx_std_17)
   add_test(NAME nvfp4_recipe_test COMMAND nvfp4_recipe_test)
   # 4-row shared-activation VPDPBUSD dot kernels parity vs 1-row Arith::Avx2
-  # (defined after strata_quant_layer in engine/CMakeLists.txt so TARGET strata_quant exists)
+  # (dot_x4_test and dot_x4_bench defined after strata_quant_layer in engine/CMakeLists.txt so TARGET strata_quant exists)
   # 3-Tier NVMe streaming primitives: 2-priority chunked I/O scheduler, proj_ready[3], pe128 wave planner, lookahead v2
   add_executable(ssd_stream_test tests/core/ssd_stream_test.cpp)
   target_include_directories(ssd_stream_test PRIVATE include)
