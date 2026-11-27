@@ -395,7 +395,10 @@ bool rdna_q6k_enabled() {
 }
 
 bool rdna_kq_shared_words_enabled() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_RDNA_KQ_SHR"); return v && v[0] == '1'; }();
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_RDNA_KQ_SHR");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
     return on;
 }
 
