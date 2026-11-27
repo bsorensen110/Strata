@@ -96,10 +96,11 @@ int main() {
     check(df2_logits_batch_b == 16ull * (uint64_t) g.n_vocab * 4ull, "batch parent logits_bytes uses 16 draft rows");
 
     const int64_t iq4_xs_max_blob = 2867200;   // ~2.734 MiB max expert blob in live Flash-Next IQ4_XS pack
+    const uint64_t staging_blobs = (uint64_t) Verifier::staging_blobs_cap();
     const uint64_t ver_arena_t8_b = Verifier::arena_bytes(g, ss, g.n_vocab, 8, iq4_xs_max_blob, 0);
     const uint64_t ver_arena_t16_b = Verifier::arena_bytes(g, ss, g.n_vocab, 16, iq4_xs_max_blob, 0);
     const uint64_t arena_major_floor_b =
-        16ull * (uint64_t) iq4_xs_max_blob +                                        // staging_ (16 blobs)
+        staging_blobs * (uint64_t) iq4_xs_max_blob +                                  // staging_
         2ull * (uint64_t) g.n_gdn_layers() * 8ull * (uint64_t) g.ssm_conv_channels * 4ull +   // qkv_L_ + h_L_
         8ull * (uint64_t) g.n_vocab * 4ull +                                        // head_logits_
         2ull * 8ull * (uint64_t) g.hc * (uint64_t) g.n_embd * 4ull;                 // R_ + xn_
@@ -107,8 +108,10 @@ int main() {
           "Verifier::arena_bytes exceeds sum of major independent constituent buffers");
     check(ver_arena_t8_b == Verifier::arena_bytes(g, ss_fallback, g.n_vocab, 8, iq4_xs_max_blob, 0),
           "Verifier::arena_bytes falls back cleanly when qsa_states is null");
-    check(ver_arena_t8_b >= (uint64_t) (65 * MiB) && ver_arena_t8_b <= (uint64_t) (95 * MiB),
-          "Verifier::arena_bytes T=8 falls in measured 65-95 MiB window");
+    const uint64_t staging_b = staging_blobs * (uint64_t) iq4_xs_max_blob;
+    check(ver_arena_t8_b >= staging_b + (uint64_t) (21 * MiB) &&
+              ver_arena_t8_b <= staging_b + (uint64_t) (52 * MiB),
+          "Verifier::arena_bytes T=8 falls in measured staging + 21-52 MiB window");
     check(ver_arena_t16_b > ver_arena_t8_b, "Verifier::arena_bytes grows monotonically with max_t");
 
     const uint64_t exact_solo_df2_b =

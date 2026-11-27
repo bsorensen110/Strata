@@ -220,6 +220,7 @@ void gdn_groups_q8(cudaStream_t s) {
     std::mt19937 rng(23);
     std::normal_distribution<float> nd(0.f, 0.5f);
     for (int n : {8, 9, 12, 16}) {
+        if (n > k::kVerifyMaxT) continue;
         const int n0 = n / 2, n1 = n - n0;
         const size_t st_floats = (size_t) HV * S * S;
         const size_t q8_bytes = ((size_t) n * ZV / 32) * 36;

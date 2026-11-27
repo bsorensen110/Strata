@@ -148,6 +148,7 @@ public:
     /// Negative `staging_blob_bytes` / `had_gu_any` read `expert_layout()`; non-negative overrides for offline tests.
     static uint64_t arena_bytes(const ModelGeometry& g, const SessionState& ss, int64_t n_vocab, int max_t,
                                 int64_t staging_blob_bytes = -1, int had_gu_any = -1);
+    static int64_t staging_blobs_cap() noexcept;
     /// Device tap buffer bytes `init` allocates for `tap_layers`, `max_t` rows, and `[stage_lb, stage_le)`.
     inline static uint64_t tap_bytes(const std::vector<int>& tap_layers, int max_t, int64_t n_embd,
                                      int64_t stage_lb = 0, int64_t stage_le = -1, int64_t n_layers = 48) noexcept {
@@ -823,7 +824,6 @@ private:
     uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
     static constexpr int64_t kStagingBlobs = 16;
     static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
-    static int64_t staging_blobs_cap() noexcept;
     static int64_t pcie_group_rows_cap() noexcept;
     bool can_cpu_reduce_miss(int n, bool dec_batch) const noexcept;
     uint8_t* hit_xq_ = nullptr;
