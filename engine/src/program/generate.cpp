@@ -16734,6 +16734,15 @@ int main(int argc, char** argv) {
             a_pl_idle = nullptr;
             a_res_dirty = false;
         };
+        struct AJobStop {
+            std::unique_ptr<JobThread>* job;
+            ~AJobStop() {
+                if (job != nullptr && *job != nullptr) {
+                    (*job)->wait();
+                    job->reset();
+                }
+            }
+        } ajob_stop{&ajob};
         // #477: write the learned profile (between requests and at QUIT: a prompt's lent slots are back by then).
         // A swap still in flight counts as done - its expert is resident once the copy lands.  `why`: for the log.
         auto save_profile = [&](const char* why) {
@@ -18179,15 +18188,20 @@ int main(int argc, char** argv) {
                     &df2);
             }
 #endif
-            struct AdaptRun {
-                std::thread th;
-                std::atomic<bool> ver_done{true};
-                bool ok = true;
-                ~AdaptRun() {
-                    ver_done.store(true, std::memory_order_release);
-                    if (th.joinable()) th.join();
-                }   // an error return below still joins it
-            } adapt_run;
+            struct AdaptEarlyCtx {
+                struct AdaptRun {
+                    std::thread th;
+                    std::atomic<bool> ver_done{true};
+                    bool ok = true;
+                    ~AdaptRun() {
+                        ver_done.store(true, std::memory_order_release);
+                        if (th.joinable()) th.join();
+                    }   // an error return below still joins it
+                };
+                AdaptRun* run = nullptr;
+                std::function<bool()> fn;
+            } adapt_early_ctx;
+            AdaptEarlyCtx::AdaptRun adapt_run;
             static const bool adapt_early = [] {
                 const char* v = std::getenv("STRATA_ADAPT_EARLY");
                 return v == nullptr || v[0] == '\0' || v[0] != '0';
@@ -18195,10 +18209,6 @@ int main(int argc, char** argv) {
             const bool want_adapt_early = adapt_early && !aflipped && !drive.d.usage.empty() && !ajob && !in_prompt_read &&
                                           o.adapt_every > 0 && ((ba_window + 1) % o.adapt_every) == 0 && pending.empty() &&
                                           stages.empty();
-            struct AdaptEarlyCtx {
-                AdaptRun* run = nullptr;
-                std::function<bool()> fn;
-            } adapt_early_ctx;
             if (want_adapt_early) {
                 std::vector<float> early_usage = snapshot_usage();
                 adapt_run.ver_done.store(false, std::memory_order_release);
