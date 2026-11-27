@@ -3503,7 +3503,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
         // When T = 9..16 and the interleaved kernel supports T columns, gather all T mixer outputs/q8_1 columns
         // across kFusedGrMaxT slices first (or in one wide pass when STRATA_HC_Q8_16=1), then run native_mmvq_il ONCE.
-        const bool use_head_il_all = head_ != nullptr && head_->loaded() && g_mmvq_il() &&
+        const bool use_head_il_all = head_ != nullptr && head_->loaded() && !head_->is_split() && g_mmvq_il() &&
                                      T > kFusedGrMaxT && T <= 16 && T <= kVerifyMaxT &&
                                      strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_);
         const bool head_single_16 = use_head_il_all && env_on_default_true("STRATA_HC_Q8_16") &&
