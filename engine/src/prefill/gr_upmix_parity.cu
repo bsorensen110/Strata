@@ -154,6 +154,11 @@ int check(strata::prefill::Gemm& gm, cudaStream_t st, float* gated, int64_t T, u
     gm.bf16(in.d_lo16, in.d_wu, gated, T, D, LR);
     strata::prefill::gr_mix_r(in.d_R, in.d_rs, in.d_w, gated, ref.mixed, ref.bf, T, st, ref.h);
     if (!strata::prefill::gr_upmix(in.d_lo16, in.d_wu, in.d_R, in.d_rs, in.d_w, got.mixed, got.bf, got.h, T, st)) {
+        const char* upmix_env = std::getenv("STRATA_FORK_HC_UPMIX");
+        if (is_gfx12 && (upmix_env == nullptr || upmix_env[0] == '0')) {
+            std::printf("gr_upmix_parity: gfx12 requires STRATA_FORK_HC_UPMIX=1, skipped\n");
+            std::exit(77);
+        }
         std::printf("FAIL T=%lld: gr_upmix refused (needs CUDA sm_80+)\n", (long long) T);
         return 1;
     }

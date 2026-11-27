@@ -4685,6 +4685,7 @@ int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
     if (ncols < 1 || ncols > 16) return 0;
     const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
     if (ncols > 8) {   // RDNA4 (gfx12, cc == 1202): 9..16 columns (cp = 16) use R = 1 row/warp, or R = 2 with STRATA_MMVQ_IL_NARROW_ACC=1
+        if (cc != 1202) return 0;
         if (mmvq_il_narrow_acc_on()) {
             if (type == 11 && !il_q3k_on()) return 0;
             return (type == 23 || type == 12 || type == 13 || type == 14 || type == 11 || type == 21 || type == 18) ? 2 : 0;
@@ -4692,7 +4693,6 @@ int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
         static const bool wide = il_env_on("STRATA_MMVQ_IL_WIDE");
         if (!wide) return 0;
         if (type == 11 && !il_q3k_on()) return 0;
-        if (cc != 1202) return 0;
         return (type == 23 || type == 12 || type == 13 || type == 14 || type == 11 || type == 21 || type == 18) ? 1 : 0;
     }
     if (ncols > 4) {   // 147-verify: 5..8 columns, only where a card measured its table

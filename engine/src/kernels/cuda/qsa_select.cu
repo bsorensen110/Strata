@@ -2460,6 +2460,10 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
 #if defined(__HIPCC__)
     // AMD: the gfx12 (RDNA4) WMMA scorer, opt-in (STRATA_SELECT_WMMA=1): it selects slightly differently from the warp
     // kernel (254/256 queries the same), so the default keeps the warp kernel; every other target keeps it too (false)
+    static const bool wmma_explicit = [] {
+        const char* v = std::getenv("STRATA_SELECT_WMMA");
+        return v != nullptr && v[0] != '\0';
+    }();
     static const bool wmma_on = [] {
         const char* v = std::getenv("STRATA_SELECT_WMMA");
         if (v != nullptr && v[0] != '\0') return v[0] != '0';
@@ -2491,7 +2495,8 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
         const int64_t min_tok = alt_min_env >= 0 ? alt_min_env : (simt_env < 0 && simt_v == 2 ? 28672 : 0);
         if (reach_all * R < min_tok) return false;
     }
-    if (simt_v != 0 && !(wmma_on && sel_gfx12_device())) {
+    const bool simt_overrides_default_wmma = simt_env > 0 && !wmma_explicit;
+    if (simt_v != 0 && !(wmma_on && !simt_overrides_default_wmma && sel_gfx12_device())) {
         const int64_t reach = active_blocks > 0 && active_blocks < max_blocks ? active_blocks : max_blocks;
         const bool rdna2 = sel_gfx103_device();
         static std::atomic<bool> said{false};

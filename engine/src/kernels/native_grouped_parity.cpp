@@ -12,6 +12,7 @@
 //
 // Random bytes are valid codes for every format here (every grid index is in range); only the fp16 block scales are
 // set, small enough that the SwiGLU outputs keep a finite fp16 q8_1 scale.
+#include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cuda_runtime.h>
@@ -380,18 +381,19 @@ void bench(cudaStream_t s, std::mt19937& rng) {
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
 #if defined(__HIP_PLATFORM_AMD__)
-    {   // gfx1151 defaults to expert mode 8 (the fused gate/up + SwiGLU + q8_1 LDS kernel) for an unstrided call and to the CUDA layout
-        // for a strided one; the two sum in a different order, so "bitwise equal to v1" does not hold between them there (summation
-        // order only: round 0214 diagnosis, RESULTS-ENGAMD.md).  Pin the CUDA layout for both runs unless the caller chose a mode.
+    {   // gfx1151 and gfx12 default to expert mode 8 (the fused gate/up + SwiGLU + q8_1 LDS kernel) for an unstrided call and to
+        // the CUDA layout for a strided one; the two sum in a different order, so "bitwise equal to v1" does not hold between them
+        // there (summation order only: round 0214 diagnosis, RESULTS-ENGAMD.md). Pin the CUDA layout unless the caller chose a mode.
         cudaDeviceProp prop;
         if (std::getenv("STRATA_EXP_MODE") == nullptr && cudaGetDeviceProperties(&prop, 0) == cudaSuccess &&
-            std::strstr(prop.gcnArchName, "gfx1151") != nullptr) {
+            (k::gfx_arch_is_gfx1151(prop.gcnArchName) || k::gfx_arch_is_gfx12(prop.gcnArchName))) {
 #ifdef _WIN32
             _putenv_s("STRATA_EXP_MODE", "0");
 #else
             setenv("STRATA_EXP_MODE", "0", 1);
 #endif
-            std::printf("gfx1151: STRATA_EXP_MODE=0 pinned for both runs (mode 8 and the CUDA layout differ in summation order)\n");
+            std::printf("%s: STRATA_EXP_MODE=0 pinned for both runs (mode 8 and the CUDA layout differ in summation order)\n",
+                        k::gfx_arch_is_gfx12(prop.gcnArchName) ? "gfx12" : "gfx1151");
         }
     }
 #endif

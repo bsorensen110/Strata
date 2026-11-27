@@ -149,9 +149,10 @@ int main() {
         std::printf("  skipped (kWindowMaxT=%d < 16)\n", k::kWindowMaxT);
         return 0;
     }
-    const int tbl_rows = k::native_mmvq_il_rows_for(1201, 12, 12, 2048);
+    // gfx12 HIP devices are keyed internally as 1202 by il_cc(); 1201 is the NVIDIA sm_120 key.
+    const int tbl_rows = k::native_mmvq_il_rows_for(1202, 12, 12, 2048);
     if (tbl_rows != 2) {
-        std::fprintf(stderr, "expected native_mmvq_il_rows_for(1201, 12, 12, 2048) == 2 with NarrowAcc=1, got %d\n", tbl_rows);
+        std::fprintf(stderr, "expected native_mmvq_il_rows_for(1202, 12, 12, 2048) == 2 with NarrowAcc=1, got %d\n", tbl_rows);
         return 1;
     }
 
