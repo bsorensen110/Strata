@@ -684,6 +684,12 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 strata_gpu_engine()
 
 strata_cpu_kernels()
+if(TARGET strata_core AND TARGET strata_kernels_cpu)
+  # pinned.cu (in strata_core) reads strata::kernels::cpu::expert_layout() for STRATA_NUMA_ARENA=1;
+  # executables that link strata_core without strata_engine (strata-load, strata-concurrent, strata-overlap)
+  # inherit the dependency here.
+  target_link_libraries(strata_core PUBLIC strata_kernels_cpu)
+endif()
 
 # ---- plan v0.3 P6: the i-quant models' CPU experts (IQ2_XS / IQ3_XXS files) ----
 #
